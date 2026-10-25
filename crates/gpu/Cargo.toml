@@ -13,6 +13,9 @@ burn = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 audiovae = { path = "../audiovae" }
+crc32fast.workspace = true
 minicpm4 = { path = "../minicpm4" }
 serde_json.workspace = true
 testkit = { path = "../testkit" }
+voices = { path = "../voices" }
+voxcpm = { path = "../voxcpm" }

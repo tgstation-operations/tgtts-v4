@@ -3128,9 +3128,12 @@ version = "0.1.0"
 dependencies = [
  "audiovae",
  "burn",
+ "crc32fast",
  "minicpm4",
  "serde_json",
  "testkit",
+ "voices",
+ "voxcpm",
 ]
 
 [[package]]
