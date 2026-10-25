@@ -1,0 +1,10 @@
+[package]
+name = "dsp"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dev-dependencies]
+safetensors.workspace = true
+testkit = { path = "../testkit" }

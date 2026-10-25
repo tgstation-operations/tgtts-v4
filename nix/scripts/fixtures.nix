@@ -10,6 +10,7 @@ let
     ps.einops
     ps.numpy
     ps.pydantic
+    ps.pydub
     ps.safetensors
     ps.torch
   ]);
