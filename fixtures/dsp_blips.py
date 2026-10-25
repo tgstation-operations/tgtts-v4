@@ -7,6 +7,9 @@ one a click, at 16 kHz to keep the file small, the Gwah so padded with silence t
 once it is stripped is shorter than a crossfade. Texts without capitals, drawn at 0.5, are never
 detuned, and their blips are pydub's integer arithmetic alone; the rest are shifted, and how
 often is saved beside them.
+
+Where the port fixes the old service, the restatement takes the fix too: text with a letter or
+digit of either case makes a sound.
 """
 
 import importlib.metadata
@@ -90,12 +93,11 @@ def cap_loudness(seg, max_dbfs=-1.0):
 
 def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
     """The service's /generate-tts-blips, from the text on, returning the WAV it sent."""
-    letters_to_use = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
     skip_these = " ,:;'\""
     actual_text_found = False
     with io.BytesIO() as data_bytes:
         for i, letter in enumerate(text):
-            if letter in letters_to_use:
+            if letter.isalpha() or letter.isnumeric():
                 actual_text_found = True
                 break
         if not actual_text_found:
@@ -350,7 +352,7 @@ if __name__ == "__main__":
         ("hob 12 lab", "0", None),
         ("c1", "0", None),
         ("ab? 1b?", "0", None),
-        ("hello there.", "0", None),
+        ("oh, hob a lab.", "0", None),
         ("'Hob", "0", None),
         ("!A", "0", None),
         ("Ha!", "0", None),
@@ -358,7 +360,7 @@ if __name__ == "__main__":
         ("hob 1", "5", 2),
         ("Lab 2 oh", "-12", 3),
     ]
-    messages = [("Hob. AH 12? hello there. b!", 4)]
+    messages = [("Hob. AH 12? oh, hob a lab. b!", 4)]
     tensors = {
         f"voice/{key}": torch.from_numpy(samples.astype(np.float32))
         for key, samples in voice.items()

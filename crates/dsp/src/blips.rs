@@ -83,7 +83,7 @@ pub fn message(
 
 /// The blips of `text` as the old blips service made them, `pitch` quarter tones up.
 ///
-/// Text with no capital letter or digit makes no sound. Each letter or digit at an even index
+/// Text with no letter or digit makes no sound. Each letter or digit at an even index
 /// makes the blip of its lowercase, detuned by up to 0.6 semitones either way, a capital by 1.6
 /// semitones more and up to 1.05 either way, and lowered by 6 dB, a capital by 3; `?` and `!`
 /// make the `Deska` and `Gwah` blips, detuned by up to 1.2 semitones, lowered by 4.4 dB and
@@ -97,7 +97,7 @@ pub fn sentence(
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
     let rate = blips.sample_rate();
-    if !text.contains(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    if !text.contains(char::is_alphanumeric) {
         return Ok(Segment::new(rate, Vec::new()));
     }
     let mut samples = HashMap::new();
@@ -110,7 +110,7 @@ pub fn sentence(
     };
     let mut result = Segment::new(rate, Vec::new());
     for (i, letter) in text.chars().enumerate() {
-        let blip = if letter.is_alphabetic() || letter.is_numeric() {
+        let blip = if letter.is_alphanumeric() {
             if i % 2 != 0 {
                 continue;
             }

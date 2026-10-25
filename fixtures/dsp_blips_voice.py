@@ -44,6 +44,7 @@ cases = [
     ("'Hi", "0", None),
     ("Hi", "0", 1),
     ("ok 1", "4", 2),
+    ("hello there", "0", None),
 ]
 messages = [("go 1. ok 2?", None)]
 generators = [Path(__file__), Path(dsp_blips.__file__)]

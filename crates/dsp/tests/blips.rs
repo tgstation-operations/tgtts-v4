@@ -1,4 +1,5 @@
-//! The blips against the old blips service and its frontend, on a made-up voice.
+//! The blips against the old blips service and its frontend, restated with the fixes the port
+//! makes, on a made-up voice.
 
 mod common;
 
@@ -24,6 +25,19 @@ impl Random for Replay {
         let draw = self.0[self.1];
         self.1 += 1;
         draw
+    }
+
+    fn below(&mut self, _: usize) -> usize {
+        unreachable!("the blips draw no integers")
+    }
+}
+
+/// Draws of 0.5, which detune nothing.
+struct Still;
+
+impl Random for Still {
+    fn random(&mut self) -> f64 {
+        0.5
     }
 
     fn below(&mut self, _: usize) -> usize {
@@ -153,6 +167,17 @@ fn messages_match_the_old_frontend() {
         let actual = blips::message(text, &voice.1, "male", "1", &mut random);
         check(&fx, &name, actual, &random);
     }
+}
+
+#[test]
+fn lowercase_text_sounds() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "lowercase");
+    let blips = |text| blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let lowercase = blips("hob");
+    assert!(!lowercase.samples.is_empty());
+    // A capital at an odd index makes no sound of its own.
+    assert_eq!(lowercase, blips("hobA"));
 }
 
 /// Making the golden needs a real voice, so a run of every generator leaves it as it is: this
