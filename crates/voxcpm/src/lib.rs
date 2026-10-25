@@ -5,6 +5,7 @@
 //!
 //! Each part loads from the checkpoint's `model.safetensors` under upstream's state_dict names.
 
+mod cfm;
 mod config;
 mod local_dit;
 mod local_encoder;
@@ -15,6 +16,7 @@ use std::fmt;
 use burn::store::SafetensorsStoreError;
 
 pub use crate::{
+    cfm::{Cfm, Sampling, schedule},
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
     local_dit::LocalDit,
     local_encoder::LocalEncoder,
