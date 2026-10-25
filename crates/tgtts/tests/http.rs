@@ -513,6 +513,39 @@ fn makes_blips_as_the_game_asks() {
     assert_eq!(h.fake.texts(), Vec::<String>::new());
 }
 
+/// The cycles in `samples`: their swings from over a tenth of their peak to under its negative.
+fn cycles(samples: &[f32]) -> usize {
+    let threshold = 0.1 * samples.iter().fold(0f32, |m, s| m.max(s.abs()));
+    let (mut high, mut count) = (false, 0);
+    for &s in samples {
+        if s > threshold && !high {
+            (high, count) = (true, count + 1);
+        } else if s < -threshold {
+            high = false;
+        }
+    }
+    count
+}
+
+#[test]
+fn shifts_the_blips_by_the_pitch() {
+    let h = harness(Fake::default(), limits());
+    // Lowercase letters, which the blips detune by no more than 0.6 semitones either way.
+    let blips = |pitch| {
+        let reply = Message {
+            pitch,
+            text: "hello there",
+            ..Message::default()
+        }
+        .blips(&h);
+        reply.assert_ogg(48000);
+        common::decode(&reply.body).samples
+    };
+    let (level, octave_up) = (blips("0"), blips("24"));
+    let ratio = cycles(&octave_up) as f64 / cycles(&level) as f64;
+    assert!((1.8..2.2).contains(&ratio), "{ratio} times the cycles");
+}
+
 #[test]
 fn serves_a_message_for_everyone_whole() {
     let h = harness(Fake::default(), limits());

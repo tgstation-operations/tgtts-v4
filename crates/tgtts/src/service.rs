@@ -459,10 +459,8 @@ impl Service {
                 self.deliver(Source::Speech, params, speech, trace).await
             }
             Route::Blips => {
-                // The old frontend read the pitch here, and failed on one that was not a number,
-                // but never passed it on to the blips.
-                pitch(&params.pitch)?;
-                let blips = self.blips(params, &body.text, trace).await?;
+                let pitch = pitch(&params.pitch)?;
+                let blips = self.blips(params, &body.text, pitch, trace).await?;
                 self.deliver(Source::Blips, params, blips, trace).await
             }
             Route::Radio => self.radio(Source::Speech, params, trace).await,
@@ -561,12 +559,13 @@ impl Service {
         Ok(speech)
     }
 
-    /// The blips of `text` in the request's voice, as the old frontend had them made: at the
-    /// request's base and number, `male` and `1` where they are not given.
+    /// The blips of `text` in the request's voice, `pitch` quarter tones up, as the old frontend
+    /// had them made: at the request's base and number, `male` and `1` where they are not given.
     async fn blips(
         self: &Arc<Self>,
         params: &Params,
         text: &str,
+        pitch: i32,
         trace: &mut Trace,
     ) -> Result<Segment, Failure> {
         let or =
@@ -577,7 +576,7 @@ impl Service {
         self.cpu(trace, move || {
             let blips = service.voices.blips(&voice).map_err(Failure::internal)?;
             let mut draws = Draws(rand::rng());
-            dsp::blips::message(&text, &blips, &base, &number, 0, &mut draws)
+            dsp::blips::message(&text, &blips, &base, &number, pitch, &mut draws)
                 .map_err(|e| Failure::internal(format!("blips: {e}")))
         })
         .await?

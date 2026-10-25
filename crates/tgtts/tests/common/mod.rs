@@ -3,9 +3,18 @@
 
 #![allow(dead_code)]
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
-use tgtts::service::{self, Service, Setup};
+use tgtts::{
+    service::{self, Service, Setup},
+    wav::{self, Audio},
+};
 
 pub const TOKEN: &str = "s3cret-token";
 pub const VOICE: &str = "Man (Test)";
@@ -229,4 +238,32 @@ pub fn resampled(frames: usize, from: u32, to: u32) -> usize {
 /// between clicks of `on` and `off` frames at 48 kHz, with 0.1 s of static before the second.
 pub fn radio_frames(frames: usize, on: usize, off: usize) -> usize {
     on + resampled(resampled(frames, 48000, 8000), 8000, 48000) + 4800 + off
+}
+
+/// The Ogg `ogg` decoded by ffmpeg to float samples.
+pub fn decode(ogg: &[u8]) -> Audio {
+    let args = [
+        "-f",
+        "ogg",
+        "-i",
+        "pipe:0",
+        "-c:a",
+        "pcm_f32le",
+        "-f",
+        "wav",
+        "pipe:1",
+    ];
+    let mut child = Command::new("ffmpeg")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (mut stdin, ogg) = (child.stdin.take().unwrap(), ogg.to_vec());
+    let writer = thread::spawn(move || stdin.write_all(&ogg));
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    assert!(output.status.success(), "ffmpeg could not decode the Ogg");
+    wav::read(&output.stdout).unwrap()
 }
