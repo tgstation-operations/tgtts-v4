@@ -5,6 +5,9 @@ license.workspace = true
 version.workspace = true
 publish = false
 
+[dependencies]
+rustfft.workspace = true
+
 [build-dependencies]
 pkg-config.workspace = true
 
