@@ -1,0 +1,15 @@
+[package]
+name = "voxcpm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+audiovae = { path = "../audiovae" }
+minicpm4 = { path = "../minicpm4" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+testkit = { path = "../testkit" }
