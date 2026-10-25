@@ -12,7 +12,7 @@ use std::{collections::HashMap, error, fmt};
 use voices::Blips;
 
 use crate::{
-    Random,
+    RATE, Random,
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
     segment::{self, Segment},
@@ -24,13 +24,15 @@ const CROSSFADE: i64 = 150;
 /// The silence after each sentence of a message, in ms.
 const SENTENCE_GAP: u32 = 250;
 
-/// What made the blips fail, where the old service failed the request.
+/// What made the blips fail.
 #[derive(Debug)]
 pub enum Error {
     /// The voice has no sample the text needs, or it could not be read.
     Voice(voices::Error),
     /// pydub would have refused an operation on the samples.
     Segment(segment::Error),
+    /// The voice's samples are at this rate, not the service's.
+    Rate(u32),
 }
 
 impl fmt::Display for Error {
@@ -38,6 +40,7 @@ impl fmt::Display for Error {
         match self {
             Self::Voice(e) => e.fmt(f),
             Self::Segment(e) => e.fmt(f),
+            Self::Rate(rate) => write!(f, "the voice's blips are at {rate} Hz, not {RATE} Hz"),
         }
     }
 }
@@ -47,6 +50,7 @@ impl error::Error for Error {
         match self {
             Self::Voice(e) => Some(e),
             Self::Segment(e) => Some(e),
+            Self::Rate(_) => None,
         }
     }
 }
@@ -65,7 +69,8 @@ impl From<segment::Error> for Error {
 
 /// The blips of `text` in the voice whose samples `blips` holds, at its `base` and `number`,
 /// `pitch` quarter tones up, as the old frontend made them: the blips of each of pysbd's
-/// sentences that makes a sound, each followed by 250 ms of silence.
+/// sentences that makes a sound, each followed by 250 ms of silence, at the service's rate, which
+/// the voice must be at.
 pub fn message(
     text: &str,
     blips: &Blips,
@@ -74,15 +79,18 @@ pub fn message(
     pitch: i32,
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
+    if blips.sample_rate() != RATE {
+        return Err(Error::Rate(blips.sample_rate()));
+    }
     let mut samples = Vec::new();
     for text in sentences::segment(text) {
         let sound = sentence(&text, blips, base, number, pitch, random)?;
         if !sound.samples.is_empty() {
             samples.extend(sound.samples);
-            samples.extend(Segment::silent(SENTENCE_GAP, blips.sample_rate()).samples);
+            samples.extend(Segment::silent(SENTENCE_GAP, RATE).samples);
         }
     }
-    Ok(Segment::new(blips.sample_rate(), samples))
+    Ok(Segment::new(RATE, samples))
 }
 
 /// The blips of `text` as the old blips service made them, `pitch` quarter tones up.

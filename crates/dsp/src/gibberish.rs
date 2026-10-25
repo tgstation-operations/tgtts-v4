@@ -6,7 +6,7 @@
 //! The alignment is not here: [`corrupted_spans`] takes the letters' times it gives.
 
 use crate::{
-    Random,
+    RATE, Random,
     radio::{self, Assets, Error, Pcm, narrow},
     segment::Segment,
 };
@@ -122,7 +122,7 @@ fn merge(mut spans: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
 ///
 /// If `assets` are not matched to 48 kHz.
 pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Result<Segment, Error> {
-    assert_eq!(assets.rate(), radio::OUTPUT_RATE, "assets for another rate");
+    assert_eq!(assets.rate(), RATE, "assets for another rate");
     let narrowed = narrow(speech)?;
     let ducked = duck(&narrowed, spans, assets.noise(), speech.rate)?;
     radio::finish(ducked, assets, speech.rate)

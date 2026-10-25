@@ -5,11 +5,7 @@ use std::{error, f64::consts::PI, fmt};
 
 use rustfft::num_complex::Complex;
 
-use crate::{float::to_pcm, resample::resample, segment::Segment};
-
-/// The rate the old service resampled speech to after 8 kHz, and declared every radio message to
-/// be at, whatever its parts were at.
-pub(crate) const OUTPUT_RATE: u32 = 48000;
+use crate::{RATE, float::to_pcm, resample::resample, segment::Segment};
 
 /// Interleaved 16-bit PCM, as a WAV file holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,7 +144,7 @@ pub(crate) fn narrow(speech: &Pcm) -> Result<Vec<f64>, Error> {
         scaled.collect()
     };
     let x = resample(&samples, f64::from(speech.rate), 8000.0);
-    let x = resample(&x, 8000.0, f64::from(OUTPUT_RATE));
+    let x = resample(&x, 8000.0, f64::from(RATE));
     let peak = x.iter().fold(None, |m: Option<f32>, v| {
         Some(m.map_or(v.abs(), |m| m.max(v.abs())))
     });
@@ -174,7 +170,7 @@ pub(crate) fn finish(speech: Vec<f64>, assets: &Assets, rate: u32) -> Result<Seg
     output.extend(speech.iter().zip(noise).map(|(s, n)| s + n * 0.2));
     output.extend_from_slice(tail);
     output.extend_from_slice(&assets.click_off);
-    Ok(Segment::new(OUTPUT_RATE, to_pcm(&normalize(&output, 0.9))))
+    Ok(Segment::new(RATE, to_pcm(&normalize(&output, 0.9))))
 }
 
 /// The old service's `normalize`: `x` scaled so its peak is `peak`, unless it is silent.

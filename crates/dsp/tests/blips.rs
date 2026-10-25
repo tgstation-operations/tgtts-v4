@@ -1,5 +1,5 @@
 //! The blips against the old blips service and its frontend, restated with the fixes the port
-//! makes, on a made-up voice.
+//! makes, on a made-up voice and a real one.
 
 mod common;
 
@@ -9,10 +9,13 @@ use common::{Tensors, first_difference};
 use dsp::{
     Random,
     blips::{self, Error},
+    float::{from_pcm, to_pcm},
+    resample::resample,
     segment::{self, Segment},
 };
 use voices::{BlipSet, Blips, Voices};
 
+/// The made-up voice's rate.
 const RATE: u32 = 16000;
 const KEYS: [&str; 10] = ["a", "b", "c", "h", "l", "o", "1", "2", "Deska", "Gwah"];
 const CROSSFADE_TOO_LONG: i64 = 1;
@@ -45,28 +48,39 @@ impl Random for Still {
     }
 }
 
-/// The fixture's voice, as a blips file the voices crate opens.
+/// The made-up voice's samples, by key.
+fn samples(fx: &Tensors) -> BTreeMap<&'static str, Vec<i16>> {
+    KEYS.iter()
+        .map(|&key| (key, fx.pcm(&format!("voice/{key}"))))
+        .collect()
+}
+
+/// A voice, as a blips file the voices crate opens.
 struct Voice(PathBuf, Blips);
 
 impl Voice {
+    /// The made-up voice.
     fn new(fx: &Tensors, test: &str) -> Self {
-        Self::with(fx, test, &[])
+        Self::of(test, RATE, samples(fx))
     }
 
-    /// The fixture's voice with the samples of `replaced` in place of its own.
-    fn with(fx: &Tensors, test: &str, replaced: &[(&str, Vec<i16>)]) -> Self {
-        let samples: BTreeMap<_, _> = KEYS
-            .iter()
-            .map(|&key| {
-                let id = ("male".to_owned(), "1".to_owned(), key.to_owned());
-                let sample = replaced.iter().find(|(k, _)| *k == key);
-                let sample =
-                    sample.map_or_else(|| fx.pcm(&format!("voice/{key}")), |s| s.1.clone());
-                (id, sample)
-            })
+    /// The made-up voice resampled to the service's rate.
+    fn at_service_rate(fx: &Tensors, test: &str) -> Self {
+        let resampled = samples(fx).into_iter().map(|(key, sample)| {
+            let sample = resample(&from_pcm(&sample), f64::from(RATE), f64::from(dsp::RATE));
+            (key, to_pcm(&sample))
+        });
+        Self::of(test, dsp::RATE, resampled.collect())
+    }
+
+    /// The voice of `samples` at `rate`.
+    fn of(test: &str, rate: u32, samples: BTreeMap<&str, Vec<i16>>) -> Self {
+        let samples = samples
+            .into_iter()
+            .map(|(key, sample)| (("male".to_owned(), "1".to_owned(), key.to_owned()), sample))
             .collect();
         let set = BlipSet {
-            sample_rate: RATE,
+            sample_rate: rate,
             samples,
         };
         let path = std::env::temp_dir().join(format!("dsp-{test}-{}.blips", std::process::id()));
@@ -165,20 +179,6 @@ fn sentences_match_the_old_service() {
 }
 
 #[test]
-fn messages_match_the_old_frontend() {
-    let fixture = testkit::fixture!("dsp_blips");
-    let fx = Tensors::new(&fixture);
-    let voice = Voice::new(&fx, "messages");
-    for (case, text) in texts(&fixture, "messages").iter().enumerate() {
-        let name = format!("message/{case}");
-        let mut random = Replay(fx.f64s(&format!("{name}/draws")), 0);
-        let pitch = fx.int(&format!("{name}/pitch")) as i32;
-        let actual = blips::message(text, &voice.1, "male", "1", pitch, &mut random);
-        check(&fx, &name, actual, &random);
-    }
-}
-
-#[test]
 fn lowercase_text_sounds() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::new(&fx, "lowercase");
@@ -209,19 +209,30 @@ fn crossfades_are_no_longer_than_either_side() {
 }
 
 #[test]
+fn messages_need_a_voice_at_the_service_rate() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "rate");
+    let message = blips::message("Hob.", &voice.1, "male", "1", 0, &mut Still);
+    let samples = message.as_ref().map(|m| m.samples.len());
+    assert!(matches!(message, Err(Error::Rate(RATE))), "{samples:?}");
+}
+
+#[test]
 fn messages_take_the_pitch() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
-    let voice = Voice::new(&fx, "pitch");
+    let voice = Voice::at_service_rate(&fx, "pitch");
     let message = blips::message("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
     let mut expected = blips::sentence("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
-    expected.samples.extend(Segment::silent(250, RATE).samples);
+    expected
+        .samples
+        .extend(Segment::silent(250, dsp::RATE).samples);
     assert_eq!(message, expected);
 }
 
 #[test]
 fn silent_sentences_take_no_time() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
-    let voice = Voice::new(&fx, "silent");
+    let voice = Voice::at_service_rate(&fx, "silent");
     let message = |text| blips::message(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
     assert!(message("...").samples.is_empty());
     // pysbd makes three sentences of this, the second without a sound.
@@ -229,7 +240,7 @@ fn silent_sentences_take_no_time() {
     for text in ["Hob.", "b!"] {
         let sentence = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
         expected.extend(sentence.samples);
-        expected.extend(Segment::silent(250, RATE).samples);
+        expected.extend(Segment::silent(250, dsp::RATE).samples);
     }
     assert_eq!(message("Hob. - . b!").samples, expected);
 }
@@ -244,7 +255,9 @@ fn loud(ms: u32) -> Vec<i16> {
 #[test]
 fn question_marks_are_faded() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
-    let voice = Voice::with(&fx, "faded", &[("Deska", loud(100))]);
+    let mut samples = samples(&fx);
+    samples.insert("Deska", loud(100));
+    let voice = Voice::of("faded", RATE, samples);
     // The b, at an odd index, makes no sound.
     let blips = blips::sentence("?b", &voice.1, "male", "1", 0, &mut Still).unwrap();
     let peak = blips.max() as i16;
@@ -258,7 +271,9 @@ fn question_marks_are_faded() {
 #[test]
 fn blips_shorter_than_their_fades_keep_their_length() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
-    let voice = Voice::with(&fx, "short", &[("Deska", loud(5))]);
+    let mut samples = samples(&fx);
+    samples.insert("Deska", loud(5));
+    let voice = Voice::of("short", RATE, samples);
     let blips = blips::sentence("?b", &voice.1, "male", "1", 0, &mut Still).unwrap();
     assert_eq!(blips.samples.len(), loud(5).len());
 }

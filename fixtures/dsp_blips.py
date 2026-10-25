@@ -4,7 +4,8 @@ The service's code is restated below as it was, around pydub and librosa, with i
 from WAV files as it read them and its calls to random.random() recorded; dsp_blips_voice runs it
 on a real voice. The voice here is made up: voiced blips of a few letters, digits, Deska and Gwah,
 one a click, at 16 kHz to keep the file small, the Gwah so padded with silence that what is left
-once it is stripped is shorter than a crossfade. Texts without capitals, drawn at 0.5, are never
+once it is stripped is shorter than a crossfade. The frontend's messages are made in the real
+voice only: its silence is at 48 kHz, which the port has a voice be at too. Texts without capitals, drawn at 0.5, are never
 detuned, and their blips are pydub's integer arithmetic alone; the rest are shifted, and how
 often is saved beside them.
 
@@ -39,8 +40,9 @@ import common  # noqa: E402
 BASE, NUMBER = "male", "1"
 CROSSFADE_TOO_LONG = 1
 
-# The voice's rate and its blips as the service kept them, which run() sets.
-RATE = None
+tts_sample_rate = 48000
+
+# The voice's blips as the service kept them, which run() sets.
 blips_cache = None
 
 
@@ -209,18 +211,14 @@ segmenter = pysbd.Segmenter(language="en", clean=True)
 
 
 def frontend(text, voice, blip_base, blip_number, pitch):
-    """The frontend's /tts-blips up to its ffmpeg: a request per sentence, with the pitch.
-
-    Its silence is at 48 kHz, the rate of every real voice, where pydub would resample this one's
-    blips to meet it: here it is at the voice's rate instead.
-    """
+    """The frontend's /tts-blips up to its ffmpeg: a request per sentence, with the pitch."""
     final_audio = AudioSegment.empty()
     for sentence in segmenter.segment(text):
         response = text_to_speech_blips(sentence, voice, blip_base, blip_number, pitch)
         sentence_audio = AudioSegment.from_file(io.BytesIO(response), "wav")
         if not sentence_audio.frame_count():
             continue
-        sentence_silence = AudioSegment.silent(250, RATE)
+        sentence_silence = AudioSegment.silent(250, tts_sample_rate)
         sentence_audio += sentence_silence
         final_audio += sentence_audio
     return final_audio
@@ -258,8 +256,7 @@ def run(voice, rate, cases, messages, checksum_exact=False):
     """The service's blips of each case, (text, pitch, seed), and the frontend's of each message,
     alike, in `voice`, a dict of 16-bit samples by key; a seed of None draws 0.5. Where
     nothing was shifted, `checksum_exact` saves the CRC-32 of the samples rather than them."""
-    global RATE, blips_cache
-    RATE = rate
+    global blips_cache
     blips_cache = {
         "voice": {
             BASE: {NUMBER: {k: io.BytesIO(wav(v, rate)) for k, v in voice.items()}}
@@ -369,10 +366,9 @@ if __name__ == "__main__":
         ("Lab 2 oh", "-12", 3),
         ("!.a", "0", None),
     ]
-    messages = [("Hob. AH 12? oh, hob a lab. b!", "0", 4), ("Ha. b!", "3", None)]
     tensors = {
         f"voice/{key}": torch.from_numpy(samples.astype(np.float32))
         for key, samples in voice.items()
     }
-    tensors |= run(voice, rate, cases, messages)
-    common.Fixture(seed=0).save("dsp", tensors, **provenance(cases, messages))
+    tensors |= run(voice, rate, cases, [])
+    common.Fixture(seed=0).save("dsp", tensors, **provenance(cases, []))
