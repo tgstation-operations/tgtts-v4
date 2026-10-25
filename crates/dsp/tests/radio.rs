@@ -5,7 +5,10 @@ mod common;
 use std::{env, fs};
 
 use common::{Tensors, assert_pcm_close, read_wav};
-use dsp::radio::{self, Assets, Pcm};
+use dsp::{
+    float::to_pcm,
+    radio::{self, Assets, Pcm},
+};
 
 /// The radio's steps are numpy's and scipy's, but the filter's coefficients and numpy's tanh
 /// differ from theirs in the last bits: the 16-bit result came out the same but for samples 1
@@ -105,6 +108,27 @@ fn loops_the_static_under_speech_longer_than_it() {
     let tail = 4800;
     let around = assets.click_on().len() + tail + assets.click_off().len();
     assert_eq!(radio.samples.len(), around + speech.samples.len());
+}
+
+#[test]
+fn the_static_goes_on_after_the_speech() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_radio"));
+    let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
+    let assets = Assets::new(&on, &off, &noise);
+    let silence = Pcm {
+        rate: 48000,
+        channels: 1,
+        samples: vec![0; 2400],
+    };
+    let noise = assets.noise();
+    let mut expected = assets.click_on().to_vec();
+    expected.extend(noise[..2400].iter().map(|n| n * 0.2));
+    expected.extend(&noise[2400..2400 + 4800]);
+    expected.extend(assets.click_off());
+    let peak = expected.iter().fold(0f64, |m, v| m.max(v.abs()));
+    let expected: Vec<f64> = expected.iter().map(|v| v / peak * 0.9).collect();
+    let radio = radio::radio(&silence, &assets).unwrap();
+    assert_eq!(radio.samples, to_pcm(&expected));
 }
 
 /// Making the golden needs the real assets, so a run of every generator leaves it as it is: this

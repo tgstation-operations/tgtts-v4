@@ -109,7 +109,7 @@ impl error::Error for Error {}
 
 /// `speech` over the radio, as the old radio service made it: its channels averaged, resampled to
 /// 8 kHz and on to the service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with the
-/// static looped under it, then between the mic clicks, with 0.1 s of static before the second.
+/// static looped under it and going on for 0.1 s after it, then between the mic clicks.
 pub fn radio(speech: &Pcm, assets: &Assets) -> Result<Segment, Error> {
     let narrowed = narrow(speech)?;
     finish(narrowed, assets)
@@ -137,13 +137,13 @@ pub(crate) fn narrow(speech: &Pcm) -> Result<Vec<f64>, Error> {
     Ok(normalize(&x, 0.7))
 }
 
-/// The rest of the radio: the static under the speech, the clicks and 0.1 s of static around it.
+/// The rest of the radio: the static under the speech and 0.1 s past it, and the clicks around
+/// them.
 pub(crate) fn finish(speech: Vec<f64>, assets: &Assets) -> Result<Segment, Error> {
-    let noise: Vec<f64> = looped(&assets.noise).take(speech.len()).collect();
-    let tail = &noise[..((f64::from(RATE) * 0.1) as usize).min(noise.len())];
+    let mut noise = looped(&assets.noise);
     let mut output = assets.click_on.clone();
-    output.extend(speech.iter().zip(&noise).map(|(s, n)| s + n * 0.2));
-    output.extend_from_slice(tail);
+    output.extend(speech.iter().zip(&mut noise).map(|(s, n)| s + n * 0.2));
+    output.extend(noise.take((f64::from(RATE) * 0.1) as usize));
     output.extend_from_slice(&assets.click_off);
     Ok(Segment::new(RATE, to_pcm(&normalize(&output, 0.9))))
 }

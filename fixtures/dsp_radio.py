@@ -9,8 +9,9 @@ dsp_radio_assets runs it on the real ones. The speech is mono, stereo and in thr
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
 at the 48 kHz it was resampled to, the clicks and static are matched to 48 kHz, whatever the
-speech's rate was, speech of more than two channels is averaged over them as stereo is, and the
-static loops under speech longer than it.
+speech's rate was, speech of more than two channels is averaged over them as stereo is, the
+static loops under speech longer than it, and the static after the speech goes on from where the
+static under it left off.
 """
 
 import io
@@ -109,11 +110,9 @@ def radio_effect(base_audio):
     speech = bandpass(speech, OUTPUT_SR)
     speech = saturate(speech, 2)
     speech = normalize(speech, 0.7)
-    static = loop(static, len(speech))
-    speech = speech + static * 0.2
-    output = np.concatenate(
-        [click_on, speech, static[: int(OUTPUT_SR * 0.1)], click_off]
-    )
+    static = loop(static, len(speech) + int(OUTPUT_SR * 0.1))
+    speech = speech + static[: len(speech)] * 0.2
+    output = np.concatenate([click_on, speech, static[len(speech) :], click_off])
 
     output = normalize(output, 0.9)
 

@@ -5,7 +5,8 @@ with the helpers it shares with the radio service taken from dsp_radio and its c
 random recorded. The letters' times are made up, as are the speech and the clicks and static.
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
-and ducked at the 48 kHz it was resampled to, and the static loops under speech longer than it.
+and ducked at the 48 kHz it was resampled to, the static loops under speech longer than it, and
+the static after the speech goes on from where the static under it left off.
 """
 
 import json
@@ -202,11 +203,9 @@ def radio_effect(base_audio, corrupted_spans):
         speech, corrupted_spans, static, OUTPUT_SR, duck_gain=0, static_gain=0.85
     )
 
-    static = loop(static, len(speech))
-    speech = speech + static * 0.2
-    output = np.concatenate(
-        [click_on, speech, static[: int(OUTPUT_SR * 0.1)], click_off]
-    )
+    static = loop(static, len(speech) + int(OUTPUT_SR * 0.1))
+    speech = speech + static[: len(speech)] * 0.2
+    output = np.concatenate([click_on, speech, static[len(speech) :], click_off])
 
     output = normalize(output, 0.9)
 
