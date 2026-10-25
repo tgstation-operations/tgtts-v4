@@ -1,21 +1,45 @@
-//! Distortion: soft clipping and a sample-rate crusher.
+//! Distortion: a waveshaper, clipping and a sample-rate crusher.
+
+use std::f64::consts::{PI, TAU};
 
 use crate::{Processor, RATE};
 
-/// Soft clipping, `tanh(drive * x)`.
+/// A sine waveshaper, as ffmpeg's acontrast: `sin(pi/2 x + amount * 2/15 * sin(2 pi x))`, which
+/// leaves full scale at full scale, brings quiet sounds up by 4 to 6 dB, more with more of
+/// `amount`, and folds whatever is over full scale back down.
 #[derive(Clone, Debug)]
-pub struct Saturate(f32);
+pub struct Saturate(f64);
 
 impl Saturate {
-    /// Clipping driven by `db`.
-    pub fn new(db: f64) -> Self {
-        Self(10f64.powf(db / 20.0) as f32)
+    /// Shaping by `amount`, from 0 to 1.
+    pub fn new(amount: f64) -> Self {
+        Self(amount * 2.0 / 15.0)
     }
 }
 
 impl Processor for Saturate {
     fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
-        output.extend(input.iter().map(|&x| (self.0 * x).tanh()));
+        output.extend(input.iter().map(|&x| {
+            let x = f64::from(x);
+            (PI / 2.0 * x + self.0 * (TAU * x).sin()).sin() as f32
+        }));
+    }
+}
+
+/// Hard clipping at a ceiling.
+#[derive(Clone, Debug)]
+pub struct Clip(f32);
+
+impl Clip {
+    /// Clipping at `ceiling` dBFS.
+    pub fn new(ceiling: f64) -> Self {
+        Self(10f64.powf(ceiling / 20.0) as f32)
+    }
+}
+
+impl Processor for Clip {
+    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        output.extend(input.iter().map(|&x| x.clamp(-self.0, self.0)));
     }
 }
 

@@ -15,11 +15,12 @@ use crate::{
     convolve::{Convolve, Impulses},
     delay::{Echo, Flanger, Vibrato},
     dynamics::{Compressor, Limiter},
-    filter::{Biquad, Shape, Wobble},
+    filter::{Biquad, Shape},
     level::{Gain, Noise, Tremolo},
     schema::{Graph, INPUT, Node, OUTPUT},
-    shape::{Crush, Saturate},
-    time::{Pitch, Speed, Tempo},
+    shape::{Clip, Crush, Saturate},
+    spectral::Wobble,
+    time::{self, Pitch, Speed},
 };
 
 /// The most graphs a request can give.
@@ -396,7 +397,7 @@ impl<'a> Plan<'a> {
 /// How much longer `node` makes audio that `fed` says how much longer it already is.
 fn lengthen(node: &Node, fed: Length, impulses: &Impulses) -> Length {
     match *node {
-        Node::Tempo { ratio } | Node::Speed { ratio } => Length {
+        Node::Tempo { ratio, .. } | Node::Speed { ratio } => Length {
             times: fed.times / ratio,
             by: fed.by / ratio,
         },
@@ -451,13 +452,15 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             knee_db,
         )),
         Node::Limiter { ceiling_db } => Box::new(Limiter::new(ceiling_db)),
-        Node::Saturate { drive_db } => Box::new(Saturate::new(drive_db)),
+        Node::Saturate { amount } => Box::new(Saturate::new(amount)),
+        Node::Clip { ceiling_db } => Box::new(Clip::new(ceiling_db)),
         Node::Crush { rate_hz, mix } => Box::new(Crush::new(rate_hz, mix)),
         Node::Pitch {
             semitones,
             keep_formants,
-        } => Box::new(Pitch::new(semitones, keep_formants)),
-        Node::Tempo { ratio } => Box::new(Tempo::new(ratio)),
+            method,
+        } => Box::new(Pitch::new(semitones, keep_formants, method)),
+        Node::Tempo { ratio, method } => time::tempo(ratio, method),
         Node::Speed { ratio } => Box::new(Speed::new(ratio)),
         Node::Tremolo { rate_hz, depth } => Box::new(Tremolo::new(rate_hz, depth)),
         Node::Vibrato {
@@ -474,8 +477,7 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             center_hz,
             swing_hz,
             rate_hz,
-            q,
-        } => Box::new(Wobble::new(center_hz, swing_hz, rate_hz, q)),
+        } => Box::new(Wobble::new(center_hz, swing_hz, rate_hz)),
         Node::Echo { ref taps } => {
             Box::new(Echo::new(taps.iter().map(|tap| (tap.delay_ms, tap.weight))))
         }

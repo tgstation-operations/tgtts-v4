@@ -5,19 +5,18 @@ Each case is a filter graph as the game sends it, its placeholders filled as the
 service filled them, beside the effects the game sends in its place. ffmpeg runs the graph on a
 made-up voice at 48 kHz, its harmonics and formants moving through a few syllables and a fricative,
 and its output is saved as a log-mel spectrum, which is what the comparison reads: a perceptual
-likeness is the bar, not the samples. Three cases are not what the game sends. The fishing spot
+likeness to what the game plays today is the bar, not the samples. Two cases are not what the game
+sends. The fishing spot
 capsule asks acompressor for a ratio of 40, which ffmpeg refuses, failing the request, so it is run
-at 20, ffmpeg's most, while the effects keep 40. The fish tongue's afftfilt is run as its comment
-intends, its cutoff swinging in seconds rather than in samples and its lowpass clamped at zero,
-since the effects follow the intent. The silicon effect, which the service runs on its own, takes
+at 20, ffmpeg's most, while the effects keep 40. The silicon effect, which the service runs on its own, takes
 made-up impulses at the rates, channels and lengths of the real ones, the synthetic one with the
 real one's correlation between its channels and its ratio of energy to magnitude, which sets the
 level afir gives it.
 
-Three more cases are single effects whose part in a graph is too small for the comparison to
-see: the compressor, the hailer's phaser and the cult's vibrato, whose pitch track is saved
-beside its spectrum, since a vibrato moves the harmonics less than a mel band is wide. The
-made-up voice is brought to the loudness the service gives speech before its effects.
+Four more cases are single effects whose part in a graph is too small for the comparison to see:
+the compressor, the hailer's phaser, the fish tongue's afftfilt and the cult's vibrato, whose pitch
+track is saved beside its spectrum, since a vibrato moves the harmonics less than a mel band is
+wide. The made-up voice is brought to the loudness the service gives speech before its effects.
 
 The noise source is seeded so that a rerun writes the same bytes.
 """
@@ -55,6 +54,9 @@ PITCH_FRAME = 1920
 VOICED = 0.6
 NEAR = 0.9
 PITCHED = ["vibrato", "cult_slurring"]
+# The fish tongue's afftfilt is matched sample for sample, its flutter too fast for the spectrum
+# to follow, so the start of what ffmpeg makes of it is saved as it is.
+WOBBLE_SAMPLES = 28800
 
 # SynthImpulse.wav's: 9570 stereo frames at 44.1 kHz, its channels correlated by 0.55, the mean of
 # its channels with an L2 norm 0.017123 times the mean of their L1 norms.
@@ -83,7 +85,9 @@ SYNTHETIC_EFFECTS = [
 
 
 def pitched(ratio):
-    return {"effect": "pitch", "semitones": round(12 * math.log2(ratio), 3)}
+    """The asetrate, aresample and atempo the game shifts pitch with, atempo splicing."""
+    semitones = round(12 * math.log2(ratio), 3)
+    return {"effect": "pitch", "semitones": semitones, "method": "splice"}
 
 
 def three_tongues(low, high, volume):
@@ -123,8 +127,8 @@ FISH = (
     "afftfilt=real='{gain}':imag='{gain_imag}':win_size=1024"
 )
 FISH_GAIN = (
-    "st(0,(b+0.5)/nb*sr);st(1,3000+1500*sin(9.3*2*PI*pts/sr));st(2,ld(0)/ld(1));"
-    "{part}*(max(0,1-ld(2)^2)+2*gauss(log(ld(2)+1)))"
+    "st(0,(b+0.5)/nb*sr);st(1,3000+1500*sin(9.3*2*PI*pts));st(2,ld(0)/ld(1));"
+    "{part}*(1-ld(2)^2+2*gauss(log(ld(2)+1)))"
 )
 
 SILICON = (
@@ -210,13 +214,14 @@ CASES = [
                     "gain_db": -10.93,
                     "q": 0.456,
                 },
-                {"effect": "saturate", "drive_db": 5.11},
+                {"effect": "saturate", "amount": 0.3},
                 {
                     "effect": "highshelf",
                     "frequency_hz": 4474,
                     "gain_db": 20.83,
                     "q": 0.422,
                 },
+                {"effect": "clip", "ceiling_db": 0},
             ]
         ],
     ),
@@ -253,7 +258,8 @@ CASES = [
                     "gain_db": 22.28,
                     "q": 0.412,
                 },
-                {"effect": "saturate", "drive_db": 5.57},
+                {"effect": "clip", "ceiling_db": 0},
+                {"effect": "saturate", "amount": 0.6},
                 {"effect": "pitch", "semitones": -1.824},
             ]
         ],
@@ -266,7 +272,7 @@ CASES = [
         "[final][noise] amix=duration=shortest",
         [
             [
-                {"effect": "pitch", "semitones": -6.175},
+                {"effect": "pitch", "semitones": -6.175, "method": "splice"},
                 {"effect": "lowshelf", "frequency_hz": 500, "gain_db": -20, "q": 0.5},
                 {"effect": "highpass", "frequency_hz": 500},
                 {
@@ -276,7 +282,7 @@ CASES = [
                     "feedback": 0.4,
                     "waveform": "triangle",
                 },
-                {"effect": "tempo", "ratio": 1.2},
+                {"effect": "tempo", "ratio": 1.2, "method": "splice"},
                 {"effect": "gain", "gain_db": 8.979},
                 {"effect": "noise", "level_db": -50.79},
                 {"effect": "lowpass", "frequency_hz": 7600, "q": 0.5098},
@@ -307,7 +313,11 @@ CASES = [
             }
         ],
     ),
-    ("snail_tongue", "atempo=0.5", [[{"effect": "tempo", "ratio": 0.5}]]),
+    (
+        "snail_tongue",
+        "atempo=0.5",
+        [[{"effect": "tempo", "ratio": 0.5, "method": "splice"}]],
+    ),
     (
         "stutter",
         "tremolo=f=10:d=0.8,rubberband=tempo=0.5",
@@ -344,10 +354,9 @@ CASES = [
                 {"effect": "highshelf", "frequency_hz": 870, "gain_db": 1, "q": 0.5},
                 {
                     "effect": "wobble",
-                    "center_hz": 3000,
-                    "swing_hz": 1500,
-                    "rate_hz": 9.3,
-                    "q": 2,
+                    "center_hz": 1500,
+                    "swing_hz": 750,
+                    "rate_hz": 37.5,
                 },
             ]
         ],
@@ -376,6 +385,14 @@ CASES = [
         "vibrato",
         "vibrato=5",
         [[{"effect": "vibrato", "rate_hz": 5, "depth_semitones": 0.74}]],
+    ),
+    (
+        "wobble",
+        FISH[FISH.index("afftfilt") :].format(
+            gain=FISH_GAIN.format(part="re"),
+            gain_imag=FISH_GAIN.format(part="im"),
+        ),
+        [[{"effect": "wobble", "center_hz": 1500, "swing_hz": 750, "rate_hz": 37.5}]],
     ),
     (
         "silicon",
@@ -611,6 +628,8 @@ with tempfile.TemporaryDirectory() as tmp:
         tensors[f"{name}/mel"] = torch.from_numpy(log_mel(y)).half()
         if name in PITCHED:
             tensors[f"{name}/pitch"] = torch.from_numpy(pitch(y).astype(np.float32))
+        if name == "wobble":
+            tensors["wobble/samples"] = torch.from_numpy(y[:WOBBLE_SAMPLES]).half()
 cases = [
     {"name": name, "ffmpeg": graph, "effects": effects}
     for name, graph, effects in CASES

@@ -1,6 +1,6 @@
-//! Filters: the RBJ cookbook's biquads, and a lowpass whose cutoff swings.
+//! Filters: the RBJ cookbook's biquads.
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
 
 use crate::{Processor, RATE};
 
@@ -103,50 +103,5 @@ impl Biquad {
 impl Processor for Biquad {
     fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         output.extend(input.iter().map(|&x| self.tick(f64::from(x)) as f32));
-    }
-}
-
-/// A resonant lowpass whose cutoff swings sinusoidally: Andrew Simper's trapezoidal
-/// state-variable filter, whose state stays stable however fast the cutoff moves.
-#[derive(Clone, Debug)]
-pub struct Wobble {
-    center: f64,
-    swing: f64,
-    step: f64,
-    damping: f64,
-    phase: f64,
-    state: [f64; 2],
-}
-
-impl Wobble {
-    /// Its cutoff swinging between `center - swing` and `center + swing` Hz, `rate` times a
-    /// second, with a resonance of `q`.
-    pub fn new(center: f64, swing: f64, rate: f64, q: f64) -> Self {
-        Self {
-            center,
-            swing,
-            step: TAU * rate / RATE,
-            damping: 1.0 / q,
-            phase: 0.0,
-            state: [0.0; 2],
-        }
-    }
-}
-
-impl Processor for Wobble {
-    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
-        output.extend(input.iter().map(|&x| {
-            let cutoff = self.center + self.swing * self.phase.sin();
-            self.phase = (self.phase + self.step) % TAU;
-            let g = (PI * cutoff / RATE).tan();
-            let a1 = 1.0 / (1.0 + g * (g + self.damping));
-            let (a2, a3) = (g * a1, g * g * a1);
-            let [ic1, ic2] = self.state;
-            let v3 = f64::from(x) - ic2;
-            let v1 = a1 * ic1 + a2 * v3;
-            let v2 = ic2 + a2 * ic1 + a3 * v3;
-            self.state = [2.0 * v1 - ic1, 2.0 * v2 - ic2];
-            v2 as f32
-        }));
     }
 }

@@ -7,12 +7,13 @@ use effects::{
     convolve::{Impulses, Response},
     delay::{Echo, Flanger, Vibrato},
     dynamics::{Compressor, Limiter},
-    filter::{Biquad, Shape, Wobble},
+    filter::{Biquad, Shape},
     level::{Gain, Noise, Tremolo},
     run,
-    schema::{self, Graph, Waveform},
-    shape::{Crush, Saturate},
-    time::{Pitch, Speed, Tempo},
+    schema::{self, Graph, Method, Waveform},
+    shape::{Clip, Crush, Saturate},
+    spectral::Wobble,
+    time::{self, Pitch, Speed},
 };
 
 const RATE: f64 = 48000.0;
@@ -132,28 +133,25 @@ fn biquads_follow_the_cookbook() {
 }
 
 #[test]
-fn wobble_passes_the_lows_and_cuts_the_highs() {
-    near(
-        gain_at(&mut Wobble::new(3000.0, 1500.0, 9.3, 2.0), 200.0),
-        0.0,
-        0.2,
-    );
-    assert!(gain_at(&mut Wobble::new(3000.0, 1500.0, 9.3, 2.0), 12000.0) < -20.0);
-    let resonance = gain_at(&mut Wobble::new(3000.0, 0.0, 9.3, 2.0), 3000.0);
-    near(resonance, db(2.0), 0.1);
-    // A tone between the cutoff's ends passes as the cutoff swings over it and is cut as it
-    // swings under: louder a quarter of a swing in than three quarters in.
+fn wobble_lifts_the_lows_and_boosts_the_highs() {
+    // With no swing, ffmpeg's curve: 1.8 times well under the cutoff, nothing at 1.27 times
+    // it and 15 times at four times.
+    let still = |frequency| gain_at(&mut Wobble::new(1500.0, 0.0, 37.5), frequency);
+    near(still(100.0), db(1.79), 0.1);
+    assert!(still(1500.0 * 1.27) < -20.0);
+    near(still(6000.0), db(14.8), 0.3);
+    // A tone between the cutoff's ends comes and goes as the cutoff swings past it.
     let y = run(
-        &mut Wobble::new(3000.0, 1500.0, 10.0, 2.0),
-        &sine(4000.0, 0.1, 0.1),
+        &mut Wobble::new(1500.0, 750.0, 37.5),
+        &sine(1900.0, 0.1, 0.2),
     );
-    let level = |at: usize| db(rms(&y[at - 120..at + 120]) / 0.1);
-    assert!(
-        level(1200) > -3.0 && level(3600) < -15.0,
-        "{} {}",
-        level(1200),
-        level(3600)
-    );
+    let levels: Vec<f64> = (0..32)
+        .map(|i| db(rms(&y[4800 + i * 64..4800 + i * 64 + 64]) / 0.1))
+        .collect();
+    let (low, high) = levels
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+    assert!(high - low > 15.0, "{levels:?}");
 }
 
 #[test]
@@ -165,10 +163,15 @@ fn levels() {
     let y = run(&mut Noise::new(-40.0), &vec![0.0; 48000]);
     near(db(rms(&y)), -40.0, 0.1);
     assert!(y.iter().all(|s| s.abs() < 0.0174));
-    near(
-        f64::from(run(&mut Saturate::new(0.0), &[0.5])[0]),
-        0.5f64.tanh(),
-        1e-6,
+    // acontrast's curve, folding back over full scale.
+    let shaped = run(&mut Saturate::new(0.3), &[0.1, 0.5, 1.0, 1.5, 2.0]);
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    for (y, expected) in shaped.iter().zip([0.18, half, 1.0, half, 0.0]) {
+        near(f64::from(*y), expected, 2e-3);
+    }
+    assert_eq!(
+        run(&mut Clip::new(-6.0), &[0.2, 0.9, -1.5]),
+        [0.2, 0.5011872, -0.5011872]
     );
 }
 
@@ -245,12 +248,15 @@ fn vibrato_swings_the_pitch_and_keeps_the_length() {
 
 #[test]
 fn tempo_keeps_the_pitch() {
-    for ratio in [0.5, 0.8, 1.2, 2.0] {
-        let x = sine(220.0, 0.5, 1.0);
-        let y = run(&mut Tempo::new(ratio), &x);
-        assert_eq!(y.len(), (48000.0 / ratio).round() as usize, "{ratio}");
-        near(frequency(&y[4800..y.len() - 4800]), 220.0, 0.5);
-        near(db(rms(&y[4800..y.len() - 4800]) / rms(&x)), 0.0, 0.3);
+    // The vocoder comes down 1.7 dB, as rubberband does, once past a quarter octave.
+    for (method, level) in [(Method::Vocoder, -1.7), (Method::Splice, 0.0)] {
+        for ratio in [0.5, 0.8, 1.2, 2.0] {
+            let x = sine(220.0, 0.5, 1.0);
+            let y = run(&mut *time::tempo(ratio, method), &x);
+            assert_eq!(y.len(), (48000.0 / ratio).round() as usize, "{ratio}");
+            near(frequency(&y[4800..y.len() - 4800]), 220.0, 0.5);
+            near(db(rms(&y[4800..y.len() - 4800]) / rms(&x)), level, 0.3);
+        }
     }
 }
 
@@ -270,9 +276,13 @@ fn speed_moves_pitch_and_tempo_together() {
 
 #[test]
 fn pitch_keeps_the_length() {
-    for (semitones, keep_formants) in [(7.0, false), (-12.0, false), (12.0, true), (-5.0, true)] {
+    let cases = [(7.0, false), (-12.0, false), (12.0, true), (-5.0, true)];
+    for ((semitones, keep_formants), method) in cases
+        .into_iter()
+        .zip([Method::Vocoder, Method::Splice].into_iter().cycle())
+    {
         let x = sine(220.0, 0.5, 1.0);
-        let y = run(&mut Pitch::new(semitones, keep_formants), &x);
+        let y = run(&mut Pitch::new(semitones, keep_formants, method), &x);
         assert_eq!(y.len(), x.len(), "{semitones}");
         let shifted = 220.0 * 2f64.powf(semitones / 12.0);
         near(frequency(&y[4800..43200]), shifted, 1.0);

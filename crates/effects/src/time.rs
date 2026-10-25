@@ -1,7 +1,11 @@
-//! Effects on time: tempo, by WSOLA; tape speed, by a windowed-sinc resampler; and pitch, the
-//! two together, with the formants kept by a spectral envelope if asked.
+//! Effects on time: tempo, by a phase vocoder or by splicing, WSOLA; tape speed, by a
+//! windowed-sinc resampler; and pitch, the two together, with the formants kept by a spectral
+//! envelope if asked.
 //!
-//! Each gives `round(n / ratio)` samples for `n` in, `n` for pitch.
+//! The vocoder sounds as rubberband does, smooth with a little phasiness, and the splicing as
+//! ffmpeg's atempo, itself WSOLA, crisp with now and then a doubled syllable: each is used where
+//! the game used the one it sounds like. Each gives `round(n / ratio)` samples for `n` in, `n`
+//! for pitch.
 
 use std::{
     f64::consts::PI,
@@ -10,7 +14,7 @@ use std::{
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
-use crate::{Processor, Series};
+use crate::{Processor, Series, schema::Method, spectral::Formants};
 
 /// The length of WSOLA's frames: two periods of a low voice, short enough that a syllable's
 /// changes do not smear.
@@ -30,7 +34,7 @@ const COARSE: usize = 4;
 /// Frames are taken from the input at `ratio` times the hop they are put down at, each moved by
 /// up to 10 ms to where it best matches how the frame before it would have gone on.
 #[derive(Clone, Debug)]
-pub struct Tempo {
+pub struct Splice {
     ratio: f64,
     window: Vec<f64>,
     /// The input from `start`, after `SEEK + HOP` zeros put before the stream, so that the first
@@ -50,7 +54,7 @@ pub struct Tempo {
     given: usize,
 }
 
-impl Tempo {
+impl Splice {
     /// The tempo times `ratio`.
     pub fn new(ratio: f64) -> Self {
         let pad = SEEK + HOP;
@@ -156,7 +160,7 @@ impl Tempo {
     }
 }
 
-impl Processor for Tempo {
+impl Processor for Splice {
     fn latency(&self) -> usize {
         FRAME + 2 * SEEK
     }
@@ -315,9 +319,17 @@ impl Processor for Speed {
     }
 }
 
-/// The pitch shifted, the duration kept: the tempo slowed by the shift, then the speed raised
-/// by it, which moves the formants with the pitch unless [`Formants`] has moved them the other
-/// way first.
+/// The tempo times `ratio` by `method`.
+pub fn tempo(ratio: f64, method: Method) -> Box<dyn Processor> {
+    match method {
+        Method::Vocoder => Box::new(Vocoder::new(ratio)),
+        Method::Splice => Box::new(Splice::new(ratio)),
+    }
+}
+
+/// The pitch shifted, the duration kept: the tempo and the speed changed by the shift in turn,
+/// which moves the formants with the pitch unless [`Formants`] has moved them the other way
+/// first.
 pub struct Pitch {
     series: Series,
     stream: usize,
@@ -325,15 +337,27 @@ pub struct Pitch {
 }
 
 impl Pitch {
-    /// The pitch shifted by `semitones`, the formants kept where they are if `keep_formants`.
-    pub fn new(semitones: f64, keep_formants: bool) -> Self {
+    /// The pitch shifted by `semitones` by `method`, the formants kept where they are if
+    /// `keep_formants`.
+    ///
+    /// Splicing comes after the speed, as the game's `asetrate` and `atempo` came in ffmpeg,
+    /// and the vocoder before it, as rubberband shifts.
+    pub fn new(semitones: f64, keep_formants: bool, method: Method) -> Self {
         let ratio = 2f64.powf(semitones / 12.0);
         let mut stages: Vec<Box<dyn Processor>> = Vec::new();
         if keep_formants {
             stages.push(Box::new(Formants::new(ratio)));
         }
-        stages.push(Box::new(Tempo::new(ratio.recip())));
-        stages.push(Box::new(Speed::new(ratio)));
+        match method {
+            Method::Vocoder => {
+                stages.push(tempo(ratio.recip(), method));
+                stages.push(Box::new(Speed::new(ratio)));
+            }
+            Method::Splice => {
+                stages.push(Box::new(Speed::new(ratio)));
+                stages.push(tempo(ratio.recip(), method));
+            }
+        }
         Self {
             series: Series(stages),
             stream: 0,
@@ -363,126 +387,186 @@ impl Processor for Pitch {
     }
 }
 
-/// The STFT's frame for [`Formants`]: fine enough in frequency to tell the harmonics of a low
-/// voice from its envelope.
-const SPECTRAL: usize = 2048;
-const SPECTRAL_HOP: usize = SPECTRAL / 4;
-/// The cepstral lifter's cutoff, in samples: 1 ms, well under the period of the highest voice,
-/// so that the envelope is smooth over its harmonics.
-const LIFTER: usize = 48;
-/// The most [`Formants`] raises or lowers a frequency, in nepers of amplitude: 24 dB, so that
-/// the valleys of the envelope are not raised into noise.
-const MOST: f64 = 24.0 / 8.685_889_638;
+/// The phase vocoder's frame: two periods of the lowest voices at the finest, as rubberband's
+/// standard window is at 48 kHz.
+const VOCODER_FRAME: usize = 2048;
+/// How far apart its frames are put down: a quarter frame, where Hann windows applied twice
+/// sum to a constant.
+const VOCODER_HOP: usize = VOCODER_FRAME / 4;
+const VOCODER_BINS: usize = VOCODER_FRAME / 2 + 1;
+/// What rubberband takes off a voice it stretches, which the game's voices are played at today:
+/// 1.5 to 2 dB on the sample voices once the stretch is a quarter octave, less below it.
+const VOCODER_LOSS: f64 = -1.7;
 
-/// Each frame's spectral envelope moved the opposite way to a pitch shift of `ratio`: the
-/// spectrum multiplied by `E(ratio * f) / E(f)`, `E` the frame's envelope by cepstral smoothing,
-/// so that once the shift has scaled the frequencies by the ratio, the envelope is where it was.
-pub struct Formants {
+/// The tempo times a ratio, the pitch kept, by a phase vocoder with identity phase locking, as
+/// Laroche and Dolson's "Improved phase vocoder time-scale modification of audio" (IEEE Trans.
+/// Speech and Audio Processing, 1999) has it: frames taken at `ratio` times the hop they are put
+/// down at, each bin's phase advanced by the frequency its own advance measures, and the bins
+/// around each peak of the spectrum kept in the phase they had relative to the peak. Its level
+/// comes down as rubberband's does, by 1.7 dB once the stretch is a quarter octave.
+pub struct Vocoder {
     ratio: f64,
+    gain: f64,
     window: Vec<f64>,
     forward: Arc<dyn Fft<f64>>,
     inverse: Arc<dyn Fft<f64>>,
-    /// The input not yet past, after the frame less a hop of zeros put before the stream.
+    /// The input from `start`, after zeros put before the stream so that a frame's middle stands
+    /// for where it is put down.
     input: Vec<f64>,
-    /// The overlap-add of the frames put down, from the first sample not yet given.
+    start: usize,
+    taken: usize,
+    stream: usize,
+    /// The next frame, and the start and the phases of the last one taken, and the phases it was
+    /// put down with.
+    frame: usize,
+    last: Option<(usize, Vec<f64>, Vec<f64>)>,
     sum: Vec<f64>,
     skip: usize,
-    stream: usize,
     given: usize,
 }
 
-impl Formants {
-    /// Moving the envelope against a pitch shift by `ratio`.
+impl Vocoder {
+    /// The tempo times `ratio`.
     pub fn new(ratio: f64) -> Self {
         let mut planner = FftPlanner::new();
+        // So that the middle of frame k, put down at k hops less the skip, stands for the input
+        // at `ratio` times that: the skip a frame less a hop, as the overlap-add needs.
+        let skip = VOCODER_FRAME - VOCODER_HOP;
+        let half = (VOCODER_FRAME / 2) as f64;
+        let pad = (half - ratio * (half - skip as f64)).round() as usize;
+        let loss = VOCODER_LOSS * (ratio.log2().abs() / 0.25).min(1.0);
         Self {
             ratio,
-            window: (0..SPECTRAL)
-                .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f64 / SPECTRAL as f64).cos())
+            gain: 10f64.powf(loss / 20.0),
+            window: (0..VOCODER_FRAME)
+                .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f64 / VOCODER_FRAME as f64).cos())
                 .collect(),
-            forward: planner.plan_fft_forward(SPECTRAL),
-            inverse: planner.plan_fft_inverse(SPECTRAL),
-            input: vec![0.0; SPECTRAL - SPECTRAL_HOP],
-            sum: vec![0.0; SPECTRAL],
-            skip: SPECTRAL - SPECTRAL_HOP,
+            forward: planner.plan_fft_forward(VOCODER_FRAME),
+            inverse: planner.plan_fft_inverse(VOCODER_FRAME),
+            input: vec![0.0; pad],
+            start: 0,
+            taken: pad,
             stream: 0,
+            frame: 0,
+            last: None,
+            sum: vec![0.0; VOCODER_FRAME],
+            skip,
             given: 0,
         }
     }
 
-    /// The log envelope of `spectrum`, by its real cepstrum cut at [`LIFTER`].
-    fn envelope(&self, spectrum: &[Complex<f64>]) -> Vec<f64> {
-        let mut cepstrum: Vec<Complex<f64>> = spectrum
-            .iter()
-            .map(|c| Complex::new(c.norm().max(1e-9).ln(), 0.0))
-            .collect();
-        self.inverse.process(&mut cepstrum);
-        for (q, c) in cepstrum.iter_mut().enumerate() {
-            let quefrency = q.min(SPECTRAL - q);
-            *c = if quefrency < LIFTER {
-                *c / SPECTRAL as f64
-            } else {
-                Complex::default()
-            };
-        }
-        self.forward.process(&mut cepstrum);
-        cepstrum[..=SPECTRAL / 2].iter().map(|c| c.re).collect()
+    /// Where frame `k` is taken from.
+    fn at(&self, k: usize) -> usize {
+        (k as f64 * VOCODER_HOP as f64 * self.ratio).round() as usize
     }
 
-    /// Puts down the frame at the start of the input, and gives the hop it finishes.
-    fn frame(&mut self, output: &mut Vec<f32>, limit: usize) {
-        let mut spectrum: Vec<Complex<f64>> = self.input[..SPECTRAL]
+    fn put_down(&mut self, output: &mut Vec<f32>, limit: usize) {
+        let from = self.at(self.frame);
+        let mut spectrum: Vec<Complex<f64>> = self.input[from - self.start..][..VOCODER_FRAME]
             .iter()
             .zip(&self.window)
             .map(|(&x, &w)| Complex::new(x * w, 0.0))
             .collect();
         self.forward.process(&mut spectrum);
-        let envelope = self.envelope(&spectrum);
-        let last = envelope.len() - 1;
-        for k in 0..=SPECTRAL / 2 {
-            let at = (k as f64 * self.ratio).min(last as f64);
-            let (i, t) = (at as usize, at.fract());
-            let moved = envelope[i] + t * (envelope[(i + 1).min(last)] - envelope[i]);
-            let gain = (moved - envelope[k]).clamp(-MOST, MOST).exp();
-            spectrum[k] *= gain;
-            if k > 0 && k < SPECTRAL / 2 {
-                spectrum[SPECTRAL - k] = spectrum[k].conj();
+        let magnitude: Vec<f64> = spectrum[..VOCODER_BINS].iter().map(|c| c.norm()).collect();
+        let phase: Vec<f64> = spectrum[..VOCODER_BINS].iter().map(|c| c.arg()).collect();
+        let put = match &self.last {
+            None => phase.clone(),
+            Some((before, analysed, put)) => {
+                let advance = (from - before) as f64;
+                // Each peak's phase advanced by the frequency its own advance measures, and the
+                // bins nearest it kept in the phase they have relative to it.
+                let peaks: Vec<usize> = (0..VOCODER_BINS)
+                    .filter(|&k| {
+                        (k == 0 || magnitude[k] > magnitude[k - 1])
+                            && (k + 1 == VOCODER_BINS || magnitude[k] >= magnitude[k + 1])
+                    })
+                    .collect();
+                let mut locked = vec![0.0; VOCODER_BINS];
+                for (i, &peak) in peaks.iter().enumerate() {
+                    let omega = 2.0 * PI * peak as f64 / VOCODER_FRAME as f64;
+                    let expected = analysed[peak] + omega * advance;
+                    let deviation = wrap(phase[peak] - expected);
+                    let frequency = omega + deviation / advance.max(1.0);
+                    let peak_phase = put[peak] + frequency * VOCODER_HOP as f64;
+                    let low = if i == 0 {
+                        0
+                    } else {
+                        (peaks[i - 1] + peak) / 2 + 1
+                    };
+                    let high = peaks
+                        .get(i + 1)
+                        .map_or(VOCODER_BINS, |&next| (peak + next) / 2 + 1);
+                    for k in low..high {
+                        locked[k] = peak_phase + phase[k] - phase[peak];
+                    }
+                }
+                locked
             }
+        };
+        for k in 0..VOCODER_BINS {
+            spectrum[k] = Complex::from_polar(magnitude[k], put[k]);
         }
+        for k in 1..VOCODER_FRAME / 2 {
+            spectrum[VOCODER_FRAME - k] = spectrum[k].conj();
+        }
+        spectrum[0].im = 0.0;
+        spectrum[VOCODER_FRAME / 2].im = 0.0;
         self.inverse.process(&mut spectrum);
         // Hann windows a quarter frame apart, applied twice, sum to 1.5.
-        let scale = 1.0 / (1.5 * SPECTRAL as f64);
+        let scale = self.gain / (1.5 * VOCODER_FRAME as f64);
         for ((s, c), &w) in self.sum.iter_mut().zip(&spectrum).zip(&self.window) {
             *s += c.re * w * scale;
         }
-        let finished: Vec<f64> = self.sum.drain(..SPECTRAL_HOP).collect();
-        self.sum.resize(SPECTRAL, 0.0);
-        self.input.drain(..SPECTRAL_HOP);
+        self.last = Some((from, phase, put.iter().map(|&p| wrap(p)).collect()));
+        self.frame += 1;
+        let finished: Vec<f64> = self.sum.drain(..VOCODER_HOP).collect();
+        self.sum.resize(VOCODER_FRAME, 0.0);
         let drop = self.skip.min(finished.len());
         self.skip -= drop;
         let take = (finished.len() - drop).min(limit - self.given);
         output.extend(finished[drop..drop + take].iter().map(|&y| y as f32));
         self.given += take;
+        let keep = self.at(self.frame).min(from);
+        if keep > self.start {
+            self.input.drain(..keep - self.start);
+            self.start = keep;
+        }
+    }
+
+    fn run(&mut self, output: &mut Vec<f32>, limit: usize) {
+        while self.given < limit && self.at(self.frame) + VOCODER_FRAME <= self.taken {
+            self.put_down(output, limit);
+        }
     }
 }
 
-impl Processor for Formants {
+/// `phase` wrapped to [-pi, pi).
+fn wrap(phase: f64) -> f64 {
+    phase - 2.0 * PI * ((phase + PI) / (2.0 * PI)).floor()
+}
+
+impl Processor for Vocoder {
     fn latency(&self) -> usize {
-        SPECTRAL
+        2 * VOCODER_FRAME
     }
 
     fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         self.input.extend(input.iter().map(|&x| f64::from(x)));
+        self.taken += input.len();
         self.stream += input.len();
-        while self.input.len() >= SPECTRAL {
-            self.frame(output, usize::MAX);
-        }
+        self.run(output, usize::MAX);
     }
 
     fn finish(&mut self, output: &mut Vec<f32>) {
-        while self.given < self.stream {
-            self.input.resize(self.input.len().max(SPECTRAL), 0.0);
-            self.frame(output, self.stream);
+        let total = (self.stream as f64 / self.ratio).round() as usize;
+        while self.given < total {
+            let zeros = (self.at(self.frame) + VOCODER_FRAME)
+                .saturating_sub(self.taken)
+                .max(VOCODER_HOP);
+            self.input.resize(self.input.len() + zeros, 0.0);
+            self.taken += zeros;
+            self.run(output, total);
         }
     }
 }

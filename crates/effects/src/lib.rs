@@ -12,6 +12,7 @@ pub mod graph;
 pub mod level;
 pub mod schema;
 pub mod shape;
+pub mod spectral;
 pub mod time;
 
 pub use graph::{Error, Pipeline};

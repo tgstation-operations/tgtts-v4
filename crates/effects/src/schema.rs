@@ -127,10 +127,17 @@ pub enum Node {
         /// The ceiling, in dBTP.
         ceiling_db: f64,
     },
-    /// Soft clipping, `tanh(drive * x)`, `drive_db` in [0, 40].
+    /// A sine waveshaper, as ffmpeg's acontrast: full scale stays at full scale, quiet sounds
+    /// come up by 4 to 6 dB, the more the more `amount`, in [0, 1], and whatever is over full
+    /// scale folds back down, which is what makes a megaphone crunch.
     Saturate {
-        /// The drive, in dB.
-        drive_db: f64,
+        /// How far from a plain sine the curve bends.
+        amount: f64,
+    },
+    /// Hard clipping at `ceiling_db`, in [-40, 0].
+    Clip {
+        /// The ceiling, in dBFS.
+        ceiling_db: f64,
     },
     /// A sample-rate crusher: the samples held at `rate_hz`, in [100, 48000], with nothing to
     /// stop what that folds over, then mixed with the signal as it was, `mix`, in [0, 1], being
@@ -141,20 +148,27 @@ pub enum Node {
         /// The fraction of the output that is crushed.
         mix: f64,
     },
-    /// The pitch shifted by `semitones`, in [-24, 24], the duration kept. The formants move with
-    /// the pitch, as a voice played faster would, unless `keep_formants`, false by default, keeps
-    /// them where they were, as the same voice speaking higher would.
+    /// The pitch shifted by `semitones`, in [-24, 24], the duration kept, by `method`. The
+    /// formants move with the pitch, as a voice played faster would, unless `keep_formants`,
+    /// false by default, keeps them where they were, as the same voice speaking higher would.
     Pitch {
         /// The shift, in semitones, up where positive.
         semitones: f64,
         /// Whether the formants stay where they are.
         #[serde(default)]
         keep_formants: bool,
+        /// How the time is stretched.
+        #[serde(default)]
+        method: Method,
     },
-    /// The tempo times `ratio`, in [0.25, 4], the pitch kept: the duration divided by it.
+    /// The tempo times `ratio`, in [0.25, 4], the pitch kept, by `method`: the duration divided
+    /// by it.
     Tempo {
         /// The ratio of the new tempo to the old.
         ratio: f64,
+        /// How the time is stretched.
+        #[serde(default)]
+        method: Method,
     },
     /// Tape speed times `ratio`, in [0.25, 4]: pitch and tempo together, the duration divided by
     /// it.
@@ -192,10 +206,12 @@ pub enum Node {
         #[serde(default)]
         waveform: Waveform,
     },
-    /// A resonant lowpass whose cutoff swings sinusoidally between `center_hz` - `swing_hz` and
-    /// `center_hz` + `swing_hz`, `rate_hz` times a second: the center in [20, 20000], the swing
-    /// in [0, center - 20], the rate in [0.1, 50], and the resonance `q` in [0.5, 20], 0.7071 by
-    /// default, which has none.
+    /// The fish tongue's filter, as ffmpeg makes it of the game's afftfilt today: around a
+    /// cutoff swinging between `center_hz` - `swing_hz` and `center_hz` + `swing_hz`, starting
+    /// at the center and going down, `rate_hz` times a second, the sound is lifted by up to 5 dB
+    /// below the cutoff, cut by a notch at 1.27 times it, and boosted above that, 12 dB more
+    /// each octave: 23 dB at four times the cutoff. The cutoff moves in steps of a 5.3 ms frame. The
+    /// center is in [20, 20000], the swing in [0, center - 20], the rate in [0.1, 90].
     Wobble {
         /// The cutoff's middle, in Hz.
         center_hz: f64,
@@ -203,9 +219,6 @@ pub enum Node {
         swing_hz: f64,
         /// How often it swings, in Hz.
         rate_hz: f64,
-        /// The resonance at the cutoff, as a filter's Q.
-        #[serde(default = "butterworth")]
-        q: f64,
     },
     /// The sum of delayed copies, 1 to 16 `taps`; one at 0 ms is the signal itself. The audio
     /// grows by the longest delay.
@@ -242,6 +255,18 @@ pub struct Tap {
     pub delay_ms: f64,
     /// Its gain, in [-4, 4].
     pub weight: f64,
+}
+
+/// How [`Node::Pitch`] and [`Node::Tempo`] stretch time.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Method {
+    /// A phase vocoder, as rubberband: smooth, a little phasey.
+    #[default]
+    Vocoder,
+    /// Splicing pieces of the waveform, as ffmpeg's atempo: crisp, now and then doubling a
+    /// syllable.
+    Splice,
 }
 
 /// The shape a [`Node::Flanger`]'s delay sweeps along.
@@ -311,13 +336,14 @@ impl Node {
                 within("knee_db", knee_db, 0.0, 24.0)
             }
             Self::Limiter { ceiling_db } => within("ceiling_db", ceiling_db, -40.0, 0.0),
-            Self::Saturate { drive_db } => within("drive_db", drive_db, 0.0, 40.0),
+            Self::Saturate { amount } => within("amount", amount, 0.0, 1.0),
+            Self::Clip { ceiling_db } => within("ceiling_db", ceiling_db, -40.0, 0.0),
             Self::Crush { rate_hz, mix } => {
                 within("rate_hz", rate_hz, 100.0, 48000.0)?;
                 within("mix", mix, 0.0, 1.0)
             }
             Self::Pitch { semitones, .. } => within("semitones", semitones, -24.0, 24.0),
-            Self::Tempo { ratio } | Self::Speed { ratio } => within("ratio", ratio, 0.25, 4.0),
+            Self::Tempo { ratio, .. } | Self::Speed { ratio } => within("ratio", ratio, 0.25, 4.0),
             Self::Tremolo { rate_hz, depth } => {
                 within("rate_hz", rate_hz, 0.1, 50.0)?;
                 within("depth", depth, 0.0, 1.0)
@@ -343,12 +369,10 @@ impl Node {
                 center_hz,
                 swing_hz,
                 rate_hz,
-                q,
             } => {
                 within("center_hz", center_hz, 20.0, 20000.0)?;
                 within("swing_hz", swing_hz, 0.0, center_hz - 20.0)?;
-                within("rate_hz", rate_hz, 0.1, 50.0)?;
-                within("q", q, 0.5, 20.0)
+                within("rate_hz", rate_hz, 0.1, 90.0)
             }
             Self::Echo { ref taps } => {
                 if !(1..=16).contains(&taps.len()) {

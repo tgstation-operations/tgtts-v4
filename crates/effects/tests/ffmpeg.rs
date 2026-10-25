@@ -16,32 +16,33 @@ use serde::Deserialize;
 /// measured and 0.25 dB, rounded up to a tenth. Each is under what the unfiltered input measures,
 /// which the test checks, so an effect that did nothing would fail it. A vibrato moves the
 /// harmonics less than a band is wide, so its case is left to [`PITCH_THRESHOLDS`].
-const THRESHOLDS: [(&str, Option<f32>); 19] = [
+const THRESHOLDS: [(&str, Option<f32>); 20] = [
     ("synthetic", Some(1.7)),
     ("tram", Some(1.6)),
-    ("fishing", Some(4.0)),
+    ("fishing", Some(3.5)),
     ("gas_mask", Some(0.3)),
-    ("megaphone", Some(3.0)),
-    ("megaphone_emagged", Some(3.5)),
-    ("hailer", Some(4.5)),
-    ("lizard_tongue", Some(1.5)),
-    ("alien_tongue", Some(2.8)),
+    ("megaphone", Some(2.8)),
+    ("megaphone_emagged", Some(2.8)),
+    ("hailer", Some(4.4)),
+    ("lizard_tongue", Some(1.6)),
+    ("alien_tongue", Some(2.7)),
     ("ethereal_tongue", Some(0.3)),
     ("snail_tongue", Some(1.3)),
-    ("stutter", Some(2.8)),
-    ("cult_slurring", Some(3.1)),
-    ("poly", Some(3.3)),
-    ("fish_tongue", Some(5.2)),
+    ("stutter", Some(2.4)),
+    ("cult_slurring", Some(2.5)),
+    ("poly", Some(2.8)),
+    ("fish_tongue", Some(5.3)),
     ("compressor", Some(0.5)),
     ("flanger", Some(0.7)),
     ("vibrato", None),
+    ("wobble", Some(1.2)),
     ("silicon", Some(1.3)),
 ];
 
 /// The most the pitch of the cases with a vibrato may differ from ffmpeg's, in cents, where
 /// log-mel bands are too coarse to tell a vibrato from none: 1.3 times what it measured and 5
 /// cents, rounded up, each under what the unfiltered input measures.
-const PITCH_THRESHOLDS: [(&str, f32); 2] = [("vibrato", 14.0), ("cult_slurring", 28.0)];
+const PITCH_THRESHOLDS: [(&str, f32); 2] = [("vibrato", 14.0), ("cult_slurring", 31.0)];
 
 // The log-mel spectrum, as fixtures/effects.py computes it.
 const RATE: f64 = 48000.0;
@@ -94,6 +95,40 @@ fn pitch_moves_as_ffmpegs_does() {
         }
     }
     assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// The least correlation between the fish tongue's filter and ffmpeg's, at the lag that brings
+/// them nearest: 0.997 was measured, and the unfiltered input, a still cutoff and one swinging at
+/// the 9.3 Hz the game meant come to 0.23, 0.93 and 0.83.
+const WOBBLE_CORRELATION: f64 = 0.97;
+/// How far ffmpeg's afftfilt may lag, in samples: it gives its output three quarters of a frame
+/// late.
+const WOBBLE_LAG: usize = 2048;
+
+#[test]
+fn wobble_follows_ffmpegs_samples() {
+    let fixture = Fixture::open();
+    let input = fixture.input();
+    let (_, reference) = fixture.tensor("wobble/samples");
+    let case = fixture.cases.iter().find(|c| c.name == "wobble").unwrap();
+    let ours = run(&mut case.pipeline(&fixture.impulses()), &input);
+    let correlation = |y: &[f32]| {
+        (0..=WOBBLE_LAG)
+            .map(|lag| {
+                let (a, b) = (&y[..reference.len() - lag], &reference[lag..]);
+                let dot = |a: &[f32], b: &[f32]| -> f64 {
+                    a.iter()
+                        .zip(b)
+                        .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                        .sum()
+                };
+                dot(a, b) / (dot(a, a) * dot(b, b)).sqrt()
+            })
+            .fold(f64::MIN, f64::max)
+    };
+    let (ours, unfiltered) = (correlation(&ours), correlation(&input));
+    eprintln!("wobble: correlation {ours:.4}, the unfiltered input {unfiltered:.4}");
+    assert!(ours >= WOBBLE_CORRELATION && unfiltered < WOBBLE_CORRELATION);
 }
 
 #[test]
