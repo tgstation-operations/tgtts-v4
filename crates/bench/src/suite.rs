@@ -586,7 +586,10 @@ fn dsp(r: &mut Runner, data: &Data) -> Result<(), String> {
         r.measure(
             spec,
             || (),
-            |()| dsp::blips::message(LINE, &blips, "male", "1", &mut draws).expect("a known voice"),
+            |()| {
+                dsp::blips::message(LINE, &blips, "male", "1", 0, &mut draws)
+                    .expect("a known voice")
+            },
         );
     }
 

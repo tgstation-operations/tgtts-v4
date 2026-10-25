@@ -63,19 +63,20 @@ impl From<segment::Error> for Error {
     }
 }
 
-/// The blips of `text` in the voice whose samples `blips` holds, at its `base` and `number`, as
-/// the old frontend made them: the blips of each of pysbd's sentences, each followed by 250 ms of
-/// silence. It never passed the pitch on to the blips.
+/// The blips of `text` in the voice whose samples `blips` holds, at its `base` and `number`,
+/// `pitch` quarter tones up, as the old frontend made them: the blips of each of pysbd's
+/// sentences, each followed by 250 ms of silence.
 pub fn message(
     text: &str,
     blips: &Blips,
     base: &str,
     number: &str,
+    pitch: i32,
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
     let mut samples = Vec::new();
     for text in sentences::segment(text) {
-        samples.extend(sentence(&text, blips, base, number, 0, random)?.samples);
+        samples.extend(sentence(&text, blips, base, number, pitch, random)?.samples);
         samples.extend(Segment::silent(SENTENCE_GAP, blips.sample_rate()).samples);
     }
     Ok(Segment::new(blips.sample_rate(), samples))

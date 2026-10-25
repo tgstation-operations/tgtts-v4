@@ -172,7 +172,8 @@ fn messages_match_the_old_frontend() {
     for (case, text) in texts(&fixture, "messages").iter().enumerate() {
         let name = format!("message/{case}");
         let mut random = Replay(fx.f64s(&format!("{name}/draws")), 0);
-        let actual = blips::message(text, &voice.1, "male", "1", &mut random);
+        let pitch = fx.int(&format!("{name}/pitch")) as i32;
+        let actual = blips::message(text, &voice.1, "male", "1", pitch, &mut random);
         check(&fx, &name, actual, &random);
     }
 }
@@ -205,6 +206,16 @@ fn crossfades_are_no_longer_than_either_side() {
         let blips = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still);
         assert!(blips.is_ok_and(|b| !b.samples.is_empty()), "{text}");
     }
+}
+
+#[test]
+fn messages_take_the_pitch() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "pitch");
+    let message = blips::message("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
+    let mut expected = blips::sentence("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
+    expected.samples.extend(Segment::silent(250, RATE).samples);
+    assert_eq!(message, expected);
 }
 
 /// A blip loud from its first sample to its last, `ms` long, which stripping leaves whole.
@@ -290,7 +301,8 @@ fn blips_in_a_real_voice_match_the_old_service() {
     for (case, text) in texts(&fixture, "messages").iter().enumerate() {
         let name = format!("message/{case}");
         let mut random = Replay(fx.f64s(&format!("{name}/draws")), 0);
-        let actual = blips::message(text, &blips, "male", "1", &mut random);
+        let pitch = fx.int(&format!("{name}/pitch")) as i32;
+        let actual = blips::message(text, &blips, "male", "1", pitch, &mut random);
         check(&fx, &name, actual, &random);
     }
 }

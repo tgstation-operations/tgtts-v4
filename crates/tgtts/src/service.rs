@@ -577,7 +577,7 @@ impl Service {
         self.cpu(trace, move || {
             let blips = service.voices.blips(&voice).map_err(Failure::internal)?;
             let mut draws = Draws(rand::rng());
-            dsp::blips::message(&text, &blips, &base, &number, &mut draws)
+            dsp::blips::message(&text, &blips, &base, &number, 0, &mut draws)
                 .map_err(|e| Failure::internal(format!("blips: {e}")))
         })
         .await?

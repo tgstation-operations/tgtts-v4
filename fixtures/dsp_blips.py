@@ -11,7 +11,7 @@ often is saved beside them.
 Where the port fixes the old service, the restatement takes the fix too: text with a letter or
 digit of either case makes a sound, a crossfade is no longer than either side, so a sentence can
 start past its first character and take blips shorter than a crossfade, and the blips of ? and !
-are faded as the letters' are.
+are faded as the letters' are. The frontend passes the pitch on.
 """
 
 import importlib.metadata
@@ -207,15 +207,15 @@ def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
 segmenter = pysbd.Segmenter(language="en", clean=True)
 
 
-def frontend(text, voice, blip_base, blip_number):
-    """The frontend's /tts-blips up to its ffmpeg: a request per sentence, without the pitch.
+def frontend(text, voice, blip_base, blip_number, pitch):
+    """The frontend's /tts-blips up to its ffmpeg: a request per sentence, with the pitch.
 
     Its silence is at 48 kHz, the rate of every real voice, where pydub would resample this one's
     blips to meet it: here it is at the voice's rate instead.
     """
     final_audio = AudioSegment.empty()
     for sentence in segmenter.segment(text):
-        response = text_to_speech_blips(sentence, voice, blip_base, blip_number, "0")
+        response = text_to_speech_blips(sentence, voice, blip_base, blip_number, pitch)
         sentence_audio = AudioSegment.from_file(io.BytesIO(response), "wav")
         sentence_silence = AudioSegment.silent(250, RATE)
         sentence_audio += sentence_silence
@@ -253,7 +253,7 @@ PITCH_SHIFT = librosa.effects.pitch_shift
 
 def run(voice, rate, cases, messages, checksum_exact=False):
     """The service's blips of each case, (text, pitch, seed), and the frontend's of each message,
-    (text, seed), in `voice`, a dict of 16-bit samples by key; a seed of None draws 0.5. Where
+    alike, in `voice`, a dict of 16-bit samples by key; a seed of None draws 0.5. Where
     nothing was shifted, `checksum_exact` saves the CRC-32 of the samples rather than them."""
     global RATE, blips_cache
     RATE = rate
@@ -305,11 +305,12 @@ def run(voice, rate, cases, messages, checksum_exact=False):
             ),
         )
     tensors["messages"] = torch.tensor(len(messages))
-    for case, (text, seed) in enumerate(messages):
+    for case, (text, pitch, seed) in enumerate(messages):
+        tensors[f"message/{case}/pitch"] = torch.tensor(int(pitch))
         save(
             f"message/{case}",
             Recorded(seed),
-            lambda: frontend(text, "voice", BASE, NUMBER),
+            lambda: frontend(text, "voice", BASE, NUMBER, pitch),
         )
     return tensors
 
@@ -317,7 +318,7 @@ def run(voice, rate, cases, messages, checksum_exact=False):
 def provenance(cases, messages):
     return {
         "texts": "\n".join(text for text, _, _ in cases),
-        "messages": "\n".join(text for text, _ in messages),
+        "messages": "\n".join(text for text, _, _ in messages),
         "librosa": librosa.__version__,
         "pydub": importlib.metadata.version("pydub"),
         "pysbd": importlib.metadata.version("pysbd"),
@@ -365,7 +366,7 @@ if __name__ == "__main__":
         ("Lab 2 oh", "-12", 3),
         ("!.a", "0", None),
     ]
-    messages = [("Hob. AH 12? oh, hob a lab. b!", 4)]
+    messages = [("Hob. AH 12? oh, hob a lab. b!", "0", 4), ("Ha. b!", "3", None)]
     tensors = {
         f"voice/{key}": torch.from_numpy(samples.astype(np.float32))
         for key, samples in voice.items()

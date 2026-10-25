@@ -46,7 +46,7 @@ cases = [
     ("ok 1", "4", 2),
     ("hello there", "0", None),
 ]
-messages = [("go 1. ok 2?", None)]
+messages = [("go 1. ok 2?", "0", None)]
 generators = [Path(__file__), Path(dsp_blips.__file__)]
 common.Fixture(seed=0).save(
     "dsp",
