@@ -7,7 +7,6 @@
 //! fail on.
 
 use std::{
-    collections::HashMap,
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -23,11 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use dsp::{
-    radio::{self, Pcm},
-    resample::resample,
-    segment::Segment,
-};
+use dsp::{radio, resample::resample, segment::Segment};
 use rand::{Rng, RngExt};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -648,8 +643,7 @@ impl Service {
         let (service, input) = (self.clone(), audio);
         let radio = self
             .cpu(trace, move || {
-                let pcm = input.to_pcm();
-                radio::radio(&pcm, &service.sounds.radio(pcm.rate))
+                radio::radio(&input.to_pcm(), &service.sounds.radio)
             })
             .await?;
         let audio = Arc::new(Audio::from_segment(&radio));
@@ -754,10 +748,7 @@ impl<R: Rng> dsp::Random for Draws<R> {
 pub struct Sounds {
     synth_impulse: PathBuf,
     room_impulse: PathBuf,
-    click_on: Pcm,
-    click_off: Pcm,
-    noise: Pcm,
-    radio: Mutex<HashMap<u32, Arc<radio::Assets>>>,
+    radio: radio::Assets,
     starts: Vec<Audio>,
     ends: Vec<Audio>,
 }
@@ -775,10 +766,11 @@ impl Sounds {
         Ok(Self {
             synth_impulse: impulse(SYNTH_IMPULSE)?,
             room_impulse: impulse(ROOM_IMPULSE)?,
-            click_on: read(CLICK_ON)?.to_pcm(),
-            click_off: read(CLICK_OFF)?.to_pcm(),
-            noise: read(STATIC)?.to_pcm(),
-            radio: Mutex::default(),
+            radio: radio::Assets::new(
+                &read(CLICK_ON)?.to_pcm(),
+                &read(CLICK_OFF)?.to_pcm(),
+                &read(STATIC)?.to_pcm(),
+            ),
             starts: STARTS
                 .iter()
                 .map(|name| read(name))
@@ -788,16 +780,6 @@ impl Sounds {
                 .map(|name| read(name))
                 .collect::<io::Result<_>>()?,
         })
-    }
-
-    /// The radio's clicks and static, matched once per rate of the speech that asks for them.
-    fn radio(&self, rate: u32) -> Arc<radio::Assets> {
-        let mut assets = self.radio.lock().unwrap_or_else(|e| e.into_inner());
-        let matched = || radio::Assets::new(&self.click_on, &self.click_off, &self.noise);
-        assets
-            .entry(rate)
-            .or_insert_with(|| Arc::new(matched()))
-            .clone()
     }
 
     /// `audio` between a start and an end click drawn from `rng`, as the old frontend's "radio"
