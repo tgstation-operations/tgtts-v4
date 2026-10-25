@@ -15,11 +15,7 @@ use crate::{
 /// replaced with as many `#`, and the words joined with single spaces. The service ignored the
 /// masked text the game sent and made its own this way.
 pub fn mask(text: &str, random: &mut impl Random) -> String {
-    let mut words: Vec<String> = text
-        .split(is_space)
-        .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let mut words: Vec<String> = words(text).map(str::to_owned).collect();
     let percent = 0.35 + (0.65 - 0.35) * random.random();
     let count = (words.len() as f64 * percent) as usize;
     for i in sample(words.len(), count, random) {
@@ -43,52 +39,31 @@ fn sample(n: usize, k: usize, random: &mut impl Random) -> Vec<usize> {
         .collect()
 }
 
+/// The words of `text` as Python's `str.split` gives them.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(is_space).filter(|w| !w.is_empty())
+}
+
 /// Python's `str.isspace` for one character.
 fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 
-/// The old service's `find_corrupted_spans`: the times, in seconds, of the letters of `clean`
-/// that `corrupted` masks, and of the spaces beside them, merged where less than 50 ms apart.
-/// `letters` are the start and end of each letter of the alignment, in order.
-///
-/// Its quirks are kept: it pairs the letters and spaces of `clean` with the characters of
-/// `corrupted` by position, so a digit or punctuation mark shifts the pairing, and it counts
-/// through `letters` by the letters of `clean`, though the alignment also times apostrophes.
-pub fn corrupted_spans(clean: &str, corrupted: &str, letters: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let clean: Vec<char> = clean
-        .chars()
-        .filter(|&c| c.is_alphabetic() || c == ' ')
-        .collect();
-    let corrupt: Vec<char> = corrupted
-        .chars()
-        .filter(|&c| c == ' ' || !is_space(c))
-        .collect();
-    let mut masked = Vec::new();
-    let mut letter = 0;
-    for (i, &c) in clean.iter().enumerate() {
-        if c == ' ' {
-            continue;
-        }
-        if corrupt.get(i).is_some_and(|c| !c.is_alphabetic()) {
-            masked.push(letter);
-        }
-        letter += 1;
-    }
+/// The times, in seconds, of the letters of the words of `text` that `masked` masks, merged
+/// where less than 50 ms apart, as the old service's `find_corrupted_spans` meant them. `masked`
+/// is `text` as [`mask`] gives it, word for word, and `letters` are the start and end of each
+/// character of `text` the alignment times, its letters and apostrophes, in order.
+pub fn corrupted_spans(text: &str, masked: &str, letters: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let masked: Vec<&str> = words(masked).collect();
+    let mut letters = letters.iter();
     let mut spans = Vec::new();
-    let mut at = 0;
-    for (&c, &corrupt) in clean.iter().zip(&corrupt) {
-        if c == ' ' {
-            // Python's at - 1 is -1 at the first letter, which no letter is.
-            let adjacent = (at > 0 && masked.contains(&(at - 1))) || masked.contains(&at);
-            if !is_space(corrupt) && adjacent && at > 0 && at < letters.len() {
-                spans.push((letters[at - 1].1, letters[at].0));
-            }
-        } else {
-            if !corrupt.is_alphabetic() && at < letters.len() {
-                spans.push(letters[at]);
-            }
-            at += 1;
+    for (i, word) in words(text).enumerate() {
+        let timed = word
+            .chars()
+            .filter(|&c| c.is_ascii_alphabetic() || c == '\'');
+        let times: Vec<(f64, f64)> = letters.by_ref().take(timed.count()).copied().collect();
+        if masked.get(i).is_some_and(|m| *m != word) {
+            spans.extend(times);
         }
     }
     merge(spans, 0.05)

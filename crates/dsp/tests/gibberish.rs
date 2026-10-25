@@ -1,4 +1,5 @@
-//! The gibberish radio's masking, spans and ducking against the old radio-gibberish service's.
+//! The gibberish radio's masking, spans and ducking against the old radio-gibberish service's,
+//! restated with the fixes the port makes.
 
 mod common;
 
@@ -71,6 +72,20 @@ fn masks_and_finds_spans_as_the_old_service() {
             "{i}: spans"
         );
     }
+}
+
+#[test]
+fn pairs_the_masked_words_letters_with_their_times() {
+    let text = "Hi, it's 5 o'clock";
+    // H i, i t ' s and o ' c l o c k, the digit untimed.
+    let letters: Vec<(f64, f64)> = (0..13)
+        .map(|k| (0.1 + 0.07 * f64::from(k), 0.15 + 0.07 * f64::from(k)))
+        .collect();
+    let spans = gibberish::corrupted_spans(text, "### it's 5 #######", &letters);
+    assert_eq!(
+        spans,
+        [(letters[0].0, letters[1].1), (letters[6].0, letters[12].1)]
+    );
 }
 
 /// The fixture's clicks and static.

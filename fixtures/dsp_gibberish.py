@@ -7,10 +7,11 @@ random recorded. The letters' times are made up, as are the speech and the click
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
 and ducked at the 48 kHz it was resampled to, the static loops under speech longer than it, and
 the static after the speech goes on from where the static under it left off, a span starting past
-the speech's end is cut to nothing where numpy could not fade it, and spans whose margins overlap
-are ducked as one.
+the speech's end is cut to nothing where numpy could not fade it, spans whose margins overlap
+are ducked as one, and the masked words' letters are paired with their times word by word.
 """
 
+import itertools
 import json
 import os
 import random
@@ -38,56 +39,19 @@ from dsp_radio import (  # noqa: E402
 )
 
 
-# The old service's code, as it had it.
+# The old service's code, as it had it, but for find_corrupted_spans.
 def find_corrupted_spans(clean_text, corrupted_text, char_timestamps):
-    clean_chars   = [(i, c) for i, c in enumerate(clean_text)   if c.isalpha() or c == " "]  # fmt: skip
-    corrupt_chars = [(i, c) for i, c in enumerate(corrupted_text) if c.isalpha() or c == " " or not c.isspace()]  # fmt: skip
-
-    # First pass: find which alpha indices are corrupted
-    corrupted_alpha_indices = set()
-    alpha_idx = 0
-    for idx, (_, clean_char) in enumerate(clean_chars):
-        if clean_char == " ":
-            continue
-        if idx < len(corrupt_chars) and not corrupt_chars[idx][1].isalpha():
-            corrupted_alpha_indices.add(alpha_idx)
-        alpha_idx += 1
-
-    # Second pass: build spans
+    """The times of the letters of the words of clean_text that corrupted_text masks, as the port
+    pairs them: a word with its masked word, and its letters and apostrophes, which the
+    alignment times, with their times in turn."""
+    masked = corrupted_text.split()
+    timestamps = iter(char_timestamps)
     corrupted_spans = []
-    ts_idx = 0
-
-    for idx, (_, clean_char) in enumerate(clean_chars):
-        if idx >= len(corrupt_chars):
-            break
-        corrupt_char = corrupt_chars[idx][1]
-
-        if clean_char == " ":
-            # Check if the alpha char before or after this space is corrupted
-            prev_alpha = ts_idx - 1
-            next_alpha = ts_idx
-            adjacent_corrupted = (
-                prev_alpha in corrupted_alpha_indices
-                or next_alpha in corrupted_alpha_indices
-            )
-            if not corrupt_char.isspace() and adjacent_corrupted:
-                if ts_idx > 0 and ts_idx < len(char_timestamps):
-                    corrupted_spans.append(
-                        (
-                            char_timestamps[ts_idx - 1]["end"],
-                            char_timestamps[ts_idx]["start"],
-                        )
-                    )
-        else:
-            if not corrupt_char.isalpha() and ts_idx < len(char_timestamps):
-                corrupted_spans.append(
-                    (
-                        char_timestamps[ts_idx]["start"],
-                        char_timestamps[ts_idx]["end"],
-                    )
-                )
-            ts_idx += 1
-
+    for i, word in enumerate(clean_text.split()):
+        timed = sum(1 for c in word if (c.isascii() and c.isalpha()) or c == "'")
+        times = [(t["start"], t["end"]) for t in itertools.islice(timestamps, timed)]
+        if i < len(masked) and masked[i] != word:
+            corrupted_spans += times
     return merge_spans(corrupted_spans, gap_threshold=0.05)
 
 
