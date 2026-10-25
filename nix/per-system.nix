@@ -5,6 +5,7 @@ let
   scripts = rec {
     fmt = import ./scripts/fmt.nix { inherit pkgs rustToolchain; };
     audit = import ./scripts/audit.nix { inherit pkgs rustToolchain fmt; };
+    bench = import ./scripts/bench.nix { inherit pkgs rustToolchain; };
   };
 in
 {

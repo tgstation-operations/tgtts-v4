@@ -15,6 +15,9 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   compare against. A rerun writes the same bytes.
 - Tests that need the real weights are ignored by default: point `VOXCPM2_DIR`
   at a VoxCPM2 checkpoint and run `cargo test -- --ignored`.
+- `nix run .#bench` times release builds of the hot paths on the real weights
+  (`VOXCPM2_DIR`, and `VOICES_DIR` for a converted voices directory) and writes
+  each run as JSON; `nix run .#bench -- --help` tells how to compare two.
 
 Entering the devshell points `core.hooksPath` at `.githooks/`. The pre-commit
 hook runs the gate over the staged tree, and post-checkout seeds a new

@@ -1,0 +1,14 @@
+[package]
+name = "bench"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+audiovae = { path = "../audiovae" }
+burn = { workspace = true, features = ["flex", "std"] }
+minicpm4 = { path = "../minicpm4" }
+serde.workspace = true
+serde_json.workspace = true
+voices = { path = "../voices" }
