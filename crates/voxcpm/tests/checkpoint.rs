@@ -10,7 +10,7 @@ use burn::tensor::{FloatDType, Tensor};
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir, device, fixture};
 use voices::Latent;
-use voxcpm::{Config, Dtypes, Params, TextToSpeech, decode};
+use voxcpm::{Config, Dtypes, Params, SeededNoise, TextToSpeech, decode};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
@@ -196,4 +196,37 @@ fn decodes_upstreams_patches_as_upstream_on_the_real_weights() {
     // upstream's.
     assert_close(audio.clone().narrow(0, 0, kept), start, 1e-6, 0.0);
     assert_close(audio.narrow(0, samples - kept, kept), end, 1e-6, 0.0);
+}
+
+/// Each part in a dtype of its own, so that what passes between them has to be cast: the LMs and
+/// the DiT in bf16 and the decoder in f16, as prod runs them, and the local encoder between them
+/// in f32.
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn synthesizes_with_each_part_in_its_own_dtype() {
+    let golden = golden();
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let dtypes = Dtypes {
+        lm: FloatDType::BF16,
+        local_encoder: FloatDType::F32,
+        local_dit: FloatDType::BF16,
+        audio_decoder: FloatDType::F16,
+    };
+    let tts = TextToSpeech::load(&checkpoint_dir(), &dtypes, &device()).unwrap();
+    let params = Params {
+        max_patches: 3,
+        ..Params::default()
+    };
+    let audio = tts
+        .synthesize(text, &voice, &params, &mut SeededNoise::new(0))
+        .unwrap();
+    let patch = 4 * 1920;
+    assert!(
+        (1..=3).any(|patches| audio.len() == patches * patch),
+        "{} samples",
+        audio.len()
+    );
+    assert!(audio.iter().all(|x| x.is_finite()));
+    let peak = audio.iter().fold(0f32, |peak, x| peak.max(x.abs()));
+    assert!(peak > 1e-3, "silent, at a peak of {peak}");
 }
