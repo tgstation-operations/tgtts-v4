@@ -5,20 +5,15 @@ librosa. The speech is made up, at the model's 48 kHz.
 """
 
 import io
-import os
 import wave
 import zlib
 
-# numpy's AVX-512 kernels round differently from its AVX2 ones: pinned to AVX2, as fixtures.nix
-# pins torch, any x86-64 host since Haswell writes the same bytes.
-os.environ["NPY_DISABLE_CPU_FEATURES"] = "X86_V4 AVX512_ICL AVX512_SPR"
+import librosa
+import numpy as np
+import pydub
+import torch
 
-import librosa  # noqa: E402
-import numpy as np  # noqa: E402
-import pydub  # noqa: E402
-import torch  # noqa: E402
-
-import common  # noqa: E402
+import common
 
 tts_sample_rate = 48000
 

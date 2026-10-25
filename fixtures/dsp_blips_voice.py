@@ -12,13 +12,10 @@ import sys
 import zlib
 from pathlib import Path
 
-# Before dsp_blips imports numpy, for the same reason it pins it.
-os.environ["NPY_DISABLE_CPU_FEATURES"] = "X86_V4 AVX512_ICL AVX512_SPR"
+from safetensors import safe_open
 
-from safetensors import safe_open  # noqa: E402
-
-import common  # noqa: E402
-import dsp_blips  # noqa: E402
+import common
+import dsp_blips
 
 VOICE = "Man (Ace Detective)"
 

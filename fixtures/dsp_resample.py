@@ -7,19 +7,14 @@ is saved as the CRC-32 of its output.
 """
 
 import importlib.metadata
-import os
 import zlib
 
-# numpy's AVX-512 kernels round differently from its AVX2 ones: pinned to AVX2, as fixtures.nix
-# pins torch, any x86-64 host since Haswell writes the same bytes.
-os.environ["NPY_DISABLE_CPU_FEATURES"] = "X86_V4 AVX512_ICL AVX512_SPR"
+import librosa
+import numpy as np
+import soxr
+import torch
 
-import librosa  # noqa: E402
-import numpy as np  # noqa: E402
-import soxr  # noqa: E402
-import torch  # noqa: E402
-
-import common  # noqa: E402
+import common
 
 fixture = common.Fixture(seed=0)
 rng = np.random.default_rng(0)

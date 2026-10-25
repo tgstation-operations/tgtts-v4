@@ -13,21 +13,16 @@ are ducked as one, and the masked words' letters are paired with their times wor
 
 import itertools
 import json
-import os
 import random
 
-# numpy's AVX-512 kernels round differently from its AVX2 ones: pinned to AVX2, as fixtures.nix
-# pins torch, any x86-64 host since Haswell writes the same bytes.
-os.environ["NPY_DISABLE_CPU_FEATURES"] = "X86_V4 AVX512_ICL AVX512_SPR"
+import librosa
+import numpy as np
+import torch
+from pydub import AudioSegment
 
-import librosa  # noqa: E402
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
-from pydub import AudioSegment  # noqa: E402
-
-import common  # noqa: E402
-import dsp_radio  # noqa: E402
-from dsp_radio import (  # noqa: E402
+import common
+import dsp_radio
+from dsp_radio import (
     OUTPUT_SR,
     audiosegment_to_numpy,
     bandpass,

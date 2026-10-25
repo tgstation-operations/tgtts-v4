@@ -5,18 +5,12 @@ those the blips draw, in semitones, and the pitch the game sends, in quarter ton
 at full scale, and its shift rings past it, where the conversion back to 16 bits saturates.
 """
 
-import os
+import librosa
+import numpy as np
+import scipy
+import torch
 
-# numpy's AVX-512 kernels round differently from its AVX2 ones: pinned to AVX2, as fixtures.nix
-# pins torch, any x86-64 host since Haswell writes the same bytes.
-os.environ["NPY_DISABLE_CPU_FEATURES"] = "X86_V4 AVX512_ICL AVX512_SPR"
-
-import librosa  # noqa: E402
-import numpy as np  # noqa: E402
-import scipy  # noqa: E402
-import torch  # noqa: E402
-
-import common  # noqa: E402
+import common
 
 RATE = 48000
 

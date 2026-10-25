@@ -20,23 +20,18 @@ silence, for a sentence without a sound.
 import importlib.metadata
 import io
 import math
-import os
 import random
 import wave
 import zlib
 
-# numpy's AVX-512 kernels round differently from its AVX2 ones: pinned to AVX2, as fixtures.nix
-# pins torch, any x86-64 host since Haswell writes the same bytes.
-os.environ["NPY_DISABLE_CPU_FEATURES"] = "X86_V4 AVX512_ICL AVX512_SPR"
+import librosa
+import numpy as np
+import pysbd
+import torch
+from pydub import AudioSegment
+from pydub.silence import detect_leading_silence
 
-import librosa  # noqa: E402
-import numpy as np  # noqa: E402
-import pysbd  # noqa: E402
-import torch  # noqa: E402
-from pydub import AudioSegment  # noqa: E402
-from pydub.silence import detect_leading_silence  # noqa: E402
-
-import common  # noqa: E402
+import common
 
 BASE, NUMBER = "male", "1"
 CROSSFADE_TOO_LONG = 1
