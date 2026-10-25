@@ -99,5 +99,5 @@ fn serves_a_message_on_the_real_model() {
         ..message.clone()
     }
     .speech(&server);
-    silicon.assert_ogg(44100);
+    silicon.assert_ogg(48000);
 }
