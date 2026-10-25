@@ -195,7 +195,6 @@ fn write_assets(dir: &Path) {
         .flat_map(|i| [16384 >> (i / 4), 8192 >> (i / 4)])
         .collect();
     write_wav(&dir.join("SynthImpulse.wav"), 44100, 2, &impulse);
-    write_wav(&dir.join("RoomImpulse.wav"), 44100, 2, &impulse);
 }
 
 const LOUDNESS: Loudness = Loudness {
@@ -551,14 +550,15 @@ fn splits_the_special_filters() {
         }
         .speech(&h)
     };
+    // The made-up impulse is 64 frames at 44.1 kHz, 70 at 48 kHz.
     let silicon = special("silicon");
-    silicon.assert_ogg(44100);
-    assert!(silicon.frames(44100) >= speech * 44100 / 48000 + 2 * 44100);
+    silicon.assert_ogg(48000);
+    assert_eq!(silicon.frames(48000), speech + 69);
     // The old frontend tested /tts's special filters as a string, for "silicon" in it.
     let not_silicon = special("notsilicon");
     not_silicon.assert_ogg(48000);
     assert_eq!(not_silicon.frames(48000), speech);
-    special("radio|silicon").assert_ogg(44100);
+    special("radio|silicon").assert_ogg(48000);
 
     let starts = [1200, 2400];
     let ends = [240, 480, 720, 960];

@@ -8,7 +8,7 @@
 
 use std::{
     fmt, fs, io,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -26,6 +26,7 @@ use dsp::{loudness::Normalized, radio, resample::resample, segment::Segment};
 use effects::{
     Pipeline,
     convolve::{self, Impulses},
+    schema::Graph,
 };
 use rand::{Rng, RngExt};
 use serde::Deserialize;
@@ -43,17 +44,21 @@ use crate::{
     wav::{self, Audio},
 };
 
-/// The old frontend's "silicon" effect, whose further inputs are [`SYNTH_IMPULSE`] and
-/// [`ROOM_IMPULSE`].
-const SILICON: &str = "[0] aresample=44100 [re_1]; [re_1] apad=pad_dur=2 [in_1]; \
-    [in_1] asplit=2 [in_1_1] [in_1_2]; [in_1_1] [1] afir=dry=10:wet=10 [reverb_1]; \
-    [in_1_2] [reverb_1] amix=inputs=2:weights=8 1 [mix_1]; [mix_1] asplit=2 [mix_1_1] [mix_1_2]; \
-    [mix_1_1] [2] afir=dry=1:wet=1 [reverb_2]; [mix_1_2] [reverb_2] amix=inputs=2:weights=10 1 [mix_2]; \
-    [mix_2] equalizer=f=7710:t=q:w=0.6:g=-6,equalizer=f=33:t=q:w=0.44:g=-10 [out]; \
-    [out] alimiter=level_in=1:level_out=1:limit=0.5:attack=5:release=20:level=disabled";
+/// The old frontend's "silicon" effect, as effects: its ffmpeg graph upmixed the voice to stereo
+/// at -3 dB, convolved each channel with its channel of [`SYNTH_IMPULSE`] scaled by 100 over the
+/// impulse's magnitude, mixed that in at 1 to 8, then the same with RoomImpulse.wav at 1 to 10,
+/// equalized and limited at -6 dBFS. The room's part was 61 dB under the voice and is left out,
+/// its mix's 10/11 folded into the weights, which give the level of the mean of the channels.
+const SILICON: &str = r#"[{"nodes": {
+    "synth": {"effect": "convolve", "impulse": "synth"},
+    "mix": {"effect": "mix", "weights": {"input": 0.5714, "synth": 0.1223}},
+    "air": {"effect": "peak", "frequency_hz": 7710, "gain_db": -6, "q": 0.6},
+    "rumble": {"effect": "peak", "frequency_hz": 33, "gain_db": -10, "q": 0.44},
+    "limit": {"effect": "limiter", "ceiling_db": -6.021}},
+  "edges": [["input", "synth"], ["input", "mix"], ["synth", "mix"], ["mix", "air"],
+    ["air", "rumble"], ["rumble", "limit"], ["limit", "output"]]}]"#;
 
 const SYNTH_IMPULSE: &str = "SynthImpulse.wav";
-const ROOM_IMPULSE: &str = "RoomImpulse.wav";
 const CLICK_ON: &str = "mic_click_on.wav";
 const CLICK_OFF: &str = "mic_click_off.wav";
 const STATIC: &str = "diffstatic.wav";
@@ -243,8 +248,6 @@ enum Treatment {
     Effects(Pipeline),
     /// The ffmpeg filter graph the game sent before it sent effects.
     Filter(String),
-    /// The old frontend's "silicon" effect.
-    Silicon,
     None,
 }
 
@@ -652,7 +655,10 @@ impl Service {
             }
         }
         if params.special_filters.split('|').any(|s| s == "silicon") {
-            Ok(Treatment::Silicon)
+            let silicon = Pipeline::new(&self.sounds.silicon, &self.sounds.impulses);
+            Ok(Treatment::Effects(
+                silicon.expect("the silicon effect is checked when read"),
+            ))
         } else {
             Ok(Treatment::None)
         }
@@ -686,11 +692,6 @@ impl Service {
             Treatment::Filter(graph) => {
                 let graph = graph.replace("%SAMPLE_RATE%", &audio.rate.to_string());
                 self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), &graph, &[]))
-                    .await?
-            }
-            Treatment::Silicon => {
-                let impulses = [&*self.sounds.synth_impulse, &*self.sounds.room_impulse];
-                self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), SILICON, &impulses))
                     .await?
             }
             Treatment::None => Audio::from_segment(&audio),
@@ -848,9 +849,8 @@ impl<R: Rng> dsp::Random for Draws<R> {
 
 /// The sounds the service puts around and under speech, from the assets directory.
 pub struct Sounds {
-    synth_impulse: PathBuf,
-    room_impulse: PathBuf,
     impulses: Impulses,
+    silicon: Vec<Graph>,
     radio: radio::Assets,
     starts: Vec<Audio>,
     ends: Vec<Audio>,
@@ -865,18 +865,23 @@ impl Sounds {
             let bytes = fs::read(&path).map_err(|e| io::Error::new(e.kind(), context(&e)))?;
             wav::read(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, context(&e)))
         };
-        let impulse = |name: &str| read(name).map(|_| dir.join(name));
         let synth = read(SYNTH_IMPULSE)?;
+        let impulses = Impulses {
+            synth: Arc::new(convolve::Response::new(
+                &synth.samples,
+                usize::from(synth.channels),
+                synth.rate,
+            )),
+        };
+        let silicon = serde_json::from_str(SILICON).expect("the silicon effect is JSON");
+        let silicon = effects::schema::parse(&silicon).expect("the silicon effect parses");
+        if let Err(e) = Pipeline::new(&silicon, &impulses) {
+            let reason = format!("the silicon effect with {SYNTH_IMPULSE}: {e}");
+            return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+        }
         Ok(Self {
-            synth_impulse: impulse(SYNTH_IMPULSE)?,
-            room_impulse: impulse(ROOM_IMPULSE)?,
-            impulses: Impulses {
-                synth: Arc::new(convolve::Response::new(
-                    &synth.samples,
-                    usize::from(synth.channels),
-                    synth.rate,
-                )),
-            },
+            impulses,
+            silicon,
             radio: radio::Assets::new(
                 &read(CLICK_ON)?.to_pcm(),
                 &read(CLICK_OFF)?.to_pcm(),
