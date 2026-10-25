@@ -6,8 +6,8 @@ pub fn from_pcm(samples: &[i16]) -> Vec<f32> {
 }
 
 /// `numpy_to_audiosegment`: floats scaled by 32767, not 32768, in their own precision, and cast
-/// to 16 bits as numpy casts on x86-64. The cast truncates to 32 bits first, so a sample past
-/// full scale wraps around rather than clipping, and one past the 32-bit range becomes 0.
+/// to 16 bits toward zero, as numpy casts, but held at full scale where numpy's cast wraps
+/// around, and a NaN made 0.
 pub fn to_pcm<F: Float>(samples: &[F]) -> Vec<i16> {
     samples.iter().map(|&s| s.to_pcm()).collect()
 }
@@ -20,24 +20,13 @@ pub trait Float: Copy + sealed::Sealed {
 
 impl Float for f32 {
     fn to_pcm(self) -> i16 {
-        cast(f64::from(self * 32767.0))
+        (self * 32767.0) as i16
     }
 }
 
 impl Float for f64 {
     fn to_pcm(self) -> i16 {
-        cast(self * 32767.0)
-    }
-}
-
-/// x86-64's `cvttsd2si` to 32 bits, which gives `i32::MIN` for what it cannot represent, then
-/// the low 16 bits.
-fn cast(value: f64) -> i16 {
-    let value = value.trunc();
-    if (-2147483648.0..2147483648.0).contains(&value) {
-        value as i32 as i16
-    } else {
-        0
+        (self * 32767.0) as i16
     }
 }
 

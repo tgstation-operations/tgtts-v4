@@ -2,11 +2,10 @@
 
 The signals are voiced, decaying like a blip, at the 48 kHz the service runs at; the shifts are
 those the blips draw, in semitones, and the pitch the game sends, in quarter tones. One is clipped
-at full scale, and its shift rings past it, where the conversion back to 16 bits wraps.
+at full scale, and its shift rings past it, where the conversion back to 16 bits saturates.
 """
 
 import os
-import warnings
 
 # numpy's AVX-512 kernels round differently from its AVX2 ones: pinned to AVX2, as fixtures.nix
 # pins torch, any x86-64 host since Haswell writes the same bytes.
@@ -32,11 +31,10 @@ def audiosegment_to_numpy(samples):
 
 
 def numpy_to_audiosegment(samples):
-    """The old service's, to the 16-bit samples it makes a segment of."""
-    with warnings.catch_warnings():
-        # numpy warns of the values past the 32-bit range, which it casts all the same.
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return (samples * 32767).astype(np.int16)
+    """The old service's, to the 16-bit samples it makes a segment of, but held at full scale
+    where its cast wraps around, and a NaN made 0, as the port has it."""
+    scaled = np.nan_to_num(samples * 32767, nan=0, posinf=32767, neginf=-32768)
+    return np.clip(scaled, -32768, 32767).astype(np.int16)
 
 
 def blip(n, f0, peak):

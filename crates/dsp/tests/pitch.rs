@@ -1,4 +1,5 @@
-//! The pitch shift against librosa's, and the conversions around it against the old service's.
+//! The pitch shift against librosa's, and the conversions around it against the old service's,
+//! restated to saturate where its cast wraps around.
 
 mod common;
 
@@ -52,6 +53,23 @@ fn matches_librosa() {
             "{case}: {differing} samples differ"
         );
     }
+}
+
+#[test]
+fn saturates_past_full_scale() {
+    let x = [
+        1.5f32,
+        -1.5,
+        1e6,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1.0,
+        -1.0,
+    ];
+    let expected = [32767, -32768, 32767, 32767, -32768, 0, 32767, -32767];
+    assert_eq!(float::to_pcm(&x), expected, "float32");
+    assert_eq!(float::to_pcm(&x.map(f64::from)), expected, "float64");
 }
 
 #[test]

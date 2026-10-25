@@ -11,8 +11,9 @@ often is saved beside them.
 
 Where the port fixes the old service, the restatement takes the fix too: text with a letter or
 digit of either case makes a sound, a crossfade is no longer than either side, so a sentence can
-start past its first character and take blips shorter than a crossfade, and the blips of ? and !
-are faded as the letters' are. The frontend passes the pitch on, and puts nothing, not even its
+start past its first character and take blips shorter than a crossfade, the blips of ? and !
+are faded as the letters' are, and the conversion back to 16 bits holds samples at full scale
+where it wrapped around. The frontend passes the pitch on, and puts nothing, not even its
 silence, for a sentence without a sound.
 """
 
@@ -66,7 +67,7 @@ def audiosegment_to_numpy(seg):
 
 
 def numpy_to_audiosegment(samples, sr, sample_width=2, channels=1):
-    samples_int16 = (samples * 32767).astype(np.int16)
+    samples_int16 = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
     return AudioSegment(
         samples_int16.tobytes(),
         frame_rate=sr,

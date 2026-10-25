@@ -36,7 +36,8 @@ def audiosegment_to_numpy(seg):
 
 
 def numpy_to_audiosegment(samples, sr, sample_width=2, channels=1):
-    samples_int16 = (samples * 32767).astype(np.int16)
+    # The port holds samples at full scale where this cast would wrap around.
+    samples_int16 = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
 
     return pydub.AudioSegment(
         samples_int16.tobytes(),
