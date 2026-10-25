@@ -157,11 +157,9 @@ fn check(fx: &Tensors, name: &str, actual: Result<Segment, Error>, random: &Repl
     );
 }
 
-/// The pitch shift's samples that truncate to a 16-bit value one off, scaled by the gain that
-/// brings the blips to -25 dBFS, made samples of the shifted cases up to 2 apart here and 3 in the
-/// real voice.
-const MAX_DIFFERENCE: i32 = 4;
-/// Of their samples, at most 0.17% differed.
+/// The pitch shift's samples that truncate to a 16-bit value one off.
+const MAX_DIFFERENCE: i32 = 1;
+/// Of the shifted cases' samples, at most 18 of 3600 differed.
 const MAX_DIFFERING: f64 = 0.01;
 
 #[test]

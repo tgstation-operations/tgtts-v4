@@ -2,8 +2,9 @@
 //! place of speech.
 //!
 //! Each blip is detuned at random, lowered in volume and faded, then crossfaded onto the last, by
-//! 150 ms or as much of that as both have, and the whole brought to -25 dBFS with its peak held
-//! under -5 dBFS. [`sentence`] is what the old
+//! 150 ms or as much of that as both have. The whole is left at the level it comes to, where the
+//! old service brought it to -25 dBFS with its peak held under -5 dBFS: the service brings every
+//! route to one loudness. [`sentence`] is what the old
 //! blips service made of the text it was sent; [`message`] is what its frontend made of a message,
 //! a sentence at a time.
 
@@ -150,13 +151,7 @@ pub fn sentence(
         let crossfade = CROSSFADE.min(result.len_ms()).min(blip.len_ms());
         result = result.append(&blip, crossfade)?;
     }
-    let result = result.apply_gain(-25.0 - result.dbfs());
-    let peak = result.max_dbfs();
-    Ok(if peak > -5.0 {
-        result.apply_gain(-5.0 - peak)
-    } else {
-        result
-    })
+    Ok(result)
 }
 
 /// The old service's detuning: `base_pitch` semitones, and a draw of up to `3 * spread`

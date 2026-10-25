@@ -13,7 +13,9 @@ Where the port fixes the old service, the restatement takes the fix too: text wi
 digit of either case makes a sound, a crossfade is no longer than either side, so a sentence can
 start past its first character and take blips shorter than a crossfade, the blips of ? and !
 are faded as the letters' are, and the conversion back to 16 bits holds samples at full scale
-where it wrapped around. The frontend passes the pitch on, and puts nothing, not even its
+where it wrapped around. The blips are left at the level they come to, without the old service's
+-25 dBFS and its peak under -5 dBFS, as the port leaves them for the service to bring to one
+loudness. The frontend passes the pitch on, and puts nothing, not even its
 silence, for a sentence without a sound.
 """
 
@@ -78,18 +80,6 @@ strip_silence = lambda x: trim_trailing_silence(trim_leading_silence(x))  # noqa
 
 def change_volume(seg, multiplier):
     return seg.apply_gain(20 * math.log10(multiplier))
-
-
-def normalize_to_target(seg, target_dbfs=-20.0):
-    change = target_dbfs - seg.dBFS
-    return seg.apply_gain(change)
-
-
-def cap_loudness(seg, max_dbfs=-1.0):
-    if seg.max_dBFS > max_dbfs:
-        change = max_dbfs - seg.max_dBFS
-        return seg.apply_gain(change)
-    return seg
 
 
 def append(result_sound, blip):
@@ -196,10 +186,6 @@ def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
                 stripped_sound = strip_silence(new_audio)  # noqa: F841
                 result_sound = append(result_sound, fade(new_audio))
         result_sound.export(data_bytes, format="wav")
-        rawsound = AudioSegment.from_file(io.BytesIO(data_bytes.getvalue()), "wav")
-        normalizedsound = normalize_to_target(rawsound, -25)
-        normalizedsound = cap_loudness(normalizedsound, max_dbfs=-5)
-        normalizedsound.export(data_bytes, format="wav")
         return data_bytes.getvalue()
 
 
@@ -339,7 +325,7 @@ if __name__ == "__main__":
     voice = {
         "a": blip(220, 180),
         "b": blip(180, 170),
-        # A click, whose peak the blips' -25 dBFS takes past -5 dBFS.
+        # A click.
         "c": blip(400, 170, decay=0.004),
         "h": blip(260, 175),
         "l": blip(200, 170),
