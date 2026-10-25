@@ -18,39 +18,32 @@ pub struct Pcm {
     pub samples: Vec<i16>,
 }
 
-/// The sounds the radio puts around and under speech, mono and matched to a rate as the old
-/// service's `load_and_match` read them from their WAV files.
+/// The sounds the radio puts around and under speech, mono and matched to the service's rate as
+/// the old service's `load_and_match` read them from their WAV files.
 #[derive(Clone, Debug)]
 pub struct Assets {
-    rate: u32,
     click_on: Vec<f64>,
     click_off: Vec<f64>,
     noise: Vec<f64>,
 }
 
 impl Assets {
-    /// The mic clicks and the static, matched to `rate`: each read as float64 and averaged over
-    /// its channels, then resampled to `rate` as librosa does.
-    pub fn new(click_on: &Pcm, click_off: &Pcm, noise: &Pcm, rate: u32) -> Self {
+    /// The mic clicks and the static, matched to the service's rate: each read as float64 and
+    /// averaged over its channels, then resampled as librosa does.
+    pub fn new(click_on: &Pcm, click_off: &Pcm, noise: &Pcm) -> Self {
         let matched = |clip: &Pcm| {
             let mono = to_mono(clip);
-            if clip.rate == rate {
+            if clip.rate == RATE {
                 mono
             } else {
-                resample(&mono, f64::from(clip.rate), f64::from(rate))
+                resample(&mono, f64::from(clip.rate), f64::from(RATE))
             }
         };
         Self {
-            rate,
             click_on: matched(click_on),
             click_off: matched(click_off),
             noise: matched(noise),
         }
-    }
-
-    /// The rate these are matched to.
-    pub fn rate(&self) -> u32 {
-        self.rate
     }
 
     /// The click before the speech.
@@ -110,22 +103,15 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-/// `speech` over the radio, as the old radio service made it: resampled to 8 kHz and on to
-/// 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with static under it, then between the
-/// mic clicks, with 0.1 s of static before the second, and declared to be at 48 kHz.
+/// `speech` over the radio, as the old radio service made it: resampled to 8 kHz and on to the
+/// service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with static under it, then
+/// between the mic clicks, with 0.1 s of static before the second.
 ///
-/// The old service filtered at the speech's own rate, though it had resampled it to 48 kHz,
-/// and matched the clicks and static to the speech's rate, though it declared the whole to be
-/// at 48 kHz: so it did with speech at another rate, as the silicon voices' 44.1 kHz. It took
-/// a frame of two channels as their mean, and the samples of more as they were interleaved.
-///
-/// # Panics
-///
-/// If `assets` are not matched to `speech`'s rate.
+/// The old service took a frame of two channels as their mean, and the samples of more as they
+/// were interleaved.
 pub fn radio(speech: &Pcm, assets: &Assets) -> Result<Segment, Error> {
-    assert_eq!(assets.rate, speech.rate, "assets for another rate");
     let narrowed = narrow(speech)?;
-    finish(narrowed, assets, speech.rate)
+    finish(narrowed, assets)
 }
 
 /// The radio's processing of the speech, up to the static: float32 through the resampling and
@@ -153,7 +139,7 @@ pub(crate) fn narrow(speech: &Pcm) -> Result<Vec<f64>, Error> {
         .iter()
         .map(|&v| f64::from(if peak > 0.0 { v / peak * 0.5 } else { v }))
         .collect();
-    let (b, a) = bandpass(speech.rate);
+    let (b, a) = bandpass();
     let x: Vec<f64> = lfilter(&b, &a, &x)
         .iter()
         .map(|v| (2.0 * v).tanh())
@@ -161,11 +147,10 @@ pub(crate) fn narrow(speech: &Pcm) -> Result<Vec<f64>, Error> {
     Ok(normalize(&x, 0.7))
 }
 
-/// The rest of the radio: the static under the speech, the clicks and 0.1 s of static, at the
-/// speech's `rate`, around it.
-pub(crate) fn finish(speech: Vec<f64>, assets: &Assets, rate: u32) -> Result<Segment, Error> {
+/// The rest of the radio: the static under the speech, the clicks and 0.1 s of static around it.
+pub(crate) fn finish(speech: Vec<f64>, assets: &Assets) -> Result<Segment, Error> {
     let noise = (assets.noise.get(..speech.len())).ok_or(Error::LongerThanStatic(speech.len()))?;
-    let tail = &noise[..((f64::from(rate) * 0.1) as usize).min(noise.len())];
+    let tail = &noise[..((f64::from(RATE) * 0.1) as usize).min(noise.len())];
     let mut output = assets.click_on.clone();
     output.extend(speech.iter().zip(noise).map(|(s, n)| s + n * 0.2));
     output.extend_from_slice(tail);
@@ -183,10 +168,10 @@ fn normalize(x: &[f64], peak: f64) -> Vec<f64> {
     }
 }
 
-/// `scipy.signal.butter(4, [300 / nyq, 3000 / nyq], btype="band")` at `rate`, through the same
-/// steps: the analog prototype's poles moved to the band and the bilinear transform.
-fn bandpass(rate: u32) -> ([f64; 9], [f64; 9]) {
-    let nyq = f64::from(rate) * 0.5;
+/// `scipy.signal.butter(4, [300 / nyq, 3000 / nyq], btype="band")` at the service's rate, through
+/// the same steps: the analog prototype's poles moved to the band and the bilinear transform.
+fn bandpass() -> ([f64; 9], [f64; 9]) {
+    let nyq = f64::from(RATE) * 0.5;
     let fs = 2.0;
     let warped = [300.0 / nyq, 3000.0 / nyq].map(|w| 2.0 * fs * (PI * w / fs).tan());
     let prototype = [-3.0, -1.0, 1.0, 3.0].map(|m| -Complex::new(0.0, PI * m / 8.0).exp());
@@ -264,15 +249,13 @@ mod tests {
                 .map(|b| f64::from_le_bytes(*b))
                 .collect()
         };
-        for rate in [8000, 44100, 48000] {
-            let (b, a) = bandpass(rate);
-            for (name, actual) in [("b", b), ("a", a)] {
-                let expected = doubles(&format!("butter/{rate}/{name}"));
-                let scale = expected.iter().fold(0f64, |m, v| m.max(v.abs()));
-                for (i, (x, e)) in actual.iter().zip(&expected).enumerate() {
-                    let error = (x - e).abs() / scale;
-                    assert!(error < 1e-13, "{rate} Hz {name}[{i}]: {x:e} for {e:e}");
-                }
+        let (b, a) = bandpass();
+        for (name, actual) in [("b", b), ("a", a)] {
+            let expected = doubles(&format!("butter/{name}"));
+            let scale = expected.iter().fold(0f64, |m, v| m.max(v.abs()));
+            for (i, (x, e)) in actual.iter().zip(&expected).enumerate() {
+                let error = (x - e).abs() / scale;
+                assert!(error < 1e-13, "{name}[{i}]: {x:e} for {e:e}");
             }
         }
     }

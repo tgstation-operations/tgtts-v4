@@ -31,8 +31,25 @@ fn matches_the_old_service() {
 }
 
 /// Checks the radio on `fx`'s speech, with the clicks and static `assets`, against the old
-/// service's, and the assets as it matched them to each rate, to the bit.
+/// service's, and the assets as it matched them to 48 kHz, to the bit.
 fn check(fx: &Tensors, [on, off, noise]: [Pcm; 3]) {
+    let assets = Assets::new(&on, &off, &noise);
+    let sounds = [assets.click_on(), assets.click_off(), assets.noise()];
+    for (stem, sound) in ASSETS.iter().zip(sounds) {
+        let matched = format!("matched/{stem}");
+        assert_eq!(
+            sound.len() as i64,
+            fx.int(&format!("{matched}/len")),
+            "{matched}"
+        );
+        let bytes: Vec<u8> = sound.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let crc = i64::from(crc32fast::hash(&bytes));
+        assert_eq!(
+            crc,
+            fx.int(&format!("{matched}/crc32")),
+            "{matched} differs"
+        );
+    }
     for case in 0..fx.int("cases") {
         let name = case.to_string();
         let speech = Pcm {
@@ -40,23 +57,6 @@ fn check(fx: &Tensors, [on, off, noise]: [Pcm; 3]) {
             channels: fx.int(&format!("{name}/channels")) as u16,
             samples: fx.pcm(&format!("{name}/input")),
         };
-        let assets = Assets::new(&on, &off, &noise, speech.rate);
-        let sounds = [assets.click_on(), assets.click_off(), assets.noise()];
-        for (stem, sound) in ASSETS.iter().zip(sounds) {
-            let matched = format!("matched/{}/{stem}", speech.rate);
-            assert_eq!(
-                sound.len() as i64,
-                fx.int(&format!("{matched}/len")),
-                "{matched}"
-            );
-            let bytes: Vec<u8> = sound.iter().flat_map(|s| s.to_le_bytes()).collect();
-            let crc = i64::from(crc32fast::hash(&bytes));
-            assert_eq!(
-                crc,
-                fx.int(&format!("{matched}/crc32")),
-                "{matched} differs"
-            );
-        }
         match (
             radio::radio(&speech, &assets),
             fx.int(&format!("{name}/error")),

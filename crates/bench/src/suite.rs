@@ -552,8 +552,8 @@ fn dsp(r: &mut Runner, data: &Data) -> Result<(), String> {
         let [on, off, noise] =
             ["mic_click_on.wav", "mic_click_off.wav", "diffstatic.wav"].map(|f| dir.join(f));
         let (on, off, noise) = (read_wav(&on)?, read_wav(&off)?, read_wav(&noise)?);
-        let match_assets = || Assets::new(&on, &off, &noise, SPEECH_RATE);
-        let spec = Spec::new("dsp.radio.assets", 1, 5).param("rate", SPEECH_RATE);
+        let match_assets = || Assets::new(&on, &off, &noise);
+        let spec = Spec::new("dsp.radio.assets", 1, 5).param("rate", dsp::RATE);
         let assets = r.measure(spec, || (), |()| match_assets());
         let assets = assets.unwrap_or_else(match_assets);
         let spec = Spec::new("dsp.radio", 2, 20).audio(seconds);

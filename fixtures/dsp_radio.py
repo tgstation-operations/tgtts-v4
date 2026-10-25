@@ -3,11 +3,13 @@
 The service's code is restated below as it was, around librosa, scipy and soundfile, from the
 segment it decoded the speech into on. The clicks and static are made up, at the rates and
 channels of the real ones (stereo 44.1 kHz, mono 11025 Hz, stereo 8 kHz), and read from WAV
-files as the service read them, and the CRC-32 of each as it matched them to the speech's rate is
-saved; dsp_radio_assets runs it on the real ones. The speech is mono and
-stereo at 48 kHz; mono at the 44.1 kHz of the silicon voices, which the service took through
-its radio at the wrong rates; and at 8 kHz, which comes out longer than the static matched to
-it, and fails.
+files as the service read them, and the CRC-32 of each as it matched them to 48 kHz is saved;
+dsp_radio_assets runs it on the real ones. The speech is mono and stereo at 48 kHz, mono at the
+44.1 kHz of the silicon voices, and mono at 8 kHz.
+
+Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
+at the 48 kHz it was resampled to, and the clicks and static are matched to 48 kHz, whatever the
+speech's rate was.
 """
 
 import io
@@ -30,6 +32,7 @@ from scipy.signal import butter, lfilter  # noqa: E402
 import common  # noqa: E402
 
 LONGER_THAN_STATIC = 1
+OUTPUT_SR = 48000
 
 # The WAV files the service read its clicks and static from, by name, which run() sets.
 assets = None
@@ -97,19 +100,19 @@ def radio_effect(base_audio):
     samples, numpy_sr = audiosegment_to_numpy(base_audio)
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
-    click_on = load_and_match("mic_click_on.wav", numpy_sr)
-    click_off = load_and_match("mic_click_off.wav", numpy_sr)
-    static = load_and_match("diffstatic.wav", numpy_sr)
+    click_on = load_and_match("mic_click_on.wav", OUTPUT_SR)
+    click_off = load_and_match("mic_click_off.wav", OUTPUT_SR)
+    static = load_and_match("diffstatic.wav", OUTPUT_SR)
     speech = librosa.resample(samples, orig_sr=numpy_sr, target_sr=8000)
-    speech = librosa.resample(speech, orig_sr=8000, target_sr=48000)
+    speech = librosa.resample(speech, orig_sr=8000, target_sr=OUTPUT_SR)
     speech = normalize(speech, 0.5)
-    speech = bandpass(speech, numpy_sr)
+    speech = bandpass(speech, OUTPUT_SR)
     speech = saturate(speech, 2)
     speech = normalize(speech, 0.7)
     static = static[: len(speech)]
     speech = speech + static * 0.2
     output = np.concatenate(
-        [click_on, speech, static[: int(numpy_sr * 0.1)], click_off]
+        [click_on, speech, static[: int(OUTPUT_SR * 0.1)], click_off]
     )
 
     output = normalize(output, 0.9)
@@ -154,22 +157,21 @@ def run(files, speeches):
             channels=channels,
         )
         try:
-            out = numpy_to_audiosegment(radio_effect(seg), 48000)
+            out = numpy_to_audiosegment(radio_effect(seg), OUTPUT_SR)
         except ValueError:
             tensors[f"{name}/error"] = torch.tensor(LONGER_THAN_STATIC)
             continue
         tensors[f"{name}/error"] = torch.tensor(0)
         tensors[f"{name}/output"] = pcm(np.frombuffer(out.raw_data, dtype=np.int16))
-    for rate in sorted({rate for _, rate, _ in speeches}):
-        nyq = rate * 0.5
-        b, a = butter(4, [300 / nyq, 3000 / nyq], btype="band")
-        tensors[f"butter/{rate}/b"] = f64(b)
-        tensors[f"butter/{rate}/a"] = f64(a)
-        for name in files:
-            matched = load_and_match(name, rate).astype("<f8").tobytes()
-            stem = name.removesuffix(".wav")
-            tensors[f"matched/{rate}/{stem}/len"] = torch.tensor(len(matched) // 8)
-            tensors[f"matched/{rate}/{stem}/crc32"] = torch.tensor(zlib.crc32(matched))
+    nyq = OUTPUT_SR * 0.5
+    b, a = butter(4, [300 / nyq, 3000 / nyq], btype="band")
+    tensors["butter/b"] = f64(b)
+    tensors["butter/a"] = f64(a)
+    for name in files:
+        matched = load_and_match(name, OUTPUT_SR).astype("<f8").tobytes()
+        stem = name.removesuffix(".wav")
+        tensors[f"matched/{stem}/len"] = torch.tensor(len(matched) // 8)
+        tensors[f"matched/{stem}/crc32"] = torch.tensor(zlib.crc32(matched))
     return tensors
 
 

@@ -3,6 +3,9 @@
 The service's code is restated below as it was, from the letters' times its alignment gave on,
 with the helpers it shares with the radio service taken from dsp_radio and its calls to Python's
 random recorded. The letters' times are made up, as are the speech and the clicks and static.
+
+Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
+and ducked at the 48 kHz it was resampled to.
 """
 
 import json
@@ -21,6 +24,7 @@ from pydub import AudioSegment  # noqa: E402
 import common  # noqa: E402
 import dsp_radio  # noqa: E402
 from dsp_radio import (  # noqa: E402
+    OUTPUT_SR,
     audiosegment_to_numpy,
     bandpass,
     load_and_match,
@@ -180,28 +184,28 @@ def build_static_mask(
 
 def radio_effect(base_audio, corrupted_spans):
     """The service's radio_effect, from the spans it found on."""
-    click_on = load_and_match("mic_click_on.wav", 48000)
-    click_off = load_and_match("mic_click_off.wav", 48000)
-    static = load_and_match("diffstatic.wav", 48000)
+    click_on = load_and_match("mic_click_on.wav", OUTPUT_SR)
+    click_off = load_and_match("mic_click_off.wav", OUTPUT_SR)
+    static = load_and_match("diffstatic.wav", OUTPUT_SR)
     samples, numpy_sr = audiosegment_to_numpy(base_audio)
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
     speech = librosa.resample(samples, orig_sr=numpy_sr, target_sr=8000)
-    speech = librosa.resample(speech, orig_sr=8000, target_sr=48000)
+    speech = librosa.resample(speech, orig_sr=8000, target_sr=OUTPUT_SR)
     speech = normalize(speech, 0.5)
-    speech = bandpass(speech, numpy_sr)
+    speech = bandpass(speech, OUTPUT_SR)
     speech = saturate(speech, 2)
     speech = normalize(speech, 0.7)
 
     # Duck speech + inject static bursts
     speech = apply_corruption_static(
-        speech, corrupted_spans, static, numpy_sr, duck_gain=0, static_gain=0.85
+        speech, corrupted_spans, static, OUTPUT_SR, duck_gain=0, static_gain=0.85
     )
 
     static = static[: len(speech)]
     speech = speech + static * 0.2
     output = np.concatenate(
-        [click_on, speech, static[: int(numpy_sr * 0.1)], click_off]
+        [click_on, speech, static[: int(OUTPUT_SR * 0.1)], click_off]
     )
 
     output = normalize(output, 0.9)
@@ -317,7 +321,7 @@ for case, (samples, rate, spans) in enumerate(radios):
         samples.astype("<i2").tobytes(), frame_rate=rate, sample_width=2, channels=1
     )
     try:
-        out = numpy_to_audiosegment(radio_effect(seg, spans), 48000)
+        out = numpy_to_audiosegment(radio_effect(seg, spans), OUTPUT_SR)
     except ValueError as e:
         error = SPAN_PAST_END if "Number of samples" in str(e) else LONGER_THAN_STATIC
         tensors[f"{name}/error"] = torch.tensor(error)

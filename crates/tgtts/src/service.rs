@@ -798,10 +798,10 @@ impl Sounds {
         })
     }
 
-    /// The radio's clicks and static matched to `rate`, matched once per rate.
+    /// The radio's clicks and static, matched once per rate of the speech that asks for them.
     fn radio(&self, rate: u32) -> Arc<radio::Assets> {
         let mut assets = self.radio.lock().unwrap_or_else(|e| e.into_inner());
-        let matched = || radio::Assets::new(&self.click_on, &self.click_off, &self.noise, rate);
+        let matched = || radio::Assets::new(&self.click_on, &self.click_off, &self.noise);
         assets
             .entry(rate)
             .or_insert_with(|| Arc::new(matched()))

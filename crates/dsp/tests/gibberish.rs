@@ -85,7 +85,7 @@ fn ducks_as_the_old_service() {
         samples: fx.pcm(&format!("{stem}/samples")),
     };
     let [on, off, noise] = ["mic_click_on", "mic_click_off", "diffstatic"].map(clip);
-    let assets = Assets::new(&on, &off, &noise, 48000);
+    let assets = Assets::new(&on, &off, &noise);
     let radios: usize = fixture.metadata()["radios"].parse().unwrap();
     for case in 0..radios {
         let name = format!("radio/{case}");

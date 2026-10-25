@@ -115,29 +115,24 @@ fn merge(mut spans: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
 /// `speech` over the radio as [`radio::radio`] makes it, but ducked under static over `spans`,
 /// in seconds, as the old radio-gibberish service made it: the speech faded out over 25 ms from
 /// 60 ms before each span and back in over 50 ms to 80 ms after it, with the static, at 0.85,
-/// faded in and out alike. The service matched the clicks and static to 48 kHz whatever the
-/// speech's rate, and timed the spans at the speech's rate.
-///
-/// # Panics
-///
-/// If `assets` are not matched to 48 kHz.
+/// faded in and out alike.
 pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Result<Segment, Error> {
-    assert_eq!(assets.rate(), RATE, "assets for another rate");
     let narrowed = narrow(speech)?;
-    let ducked = duck(&narrowed, spans, assets.noise(), speech.rate)?;
-    radio::finish(ducked, assets, speech.rate)
+    let ducked = duck(&narrowed, spans, assets.noise())?;
+    radio::finish(ducked, assets)
 }
 
 /// The old service's `apply_corruption_static` with `build_static_mask`, at its settings.
-fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64], rate: u32) -> Result<Vec<f64>, Error> {
+fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Result<Vec<f64>, Error> {
     let total = speech.len();
-    let ms = |ms: u32| (f64::from(ms * rate) / 1000.0) as i64;
+    let rate = f64::from(RATE);
+    let ms = |ms: u32| (f64::from(ms * RATE) / 1000.0) as i64;
     let (pre, post, fade) = (ms(60), ms(80), ms(25));
     let mut envelope = vec![1.0; total];
     let mut mask = vec![0.0; total];
     for &(start, end) in spans {
-        let s = ((start * f64::from(rate)) as i64 - pre).max(0);
-        let e = ((end * f64::from(rate)) as i64 + post).min(total as i64);
+        let s = ((start * rate) as i64 - pre).max(0);
+        let e = ((end * rate) as i64 + post).min(total as i64);
         // numpy's linspace of a negative length, where the span starts past the speech's end.
         let half = (e - s).div_euclid(2);
         if half < 0 {
