@@ -7,7 +7,7 @@ use burn::{
     },
 };
 
-use crate::{Config, rope::Rotation};
+use crate::{Config, cache::LayerCache, rope::Rotation};
 
 /// Upstream's `MiniCPMRMSNorm`, which takes the mean square in f32.
 #[derive(Module, Debug)]
@@ -22,6 +22,10 @@ impl RmsNorm {
             weight: Initializer::Ones.init([size], device),
             eps,
         }
+    }
+
+    pub(crate) fn weight(&self) -> Tensor<1> {
+        self.weight.val()
     }
 
     pub(crate) fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
@@ -65,6 +69,7 @@ impl Attention {
         x: Tensor<3>,
         rotation: Option<&Rotation>,
         mask: Option<&Tensor<4, Bool>>,
+        cache: Option<(&mut LayerCache, usize)>,
     ) -> Tensor<3> {
         let [batch, len, _] = x.dims();
         let project = |proj: &Linear, heads| {
@@ -79,6 +84,10 @@ impl Attention {
             q = rotation.apply(q);
             k = rotation.apply(k);
         }
+        let (k, v) = match cache {
+            Some((cache, start)) => cache.append(start, k, v),
+            None => (k, v),
+        };
         // Each key-value head serves a run of consecutive query heads, as torch's enable_gqa
         // has it: stacking a run's queries along the sequence lets them share it uncopied.
         let groups = self.heads / self.kv_heads;
@@ -141,10 +150,10 @@ impl DecoderLayer {
         x: Tensor<3>,
         rotation: Option<&Rotation>,
         mask: Option<&Tensor<4, Bool>>,
+        cache: Option<(&mut LayerCache, usize)>,
     ) -> Tensor<3> {
-        let attended =
-            self.self_attn
-                .forward(self.input_layernorm.forward(x.clone()), rotation, mask);
+        let normed = self.input_layernorm.forward(x.clone());
+        let attended = self.self_attn.forward(normed, rotation, mask, cache);
         let x = x + attended;
         x.clone() + self.mlp.forward(self.post_attention_layernorm.forward(x))
     }

@@ -1,10 +1,10 @@
-use burn::tensor::FloatDType;
+use burn::tensor::{FloatDType, Tensor};
 use minicpm4::{Config, Error, LocalShape, Mask, Model};
 use serde_json::Value;
 use testkit::{Fixture, assert_close, device, fixture};
 
 // f32 here and in upstream, summing in other orders and rounding transcendentals an ulp
-// apart: these outputs, of magnitude under 4, came within 7.2e-7 (3 ulps) of upstream's.
+// apart: these outputs, of magnitude under 4, came within 9.6e-7 (4 ulps) of upstream's.
 const ATOL: f32 = 2e-6;
 const RTOL: f32 = 1e-6;
 
@@ -76,6 +76,43 @@ fn local_encoder_attends_bidirectionally_with_rope_as_upstream() {
     let x = fixture.tensor("input.feat_encoder.encoder.x", &device);
     let expected = fixture.tensor("output.feat_encoder.encoder.bidirectional", &device);
     assert_close(model.forward(x, Mask::Bidirectional), expected, ATOL, RTOL);
+}
+
+/// Prefills the first 3 of the 7 positions of `input`, then runs 2 more at once and the last
+/// 2 one at a time, where upstream stepped through all 4 one at a time.
+fn decodes_as_upstream(config: &Config, prefix: &str, input: &str) {
+    let (fixture, device) = (fixture!("minicpm4"), device());
+    let model = load(config, &fixture, prefix).unwrap();
+    let x = fixture.tensor::<3>(input, &device);
+    let mut cache = model.cache(2, 7);
+    let mut run = |start, len| model.forward_cached(x.clone().narrow(1, start, len), &mut cache);
+    let prefill = run(0, 3);
+    let steps = Tensor::cat(vec![run(3, 2), run(5, 1), run(6, 1)], 1);
+    let causal = fixture.tensor::<3>(&format!("output.{prefix}causal"), &device);
+    assert_close(prefill, causal.narrow(1, 0, 3), ATOL, RTOL);
+    let expected = fixture.tensor(&format!("output.{prefix}steps"), &device);
+    assert_close(steps, expected, ATOL, RTOL);
+}
+
+#[test]
+fn base_lm_decodes_as_upstream() {
+    decodes_as_upstream(&tiny().lm, "base_lm.", "output.base_lm.embeds");
+}
+
+#[test]
+fn residual_lm_decodes_as_upstream() {
+    decodes_as_upstream(&tiny().residual_lm, "residual_lm.", "input.residual_lm.x");
+}
+
+#[test]
+#[should_panic(expected = "KV cache is full: 6 positions and 2 more are past its 7")]
+fn a_full_cache_is_refused() {
+    let (fixture, device) = (fixture!("minicpm4"), device());
+    let model = load(&tiny().residual_lm, &fixture, "residual_lm.").unwrap();
+    let x = fixture.tensor::<3>("input.residual_lm.x", &device);
+    let mut cache = model.cache(2, 7);
+    model.forward_cached(x.clone().narrow(1, 0, 6), &mut cache);
+    model.forward_cached(x.narrow(1, 0, 2), &mut cache);
 }
 
 #[test]

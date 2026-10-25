@@ -42,6 +42,18 @@ def stack(prefix, config):
     return model
 
 
+def decode(model, x, prefill):
+    """Prefill x's first positions, then step through the rest, as VoxCPM2 decodes."""
+    model.setup_cache(x.size(0), x.size(1), x.device, x.dtype)
+    _, kv = model(x[:, :prefill], is_causal=True)
+    model.kv_cache.fill_caches(kv)
+    steps = [
+        model.forward_step(x[:, t], torch.tensor([model.kv_cache.step()]))
+        for t in range(prefill, x.size(1))
+    ]
+    return torch.stack(steps, dim=1)
+
+
 with torch.no_grad():
     base_lm = stack("base_lm.", lm_config)
     ids = torch.randint(lm_config.vocab_size, (2, 7))
@@ -49,11 +61,13 @@ with torch.no_grad():
     tensors["input.base_lm.ids"] = ids
     tensors["output.base_lm.embeds"] = embeds
     tensors["output.base_lm.causal"], _ = base_lm(embeds, is_causal=True)
+    tensors["output.base_lm.steps"] = decode(base_lm, embeds, prefill=3)
 
     residual_lm = stack("residual_lm.", residual_lm_config)
     x = torch.randn(2, 7, residual_lm_config.hidden_size)
     tensors["input.residual_lm.x"] = x
     tensors["output.residual_lm.causal"], _ = residual_lm(x, is_causal=True)
+    tensors["output.residual_lm.steps"] = decode(residual_lm, x, prefill=3)
 
     encoder = stack("feat_encoder.encoder.", encoder_config)
     x = torch.randn(3, 5, encoder_config.hidden_size)

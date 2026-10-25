@@ -6,6 +6,7 @@
 //! It follows upstream VoxCPM's `voxcpm.modules.minicpm4`, and loads that module's state_dict
 //! names.
 
+mod cache;
 mod config;
 mod layer;
 mod rope;
@@ -22,7 +23,10 @@ use burn::{
     tensor::{Bool, Device, FloatDType, Int, Tensor, TensorData},
 };
 
-pub use crate::config::{Config, LocalShape, RopeScaling};
+pub use crate::{
+    cache::KvCache,
+    config::{Config, LocalShape, RopeScaling},
+};
 use crate::{
     layer::{DecoderLayer, RmsNorm},
     rope::Rope,
@@ -121,8 +125,48 @@ impl Model {
             Mask::Bidirectional => None,
         };
         let x = self.layers.iter().fold(x, |x, layer| {
-            layer.forward(x, rotation.as_ref(), mask.as_ref())
+            layer.forward(x, rotation.as_ref(), mask.as_ref(), None)
         });
+        self.norm.forward(x)
+    }
+
+    /// An empty cache for `batch` sequences of up to `capacity` positions, in the model's
+    /// dtype on its device.
+    pub fn cache(&self, batch: usize, capacity: usize) -> KvCache {
+        let weight = self.norm.weight();
+        let shape = [
+            batch,
+            self.config.num_key_value_heads,
+            capacity,
+            self.config.head_dim(),
+        ];
+        KvCache::new(self.layers.len(), shape, (&weight.device(), weight.dtype()))
+    }
+
+    /// Runs the stack causally over `x` `[batch, len, hidden]` as the next `len` positions of
+    /// the sequences in `cache`, adding them to it: a prefill on an empty cache, then a step
+    /// at a time, as upstream's `forward`, `fill_caches` and `forward_step` do.
+    ///
+    /// # Panics
+    ///
+    /// If `cache` is for another batch size or has no room for `len` more positions, or the
+    /// stack has RoPE and they would be past `max_position_embeddings`.
+    pub fn forward_cached(&self, x: Tensor<3>, cache: &mut KvCache) -> Tensor<3> {
+        let [batch, len, _] = x.dims();
+        let start = cache.len;
+        assert_eq!(batch, cache.batch, "a cache for {} sequences", cache.batch);
+        assert!(
+            start + len <= cache.capacity,
+            "KV cache is full: {start} positions and {len} more are past its {}",
+            cache.capacity
+        );
+        let rotation = self.rope.as_ref().map(|rope| rope.at(start, len));
+        let mask = self.causal_mask(len, start + len, &x.device());
+        let layers = self.layers.iter().zip(&mut cache.layers);
+        let x = layers.fold(x, |x, (layer, cache)| {
+            layer.forward(x, rotation.as_ref(), mask.as_ref(), Some((cache, start)))
+        });
+        cache.len += len;
         self.norm.forward(x)
     }
 
