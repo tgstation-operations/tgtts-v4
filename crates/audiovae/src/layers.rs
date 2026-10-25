@@ -7,7 +7,7 @@ use burn::{
     tensor::{Device, Int, Tensor, module::conv_transpose1d, ops::ConvTransposeOptions},
 };
 
-use crate::decoder::DecoderBlock;
+use crate::{decoder::DecoderBlock, encoder::EncoderBlock};
 
 /// An element of one of upstream's `nn.Sequential`s, which are mirrored as `Vec<Layer>` so that
 /// every parameter keeps its state_dict name: loading skips the variant names.
@@ -17,6 +17,7 @@ pub(crate) enum Layer {
     Conv(Conv1d),
     ConvTranspose(CausalConvTranspose1d),
     Residual(ResidualUnit),
+    EncoderBlock(EncoderBlock),
     DecoderBlock(DecoderBlock),
     Tanh(Tanh),
 }
@@ -28,6 +29,7 @@ impl Layer {
             Self::Conv(conv) => conv.forward(x),
             Self::ConvTranspose(conv) => conv.forward(x),
             Self::Residual(unit) => unit.forward(x),
+            Self::EncoderBlock(block) => block.forward(x),
             Self::DecoderBlock(block) => block.forward(x),
             Self::Tanh(tanh) => tanh.forward(x),
         }

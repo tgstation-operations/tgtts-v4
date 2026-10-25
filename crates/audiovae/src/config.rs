@@ -5,8 +5,8 @@ use crate::Error;
 /// The `audio_vae_config` of a VoxCPM2 `config.json`.
 ///
 /// Fields the JSON leaves out take the defaults of upstream's `AudioVAEConfig`, and a field
-/// upstream does not have is refused rather than ignored. Building a [`Decoder`](crate::Decoder)
-/// refuses the values this port does not implement.
+/// upstream does not have is refused rather than ignored. Building an [`Encoder`](crate::Encoder)
+/// or a [`Decoder`](crate::Decoder) refuses the values this port does not implement.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioVaeConfig {
@@ -63,6 +63,17 @@ impl Default for AudioVaeConfig {
 }
 
 impl AudioVaeConfig {
+    /// Refuses what the encoder needs and this port does not implement, or what cannot be
+    /// built at all.
+    pub(crate) fn check_encoder(&self) -> Result<(), Error> {
+        self.check_shared()?;
+        check_rates("encoder_rates", &self.encoder_rates)?;
+        if self.encoder_dim == 0 {
+            return Err(Error::Unsupported("encoder_dim: 0".into()));
+        }
+        Ok(())
+    }
+
     /// Refuses what the decoder needs and this port does not implement, or what cannot be
     /// built at all, and gives the sample-rate bucket boundaries.
     pub(crate) fn check_decoder(&self) -> Result<&[u32], Error> {
@@ -148,6 +159,7 @@ mod tests {
     fn checkpoint_config_is_upstreams_default() {
         let config: AudioVaeConfig = serde_json::from_str(CHECKPOINT).unwrap();
         assert_eq!(config, AudioVaeConfig::default());
+        config.check_encoder().unwrap();
         assert_eq!(config.check_decoder().unwrap(), [20000, 30000, 40000]);
     }
 
@@ -180,6 +192,15 @@ mod tests {
         for (field, value, message) in cases {
             let config = with(field, value).unwrap();
             assert_eq!(unsupported(config.check_decoder()), message);
+        }
+        let cases = [
+            ("depthwise", "false", "depthwise: false"),
+            ("encoder_rates", "[2, 0]", "encoder_rates: [2, 0]"),
+            ("encoder_dim", "0", "encoder_dim: 0"),
+        ];
+        for (field, value, message) in cases {
+            let config = with(field, value).unwrap();
+            assert_eq!(unsupported(config.check_encoder()), message);
         }
     }
 

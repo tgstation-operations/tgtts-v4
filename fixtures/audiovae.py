@@ -1,4 +1,5 @@
-"""The audio VAE's building blocks and its decoder, at tiny sizes with random weights.
+"""The audio VAE's building blocks, its decoder and its encoder, at tiny sizes with random
+weights.
 
 Each module's weights are saved under its name, and what it was given and gave back under
 input.<name> and output.<name>.
@@ -105,5 +106,14 @@ decoder["sr_bin_boundaries"] = decoder["sr_bin_boundaries"].long()
 tensors.update({f"decoder.{key}": value for key, value in decoder.items()})
 tensors["input.decode.z"] = z
 tensors["output.decode"] = model.decode(z).detach()
+
+randomize(model.encoder)
+# Upstream pads 97 samples to whole frames of 10, and encodes 10 frames.
+audio = 0.3 * torch.randn(2, 1, 97)
+tensors.update(
+    {f"encoder.{key}": value for key, value in model.encoder.state_dict().items()}
+)
+tensors["input.encode.audio"] = audio
+tensors["output.encode"] = model.encode(audio, config.sample_rate).detach()
 
 fixture.save("audiovae", tensors)

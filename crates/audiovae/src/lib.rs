@@ -1,20 +1,22 @@
 //! The audio VAE of VoxCPM2, ported from upstream VoxCPM's `audio_vae_v2.py`: causal
 //! convolutional networks between audio and the latent frames the language model speaks in.
-//! VoxCPM2's decoder writes 48 kHz audio, 1920 samples to a 64-channel frame at 25 Hz.
+//! VoxCPM2's encoder takes 16 kHz audio, 640 samples to a 64-channel frame at 25 Hz, and its
+//! decoder writes 48 kHz audio, 1920 samples to a frame.
 //!
 //! The modules mirror upstream's, its `nn.Sequential`s included, so that `audiovae.pth`
 //! loads under its own state_dict names.
 
 mod config;
 mod decoder;
+mod encoder;
 mod layers;
 mod weights;
 
 use std::fmt;
 
-pub use crate::{config::AudioVaeConfig, decoder::Decoder, weights::Weights};
+pub use crate::{config::AudioVaeConfig, decoder::Decoder, encoder::Encoder, weights::Weights};
 
-/// Why a decoder could not be built or loaded.
+/// Why a decoder or an encoder could not be built or loaded.
 #[derive(Debug)]
 pub enum Error {
     /// The config asks for something this port does not implement.

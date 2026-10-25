@@ -1,24 +1,9 @@
-use audiovae::{AudioVaeConfig, Decoder, Error, Weights};
-use burn::{store::SafetensorsStore, tensor::FloatDType};
+mod common;
+
+use audiovae::{AudioVaeConfig, Decoder, Error};
+use burn::tensor::FloatDType;
+use common::{tiny, weights};
 use testkit::{assert_close, device, fixture};
-
-/// The config fixtures/audiovae.py builds its decoder from.
-fn tiny() -> AudioVaeConfig {
-    AudioVaeConfig {
-        encoder_dim: 2,
-        encoder_rates: vec![2, 5],
-        latent_dim: 4,
-        decoder_dim: 32,
-        decoder_rates: vec![3, 2, 2],
-        out_sample_rate: 24000,
-        ..AudioVaeConfig::default()
-    }
-}
-
-fn weights() -> Weights {
-    let mut store = SafetensorsStore::from_file(fixture!("audiovae").path());
-    Weights::from_store(&mut store).unwrap()
-}
 
 #[test]
 fn decodes_as_upstream_in_the_bucket_of_out_sample_rate() {
