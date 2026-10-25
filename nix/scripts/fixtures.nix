@@ -12,6 +12,7 @@ let
     ps.numpy
     ps.pydantic
     ps.pydub
+    ps.pysbd
     ps.safetensors
     ps.torch
   ]);

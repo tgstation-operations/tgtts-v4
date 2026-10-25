@@ -5,3 +5,4 @@ pub mod float;
 pub mod pitch;
 pub mod resample;
 pub mod segment;
+pub mod sentences;
