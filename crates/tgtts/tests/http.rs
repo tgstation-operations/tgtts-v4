@@ -33,6 +33,8 @@ use voices::{BlipSet, Latent, Voices};
 const FRAMES_PER_CHAR: usize = 1200;
 /// The silence the old frontend put after speech.
 const TAIL: usize = 12000;
+/// The seed of the blips' draws, so that every request draws the same.
+const BLIP_SEED: u64 = 0;
 
 /// A model that says a tone as long as the text, counting what it is asked and how many it
 /// is asked at once, and failing on text with "Fail" in it.
@@ -247,6 +249,7 @@ fn harness_at(fake: Fake, limits: Limits, loudness: Loudness) -> Harness {
         }),
         loudness,
         limits,
+        blip_seed: Some(BLIP_SEED),
     });
     Harness {
         server,
@@ -630,7 +633,8 @@ fn cycles(samples: &[f32]) -> usize {
 #[test]
 fn shifts_the_blips_by_the_pitch() {
     let h = harness(Fake::default(), limits());
-    // Lowercase letters, which the blips detune by no more than 0.6 semitones either way.
+    // Lowercase letters, which the blips detune by no more than 0.6 semitones either way, the
+    // same in both, since every request draws the same.
     let blips = |pitch| {
         let reply = Message {
             pitch,

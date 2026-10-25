@@ -97,6 +97,7 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error>> {
             queue_timeout: config.queue_timeout,
             radio_wait: config.radio_wait,
         },
+        blip_seed: None,
     });
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {

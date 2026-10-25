@@ -74,6 +74,7 @@ fn serves_a_message_on_the_real_model() {
             queue_timeout: Duration::from_secs(3600),
             radio_wait: Duration::from_secs(3600),
         },
+        blip_seed: None,
     });
     let message = Message {
         speaker: &speaker,

@@ -28,7 +28,7 @@ use effects::{
     convolve::{self, Impulses},
     schema::Graph,
 };
-use rand::{Rng, RngExt};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -149,6 +149,9 @@ pub struct Setup {
     pub logging: Logging,
     pub loudness: Loudness,
     pub limits: Limits,
+    /// The seed of every request's blips, which are drawn from a seed of their own each time
+    /// where there is none.
+    pub blip_seed: Option<u64>,
 }
 
 /// The service: its voices, model, cache and limits, shared by every request.
@@ -166,6 +169,7 @@ pub struct Service {
     model: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
     queue_timeout: Duration,
+    blip_seed: Option<u64>,
 }
 
 impl Service {
@@ -184,6 +188,7 @@ impl Service {
             model: Arc::new(Semaphore::new(setup.limits.synthesis)),
             cpu: Arc::new(Semaphore::new(setup.limits.cpu)),
             queue_timeout: setup.limits.queue_timeout,
+            blip_seed: setup.blip_seed,
         })
     }
 
@@ -622,9 +627,10 @@ impl Service {
         let number = or(&params.blip_number, "1");
         let (service, voice, text) = (self.clone(), params.voice.clone(), text.to_owned());
         let loudness = self.loudness;
+        let seed = self.blip_seed.unwrap_or_else(|| rand::rng().random());
         self.cpu(trace, move || {
             let blips = service.voices.blips(&voice).map_err(Failure::internal)?;
-            let mut draws = Draws(rand::rng());
+            let mut draws = Draws(StdRng::seed_from_u64(seed));
             let blips = dsp::blips::message(&text, &blips, &base, &number, pitch, &mut draws)
                 .map_err(|e| Failure::internal(format!("blips: {e}")))?;
             Ok(dsp::loudness::normalize(
