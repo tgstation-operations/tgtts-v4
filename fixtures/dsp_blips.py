@@ -11,7 +11,8 @@ often is saved beside them.
 Where the port fixes the old service, the restatement takes the fix too: text with a letter or
 digit of either case makes a sound, a crossfade is no longer than either side, so a sentence can
 start past its first character and take blips shorter than a crossfade, and the blips of ? and !
-are faded as the letters' are. The frontend passes the pitch on.
+are faded as the letters' are. The frontend passes the pitch on, and puts nothing, not even its
+silence, for a sentence without a sound.
 """
 
 import importlib.metadata
@@ -217,6 +218,8 @@ def frontend(text, voice, blip_base, blip_number, pitch):
     for sentence in segmenter.segment(text):
         response = text_to_speech_blips(sentence, voice, blip_base, blip_number, pitch)
         sentence_audio = AudioSegment.from_file(io.BytesIO(response), "wav")
+        if not sentence_audio.frame_count():
+            continue
         sentence_silence = AudioSegment.silent(250, RATE)
         sentence_audio += sentence_silence
         final_audio += sentence_audio

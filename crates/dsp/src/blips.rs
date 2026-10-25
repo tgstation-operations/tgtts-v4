@@ -65,7 +65,7 @@ impl From<segment::Error> for Error {
 
 /// The blips of `text` in the voice whose samples `blips` holds, at its `base` and `number`,
 /// `pitch` quarter tones up, as the old frontend made them: the blips of each of pysbd's
-/// sentences, each followed by 250 ms of silence.
+/// sentences that makes a sound, each followed by 250 ms of silence.
 pub fn message(
     text: &str,
     blips: &Blips,
@@ -76,8 +76,11 @@ pub fn message(
 ) -> Result<Segment, Error> {
     let mut samples = Vec::new();
     for text in sentences::segment(text) {
-        samples.extend(sentence(&text, blips, base, number, pitch, random)?.samples);
-        samples.extend(Segment::silent(SENTENCE_GAP, blips.sample_rate()).samples);
+        let sound = sentence(&text, blips, base, number, pitch, random)?;
+        if !sound.samples.is_empty() {
+            samples.extend(sound.samples);
+            samples.extend(Segment::silent(SENTENCE_GAP, blips.sample_rate()).samples);
+        }
     }
     Ok(Segment::new(blips.sample_rate(), samples))
 }

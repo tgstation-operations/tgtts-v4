@@ -218,6 +218,22 @@ fn messages_take_the_pitch() {
     assert_eq!(message, expected);
 }
 
+#[test]
+fn silent_sentences_take_no_time() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "silent");
+    let message = |text| blips::message(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+    assert!(message("...").samples.is_empty());
+    // pysbd makes three sentences of this, the second without a sound.
+    let mut expected = Vec::new();
+    for text in ["Hob.", "b!"] {
+        let sentence = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+        expected.extend(sentence.samples);
+        expected.extend(Segment::silent(250, RATE).samples);
+    }
+    assert_eq!(message("Hob. - . b!").samples, expected);
+}
+
 /// A blip loud from its first sample to its last, `ms` long, which stripping leaves whole.
 fn loud(ms: u32) -> Vec<i16> {
     (0..RATE * ms / 1000)
