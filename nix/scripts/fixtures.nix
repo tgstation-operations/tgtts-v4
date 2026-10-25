@@ -1,4 +1,4 @@
-{ pkgs }:
+{ pkgs, ffmpeg }:
 let
   voxcpm = pkgs.fetchFromGitHub {
     owner = "OpenBMB";
@@ -23,6 +23,7 @@ in
 pkgs.writeShellApplication {
   name = "fixtures";
   runtimeInputs = [
+    ffmpeg
     pkgs.git
     python
   ];

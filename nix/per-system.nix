@@ -20,7 +20,7 @@ in
 {
   # fixtures stays out of the devshell, whose closure would then hold torch.
   packages = scripts // {
-    fixtures = import ./scripts/fixtures.nix { inherit pkgs; };
+    fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
   };
   devShell = import ./devshell.nix {
     inherit

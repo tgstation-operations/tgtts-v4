@@ -4,6 +4,7 @@
 pub mod blips;
 pub mod float;
 pub mod gibberish;
+pub mod loudness;
 pub mod pitch;
 pub mod radio;
 pub mod resample;
