@@ -1,7 +1,30 @@
 //! Loudness as ITU-R BS.1770-4 measures it, the meter EBU R128 normalizes to: the integrated
-//! loudness of a single channel in LUFS, and its true peak in dBTP, full scale at 1.
+//! loudness of a single channel in LUFS, and its true peak in dBTP, full scale at 1; and speech
+//! brought to a loudness by it.
 
 use std::f64::consts::PI;
+
+use crate::segment::Segment;
+
+/// EBU R128's highest true peak, in dBTP.
+pub const CEILING: f64 = -1.0;
+
+/// `segment` brought to an integrated loudness of `target` LUFS by a gain, lowered as far as
+/// keeps its true peak at or under `ceiling` dBTP: nothing limits the peaks instead, which would
+/// change the sound. Silence, and anything else the gates leave nothing of, is left as it is.
+pub fn normalize(segment: &Segment, target: f64, ceiling: f64) -> Segment {
+    let samples: Vec<f64> = (segment.samples.iter())
+        .map(|&s| f64::from(s) / 32768.0)
+        .collect();
+    let loudness = integrated(&samples, segment.rate);
+    if loudness == f64::NEG_INFINITY {
+        return segment.clone();
+    }
+    let gain = (target - loudness).min(ceiling - true_peak(&samples));
+    let factor = 10f64.powf(gain / 20.0);
+    let scaled = (segment.samples.iter()).map(|&s| (f64::from(s) * factor).round() as i16);
+    Segment::new(segment.rate, scaled.collect())
+}
 
 /// The integrated loudness of `samples` at `rate` Hz, in LUFS: the mean square of their
 /// K-weighted values over 400 ms blocks overlapping by 75%, leaving out the blocks under
