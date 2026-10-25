@@ -5,14 +5,13 @@ mod common;
 use std::{env, fs};
 
 use common::{Tensors, assert_pcm_close, read_wav};
-use dsp::radio::{self, Assets, Error, Pcm};
+use dsp::radio::{self, Assets, Pcm};
 
 /// The radio's steps are numpy's and scipy's, but the filter's coefficients and numpy's tanh
 /// differ from theirs in the last bits: the 16-bit result came out the same but for samples 1
 /// apart, at most 6 of 12297.
 const MAX_DIFFERENCE: i32 = 1;
 const MAX_DIFFERING: f64 = 0.001;
-const LONGER_THAN_STATIC: i64 = 1;
 
 fn clip(fx: &Tensors, stem: &str) -> Pcm {
     Pcm {
@@ -57,24 +56,16 @@ fn check(fx: &Tensors, [on, off, noise]: [Pcm; 3]) {
             channels: fx.int(&format!("{name}/channels")) as u16,
             samples: fx.pcm(&format!("{name}/input")),
         };
-        match (
-            radio::radio(&speech, &assets),
-            fx.int(&format!("{name}/error")),
-        ) {
-            (Ok(actual), 0) => {
-                assert_eq!(actual.rate, 48000);
-                let expected = fx.pcm(&format!("{name}/output"));
-                assert_pcm_close(
-                    &name,
-                    &actual.samples,
-                    &expected,
-                    MAX_DIFFERENCE,
-                    MAX_DIFFERING,
-                );
-            }
-            (Err(Error::LongerThanStatic(_)), LONGER_THAN_STATIC) => {}
-            (actual, error) => panic!("{name}: {actual:?} where the service gave error {error}"),
-        }
+        let actual = radio::radio(&speech, &assets).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(actual.rate, 48000);
+        let expected = fx.pcm(&format!("{name}/output"));
+        assert_pcm_close(
+            &name,
+            &actual.samples,
+            &expected,
+            MAX_DIFFERENCE,
+            MAX_DIFFERING,
+        );
     }
 }
 
@@ -97,6 +88,23 @@ fn averages_any_number_of_channels() {
         radio::radio(&tripled, &assets),
         radio::radio(&mono, &assets)
     );
+}
+
+#[test]
+fn loops_the_static_under_speech_longer_than_it() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_radio"));
+    let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
+    let assets = Assets::new(&on, &off, &noise);
+    let speech = Pcm {
+        rate: 48000,
+        channels: 1,
+        samples: fx.pcm("0/input").repeat(8),
+    };
+    assert!(speech.samples.len() > assets.noise().len());
+    let radio = radio::radio(&speech, &assets).unwrap();
+    let tail = 4800;
+    let around = assets.click_on().len() + tail + assets.click_off().len();
+    assert_eq!(radio.samples.len(), around + speech.samples.len());
 }
 
 /// Making the golden needs the real assets, so a run of every generator leaves it as it is: this

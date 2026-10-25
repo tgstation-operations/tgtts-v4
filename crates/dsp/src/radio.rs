@@ -4,7 +4,7 @@
 use std::{
     error,
     f64::consts::PI,
-    fmt,
+    fmt, iter,
     ops::{Add, Div},
 };
 
@@ -91,9 +91,6 @@ where
 pub enum Error {
     /// There was no speech, whose peak numpy could not take.
     Empty,
-    /// The speech, of this many samples once resampled, outlasts the static, which numpy could
-    /// not add to it.
-    LongerThanStatic(usize),
     /// A span to duck, starting at this many seconds, starts past the end of the speech, where
     /// numpy could not fade it.
     SpanPastEnd(f64),
@@ -103,9 +100,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("no speech"),
-            Self::LongerThanStatic(len) => {
-                write!(f, "speech of {len} samples outlasts the static")
-            }
             Self::SpanPastEnd(start) => write!(f, "span at {start} s starts past the speech"),
         }
     }
@@ -114,8 +108,8 @@ impl fmt::Display for Error {
 impl error::Error for Error {}
 
 /// `speech` over the radio, as the old radio service made it: its channels averaged, resampled to
-/// 8 kHz and on to the service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with static
-/// under it, then between the mic clicks, with 0.1 s of static before the second.
+/// 8 kHz and on to the service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with the
+/// static looped under it, then between the mic clicks, with 0.1 s of static before the second.
 pub fn radio(speech: &Pcm, assets: &Assets) -> Result<Segment, Error> {
     let narrowed = narrow(speech)?;
     finish(narrowed, assets)
@@ -145,13 +139,18 @@ pub(crate) fn narrow(speech: &Pcm) -> Result<Vec<f64>, Error> {
 
 /// The rest of the radio: the static under the speech, the clicks and 0.1 s of static around it.
 pub(crate) fn finish(speech: Vec<f64>, assets: &Assets) -> Result<Segment, Error> {
-    let noise = (assets.noise.get(..speech.len())).ok_or(Error::LongerThanStatic(speech.len()))?;
+    let noise: Vec<f64> = looped(&assets.noise).take(speech.len()).collect();
     let tail = &noise[..((f64::from(RATE) * 0.1) as usize).min(noise.len())];
     let mut output = assets.click_on.clone();
-    output.extend(speech.iter().zip(noise).map(|(s, n)| s + n * 0.2));
+    output.extend(speech.iter().zip(&noise).map(|(s, n)| s + n * 0.2));
     output.extend_from_slice(tail);
     output.extend_from_slice(&assets.click_off);
     Ok(Segment::new(RATE, to_pcm(&normalize(&output, 0.9))))
+}
+
+/// The static from its start, looped for as long as it is taken; none where there is none.
+pub(crate) fn looped(noise: &[f64]) -> impl Iterator<Item = f64> + '_ {
+    noise.iter().copied().cycle().chain(iter::repeat(0.0))
 }
 
 /// The old service's `normalize`: `x` scaled so its peak is `peak`, unless it is silent.

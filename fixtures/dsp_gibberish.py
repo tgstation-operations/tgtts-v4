@@ -5,7 +5,7 @@ with the helpers it shares with the radio service taken from dsp_radio and its c
 random recorded. The letters' times are made up, as are the speech and the clicks and static.
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
-and ducked at the 48 kHz it was resampled to.
+and ducked at the 48 kHz it was resampled to, and the static loops under speech longer than it.
 """
 
 import json
@@ -28,13 +28,13 @@ from dsp_radio import (  # noqa: E402
     audiosegment_to_numpy,
     bandpass,
     load_and_match,
+    loop,
     normalize,
     numpy_to_audiosegment,
     saturate,
 )
 
 SPAN_PAST_END = 1
-LONGER_THAN_STATIC = 2
 
 
 # The old service's code, as it had it.
@@ -202,7 +202,7 @@ def radio_effect(base_audio, corrupted_spans):
         speech, corrupted_spans, static, OUTPUT_SR, duck_gain=0, static_gain=0.85
     )
 
-    static = static[: len(speech)]
+    static = loop(static, len(speech))
     speech = speech + static * 0.2
     output = np.concatenate(
         [click_on, speech, static[: int(OUTPUT_SR * 0.1)], click_off]
@@ -305,7 +305,8 @@ for name, (samples, rate, channels) in clips.items():
     tensors[f"{stem}/rate"] = torch.tensor(rate)
     tensors[f"{stem}/channels"] = torch.tensor(channels)
 
-# A span runs past the speech's end, one starts past it, and the last speech outlasts the static.
+# A span runs past the speech's end, one starts past it, and the last speech outlasts the static,
+# which loops under it.
 radios = [
     (voice(0.2, 48000), 48000, [(0.02, 0.05), (0.07, 0.09), (0.15, 0.3)]),
     (voice(0.08, 44100), 44100, [(0.0, 0.01)]),
@@ -322,9 +323,8 @@ for case, (samples, rate, spans) in enumerate(radios):
     )
     try:
         out = numpy_to_audiosegment(radio_effect(seg, spans), OUTPUT_SR)
-    except ValueError as e:
-        error = SPAN_PAST_END if "Number of samples" in str(e) else LONGER_THAN_STATIC
-        tensors[f"{name}/error"] = torch.tensor(error)
+    except ValueError:
+        tensors[f"{name}/error"] = torch.tensor(SPAN_PAST_END)
         continue
     tensors[f"{name}/error"] = torch.tensor(0)
     tensors[f"{name}/output"] = dsp_radio.pcm(

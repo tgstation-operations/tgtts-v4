@@ -9,7 +9,8 @@ dsp_radio_assets runs it on the real ones. The speech is mono, stereo and in thr
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
 at the 48 kHz it was resampled to, the clicks and static are matched to 48 kHz, whatever the
-speech's rate was, and speech of more than two channels is averaged over them as stereo is.
+speech's rate was, speech of more than two channels is averaged over them as stereo is, and the
+static loops under speech longer than it.
 """
 
 import io
@@ -31,7 +32,6 @@ from scipy.signal import butter, lfilter  # noqa: E402
 
 import common  # noqa: E402
 
-LONGER_THAN_STATIC = 1
 OUTPUT_SR = 48000
 
 # The WAV files the service read its clicks and static from, by name, which run() sets.
@@ -109,7 +109,7 @@ def radio_effect(base_audio):
     speech = bandpass(speech, OUTPUT_SR)
     speech = saturate(speech, 2)
     speech = normalize(speech, 0.7)
-    static = static[: len(speech)]
+    static = loop(static, len(speech))
     speech = speech + static * 0.2
     output = np.concatenate(
         [click_on, speech, static[: int(OUTPUT_SR * 0.1)], click_off]
@@ -118,6 +118,11 @@ def radio_effect(base_audio):
     output = normalize(output, 0.9)
 
     return output
+
+
+def loop(static, n):
+    """The first `n` samples of `static` looped, as the port loops it under speech."""
+    return np.tile(static, int(np.ceil(n / len(static))))[:n]
 
 
 def wav(samples, rate, channels):
@@ -156,12 +161,7 @@ def run(files, speeches):
             sample_width=2,
             channels=channels,
         )
-        try:
-            out = numpy_to_audiosegment(radio_effect(seg), OUTPUT_SR)
-        except ValueError:
-            tensors[f"{name}/error"] = torch.tensor(LONGER_THAN_STATIC)
-            continue
-        tensors[f"{name}/error"] = torch.tensor(0)
+        out = numpy_to_audiosegment(radio_effect(seg), OUTPUT_SR)
         tensors[f"{name}/output"] = pcm(np.frombuffer(out.raw_data, dtype=np.int16))
     nyq = OUTPUT_SR * 0.5
     b, a = butter(4, [300 / nyq, 3000 / nyq], btype="band")

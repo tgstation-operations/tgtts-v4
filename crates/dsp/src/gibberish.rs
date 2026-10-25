@@ -158,9 +158,8 @@ fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Result<Vec<f64>,
             *m *= f;
         }
     }
-    let looped = noise.iter().cycle();
     Ok((speech.iter().zip(&envelope))
-        .zip(looped.zip(&mask))
+        .zip(radio::looped(noise).zip(&mask))
         .map(|((s, d), (n, m))| s * d + n * m * 0.85)
         .collect())
 }

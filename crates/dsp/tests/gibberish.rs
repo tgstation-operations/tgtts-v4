@@ -14,7 +14,6 @@ use serde_json::Value;
 const MAX_DIFFERENCE: i32 = 1;
 const MAX_DIFFERING: f64 = 0.001;
 const SPAN_PAST_END: i64 = 1;
-const LONGER_THAN_STATIC: i64 = 2;
 
 /// Python's draws, replayed in order: each a kind, 0 for `random()` and 1 for `_randbelow`, its
 /// bound, and its value, a double's bits for `random()`.
@@ -109,8 +108,7 @@ fn ducks_as_the_old_service() {
                     MAX_DIFFERING,
                 );
             }
-            (Err(Error::SpanPastEnd(_)), SPAN_PAST_END)
-            | (Err(Error::LongerThanStatic(_)), LONGER_THAN_STATIC) => {}
+            (Err(Error::SpanPastEnd(_)), SPAN_PAST_END) => {}
             (actual, error) => panic!("{name}: {actual:?} where the service gave error {error}"),
         }
     }
