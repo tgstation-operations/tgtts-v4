@@ -7,7 +7,9 @@ publish = false
 
 [dependencies]
 audiovae = { path = "../audiovae" }
+burn = { workspace = true, features = ["safetensors", "std", "store"] }
 minicpm4 = { path = "../minicpm4" }
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

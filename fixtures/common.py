@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import torch
@@ -32,15 +33,38 @@ DTYPES = {
 def upstream(module):
     """Import voxcpm.<module> from the pinned upstream source.
 
-    The package's __init__ imports .core, which needs librosa, transformers and more, while
-    the modules need only torch, einops, pydantic and numpy: voxcpm is registered as a bare
-    package, so that its __init__ never runs.
+    The package's __init__ imports .core, and voxcpm.model's VoxCPM 1, which both need
+    torchaudio, while the modules need only torch, einops, pydantic and numpy, and
+    model.voxcpm2 transformers and librosa besides: both packages are registered bare, so that
+    their __init__ never runs.
     """
-    if "voxcpm" not in sys.modules:
-        spec = importlib.machinery.ModuleSpec("voxcpm", None, is_package=True)
-        spec.submodule_search_locations = [str(UPSTREAM / "src" / "voxcpm")]
-        sys.modules["voxcpm"] = importlib.util.module_from_spec(spec)
+    for package in ["voxcpm", "voxcpm.model"]:
+        if package not in sys.modules:
+            spec = importlib.machinery.ModuleSpec(package, None, is_package=True)
+            path = UPSTREAM / "src" / Path(*package.split("."))
+            spec.submodule_search_locations = [str(path)]
+            sys.modules[package] = importlib.util.module_from_spec(spec)
     return importlib.import_module(f"voxcpm.{module}")
+
+
+def voxcpm2(config):
+    """Upstream's VoxCPM2Model at `config`, the text of a config.json, in f32 on the CPU.
+
+    Its weights are upstream's initial values, random but for the norms', which start at one,
+    where a port that ignored them would pass. Its tokenizer has no vocabulary, which only
+    upstream's masking of Chinese tokens reads, until a generator gives it one.
+    """
+    voxcpm2 = upstream("model.voxcpm2")
+    config = voxcpm2.VoxCPMConfig.model_validate_json(config)
+    config.dtype = "float32"
+    vae = voxcpm2.AudioVAEV2(config.audio_vae_config)
+    tokenizer = types.SimpleNamespace(vocab={})
+    model = voxcpm2.VoxCPM2Model(config, tokenizer, vae, device="cpu").eval()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.endswith("norm.weight"):
+                parameter.uniform_(0.5, 1.5)
+    return model
 
 
 class Fixture:

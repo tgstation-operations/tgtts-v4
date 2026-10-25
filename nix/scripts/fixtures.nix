@@ -17,6 +17,7 @@ let
     ps.scipy
     ps.soundfile
     ps.torch
+    ps.transformers
   ]);
 in
 pkgs.writeShellApplication {
