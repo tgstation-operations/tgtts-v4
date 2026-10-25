@@ -3784,6 +3784,7 @@ name = "minicpm4"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "crc32fast",
  "regex",
  "serde",
  "serde_json",
