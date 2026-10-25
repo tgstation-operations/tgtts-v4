@@ -104,6 +104,27 @@ impl TextToSpeech {
         Ok(self.speech_decoder(voice, params).push(patches))
     }
 
+    /// `text` spoken in `voice` as [`synthesize`](Self::synthesize) speaks it, to rounding, but
+    /// a patch's audio at a time, each decoded as soon as it is generated, for a caller to play
+    /// or send on while the rest is generated.
+    ///
+    /// # Errors
+    ///
+    /// As [`synthesize`](Self::synthesize).
+    pub fn stream<'a, N: Noise>(
+        &'a self,
+        text: &str,
+        voice: &Latent,
+        params: &'a Params,
+        noise: &'a mut N,
+    ) -> Result<impl Iterator<Item = Vec<f32>> + use<'a, N>, Error> {
+        let prompt = self.prompt(text, voice)?;
+        let (sampling, max_patches) = (&params.sampling, params.max_patches);
+        let patches = self.model.patches(&prompt, sampling, max_patches, noise)?;
+        let mut decoder = self.speech_decoder(voice, params);
+        Ok(patches.map(move |patch| decoder.push(patch)))
+    }
+
     /// A decoder of the patches generated from the [`prompt`](Self::prompt) of `voice`, in
     /// calls of at most `params.decode_chunk_frames` frames.
     pub fn speech_decoder(&self, voice: &Latent, params: &Params) -> SpeechDecoder<'_> {

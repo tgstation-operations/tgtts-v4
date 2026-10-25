@@ -25,7 +25,7 @@ pub use crate::{
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
     local_dit::LocalDit,
     local_encoder::LocalEncoder,
-    model::{Dtypes, Generation, Model, Step},
+    model::{Dtypes, Generation, Model, Patches, Step},
     noise::{Noise, SeededNoise},
     prompt::Prompt,
     speech::{Params, SpeechDecoder, TextToSpeech},

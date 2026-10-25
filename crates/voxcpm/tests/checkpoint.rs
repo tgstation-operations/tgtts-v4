@@ -205,6 +205,30 @@ fn decodes_upstreams_patches_as_upstream_on_the_real_weights() {
     assert_close(audio.narrow(0, samples - kept, kept), end, 1e-6, 0.0);
 }
 
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn streams_speech_a_patch_at_a_time_as_it_synthesizes() {
+    let (golden, device) = (golden(), device());
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let tts = TextToSpeech::load(&checkpoint_dir(), &F32, &device).unwrap();
+    let params = Params {
+        max_patches: 8,
+        ..Params::default()
+    };
+    let whole = tts
+        .synthesize(text, &voice, &params, &mut SeededNoise::new(1))
+        .unwrap();
+    let mut noise = SeededNoise::new(1);
+    let stream = tts.stream(text, &voice, &params, &mut noise).unwrap();
+    let patches: Vec<Vec<f32>> = stream.collect();
+    assert!(patches.iter().all(|patch| patch.len() == 4 * 1920));
+    let streamed = Tensor::<1>::from_floats(patches.concat().as_slice(), &device);
+    let whole = Tensor::from_floats(whole.as_slice(), &device);
+    // Decoded a patch at a time, the first after the voice's frames, this came within 3.3e-9 of
+    // the audio decoded a second at a time.
+    assert_close(streamed, whole, 1e-6, 0.0);
+}
+
 /// Each part in a dtype of its own, so that what passes between them has to be cast: the LMs and
 /// the DiT in bf16 and the decoder in f16, as prod runs them, and the local encoder between them
 /// in f32.

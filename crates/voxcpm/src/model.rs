@@ -195,16 +195,30 @@ impl Model {
         max_patches: usize,
         noise: &mut impl Noise,
     ) -> Result<Tensor<3>, Error> {
-        let mut generation = self.start(prompt, max_patches)?;
-        let mut patches = vec![];
-        loop {
-            let step = generation.sample(self.noise(noise), sampling);
-            patches.push(step.patch.clone());
-            if step.stops() || patches.len() == max_patches {
-                return Ok(Tensor::cat(patches, 0));
-            }
-            generation.advance(step.patch);
-        }
+        let patches = self.patches(prompt, sampling, max_patches, noise)?;
+        Ok(Tensor::cat(patches.collect(), 0))
+    }
+
+    /// The patches [`generate`](Self::generate) gives, each sampled only as the iterator is
+    /// advanced, for a caller to decode and send on while the next is sampled.
+    ///
+    /// # Errors
+    ///
+    /// As [`start`](Self::start).
+    pub fn patches<'a, N: Noise>(
+        &'a self,
+        prompt: &Prompt,
+        sampling: &'a Sampling,
+        max_patches: usize,
+        noise: &'a mut N,
+    ) -> Result<Patches<'a, N>, Error> {
+        Ok(Patches {
+            generation: self.start(prompt, max_patches)?,
+            sampling,
+            noise,
+            left: max_patches,
+            last: None,
+        })
     }
 
     /// The next of `noise` as a tensor `[1, feat_dim, patch_size]`.
@@ -230,6 +244,38 @@ pub struct Generation<'a> {
     lm_hidden: Tensor<2>,
     residual_hidden: Tensor<2>,
     cond: Tensor<3>,
+}
+
+/// The patches of a generation, each `[1, patch_size, feat_dim]` in f32, sampled one at a time
+/// as the iterator is advanced: [`Model::patches`].
+#[derive(Debug)]
+pub struct Patches<'a, N> {
+    generation: Generation<'a>,
+    sampling: &'a Sampling,
+    noise: &'a mut N,
+    /// How many more patches may follow, none once the stop head has said to stop.
+    left: usize,
+    /// The patch given last, which the LMs take in only before the next is sampled, so that
+    /// the caller has it sooner.
+    last: Option<Tensor<3>>,
+}
+
+impl<N: Noise> Iterator for Patches<'_, N> {
+    type Item = Tensor<3>;
+
+    fn next(&mut self) -> Option<Tensor<3>> {
+        if self.left == 0 {
+            return None;
+        }
+        if let Some(patch) = self.last.take() {
+            self.generation.advance(patch);
+        }
+        let noise = self.generation.model.noise(self.noise);
+        let step = self.generation.sample(noise, self.sampling);
+        self.left = if step.stops() { 0 } else { self.left - 1 };
+        self.last = Some(step.patch.clone());
+        Some(step.patch)
+    }
 }
 
 /// A patch sampled, and what the stop head said of the state it was sampled in.
