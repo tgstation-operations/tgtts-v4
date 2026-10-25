@@ -6,6 +6,7 @@
 //! Each part loads from the checkpoint's `model.safetensors` under upstream's state_dict names.
 
 mod config;
+mod local_dit;
 mod local_encoder;
 mod weights;
 
@@ -15,6 +16,7 @@ use burn::store::SafetensorsStoreError;
 
 pub use crate::{
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
+    local_dit::LocalDit,
     local_encoder::LocalEncoder,
 };
 
