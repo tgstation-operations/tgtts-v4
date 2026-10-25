@@ -2,6 +2,7 @@
   pkgs,
   rustToolchain,
   scripts,
+  ffmpeg,
 }:
 pkgs.mkShell {
   # A worktree's target starts as a clone of the main checkout's
@@ -16,6 +17,7 @@ pkgs.mkShell {
 
   packages = [
     rustToolchain
+    ffmpeg
     pkgs.deadnix
     pkgs.nixfmt
     pkgs.pkg-config

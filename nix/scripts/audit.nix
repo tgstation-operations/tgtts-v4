@@ -2,6 +2,7 @@
   pkgs,
   rustToolchain,
   fmt,
+  ffmpeg,
 }:
 pkgs.writeShellApplication {
   name = "audit";
@@ -17,6 +18,8 @@ pkgs.writeShellApplication {
     pkgs.gnugrep
     pkgs.pkg-config
     pkgs.statix
+    # The service's tests run it.
+    ffmpeg
   ];
   text = ''
     # A copy of the gate on a shell's PATH goes stale when this file changes;
