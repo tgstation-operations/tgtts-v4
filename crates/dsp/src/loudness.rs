@@ -4,26 +4,72 @@
 
 use std::f64::consts::PI;
 
-use crate::segment::Segment;
+use crate::{limiter::limit, segment::Segment};
 
 /// EBU R128's highest true peak, in dBTP.
 pub const CEILING: f64 = -1.0;
 
-/// `segment` brought to an integrated loudness of `target` LUFS by a gain, lowered as far as
-/// keeps its true peak at or under `ceiling` dBTP: nothing limits the peaks instead, which would
-/// change the sound. Silence, and anything else the gates leave nothing of, is left as it is.
-pub fn normalize(segment: &Segment, target: f64, ceiling: f64) -> Segment {
+/// How near the target [`normalize`] brings the loudness, in LU, where the limiter has lowered it.
+const NEAR: f64 = 0.05;
+/// The most gains [`normalize`] tries.
+const TRIES: usize = 8;
+
+/// What [`normalize`] made of speech.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Normalized {
+    /// The speech.
+    pub segment: Segment,
+    /// The gain it took before the limiter, in dB.
+    pub gain: f64,
+    /// The most the limiter took off, in dB: 0 where it did nothing.
+    pub reduction: f64,
+    /// The fraction of the samples whose gain the limiter lowered.
+    pub limited: f64,
+}
+
+/// `segment` brought to an integrated loudness of `target` LUFS by a gain, and its true peak held
+/// at or under `ceiling` dBTP by the [limiter](crate::limiter). Where the limiter takes enough
+/// off to lower the loudness, the gain is raised and the limiter run again until the loudness is
+/// within 0.05 LU of the target. Silence, and anything else the gates leave nothing of, is left as
+/// it is.
+pub fn normalize(segment: &Segment, target: f64, ceiling: f64) -> Normalized {
     let samples: Vec<f64> = (segment.samples.iter())
         .map(|&s| f64::from(s) / 32768.0)
         .collect();
     let loudness = integrated(&samples, segment.rate);
     if loudness == f64::NEG_INFINITY {
-        return segment.clone();
+        return Normalized {
+            segment: segment.clone(),
+            gain: 0.0,
+            reduction: 0.0,
+            limited: 0.0,
+        };
     }
-    let gain = (target - loudness).min(ceiling - true_peak(&samples));
-    let factor = 10f64.powf(gain / 20.0);
-    let scaled = (segment.samples.iter()).map(|&s| (f64::from(s) * factor).round() as i16);
-    Segment::new(segment.rate, scaled.collect())
+    let mut gain = target - loudness;
+    let mut last: Option<(f64, f64)> = None;
+    let mut tries = 0;
+    let limited = loop {
+        let factor = 10f64.powf(gain / 20.0);
+        let scaled: Vec<f64> = samples.iter().map(|s| s * factor).collect();
+        let limited = limit(&scaled, segment.rate, ceiling);
+        let reached = integrated(&limited.samples, segment.rate);
+        tries += 1;
+        if (reached - target).abs() <= NEAR || tries == TRIES {
+            break limited;
+        }
+        // Where the limiter holds peaks down, the loudness rises by less than the gain: the next
+        // gain follows its rise between the last two tries.
+        let rise = last.map_or(1.0, |(g, r)| (reached - r) / (gain - g));
+        last = Some((gain, reached));
+        gain += (target - reached) / rise.clamp(0.1, 1.0);
+    };
+    let pcm = limited.samples.iter().map(|s| (s * 32768.0).round() as i16);
+    Normalized {
+        segment: Segment::new(segment.rate, pcm.collect()),
+        gain,
+        reduction: limited.reduction,
+        limited: limited.fraction,
+    }
 }
 
 /// The integrated loudness of `samples` at `rate` Hz, in LUFS: the mean square of their

@@ -126,26 +126,49 @@ fn measured(segment: &Segment) -> Vec<f64> {
 fn normalizes_to_the_target() {
     for seconds in [3.0, 0.2] {
         let quiet = pcm(&tone(&[-40.0], &[seconds]));
-        let loudness = integrated(&measured(&normalize(&quiet, -20.0, CEILING)), RATE);
+        let normalized = normalize(&quiet, -20.0, CEILING);
+        let loudness = integrated(&measured(&normalized.segment), RATE);
         assert!((loudness + 20.0).abs() < 0.01, "{seconds} s: {loudness}");
+        assert_eq!((normalized.reduction, normalized.limited), (0.0, 0.0));
     }
 }
 
-#[test]
-fn the_ceiling_holds_the_gain_down() {
-    // A quiet tone with one loud click in it, whose loudness the click hardly moves.
+/// A quiet tone with loud clicks in it, every `every` seconds.
+fn clicked(every: f64) -> Vec<f64> {
     let mut x = tone(&[-40.0], &[3.0]);
-    x[RATE as usize] = 0.3;
-    let normalized = measured(&normalize(&pcm(&x), -20.0, CEILING));
-    let peak = true_peak(&normalized);
-    assert!((peak - CEILING).abs() < 0.01, "{peak} dBTP");
-    assert!(integrated(&normalized, RATE) < -25.0);
+    for click in (0..)
+        .map(|i| f64::from(i) * every + 0.05)
+        .take_while(|&t| t < 3.0)
+    {
+        x[(click * f64::from(RATE)) as usize] = 0.3;
+    }
+    x
+}
+
+#[test]
+fn limits_the_peaks_to_reach_the_target() {
+    // One click, and then so many that the limiter is never done with them, which takes the
+    // loudness down and the gain back up.
+    for every in [10.0, 0.05] {
+        let normalized = normalize(&pcm(&clicked(every)), -20.0, CEILING);
+        let x = measured(&normalized.segment);
+        let (loudness, peak) = (integrated(&x, RATE), true_peak(&x));
+        assert!((loudness + 20.0).abs() < 0.1, "{every} s: {loudness} LUFS");
+        assert!(peak <= CEILING, "{every} s: {peak} dBTP");
+        assert!(normalized.reduction > 12.0, "{every} s: {normalized:?}");
+        assert!(normalized.limited > 0.0);
+    }
 }
 
 #[test]
 fn leaves_silence_as_it_is() {
     for x in [vec![0.0; 48000], tone(&[-80.0], &[1.0])] {
         let silence = pcm(&x);
-        assert_eq!(normalize(&silence, -20.0, CEILING), silence);
+        let normalized = normalize(&silence, -20.0, CEILING);
+        assert_eq!(normalized.segment, silence);
+        assert_eq!(
+            (normalized.gain, normalized.reduction, normalized.limited),
+            (0.0, 0.0, 0.0)
+        );
     }
 }
