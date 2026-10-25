@@ -23,6 +23,10 @@ use axum::{
     routing::get,
 };
 use dsp::{loudness::Normalized, radio, resample::resample, segment::Segment};
+use effects::{
+    Pipeline,
+    convolve::{self, Impulses},
+};
 use rand::{Rng, RngExt};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -57,6 +61,9 @@ const STATIC: &str = "diffstatic.wav";
 const STARTS: [&str; 2] = ["on1.wav", "on2.wav"];
 /// The clicks it put after.
 const ENDS: [&str; 4] = ["off1.wav", "off2.wav", "off3.wav", "off4.wav"];
+
+/// The rate the effects run at.
+const RATE: f64 = dsp::RATE as f64;
 
 /// The most quarter tones speech is shifted by either way. The old frontend took any integer,
 /// though a few octaves up would only have run it out of memory; the game asks for 24 at most.
@@ -225,6 +232,20 @@ struct Body {
     text: String,
     raw_text: String,
     gibberish_text: String,
+    /// The graphs of [`effects::schema`], which the speech or blips go through in place of the
+    /// `filter` query's ffmpeg graph when they are given, even as none.
+    effects: Option<serde_json::Value>,
+}
+
+/// What a request's speech or blips go through before they are encoded.
+enum Treatment {
+    /// The effects it gives.
+    Effects(Pipeline),
+    /// The ffmpeg filter graph the game sent before it sent effects.
+    Filter(String),
+    /// The old frontend's "silicon" effect.
+    Silicon,
+    None,
 }
 
 async fn speech(
@@ -467,13 +488,17 @@ impl Service {
         match route {
             Route::Speech => {
                 let pitch = pitch(&params.pitch)?;
+                let treatment = self.treatment(params, body)?;
                 let speech = self.speech(&params.voice, &body.text, pitch, trace).await?;
-                self.deliver(Source::Speech, params, speech, trace).await
+                self.deliver(Source::Speech, params, speech, treatment, trace)
+                    .await
             }
             Route::Blips => {
                 let pitch = pitch(&params.pitch)?;
+                let treatment = self.treatment(params, body)?;
                 let blips = self.blips(params, &body.text, pitch, trace).await?;
-                self.deliver(Source::Blips, params, blips, trace).await
+                self.deliver(Source::Blips, params, blips, treatment, trace)
+                    .await
             }
             Route::Radio => self.radio(Source::Speech, params, trace).await,
             Route::RadioGibberish => {
@@ -608,31 +633,67 @@ impl Service {
         .map(|normalized| leveled(normalized, trace))
     }
 
-    /// `audio` through the request's filter and special filters and encoded, handed over to the
-    /// radio routes as it is before the encoding.
-    ///
-    /// As the old frontend, it runs the game's filter graph if there is one and the "silicon"
-    /// effect only if there is not, and strips the graph of double quotes.
+    /// What the request's speech or blips go through: its effects if it gives them, checked
+    /// before anything is made for it, or else as the old frontend did, the game's filter graph
+    /// if there is one, stripped of double quotes, and the "silicon" effect only if there is
+    /// not.
+    fn treatment(&self, params: &Params, body: &Body) -> Result<Treatment, Failure> {
+        if let Some(effects) = &body.effects {
+            let refuse = |e: effects::Error| Failure::new(StatusCode::BAD_REQUEST, e);
+            let graphs = effects::schema::parse(effects).map_err(refuse)?;
+            if !graphs.is_empty() {
+                let pipeline = Pipeline::new(&graphs, &self.sounds.impulses).map_err(refuse)?;
+                return Ok(Treatment::Effects(pipeline));
+            }
+        } else {
+            let graph = params.filter.replace('"', "");
+            if !graph.is_empty() {
+                return Ok(Treatment::Filter(graph));
+            }
+        }
+        if params.special_filters.split('|').any(|s| s == "silicon") {
+            Ok(Treatment::Silicon)
+        } else {
+            Ok(Treatment::None)
+        }
+    }
+
+    /// `audio` through `treatment` and the request's special filters and encoded, handed over
+    /// to the radio routes as it is before the encoding.
     async fn deliver(
         self: &Arc<Self>,
         source: Source,
         params: &Params,
         audio: Segment,
+        treatment: Treatment,
         trace: &mut Trace,
     ) -> Result<Served, Failure> {
         let specials: Vec<&str> = params.special_filters.split('|').collect();
-        let graph = params.filter.replace('"', "");
-        let graph = graph.replace("%SAMPLE_RATE%", &audio.rate.to_string());
         let wav = || wav::write_pcm16(audio.rate, 1, &audio.samples);
-        let mut audio = if !graph.is_empty() {
-            self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), &graph, &[]))
+        let mut audio = match treatment {
+            Treatment::Effects(mut pipeline) => {
+                let input = Audio::from_segment(&audio);
+                self.cpu(trace, move || {
+                    let samples = resample(&input.samples, f64::from(input.rate), RATE);
+                    Audio {
+                        rate: dsp::RATE,
+                        channels: 1,
+                        samples: effects::run(&mut pipeline, &samples),
+                    }
+                })
                 .await?
-        } else if specials.contains(&"silicon") {
-            let impulses = [&*self.sounds.synth_impulse, &*self.sounds.room_impulse];
-            self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), SILICON, &impulses))
-                .await?
-        } else {
-            Audio::from_segment(&audio)
+            }
+            Treatment::Filter(graph) => {
+                let graph = graph.replace("%SAMPLE_RATE%", &audio.rate.to_string());
+                self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), &graph, &[]))
+                    .await?
+            }
+            Treatment::Silicon => {
+                let impulses = [&*self.sounds.synth_impulse, &*self.sounds.room_impulse];
+                self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), SILICON, &impulses))
+                    .await?
+            }
+            Treatment::None => Audio::from_segment(&audio),
         };
         if specials.contains(&"radio") {
             let service = self.clone();
@@ -789,6 +850,7 @@ impl<R: Rng> dsp::Random for Draws<R> {
 pub struct Sounds {
     synth_impulse: PathBuf,
     room_impulse: PathBuf,
+    impulses: Impulses,
     radio: radio::Assets,
     starts: Vec<Audio>,
     ends: Vec<Audio>,
@@ -804,9 +866,17 @@ impl Sounds {
             wav::read(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, context(&e)))
         };
         let impulse = |name: &str| read(name).map(|_| dir.join(name));
+        let synth = read(SYNTH_IMPULSE)?;
         Ok(Self {
             synth_impulse: impulse(SYNTH_IMPULSE)?,
             room_impulse: impulse(ROOM_IMPULSE)?,
+            impulses: Impulses {
+                synth: Arc::new(convolve::Response::new(
+                    &synth.samples,
+                    usize::from(synth.channels),
+                    synth.rate,
+                )),
+            },
             radio: radio::Assets::new(
                 &read(CLICK_ON)?.to_pcm(),
                 &read(CLICK_OFF)?.to_pcm(),

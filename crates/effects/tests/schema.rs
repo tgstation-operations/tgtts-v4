@@ -5,11 +5,12 @@ use std::sync::Arc;
 use effects::{
     Pipeline,
     convolve::{Impulses, Response},
-    schema::Graph,
+    schema,
 };
 
 fn check(json: &str) -> Result<(), String> {
-    let graphs: Vec<Graph> = serde_json::from_str(json).map_err(|e| format!("json: {e}"))?;
+    let value = serde_json::from_str(json).unwrap();
+    let graphs = schema::parse(&value).map_err(|e| e.to_string())?;
     let impulses = Impulses {
         synth: Arc::new(Response::new(&[1.0, 0.5], 1, 48000)),
     };
@@ -27,10 +28,10 @@ fn refused(json: &str, reason: &str) {
 }
 
 #[track_caller]
-fn unparsed(json: &str, part: &str) {
+fn unparsed(json: &str, start: &str, part: &str) {
     match check(json) {
-        Err(e) if e.starts_with("json: ") => assert!(e.contains(part), "{e}"),
-        other => panic!("{json}: {other:?}"),
+        Err(e) => assert!(e.starts_with(start) && e.contains(part), "{e}"),
+        Ok(()) => panic!("accepted {json}"),
     }
 }
 
@@ -74,21 +75,38 @@ fn names_the_graph_the_node_and_the_reason() {
 
 #[test]
 fn refuses_what_does_not_parse() {
-    unparsed(r#"[[{"effect": "reverse"}]]"#, "unknown variant `reverse`");
+    let node = "effects[0], node 0: ";
+    unparsed(
+        r#"[[{"effect": "reverse"}]]"#,
+        node,
+        "unknown variant `reverse`",
+    );
     unparsed(
         r#"[[{"effect": "gain", "gain_db": 1, "gain": 2}]]"#,
+        node,
         "unknown field `gain`",
     );
-    unparsed(r#"[[{"effect": "gain"}]]"#, "missing field `gain_db`");
-    unparsed(r#"[{"nodes": {}}]"#, "missing field `edges`");
+    unparsed(r#"[[{"effect": "gain"}]]"#, node, "missing field `gain_db`");
     unparsed(
+        r#"[{"nodes": {"low": {"effect": "lowpass"}}, "edges": []}]"#,
+        r#"effects[0], node "low": "#,
+        "missing field `frequency_hz`",
+    );
+    refused(r#"[{"nodes": {}}]"#, "effects[0]: `edges` is missing");
+    refused(
         r#"[{"nodes": {}, "edges": [], "x": 1}]"#,
-        "unknown field `x`",
+        "effects[0]: unknown field `x`, expected `nodes` or `edges`",
     );
     unparsed(
-        r#"["gain"]"#,
-        "an array of nodes, or an object of nodes and edges",
+        r#"[{"nodes": {}, "edges": [["input"]]}]"#,
+        "effects[0]: edges: ",
+        "",
     );
+    refused(
+        r#"[[], "gain"]"#,
+        "effects[1]: neither an array of nodes nor an object of nodes and edges",
+    );
+    refused(r#"{"gain_db": 1}"#, "effects: not an array of graphs");
 }
 
 #[test]

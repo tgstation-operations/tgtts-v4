@@ -468,6 +468,79 @@ fn runs_the_games_filters() {
 }
 
 #[test]
+fn runs_the_effects_the_game_sends() {
+    let h = harness(Fake::default(), limits());
+    let speech = 12 * FRAMES_PER_CHAR + TAIL;
+    let with = |effects| Message {
+        effects,
+        ..Message::default()
+    };
+    let gas_mask = with(
+        r#"[[{"effect": "lowpass", "frequency_hz": 750}, {"effect": "gain", "gain_db": 6.021}]]"#,
+    );
+    let reply = gas_mask.speech(&h);
+    reply.assert_ogg(48000);
+    assert_eq!(reply.frames(48000), speech);
+    let tongue = r#"[{"nodes": {"low": {"effect": "pitch", "semitones": -2},
+        "mix": {"effect": "mix", "weights": {"low": 0.5, "input": 0.5}}},
+        "edges": [["input", "low"], ["input", "mix"], ["low", "mix"], ["mix", "output"]]}]"#;
+    let fast = Message {
+        identifier: "fast",
+        ..with(r#"[[{"effect": "tempo", "ratio": 2}]]"#)
+    };
+    let [speech_fast, blips_fast, radio, blips_radio, gibberish] = fast.all(&h);
+    for reply in [&speech_fast, &blips_fast, &radio, &blips_radio, &gibberish] {
+        reply.assert_ogg(48000);
+    }
+    assert_eq!(speech_fast.frames(48000), speech / 2);
+    assert_eq!(radio.frames(48000), radio_frames(speech / 2));
+    let blips = Message::default().blips(&h).frames(48000);
+    assert_eq!(blips_fast.frames(48000), blips.div_ceil(2));
+    assert_eq!(blips_radio.frames(48000), radio_frames(blips.div_ceil(2)));
+    assert_eq!(with(tongue).speech(&h).frames(48000), speech);
+
+    // Given, even as none, they take the place of the filter.
+    let ignored = Message {
+        filter: "nosuchfilter",
+        effects: "[]",
+        ..Message::default()
+    }
+    .speech(&h);
+    ignored.assert_ogg(48000);
+    assert_eq!(ignored.frames(48000), speech);
+}
+
+#[test]
+fn refuses_bad_effects_before_speaking() {
+    let h = harness(Fake::default(), limits());
+    let refused = |effects| {
+        let message = Message {
+            effects,
+            text: "Never said.",
+            ..Message::default()
+        };
+        [message.speech(&h), message.blips(&h)].map(|reply| {
+            assert_eq!(reply.status, 400);
+            reply.text().to_owned()
+        })
+    };
+    let [speech, blips] = refused(r#"[[], [{"effect": "pitch", "semitones": 30}]]"#);
+    assert_eq!(
+        speech,
+        "effects[1], node 0: semitones 30 is not in [-24, 24]"
+    );
+    assert_eq!(blips, speech);
+    let [speech, _] = refused(r#"[{"nodes": {"a": {"effect": "echoes"}}, "edges": []}]"#);
+    assert!(
+        speech.starts_with(r#"effects[0], node "a": unknown variant `echoes`"#),
+        "{speech}"
+    );
+    let [speech, _] = refused(r#"{"effect": "gain"}"#);
+    assert_eq!(speech, "effects: not an array of graphs");
+    assert!(h.fake.texts().is_empty());
+}
+
+#[test]
 fn splits_the_special_filters() {
     let h = harness(Fake::default(), limits());
     let speech = 12 * FRAMES_PER_CHAR + TAIL;

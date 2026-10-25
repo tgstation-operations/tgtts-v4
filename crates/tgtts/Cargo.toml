@@ -10,6 +10,7 @@ axum = { workspace = true, features = ["http1", "query", "tokio"] }
 blake3.workspace = true
 burn = { workspace = true, features = ["flex"] }
 dsp = { path = "../dsp" }
+effects = { path = "../effects" }
 rand = { workspace = true, features = ["thread_rng"] }
 # The SQLite built in, so the binary needs no library at run time.
 rusqlite = { workspace = true, features = ["bundled"] }

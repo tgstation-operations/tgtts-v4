@@ -9,12 +9,12 @@
 //! unknown parameter or a value out of its range is refused, as is a graph that is cyclic or past
 //! the limits in [`crate::graph`].
 
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
-use serde::{
-    Deserialize, Deserializer,
-    de::{MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer},
-};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::graph::Error;
 
 /// The id an edge leaves from to take a graph's input.
 pub const INPUT: &str = "input";
@@ -388,38 +388,62 @@ fn within(name: &str, value: f64, low: f64, high: f64) -> Result<(), String> {
     }
 }
 
-impl<'de> Deserialize<'de> for Graph {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(GraphVisitor)
-    }
-}
-
-struct GraphVisitor;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Wired {
-    nodes: BTreeMap<String, Node>,
-    edges: Vec<[String; 2]>,
-}
-
-impl<'de> Visitor<'de> for GraphVisitor {
-    type Value = Graph;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("an array of nodes, or an object of nodes and edges")
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Graph, A::Error> {
-        let mut nodes = Vec::new();
-        while let Some(node) = seq.next_element()? {
-            nodes.push(node);
-        }
-        Ok(Graph::Chain(nodes))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Graph, A::Error> {
-        let Wired { nodes, edges } = Wired::deserialize(MapAccessDeserializer::new(map))?;
-        Ok(Graph::Wired { nodes, edges })
-    }
+/// The effects a request gives as JSON, checked as they are read, so that what is wrong is named
+/// with the graph and the node it is in.
+pub fn parse(value: &Value) -> Result<Vec<Graph>, Error> {
+    let refuse = |graph: Option<usize>, node: Option<String>, reason: String| Error {
+        graph,
+        node,
+        reason,
+    };
+    let Value::Array(graphs) = value else {
+        return Err(refuse(None, None, "not an array of graphs".to_owned()));
+    };
+    graphs
+        .iter()
+        .enumerate()
+        .map(|(index, graph)| {
+            let at = Some(index);
+            match graph {
+                Value::Array(chain) => chain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, node)| {
+                        Node::deserialize(node)
+                            .map_err(|e| refuse(at, Some(i.to_string()), e.to_string()))
+                    })
+                    .collect::<Result<_, _>>()
+                    .map(Graph::Chain),
+                Value::Object(wired) => {
+                    if let Some(key) = wired.keys().find(|&k| k != "nodes" && k != "edges") {
+                        let reason = format!("unknown field `{key}`, expected `nodes` or `edges`");
+                        return Err(refuse(at, None, reason));
+                    }
+                    let Some(Value::Object(nodes)) = wired.get("nodes") else {
+                        let reason = "`nodes` is not an object of nodes by id".to_owned();
+                        return Err(refuse(at, None, reason));
+                    };
+                    let nodes = nodes
+                        .iter()
+                        .map(|(id, node)| {
+                            Node::deserialize(node)
+                                .map(|node| (id.clone(), node))
+                                .map_err(|e| refuse(at, Some(format!("{id:?}")), e.to_string()))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let edges = wired
+                        .get("edges")
+                        .ok_or_else(|| refuse(at, None, "`edges` is missing".to_owned()))?;
+                    let edges = Vec::deserialize(edges)
+                        .map_err(|e| refuse(at, None, format!("edges: {e}")))?;
+                    Ok(Graph::Wired { nodes, edges })
+                }
+                _ => Err(refuse(
+                    at,
+                    None,
+                    "neither an array of nodes nor an object of nodes and edges".to_owned(),
+                )),
+            }
+        })
+        .collect()
 }

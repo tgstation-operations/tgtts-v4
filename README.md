@@ -23,10 +23,11 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
 ## Running the service
 
 `tgtts` serves the routes the game calls, in one process: the model, the blips,
-the radio and the game's ffmpeg filters. It reads a TOML file named as its
-argument, and `TGTTS_<KEY>` in the environment overrides any key; the keys are
-listed in `crates/tgtts/src/config.rs`. The token is read from a file, so that
-a secret manager can provide it. To serve locally, write a `tgtts.toml` such as
+the radio and the game's voice effects, or the ffmpeg filters it sent before
+them. It reads a TOML file named as its argument, and `TGTTS_<KEY>` in the
+environment overrides any key; the keys are listed in
+`crates/tgtts/src/config.rs`. The token is read from a file, so that a secret
+manager can provide it. To serve locally, write a `tgtts.toml` such as
 
 ```toml
 token_file = "token"

@@ -10,12 +10,16 @@ use effects::{
     filter::{Biquad, Shape, Wobble},
     level::{Gain, Noise, Tremolo},
     run,
-    schema::{Graph, Waveform},
+    schema::{self, Graph, Waveform},
     shape::{Crush, Saturate},
     time::{Pitch, Speed, Tempo},
 };
 
 const RATE: f64 = 48000.0;
+
+fn graph(json: &str) -> Vec<Graph> {
+    schema::parse(&serde_json::from_str(json).unwrap()).unwrap()
+}
 
 /// A made-up impulse: a fifth of a second of decaying noise at 44.1 kHz, in stereo.
 fn impulses() -> Impulses {
@@ -281,8 +285,7 @@ fn convolution_is_convolution() {
     let response = &impulses.synth;
     let mut unit = vec![0.0; 5000];
     unit[0] = 1.0;
-    let graph: Vec<Graph> =
-        serde_json::from_str(r#"[[{"effect": "convolve", "impulse": "synth"}]]"#).unwrap();
+    let graph = graph(r#"[[{"effect": "convolve", "impulse": "synth"}]]"#);
     let mut pipeline = Pipeline::new(&graph, &impulses).unwrap();
     let h = run(&mut pipeline, &unit);
     assert_eq!(h.len(), unit.len() + response.len() - 1);
@@ -306,12 +309,11 @@ fn convolution_is_convolution() {
 fn branches_line_up_whatever_each_holds_back() {
     // The limiter leaves audio under its ceiling as it is, a few hundred samples late; mixed
     // against the input it delays, the two cancel.
-    let graph: Vec<Graph> = serde_json::from_str(
+    let graph = graph(
         r#"[{"nodes": {"late": {"effect": "limiter", "ceiling_db": 0},
               "mix": {"effect": "mix", "weights": {"late": 1, "input": -1}}},
              "edges": [["input", "late"], ["input", "mix"], ["late", "mix"], ["mix", "output"]]}]"#,
-    )
-    .unwrap();
+    );
     let mut pipeline = Pipeline::new(&graph, &impulses()).unwrap();
     assert!(pipeline.latency() > 100);
     let x = sine(440.0, 0.5, 0.5);

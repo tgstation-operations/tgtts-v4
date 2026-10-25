@@ -148,6 +148,8 @@ pub struct Message<'a> {
     pub blip_base: &'a str,
     pub blip_number: &'a str,
     pub text: &'a str,
+    /// The effects as JSON, none given where empty.
+    pub effects: &'a str,
 }
 
 impl Default for Message<'_> {
@@ -161,6 +163,7 @@ impl Default for Message<'_> {
             blip_base: "male",
             blip_number: "1",
             text: "Hello there.",
+            effects: "",
         }
     }
 }
@@ -186,12 +189,19 @@ impl Message<'_> {
     }
 
     pub fn body(&self) -> String {
-        serde_json::json!({ "text": self.text }).to_string()
+        self.with_effects(serde_json::json!({ "text": self.text }))
     }
 
     /// The gibberish request's body, which the game sends with the same text twice.
     pub fn gibberish_body(&self) -> String {
-        serde_json::json!({ "raw_text": self.text, "gibberish_text": self.text }).to_string()
+        self.with_effects(serde_json::json!({ "raw_text": self.text, "gibberish_text": self.text }))
+    }
+
+    fn with_effects(&self, mut body: serde_json::Value) -> String {
+        if !self.effects.is_empty() {
+            body["effects"] = serde_json::from_str(self.effects).unwrap();
+        }
+        body.to_string()
     }
 
     pub fn speech(&self, server: &Server) -> Reply {

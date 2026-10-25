@@ -6,8 +6,7 @@ use std::sync::Arc;
 use effects::{
     Pipeline, Processor,
     convolve::{Impulses, Response},
-    run,
-    schema::Graph,
+    run, schema,
 };
 use rustfft::{FftPlanner, num_complex::Complex};
 use safetensors::{Dtype, SafeTensors};
@@ -83,7 +82,7 @@ fn pitch_moves_as_ffmpegs_does() {
     for (name, threshold) in PITCH_THRESHOLDS {
         let case = fixture.cases.iter().find(|c| c.name == name).expect(name);
         let reference = fixture.reference_pitch(name);
-        let mut pipeline = Pipeline::new(&case.effects, &impulses).unwrap();
+        let mut pipeline = case.pipeline(&impulses);
         let ours = pitch_distance(&pitch(&run(&mut pipeline, &input)), &reference);
         let unfiltered = pitch_distance(&pitch(&input), &reference);
         eprintln!(
@@ -108,7 +107,7 @@ fn every_graph_sounds_like_ffmpegs() {
             continue;
         };
         let reference = fixture.reference(&case.name);
-        let mut pipeline = Pipeline::new(&case.effects, &impulses).unwrap();
+        let mut pipeline = case.pipeline(&impulses);
         let ours = distance(&log_mel(&run(&mut pipeline, &input)), &reference);
         let unfiltered = distance(&log_mel(&input), &reference);
         eprintln!(
@@ -129,11 +128,8 @@ fn chunks_change_nothing() {
     let input = fixture.input();
     let impulses = fixture.impulses();
     for case in &fixture.cases {
-        let whole = run(
-            &mut Pipeline::new(&case.effects, &impulses).unwrap(),
-            &input,
-        );
-        let mut pipeline = Pipeline::new(&case.effects, &impulses).unwrap();
+        let whole = run(&mut case.pipeline(&impulses), &input);
+        let mut pipeline = case.pipeline(&impulses);
         let mut chunked = Vec::new();
         let mut rest = &input[..];
         let mut size = 1;
@@ -153,7 +149,13 @@ fn chunks_change_nothing() {
 #[derive(Debug, Deserialize)]
 struct Case {
     name: String,
-    effects: Vec<Graph>,
+    effects: serde_json::Value,
+}
+
+impl Case {
+    fn pipeline(&self, impulses: &Impulses) -> Pipeline {
+        Pipeline::new(&schema::parse(&self.effects).unwrap(), impulses).unwrap()
+    }
 }
 
 /// The fixture's tensors and cases.
