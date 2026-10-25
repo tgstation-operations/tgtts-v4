@@ -1,0 +1,6 @@
+[toolchain]
+# Nightly for rustfmt's import options in rustfmt.toml and cargo's content
+# fingerprints (nix/devshell.nix).
+channel = "nightly-2026-10-25"
+profile = "minimal"
+components = ["clippy", "rust-analyzer", "rust-src", "rustfmt"]

@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-only"
+version = "0.1.0"
+
+# Shared dependency versions, inherited by members. No entry without a consumer.
+[workspace.dependencies]

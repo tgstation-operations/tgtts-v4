@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# seed-target FROM TO: make the cargo target TO a copy-on-write clone of FROM,
+# taken under cargo's build locks, so a new tree's first build reuses every unit
+# whose sources match (the devshell and the gate have cargo judge freshness by
+# content for this). Seeds nothing where the filesystem cannot clone: a plain
+# copy would double the disk a target takes. A seed that fails costs a cold
+# build, so this never fails its caller.
+set -uo pipefail
+
+from=$1
+to=$2
+say() { echo "seed-target: $*" >&2; }
+
+[ -e "$to" ] && exit 0
+if [ ! -f "$from/CACHEDIR.TAG" ]; then
+  say "seeded nothing into $to: $from is not a cargo target"
+  exit 0
+fi
+if ! command -v flock >/dev/null; then
+  say "seeded nothing into $to: no flock to take cargo's build locks with"
+  exit 0
+fi
+
+staging="$to.seeding-$$"
+trap 'rm -rf "$staging"' EXIT
+mkdir -p "$staging" || exit 0
+if ! cp --reflink=always "$from/CACHEDIR.TAG" "$staging/" 2>/dev/null; then
+  say "seeded nothing into $to: this filesystem cannot clone $from there"
+  exit 0
+fi
+
+# cargo holds these exclusively while it builds.
+for lock in "$from"/*/.cargo-build-lock "$from"/*/.cargo-lock \
+  "$from"/*/*/.cargo-build-lock "$from"/*/*/.cargo-lock; do
+  [ -f "$lock" ] || continue
+  exec {fd}<"$lock"
+  if ! flock -s -w 300 "$fd"; then
+    say "seeded nothing into $to: a build in ${lock%/*} held it for 300 s"
+    exit 0
+  fi
+done
+
+if ! cp -a --reflink=always "$from/." "$staging/"; then
+  say "seeded nothing into $to: the clone of $from failed"
+  exit 0
+fi
+# rustc tracks the working directory, so a clone's incremental caches would be
+# thrown away anyway.
+find "$staging" -type d -name incremental -prune -exec rm -rf {} +
+# A unit whose dep-info names a file under FROM's tree by absolute path would be
+# judged against that tree's copy; without the record it rebuilds instead.
+tree=$(dirname "$from")
+find "$staging" -type f -path '*/fingerprint/dep-*' -print0 |
+  xargs -0 -r grep -lZF -e "$tree/" -e "$(cd "$tree" && pwd -P)/" |
+  xargs -0 -r rm -f
+
+mv -T "$staging" "$to" 2>/dev/null || exit 0
+say "seeded $to from $from"

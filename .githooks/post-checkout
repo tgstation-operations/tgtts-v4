@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# `git worktree add` runs this with the null commit as the previous HEAD: seed
+# the new worktree's target from the main checkout's.
+set -euo pipefail
+
+[ "$1" = 0000000000000000000000000000000000000000 ] && [ "$3" = 1 ] || exit 0
+top=$(git rev-parse --show-toplevel)
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+[ "$main" -ef "$top" ] && exit 0
+"$(dirname "$0")/seed-target" "$main/target" "$top/target"

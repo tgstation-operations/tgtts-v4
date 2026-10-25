@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Runs the gate over the index rather than the working tree, so a partial or
+# pathspec commit is judged by what it records, and the checkout stays editable
+# while it runs. The staged tree is checked out in a worktree kept under the
+# git directory, with a cargo target of its own, seeded from this checkout's.
+set -euo pipefail
+
+hooks=$(cd "$(dirname "$0")" && pwd)
+checkout=$(git rev-parse --show-toplevel)
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+tree=$(git write-tree)
+# A fixed identity and date: commit-tree needs one, and this commit is only a
+# way to check the tree out.
+commit=$(
+  GIT_AUTHOR_NAME=audit GIT_AUTHOR_EMAIL=audit@invalid GIT_AUTHOR_DATE="@0 +0000" \
+    GIT_COMMITTER_NAME=audit GIT_COMMITTER_EMAIL=audit@invalid GIT_COMMITTER_DATE="@0 +0000" \
+    git commit-tree "$tree" -m "pre-commit audit"
+)
+audit_home="$(git rev-parse --absolute-git-dir)/audit"
+audit_tree="$audit_home/tree"
+export CARGO_TARGET_DIR="$audit_home/target"
+
+# git hands a hook GIT_INDEX_FILE and the like, which would aim every git
+# command below at this checkout instead of the audit tree.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars)
+
+# Without hooks, so post-checkout does not seed a target inside the audit tree,
+# which the audit never builds in.
+if ! {
+  [ -f "$audit_tree/.git" ] &&
+    git -C "$audit_tree" -c core.hooksPath=/dev/null checkout --quiet --detach --force "$commit" &&
+    git -C "$audit_tree" clean -ffdxq
+}; then
+  rm -rf "$audit_tree"
+  mkdir -p "$audit_home"
+  git worktree prune
+  git -c core.hooksPath=/dev/null worktree add --quiet --force --detach "$audit_tree" "$commit"
+fi
+
+seed="$checkout/target"
+[ -f "$seed/CACHEDIR.TAG" ] || seed="$main/target"
+"$hooks/seed-target" "$seed" "$CARGO_TARGET_DIR"
+
+echo "pre-commit: auditing the index (tree ${tree:0:12}) in $audit_tree" >&2
+cd "$audit_tree"
+exec nix develop . -c audit
