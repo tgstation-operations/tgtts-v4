@@ -14,3 +14,4 @@ minicpm4 = { path = "../minicpm4" }
 serde.workspace = true
 serde_json.workspace = true
 voices = { path = "../voices" }
+voxcpm = { path = "../voxcpm" }

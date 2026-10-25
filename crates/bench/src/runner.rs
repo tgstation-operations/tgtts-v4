@@ -247,6 +247,16 @@ impl Runner {
         }
     }
 
+    /// Gives the measurement `name` a real-time factor for `seconds` of audio per repetition,
+    /// for audio whose length is known only once it has run.
+    pub fn set_audio(&mut self, name: &str, seconds: f64) {
+        let measurement = self.measurements.iter_mut().rev().find(|m| m.name == name);
+        if let Some(m) = measurement {
+            m.rtf = Some(m.summary.median / seconds);
+            m.params.insert("audio_seconds".into(), seconds.into());
+        }
+    }
+
     fn sync(&self) {
         self.device
             .sync()

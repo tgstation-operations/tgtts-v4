@@ -7,7 +7,8 @@ use burn::module::Module;
 use dsp::radio::{Assets, Pcm};
 use minicpm4::{Config, KvCache, LocalShape, Mask, Model};
 use serde_json::Value;
-use voices::Voices;
+use voices::{Latent, Voices};
+use voxcpm::{Dtypes, Params, SeededNoise, TextToSpeech};
 
 use crate::{
     conditions::BIGMEM_LOCK,
@@ -27,6 +28,10 @@ pub const NAMES: &[&str] = &[
     "minicpm4.local_dit.load",
     "minicpm4.local_dit.eval",
     "minicpm4.patch",
+    "voxcpm.load",
+    "voxcpm.prefill",
+    "voxcpm.patch",
+    "voxcpm.synthesize",
     "audiovae.decoder.load",
     "audiovae.decode.utterance",
     "audiovae.decode.patch",
@@ -87,11 +92,13 @@ pub fn check(r: &Runner, data: &Data) -> Result<(), String> {
         return Err("no benchmark matches the filters".into());
     }
     let mut missing = Vec::new();
-    let needs_checkpoint = r.any_selected("minicpm4.") || r.any_selected("audiovae.");
+    let needs_checkpoint =
+        r.any_selected("minicpm4.") || r.any_selected("voxcpm.") || r.any_selected("audiovae.");
     if needs_checkpoint && data.checkpoint.is_none() {
         missing.push("VOXCPM2_DIR to name the VoxCPM2 checkpoint");
     }
-    let needs_voices = r.any_selected("voices.") || r.any_selected("dsp.blips");
+    let needs_voices =
+        r.any_selected("voices.") || r.any_selected("voxcpm.") || r.any_selected("dsp.blips");
     if needs_voices && data.voices.is_none() {
         missing.push("VOICES_DIR to name a converted voices directory");
     }
@@ -110,6 +117,8 @@ pub fn check(r: &Runner, data: &Data) -> Result<(), String> {
         .map(|spec| r.counts(spec))
         .map(|(warmup, reps)| warmup + reps)
         .sum::<usize>();
+    let (warmup, reps) = r.counts(&patch_step_spec());
+    let steps = steps.max(warmup + reps);
     if steps > MAX_PATCHES {
         return Err(format!(
             "the step and patch benchmarks would take {steps} decode steps, more than the \
@@ -123,6 +132,9 @@ pub fn check(r: &Runner, data: &Data) -> Result<(), String> {
 pub fn run(r: &mut Runner, data: &Data) -> Result<(), String> {
     if r.any_selected("minicpm4.") {
         minicpm4(r, data.checkpoint.expect("checked"))?;
+    }
+    if r.any_selected("voxcpm.") {
+        voxcpm(r, data)?;
     }
     if r.any_selected("audiovae.") {
         audiovae(r, data.checkpoint.expect("checked"))?;
@@ -305,6 +317,101 @@ fn lm_benches(r: &mut Runner, stack: &str, model: &Model, hidden: usize, seed: u
         |()| model.forward_cached(step.clone(), &mut cache),
     );
     cache
+}
+
+/// The voice whose latent has the median length, as the prompt's length sets the prefill's
+/// cost: of the table's voices sorted by frames, then name.
+fn median_voice(table: &Voices) -> Result<(String, Latent), String> {
+    let mut lengths = Vec::new();
+    for name in table.names() {
+        let latent = table.latent(name).map_err(|e| e.to_string())?;
+        lengths.push((latent.frames.len(), name.to_owned()));
+    }
+    lengths.sort();
+    let (_, name) = lengths
+        .get(lengths.len() / 2)
+        .ok_or("the voices table is empty")?;
+    let latent = table.latent(name).map_err(|e| e.to_string())?;
+    Ok((name.clone(), latent))
+}
+
+fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
+    let dir = data.checkpoint.expect("checked");
+    let table = Voices::open(data.voices.expect("checked")).map_err(|e| e.to_string())?;
+    let (voice, latent) = match data.voice {
+        Some(voice) => {
+            let latent = table.latent(voice).map_err(|e| e.to_string())?;
+            (voice.to_owned(), latent)
+        }
+        None => median_voice(&table)?,
+    };
+    let dtype = r.dtype;
+    let dtypes = Dtypes {
+        lm: dtype,
+        local_encoder: dtype,
+        local_dit: dtype,
+        audio_decoder: dtype,
+    };
+    let params = Params::default();
+    let device = r.device.clone();
+    let _bigmem = r.lock(BIGMEM_LOCK)?;
+
+    let load =
+        || TextToSpeech::load(dir, &dtypes, &device).unwrap_or_else(|e| panic!("VoxCPM2: {e}"));
+    let spec = Spec::new("voxcpm.load", 1, 2).param("page_cache", "warm");
+    let tts = r.measure(spec, || (), |()| load()).unwrap_or_else(load);
+    let prompt = tts.prompt(LINE, &latent).map_err(|e| e.to_string())?;
+    let model = tts.model();
+
+    if r.selected("voxcpm.prefill") || r.selected("voxcpm.patch") {
+        let start = || {
+            model
+                .start(&prompt, params.max_patches)
+                .expect("the prompt fits the LM")
+        };
+        let spec = Spec::new("voxcpm.prefill", 1, 3)
+            .work(prompt.len() as f64, "positions")
+            .param("voice", voice.as_str())
+            .param("positions", prompt.len());
+        let generation = r.measure(spec, || (), |()| start());
+        let mut generation = generation.unwrap_or_else(start);
+        let mut noise = SeededNoise::new(14);
+        let spec = patch_step_spec()
+            .work(1.0, "patches")
+            .audio(FRAMES_PER_PATCH as f64 * FRAME_SECONDS)
+            .param("timesteps", params.sampling.timesteps);
+        r.measure(
+            spec,
+            || model.noise(&mut noise),
+            |noise| {
+                let step = generation.sample(noise, &params.sampling);
+                generation.advance(step.patch.clone());
+                step
+            },
+        );
+    }
+
+    let spec = Spec::new("voxcpm.synthesize", 0, 2)
+        .param("voice", voice.as_str())
+        .param("text", LINE)
+        .param("max_patches", params.max_patches);
+    let audio = r.measure(
+        spec,
+        || SeededNoise::new(15),
+        |mut noise| {
+            tts.synthesize(LINE, &latent, &params, &mut noise)
+                .expect("the prompt fits the LM")
+        },
+    );
+    if let Some(audio) = audio {
+        let seconds = audio.len() as f64 / f64::from(tts.out_sample_rate());
+        r.set_audio("voxcpm.synthesize", seconds);
+    }
+    Ok(())
+}
+
+fn patch_step_spec() -> Spec {
+    Spec::new("voxcpm.patch", 2, 10)
 }
 
 fn audiovae(r: &mut Runner, dir: &Path) -> Result<(), String> {
