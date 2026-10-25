@@ -25,6 +25,10 @@ impl Random for Replay {
         self.1 += 1;
         draw
     }
+
+    fn below(&mut self, _: usize) -> usize {
+        unreachable!("the blips draw no integers")
+    }
 }
 
 /// The fixture's voice, as a blips file the voices crate opens.

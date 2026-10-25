@@ -88,13 +88,16 @@ fn to_mono(clip: &Pcm) -> Vec<f64> {
 }
 
 /// Why the radio failed, where the old service failed the request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     /// There was no speech, whose peak numpy could not take.
     Empty,
     /// The speech, of this many samples once resampled, outlasts the static, which numpy could
     /// not add to it.
     LongerThanStatic(usize),
+    /// A span to duck, starting at this many seconds, starts past the end of the speech, where
+    /// numpy could not fade it.
+    SpanPastEnd(f64),
 }
 
 impl fmt::Display for Error {
@@ -104,6 +107,7 @@ impl fmt::Display for Error {
             Self::LongerThanStatic(len) => {
                 write!(f, "speech of {len} samples outlasts the static")
             }
+            Self::SpanPastEnd(start) => write!(f, "span at {start} s starts past the speech"),
         }
     }
 }

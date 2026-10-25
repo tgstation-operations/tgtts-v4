@@ -3,6 +3,7 @@
 
 pub mod blips;
 pub mod float;
+pub mod gibberish;
 pub mod pitch;
 pub mod radio;
 pub mod resample;
@@ -14,4 +15,7 @@ pub mod sentences;
 pub trait Random {
     /// `random.random()`: a draw from [0, 1).
     fn random(&mut self) -> f64;
+
+    /// `random._randbelow(n)`: a draw from `0..n`, which `random.sample` makes.
+    fn below(&mut self, n: usize) -> usize;
 }
