@@ -32,3 +32,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false }
 ureq = { version = "2.12.1", default-features = false }
 vorbis_rs = { version = "0.5.6", default-features = false }
+
+# burn as the tgstation fork carries it, pinned by revision: changes to its GPU kernels land there first.
+[patch.crates-io]
+burn = { git = "https://git.scriptis.net/scriptis/burn.git", rev = "907ab111a02c2dea47bc41633754f095c6b2220e" }
