@@ -458,12 +458,20 @@ fn runs_the_games_filters() {
         assert_eq!(reply.status, 200, "{filter}: {}", reply.text());
         assert!(reply.frames(48000) > 0);
     }
-    let broken = Message {
-        filter: "nosuchfilter",
-        ..Message::default()
+    // Served unfiltered: a graph ffmpeg refuses, as it does the fishing spot capsule's, and one
+    // with a filter the game's graphs do not use.
+    for filter in [
+        "acompressor=threshold=0.3:ratio=40",
+        "[0:a] amovie=/etc/hostname [m]; [0:a][m] amix",
+    ] {
+        let unfiltered = Message {
+            filter,
+            ..Message::default()
+        }
+        .speech(&h);
+        unfiltered.assert_ogg(48000);
+        assert_eq!(unfiltered.frames(48000), 12 * FRAMES_PER_CHAR + TAIL);
     }
-    .speech(&h);
-    assert_eq!(broken.status, 500);
 }
 
 #[test]

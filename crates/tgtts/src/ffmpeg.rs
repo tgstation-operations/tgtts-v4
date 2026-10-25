@@ -102,6 +102,88 @@ impl Ffmpeg {
     }
 }
 
+/// The filters the game's own filter graphs use: all a graph from the game may name, since an
+/// admin can set any string as an object's voice filter, and other filters can read files or
+/// make audio without end.
+const ALLOWED: [&str; 25] = [
+    "acompressor",
+    "acontrast",
+    "acrusher",
+    "aecho",
+    "aemphasis",
+    "afftfilt",
+    "aformat",
+    "alimiter",
+    "amix",
+    "anoisesrc",
+    "aphaser",
+    "aresample",
+    "asetrate",
+    "asplit",
+    "atempo",
+    "crystalizer",
+    "equalizer",
+    "highpass",
+    "highshelf",
+    "lowpass",
+    "lowshelf",
+    "rubberband",
+    "tremolo",
+    "vibrato",
+    "volume",
+];
+
+/// Why `graph` is not run, if it is not: a filter the game's own graphs do not use, or quoting
+/// left open, which ffmpeg would read otherwise than the check does.
+pub fn refusal(graph: &str) -> Option<String> {
+    let Some(names) = filters(graph) else {
+        return Some("a quote left open".to_owned());
+    };
+    names
+        .into_iter()
+        .find(|name| !ALLOWED.contains(name))
+        .map(|name| format!("the filter {name:?}"))
+}
+
+/// The names of the filters in `graph`, an ffmpeg filter graph: each filter of each chain, after
+/// the link labels before it and up to its arguments, or `None` if a quote is left open. As in
+/// ffmpeg's `av_get_token`, a backslash outside quotes escapes the character after it, and inside
+/// them is a backslash.
+fn filters(graph: &str) -> Option<Vec<&str>> {
+    let mut descriptions = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in graph.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if !quoted => escaped = true,
+            '\'' => quoted = !quoted,
+            ',' | ';' if !quoted => {
+                descriptions.push(&graph[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    descriptions.push(&graph[start..]);
+    let names = descriptions.into_iter().filter_map(|description| {
+        let mut rest = description.trim_start();
+        while let Some(label) = rest.strip_prefix('[') {
+            rest = label
+                .split_once(']')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        }
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (end > 0).then(|| &rest[..end])
+    });
+    Some(names.collect())
+}
+
 /// Why ffmpeg gave nothing to use.
 #[derive(Debug)]
 pub enum Error {
@@ -219,6 +301,40 @@ mod tests {
         let output = ffmpeg().filter(input, graph, &[&impulse]).await.unwrap();
         assert_eq!((output.rate, output.channels), (48000, 1));
         assert!(output.frames() >= 480);
+    }
+
+    #[test]
+    fn finds_the_filters_a_graph_names() {
+        let names = |graph| filters(graph).unwrap();
+        assert_eq!(
+            names(
+                "[0:a] asplit [out0][out2]; [out0] asetrate=48000*0.9,aresample=48000 [p0]; [p0][0][out2] amix=inputs=3"
+            ),
+            ["asplit", "asetrate", "aresample", "amix"]
+        );
+        assert_eq!(
+            names(
+                "rubberband=pitch='ifnot(0,2-(0+if(1,4))/16,1)':formant=preserved,highpass=f=1000"
+            ),
+            ["rubberband", "highpass"]
+        );
+        assert_eq!(
+            names(r"volume=1\,amovie=x,volume@loud=2"),
+            ["volume", "volume"]
+        );
+        // Inside quotes a backslash is a backslash, so the quote after it closes them.
+        assert_eq!(names(r"volume='\',amovie=x"), ["volume", "amovie"]);
+        assert_eq!(filters("volume='2,amovie=x"), None);
+    }
+
+    #[test]
+    fn refuses_filters_the_game_does_not_use() {
+        assert_eq!(refusal("lowpass=f=750,volume=2"), None);
+        assert_eq!(
+            refusal("[0:a] amovie=/etc/passwd [m]; [0:a][m] amix"),
+            Some("the filter \"amovie\"".to_owned())
+        );
+        assert_eq!(refusal("volume='2"), Some("a quote left open".to_owned()));
     }
 
     #[tokio::test]

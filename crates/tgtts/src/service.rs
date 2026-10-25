@@ -689,10 +689,24 @@ impl Service {
                 })
                 .await?
             }
+            // A graph that fails is served unfiltered, since failing would drop the whole
+            // message.
             Treatment::Filter(graph) => {
                 let graph = graph.replace("%SAMPLE_RATE%", &audio.rate.to_string());
-                self.run_ffmpeg(trace, self.ffmpeg.filter(wav(), &graph, &[]))
-                    .await?
+                let identifier = &params.identifier;
+                if let Some(reason) = ffmpeg::refusal(&graph) {
+                    warn!(%identifier, "serving unfiltered, the filter graph has {reason}: {graph}");
+                    Audio::from_segment(&audio)
+                } else {
+                    let filtered = self.ffmpeg.filter(wav(), &graph, &[]);
+                    match self.run_ffmpeg(trace, filtered).await {
+                        Ok(filtered) => filtered,
+                        Err(failure) => {
+                            error!(%identifier, "serving unfiltered: {}", failure.reason);
+                            Audio::from_segment(&audio)
+                        }
+                    }
+                }
             }
             Treatment::None => Audio::from_segment(&audio),
         };
