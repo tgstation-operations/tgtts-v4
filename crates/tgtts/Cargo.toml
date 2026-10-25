@@ -6,7 +6,9 @@ version.workspace = true
 publish = false
 
 [dependencies]
+blake3.workspace = true
 dsp = { path = "../dsp" }
+rand = { workspace = true, features = ["thread_rng"] }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt"] }
 
 [dev-dependencies]
