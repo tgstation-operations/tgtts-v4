@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use burn::tensor::{DType, Device, Tensor, TensorData};
+use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 use safetensors::{Dtype, SafeTensors};
 
 /// The device every test runs on.
@@ -78,6 +78,36 @@ impl Fixture {
     #[track_caller]
     pub fn tensor<const D: usize>(&self, name: &str, device: &Device) -> Tensor<D> {
         let file = self.path.display();
+        let (shape, dtype, bytes) = self.view(name, D);
+        let dtype = match dtype {
+            Dtype::F32 => DType::F32,
+            Dtype::F16 => DType::F16,
+            Dtype::BF16 => DType::BF16,
+            other => panic!("{file}: tensor {name:?} is {other:?}, not F32, F16 or BF16"),
+        };
+        let data = TensorData::from_bytes_vec(bytes, shape, dtype);
+        Tensor::from_data(data.convert::<f32>(), device)
+    }
+
+    /// The integer tensor `name` on `device`, such as the token ids a model is run on.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such tensor, it is not of rank `D`, or it is not I64, the integer type
+    /// torch gives indices.
+    #[track_caller]
+    pub fn int_tensor<const D: usize>(&self, name: &str, device: &Device) -> Tensor<D, Int> {
+        let file = self.path.display();
+        let (shape, dtype, bytes) = self.view(name, D);
+        if dtype != Dtype::I64 {
+            panic!("{file}: tensor {name:?} is {dtype:?}, not I64");
+        }
+        Tensor::from_data(TensorData::from_bytes_vec(bytes, shape, DType::I64), device)
+    }
+
+    #[track_caller]
+    fn view(&self, name: &str, rank: usize) -> (Vec<usize>, Dtype, Vec<u8>) {
+        let file = self.path.display();
         let tensors = SafeTensors::deserialize(&self.bytes).expect("deserialized when opened");
         let view = tensors.tensor(name).unwrap_or_else(|_| {
             let mut names = tensors.names();
@@ -85,17 +115,10 @@ impl Fixture {
             panic!("{file}: no tensor {name:?} among {names:?}")
         });
         let shape = view.shape();
-        if shape.len() != D {
-            panic!("{file}: tensor {name:?} has shape {shape:?}, not rank {D}");
+        if shape.len() != rank {
+            panic!("{file}: tensor {name:?} has shape {shape:?}, not rank {rank}");
         }
-        let dtype = match view.dtype() {
-            Dtype::F32 => DType::F32,
-            Dtype::F16 => DType::F16,
-            Dtype::BF16 => DType::BF16,
-            other => panic!("{file}: tensor {name:?} is {other:?}, not F32, F16 or BF16"),
-        };
-        let data = TensorData::from_bytes_vec(view.data().to_vec(), shape, dtype);
-        Tensor::from_data(data.convert::<f32>(), device)
+        (shape.to_vec(), view.dtype(), view.data().to_vec())
     }
 }
 

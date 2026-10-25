@@ -91,6 +91,18 @@ fn integer_tensor_is_refused() {
 }
 
 #[test]
+fn i64_reads_exactly() {
+    let i64s = fixture!("testkit").int_tensor::<1>("i64", &device());
+    assert_eq!(i64s.into_data().iter::<i64>().collect::<Vec<_>>(), [7, -1]);
+}
+
+#[test]
+#[should_panic(expected = "testkit.safetensors: tensor \"f32\" is F32, not I64")]
+fn float_tensor_is_not_an_int_tensor() {
+    let _ = fixture!("testkit").int_tensor::<2>("f32", &device());
+}
+
+#[test]
 fn close_within_either_tolerance() {
     assert_close(floats([1.0005, -0.0]), floats([1.0, 0.0]), 1e-3, 0.0);
     assert_close(
