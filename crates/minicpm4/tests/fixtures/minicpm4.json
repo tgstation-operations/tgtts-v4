@@ -1,0 +1,35 @@
+{
+  "lm_config": {
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_size": 32,
+    "intermediate_size": 48,
+    "max_position_embeddings": 32,
+    "num_attention_heads": 8,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000,
+    "kv_channels": 8,
+    "rope_scaling": {
+      "type": "longrope",
+      "long_factor": [2.0, 4.0, 9.0, 20.0],
+      "short_factor": [0.99, 1.6, 3.4, 8.9],
+      "original_max_position_embeddings": 32
+    },
+    "vocab_size": 40,
+    "use_mup": false,
+    "scale_emb": 12,
+    "dim_model_base": 256,
+    "scale_depth": 1.4
+  },
+  "residual_lm_num_layers": 1,
+  "residual_lm_no_rope": true,
+  "encoder_config": {
+    "hidden_dim": 32,
+    "ffn_dim": 40,
+    "num_heads": 4,
+    "num_layers": 2,
+    "kv_channels": null
+  }
+}

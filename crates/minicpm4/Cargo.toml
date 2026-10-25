@@ -1,0 +1,15 @@
+[package]
+name = "minicpm4"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+burn = { workspace = true, features = ["safetensors", "std", "store"] }
+regex.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+testkit = { path = "../testkit" }
