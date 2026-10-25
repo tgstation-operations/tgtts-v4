@@ -1,9 +1,12 @@
 //! The service as the game sees it: each route called as code/controllers/subsystem/tts.dm
-//! calls it, through ureq as rust-g does, with a fake model, real ffmpeg and real dsp.
+//! calls it, with a fake model, real ffmpeg and real dsp.
+
+mod common;
 
 use std::{
     collections::BTreeMap,
     f32::consts::TAU,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -14,19 +17,18 @@ use std::{
     time::Duration,
 };
 
+use common::{Message, Reply, Server, VOICE, call};
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
     metrics::Metrics,
-    service::{self, Limits, Logging, Service, Setup, Sounds},
+    service::{Limits, Logging, Setup, Sounds},
     synth::{self, Speech, Synthesizer},
     wav,
 };
 use tracing::level_filters::LevelFilter;
 use voices::{BlipSet, Latent, Voices};
 
-const TOKEN: &str = "s3cret-token";
-const VOICE: &str = "Man (Test)";
 /// What the fake model says per character of text.
 const FRAMES_PER_CHAR: usize = 1200;
 /// The silence the old frontend put after speech.
@@ -205,12 +207,10 @@ fn limits() -> Limits {
     }
 }
 
-/// The service on a port of its own, and what the tests look at.
+/// The service with the fake model, and what the tests look at.
 struct Harness {
+    server: Server,
     _dir: tempfile::TempDir,
-    runtime: tokio::runtime::Runtime,
-    base: String,
-    service: Arc<Service>,
     fake: Arc<Fake>,
     cache: PathBuf,
     metrics: PathBuf,
@@ -226,8 +226,8 @@ fn harness(fake: Fake, limits: Limits) -> Harness {
     let levels = Arc::new(Mutex::new(Vec::new()));
     let set = levels.clone();
     let fake = Arc::new(fake);
-    let service = Service::new(Setup {
-        token: TOKEN.to_owned(),
+    let server = common::serve(Setup {
+        token: String::new(),
         voices: Voices::open(&voices).unwrap(),
         synthesizer: fake.clone(),
         cache: Cache::open(&cache).unwrap(),
@@ -239,21 +239,9 @@ fn harness(fake: Fake, limits: Limits) -> Harness {
         }),
         limits,
     });
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let listener = runtime
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let router = service::router(service.clone());
-    runtime.spawn(async move { axum::serve(listener, router).await });
     Harness {
+        server,
         _dir: dir,
-        runtime,
-        base,
-        service,
         fake,
         cache,
         metrics,
@@ -261,81 +249,15 @@ fn harness(fake: Fake, limits: Limits) -> Harness {
     }
 }
 
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    content_type: Option<String>,
-    disposition: Option<String>,
-    length: Option<String>,
-    body: Vec<u8>,
-}
+impl Deref for Harness {
+    type Target = Server;
 
-impl Reply {
-    /// The length the game takes from `audio-length`, in frames at `rate`.
-    fn frames(&self, rate: u32) -> usize {
-        let seconds: f64 = self.length.as_deref().unwrap().parse().unwrap();
-        (seconds * f64::from(rate)).round() as usize
-    }
-
-    fn text(&self) -> &str {
-        std::str::from_utf8(&self.body).unwrap()
-    }
-
-    #[track_caller]
-    fn assert_ogg(&self, rate: u32) {
-        assert_eq!(self.status, 200, "{}", String::from_utf8_lossy(&self.body));
-        assert_eq!(self.content_type.as_deref(), Some("audio/ogg"));
-        assert_eq!(
-            self.disposition.as_deref(),
-            Some("attachment; filename=identifier.ogg")
-        );
-        let (_, header_rate, bitrate) = vorbis_header(&self.body);
-        assert_eq!((header_rate, bitrate), (rate, 64000));
-    }
-}
-
-/// The Vorbis identification header's channels, rate and nominal bitrate.
-fn vorbis_header(ogg: &[u8]) -> (u8, u32, i32) {
-    assert_eq!(&ogg[..4], b"OggS");
-    let at = ogg.windows(7).position(|w| w == b"\x01vorbis").unwrap();
-    let header = &ogg[at + 7..];
-    let rate = u32::from_le_bytes(header[5..9].try_into().unwrap());
-    let bitrate = i32::from_le_bytes(header[13..17].try_into().unwrap());
-    (header[4], rate, bitrate)
-}
-
-/// A GET as rust-g's `http_request_async` sends it: the game's headers and its body.
-fn call(url: &str, token: Option<&str>, body: &str) -> Reply {
-    let mut request = ureq::get(url)
-        .set("User-Agent", "rust-g/7.0.0")
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(60));
-    if let Some(token) = token {
-        request = request.set("Authorization", token);
-    }
-    let response = match request.send_bytes(body.as_bytes()) {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-        Err(e) => panic!("{url}: {e}"),
-    };
-    let header = |name| response.header(name).map(str::to_owned);
-    let (content_type, disposition) = (header("content-type"), header("content-disposition"));
-    let (status, length) = (response.status(), header("audio-length"));
-    let mut body = Vec::new();
-    std::io::Read::read_to_end(&mut response.into_reader(), &mut body).unwrap();
-    Reply {
-        status,
-        content_type,
-        disposition,
-        length,
-        body,
+    fn deref(&self) -> &Server {
+        &self.server
     }
 }
 
 impl Harness {
-    fn get(&self, path: &str, body: &str) -> Reply {
-        call(&format!("{}{path}", self.base), Some(TOKEN), body)
-    }
-
     fn rows(&self) -> Vec<Row> {
         self.service.metrics().unwrap().flush();
         let connection = rusqlite::Connection::open(&self.metrics).unwrap();
@@ -376,114 +298,9 @@ struct Row {
     patches: Option<i64>,
 }
 
-/// BYOND's `url_encode`, as `tts_filter_encode` and the special filters go through it.
-fn url_encode(text: &str) -> String {
-    text.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                char::from(b).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
-/// A message as `queue_tts_message` sends it.
-#[derive(Clone)]
-struct Message<'a> {
-    speaker: &'a str,
-    identifier: &'a str,
-    filter: &'a str,
-    pitch: &'a str,
-    special_filters: &'a str,
-    blip_base: &'a str,
-    blip_number: &'a str,
-    text: &'a str,
-}
-
-impl Default for Message<'_> {
-    fn default() -> Self {
-        Self {
-            speaker: VOICE,
-            identifier: "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12.1234.5",
-            filter: "",
-            pitch: "0",
-            special_filters: "",
-            blip_base: "male",
-            blip_number: "1",
-            text: "Hello there.",
-        }
-    }
-}
-
-impl Message<'_> {
-    /// tts.dm's query for `route`, the speaker as it is, unencoded.
-    fn query(&self, route: &str) -> String {
-        let mut query = format!(
-            "/{route}?voice={}&identifier={}&filter={}&pitch={}&special_filters={}",
-            self.speaker,
-            self.identifier,
-            url_encode(self.filter),
-            self.pitch,
-            url_encode(self.special_filters)
-        );
-        if route.starts_with("tts-blips") {
-            query += &format!(
-                "&blip_base={}&blip_number={}",
-                self.blip_base, self.blip_number
-            );
-        }
-        query
-    }
-
-    fn body(&self) -> String {
-        serde_json::json!({ "text": self.text }).to_string()
-    }
-
-    /// The gibberish request's body, which the game sends with the same text twice.
-    fn gibberish_body(&self) -> String {
-        serde_json::json!({ "raw_text": self.text, "gibberish_text": self.text }).to_string()
-    }
-
-    fn speech(&self, harness: &Harness) -> Reply {
-        harness.get(&self.query("tts"), &self.body())
-    }
-
-    fn blips(&self, harness: &Harness) -> Reply {
-        harness.get(&self.query("tts-blips"), &self.body())
-    }
-
-    fn radio(&self, harness: &Harness) -> Reply {
-        harness.get(&self.query("tts-radio"), &self.body())
-    }
-
-    fn blips_radio(&self, harness: &Harness) -> Reply {
-        harness.get(&self.query("tts-blips-radio"), &self.body())
-    }
-
-    fn gibberish(&self, harness: &Harness) -> Reply {
-        harness.get(&self.query("tts-radio"), &self.gibberish_body())
-    }
-
-    /// All five, at once, as `start_requests` sends a message that is not local.
-    fn all(&self, harness: &Harness) -> [Reply; 5] {
-        thread::scope(|s| {
-            let calls = [
-                s.spawn(|| self.speech(harness)),
-                s.spawn(|| self.blips(harness)),
-                s.spawn(|| self.radio(harness)),
-                s.spawn(|| self.blips_radio(harness)),
-                s.spawn(|| self.gibberish(harness)),
-            ];
-            calls.map(|call| call.join().unwrap())
-        })
-    }
-}
-
-/// The length of `frames` of speech over the radio: resampled to 8 kHz and back, between the
-/// test's clicks, with 0.1 s of static before the second.
+/// The length of `frames` of speech over the radio, between the test's clicks.
 fn radio_frames(frames: usize) -> usize {
-    2400 + frames.div_ceil(6) * 6 + 4800 + 2400
+    common::radio_frames(frames, 2400, 2400)
 }
 
 #[test]
@@ -907,10 +724,11 @@ fn records_metrics_without_the_text() {
             },
         ]
     );
-    drop(h.runtime);
-    let service = Arc::into_inner(h.service).expect("the server has stopped");
+    let Harness { server, _dir, .. } = h;
+    drop(server.runtime);
+    let service = Arc::into_inner(server.service).expect("the server has stopped");
     drop(service);
-    for entry in std::fs::read_dir(h._dir.path()).unwrap() {
+    for entry in std::fs::read_dir(_dir.path()).unwrap() {
         let path = entry.unwrap().path();
         if path.to_string_lossy().contains("metrics.sqlite") {
             let bytes = std::fs::read(&path).unwrap();

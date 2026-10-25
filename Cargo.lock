@@ -5929,6 +5929,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "blake3",
+ "burn",
  "dsp",
  "rand 0.10.3",
  "rusqlite",
@@ -5940,6 +5941,7 @@ dependencies = [
  "tracing",
  "ureq 2.12.1",
  "voices",
+ "voxcpm",
 ]
 
 [[package]]

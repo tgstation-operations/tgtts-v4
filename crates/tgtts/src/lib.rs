@@ -4,6 +4,7 @@ pub mod cache;
 pub mod ffmpeg;
 pub mod handoff;
 pub mod metrics;
+pub mod model;
 pub mod service;
 pub mod synth;
 pub mod wav;
