@@ -2321,6 +2321,7 @@ dependencies = [
  "safetensors 0.8.0",
  "serde_json",
  "testkit",
+ "voices",
 ]
 
 [[package]]

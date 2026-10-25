@@ -22,6 +22,12 @@ impl Tensors {
         }
     }
 
+    /// Whether there is a tensor `name`.
+    pub fn contains(&self, name: &str) -> bool {
+        let tensors = SafeTensors::deserialize(&self.bytes).expect("testkit checked it");
+        tensors.tensor(name).is_ok()
+    }
+
     #[track_caller]
     fn raw(&self, name: &str, dtype: Dtype) -> (Vec<usize>, Vec<u8>) {
         let tensors = SafeTensors::deserialize(&self.bytes).expect("testkit checked it");
