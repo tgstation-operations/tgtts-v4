@@ -9,7 +9,8 @@ detuned, and their blips are pydub's integer arithmetic alone; the rest are shif
 often is saved beside them.
 
 Where the port fixes the old service, the restatement takes the fix too: text with a letter or
-digit of either case makes a sound.
+digit of either case makes a sound, and a crossfade is no longer than either side, so a sentence
+can start past its first character and take blips shorter than a crossfade.
 """
 
 import importlib.metadata
@@ -91,6 +92,11 @@ def cap_loudness(seg, max_dbfs=-1.0):
     return seg
 
 
+def append(result_sound, blip):
+    """`blip` crossfaded onto `result_sound` by 150 ms, or as much of that as both have."""
+    return result_sound.append(blip, crossfade=min(150, len(result_sound), len(blip)))
+
+
 def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
     """The service's /generate-tts-blips, from the text on, returning the WAV it sent."""
     skip_these = " ,:;'\""
@@ -144,12 +150,7 @@ def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
                         )
                         speech_audio = change_volume(speech_audio, 0.6)
                         stripped_sound = strip_silence(speech_audio)
-                        if not i == 0:
-                            result_sound = result_sound.append(
-                                stripped_sound, crossfade=150
-                            )
-                        else:
-                            result_sound = stripped_sound
+                        result_sound = append(result_sound, stripped_sound)
             else:
                 if not i % 2 == 0:
                     continue
@@ -186,12 +187,7 @@ def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
                 )
                 new_audio = change_volume(new_audio, 0.7 if letter.isupper() else 0.5)
                 stripped_sound = strip_silence(new_audio)  # noqa: F841
-                if not i == 0:
-                    result_sound = result_sound.append(
-                        new_audio.fade_in(3).fade_out(8), crossfade=150
-                    )
-                else:
-                    result_sound = new_audio.fade_in(3).fade_out(8)
+                result_sound = append(result_sound, new_audio.fade_in(3).fade_out(8))
         result_sound.export(data_bytes, format="wav")
         rawsound = AudioSegment.from_file(io.BytesIO(data_bytes.getvalue()), "wav")
         normalizedsound = normalize_to_target(rawsound, -25)
@@ -359,6 +355,7 @@ if __name__ == "__main__":
         ("Hob lab? AH 12", "0", 1),
         ("hob 1", "5", 2),
         ("Lab 2 oh", "-12", 3),
+        ("!.a", "0", None),
     ]
     messages = [("Hob. AH 12? oh, hob a lab. b!", 4)]
     tensors = {

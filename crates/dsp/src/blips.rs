@@ -1,8 +1,9 @@
 //! The blips: a voice's recorded syllables strung together, one per other letter of the text, in
 //! place of speech.
 //!
-//! Each blip is detuned at random, lowered in volume and faded, then crossfaded onto the last, and
-//! the whole brought to -25 dBFS with its peak held under -5 dBFS. [`sentence`] is what the old
+//! Each blip is detuned at random, lowered in volume and faded, then crossfaded onto the last, by
+//! 150 ms or as much of that as both have, and the whole brought to -25 dBFS with its peak held
+//! under -5 dBFS. [`sentence`] is what the old
 //! blips service made of the text it was sent; [`message`] is what its frontend made of a message,
 //! a sentence at a time.
 
@@ -28,8 +29,7 @@ const SENTENCE_GAP: u32 = 250;
 pub enum Error {
     /// The voice has no sample the text needs, or it could not be read.
     Voice(voices::Error),
-    /// pydub refused to put the samples together, as when the first blip of a sentence comes
-    /// after a character that makes none, and is crossfaded onto nothing.
+    /// pydub would have refused an operation on the samples.
     Segment(segment::Error),
 }
 
@@ -134,12 +134,8 @@ pub fn sentence(
         } else {
             continue;
         };
-        // Past index 0, a blip is crossfaded even onto nothing, which pydub refuses.
-        result = if i == 0 {
-            blip
-        } else {
-            result.append(&blip, CROSSFADE)?
-        };
+        let crossfade = CROSSFADE.min(result.len_ms()).min(blip.len_ms());
+        result = result.append(&blip, crossfade)?;
     }
     let result = result.apply_gain(-25.0 - result.dbfs());
     let peak = result.max_dbfs();

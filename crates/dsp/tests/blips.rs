@@ -180,6 +180,25 @@ fn lowercase_text_sounds() {
     assert_eq!(lowercase, blips("hobA"));
 }
 
+#[test]
+fn a_sentence_starts_at_its_first_sound() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "first-sound");
+    let blips = |text| blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+    assert_eq!(blips("'Hob"), blips("o"));
+}
+
+#[test]
+fn crossfades_are_no_longer_than_either_side() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "crossfades");
+    // The made-up Gwah, stripped of its silence, is shorter than a crossfade.
+    for text in ["Ha!", "!.a"] {
+        let blips = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still);
+        assert!(blips.is_ok_and(|b| !b.samples.is_empty()), "{text}");
+    }
+}
+
 /// Making the golden needs a real voice, so a run of every generator leaves it as it is: this
 /// refuses one that such a run has left behind.
 #[test]
