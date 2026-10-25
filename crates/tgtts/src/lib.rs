@@ -2,4 +2,5 @@
 
 pub mod cache;
 pub mod ffmpeg;
+pub mod metrics;
 pub mod wav;
