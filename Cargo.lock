@@ -2429,8 +2429,10 @@ version = "0.1.0"
 dependencies = [
  "dsp",
  "rustfft",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
+ "testkit",
 ]
 
 [[package]]

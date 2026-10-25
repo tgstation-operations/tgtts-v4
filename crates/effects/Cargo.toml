@@ -11,4 +11,6 @@ rustfft.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+safetensors.workspace = true
 serde_json.workspace = true
+testkit = { path = "../testkit" }
