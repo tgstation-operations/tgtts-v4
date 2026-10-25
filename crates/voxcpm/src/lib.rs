@@ -12,6 +12,7 @@ mod local_encoder;
 mod model;
 mod noise;
 mod prompt;
+mod tokenizer;
 mod weights;
 
 use std::fmt;
@@ -26,6 +27,7 @@ pub use crate::{
     model::{Dtypes, Generation, Model, Step},
     noise::{Noise, SeededNoise},
     prompt::Prompt,
+    tokenizer::Tokenizer,
 };
 
 /// Why a model could not be loaded, or a request served.
@@ -39,6 +41,8 @@ pub enum Error {
     Stack(minicpm4::Error),
     /// The weights around the stacks could not be read, or do not fit the config.
     Load(SafetensorsStoreError),
+    /// `tokenizer.json` is not one this crate implements.
+    Tokenizer(String),
     /// A request the model cannot serve.
     Request(String),
 }
@@ -50,6 +54,7 @@ impl fmt::Display for Error {
             Self::Unsupported(what) => write!(f, "unsupported VoxCPM2 config: {what}"),
             Self::Stack(e) => write!(f, "{e}"),
             Self::Load(e) => write!(f, "loading VoxCPM2 weights: {e}"),
+            Self::Tokenizer(what) => write!(f, "tokenizer.json: {what}"),
             Self::Request(what) => write!(f, "cannot generate from {what}"),
         }
     }

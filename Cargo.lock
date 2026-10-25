@@ -6429,13 +6429,16 @@ version = "0.1.0"
 dependencies = [
  "audiovae",
  "burn",
+ "crc32fast",
  "minicpm4",
  "rand 0.10.3",
  "rand_distr",
  "regex",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
  "testkit",
+ "voices",
 ]
 
 [[package]]
