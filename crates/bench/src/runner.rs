@@ -6,8 +6,14 @@ use serde_json::Value;
 
 use crate::{
     conditions::{CpuTimes, Quietness, lock},
+    counters::Counters,
     stats::{Summary, duration},
 };
+
+/// The shortest timed stretch whose share of other processes' work is judged: /proc/stat
+/// counts in 10 ms ticks, so over a few milliseconds one tick on one CPU reads as several
+/// CPUs busy.
+const FOREIGN_WINDOW_SECONDS: f64 = 1.0;
 
 /// One benchmark's timings and what they mean.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,8 +29,13 @@ pub struct Measurement {
     pub throughput: Option<Throughput>,
     /// Seconds of compute per second of audio at the median: below 1 is faster than real time.
     pub rtf: Option<f64>,
-    /// CPUs' worth of work other processes did while it was timed.
-    pub foreign_cores: f64,
+    /// CPUs' worth of work other processes did while it was timed, if that took long enough
+    /// to tell.
+    pub foreign_cores: Option<f64>,
+    /// Hardware events per repetition, its untimed setup included, of every thread, by perf's
+    /// names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counters: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,6 +92,7 @@ pub struct Runner {
     warmup: Option<usize>,
     reps: Option<usize>,
     limit: f64,
+    counters: Option<Counters>,
     pub measurements: Vec<Measurement>,
     /// Why the run's timings may not be trusted, if they may not.
     pub noisy: Vec<String>,
@@ -99,6 +111,7 @@ impl Runner {
         filters: Vec<String>,
         counts: Counts,
         limit: f64,
+        counters: Option<Counters>,
     ) -> Self {
         Self {
             device,
@@ -108,6 +121,7 @@ impl Runner {
             warmup: counts.warmup,
             reps: counts.reps,
             limit,
+            counters,
             measurements: Vec::new(),
             noisy: Vec::new(),
         }
@@ -176,6 +190,7 @@ impl Runner {
             drop(out);
         }
         let before = CpuTimes::now();
+        let counted = self.counters.as_ref().map(Counters::read);
         let mut samples = Vec::with_capacity(reps);
         let mut last = None;
         for _ in 0..reps {
@@ -186,9 +201,15 @@ impl Runner {
             samples.push(start.elapsed().as_secs_f64());
             last = Some(out);
         }
-        let foreign_cores = before.foreign_cores(&CpuTimes::now());
+        let counters = match (&self.counters, counted) {
+            (Some(counters), Some(before)) => before.per_rep(&counters.read(), reps),
+            _ => BTreeMap::new(),
+        };
+        let timed: f64 = samples.iter().sum();
+        let foreign_cores =
+            (timed >= FOREIGN_WINDOW_SECONDS).then(|| before.foreign_cores(&CpuTimes::now()));
         let summary = Summary::of(&samples);
-        if foreign_cores > self.limit {
+        if let Some(foreign_cores) = foreign_cores.filter(|&cores| cores > self.limit) {
             self.noisy.push(format!(
                 "{}: other processes kept {foreign_cores:.2} CPUs busy, over {:.2}",
                 spec.name, self.limit
@@ -207,6 +228,7 @@ impl Runner {
             summary,
             throughput,
             foreign_cores,
+            counters,
         };
         eprintln!("bench:   {}", line(&measurement));
         self.measurements.push(measurement);
@@ -271,6 +293,9 @@ pub fn line(m: &Measurement) -> String {
     }
     if let Some(rtf) = m.rtf {
         out += &format!("  RTF {rtf:.3}");
+    }
+    if let Some(instructions) = m.counters.get("instructions") {
+        out += &format!("  {} instr", significant(*instructions));
     }
     out
 }

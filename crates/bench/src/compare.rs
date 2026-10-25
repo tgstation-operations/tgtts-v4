@@ -6,6 +6,11 @@
 //! machine did): the change has to exceed twice the run-to-run spread, the range of the
 //! medians of back-to-back runs of one commit over their median. Twice, because the spread
 //! comes from a few runs and a single pair understates it about as often as it overstates it.
+//!
+//! Instruction counts answer another question: whether the code path changed. Other work on
+//! the machine barely moves them, so a change beyond their own noise is the code's, however
+//! noisy the timings; and an unchanged count with a changed time points at memory, threads or
+//! the machine rather than the code.
 
 use std::collections::BTreeMap;
 
@@ -13,8 +18,16 @@ use serde_json::Value;
 
 use crate::{
     Failure, Run, read_run,
+    runner::Measurement,
     stats::{Summary, duration},
 };
+
+/// The least relative change in instructions per repetition that marks a changed code path.
+/// Single-threaded, two runs of one commit differed by at most 0.023 % on the model
+/// benchmarks, but by 0.55 % on the audio VAE's loads and 2.4 % on the microsecond voice
+/// reads, and a thread pool's spinning moved threaded counts by up to 5.5 %: so a change has to
+/// clear twice the instruction spread of the --spread runs as well, as the timings do.
+const CODE_CHANGE: f64 = 0.005;
 
 pub fn main(args: &[String]) -> Result<(), Failure> {
     let (runs, spread) = match args.iter().position(|a| a == "--spread") {
@@ -42,20 +55,34 @@ pub fn main(args: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The relative range of each benchmark's medians over `runs`, where at least two hold it.
-fn spreads(runs: &[Run]) -> BTreeMap<&str, f64> {
-    let mut medians = BTreeMap::<&str, Vec<f64>>::new();
+/// The relative range of `value` of each benchmark over `runs`, where at least two hold it.
+fn spreads(runs: &[Run], value: impl Fn(&Measurement) -> Option<f64>) -> BTreeMap<&str, f64> {
+    let mut values = BTreeMap::<&str, Vec<f64>>::new();
     for m in runs.iter().flat_map(|run| &run.benchmarks) {
-        medians.entry(&m.name).or_default().push(m.summary.median);
+        if let Some(value) = value(m) {
+            values.entry(&m.name).or_default().push(value);
+        }
     }
-    medians
+    values
         .into_iter()
-        .filter(|(_, medians)| medians.len() >= 2)
-        .map(|(name, medians)| {
-            let summary = Summary::of(&medians);
+        .filter(|(_, values)| values.len() >= 2)
+        .map(|(name, values)| {
+            let summary = Summary::of(&values);
             (name, (summary.max - summary.min) / summary.median)
         })
         .collect()
+}
+
+fn median(m: &Measurement) -> Option<f64> {
+    Some(m.summary.median)
+}
+
+fn instructions(m: &Measurement) -> Option<f64> {
+    m.counters.get("instructions").copied()
+}
+
+fn code_changed(change: f64, spread: Option<f64>) -> bool {
+    change.abs() > CODE_CHANGE.max(2.0 * spread.unwrap_or(0.0))
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,10 +102,11 @@ fn verdict(change: f64, disjoint: bool, spread: Option<f64>) -> Verdict {
 }
 
 fn report(base: &Run, new: &Run, spread_runs: &[Run]) -> String {
-    let spreads = spreads(spread_runs);
+    let instruction_spreads = spreads(spread_runs, instructions);
+    let spreads = spreads(spread_runs, median);
     let mut out = format!(
-        "{:<36} {:>12} {:>12} {:>8} {:>8}  verdict\n",
-        "benchmark", "base", "new", "change", "spread"
+        "{:<36} {:>12} {:>12} {:>8} {:>8} {:>9}  verdict\n",
+        "benchmark", "base", "new", "change", "spread", "instr"
     );
     for b in &base.benchmarks {
         let Some(n) = new.benchmarks.iter().find(|n| n.name == b.name) else {
@@ -95,8 +123,21 @@ fn report(base: &Run, new: &Run, spread_runs: &[Run]) -> String {
             Verdict::WithinNoise if !disjoint => "within noise (IQRs overlap)",
             Verdict::WithinNoise => "within noise (inside 2x spread)",
         };
+        let instr = match (instructions(b), instructions(n)) {
+            (Some(b_count), Some(n_count)) => {
+                let change = n_count / b_count - 1.0;
+                let spread = instruction_spreads.get(b.name.as_str()).copied();
+                let mark = if code_changed(change, spread) {
+                    "!"
+                } else {
+                    " "
+                };
+                format!("{:+.2}%{mark}", change * 100.0)
+            }
+            _ => "-".into(),
+        };
         out += &format!(
-            "{:<36} {:>12} {:>12} {:>+7.1}% {:>8}  {verdict}\n",
+            "{:<36} {:>12} {:>12} {:>+7.1}% {:>8} {instr:>9}  {verdict}\n",
             b.name,
             duration(b_s.median),
             duration(n_s.median),
@@ -111,6 +152,21 @@ fn report(base: &Run, new: &Run, spread_runs: &[Run]) -> String {
     }
     if spreads.is_empty() {
         out += "\nno --spread runs: verdicts rest on the interquartile ranges alone\n";
+    }
+    out += &format!(
+        "instr: instructions per repetition; ! marks a changed code path, a change beyond {:.1}% \
+         and beyond twice the --spread runs' instruction spread\n",
+        CODE_CHANGE * 100.0
+    );
+    let threaded = |run: &Run| {
+        run.conditions
+            .threads
+            .process_threads_at_end
+            .is_some_and(|n| n > 1)
+    };
+    if threaded(base) || threaded(new) {
+        out += "a thread pool ran: its spinning counts as instructions and varies with timing, \
+                so read instr only between runs threaded alike\n";
     }
     for (run, which) in [(base, "base"), (new, "new")] {
         if let Some(first) = run.noisy.first() {
@@ -199,5 +255,13 @@ mod tests {
         assert_eq!(verdict(-0.07, true, Some(0.04)), Verdict::WithinNoise);
         assert_eq!(verdict(-0.50, false, Some(0.01)), Verdict::WithinNoise);
         assert_eq!(verdict(-0.01, true, None), Verdict::Faster);
+    }
+
+    #[test]
+    fn a_code_change_must_clear_the_floor_and_twice_the_count_spread() {
+        assert!(code_changed(-0.006, None));
+        assert!(!code_changed(0.004, None));
+        assert!(!code_changed(0.08, Some(0.05)));
+        assert!(code_changed(0.12, Some(0.05)));
     }
 }

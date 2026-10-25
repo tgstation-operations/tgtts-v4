@@ -8,6 +8,7 @@
 
 mod compare;
 mod conditions;
+mod counters;
 mod runner;
 mod stats;
 mod suite;
@@ -23,7 +24,8 @@ use burn::tensor::{Device, FloatDType};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    conditions::{BENCH_LOCK, Conditions, Quietness, lock},
+    conditions::{BENCH_LOCK, Conditions, CounterSupport, Quietness, lock},
+    counters::Counters,
     runner::{Counts, Measurement, Runner, line},
     suite::{Data, NAMES},
 };
@@ -119,6 +121,12 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<(), Failure> {
+    // Before anything can start a thread, so that the counters follow every thread there is.
+    let (counters, refused) = Counters::open();
+    let support = CounterSupport {
+        recorded: counters.names(),
+        refused,
+    };
     let mut options = Options {
         device: "flex".into(),
         dtype: "f32".into(),
@@ -174,7 +182,16 @@ fn run(args: &[String]) -> Result<(), Failure> {
         }
     };
     let filters = options.filters.clone();
-    let mut runner = Runner::new(device, dtype, NAMES, filters, counts, options.max_load);
+    let counters = (!support.recorded.is_empty()).then_some(counters);
+    let mut runner = Runner::new(
+        device,
+        dtype,
+        NAMES,
+        filters,
+        counts,
+        options.max_load,
+        counters,
+    );
     let dir = |var| {
         env::var_os(var)
             .filter(|v| !v.is_empty())
@@ -205,7 +222,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     }
     eprintln!("bench: {state}");
 
-    let mut conditions = Conditions::before();
+    let mut conditions = Conditions::before(support);
     let started = now();
     suite::run(&mut runner, &data).map_err(Failure::Failed)?;
     conditions.finish();
@@ -305,6 +322,19 @@ pub fn summary(run: &Run) -> String {
         c.loadavg_before,
         c.loadavg_after
     );
+    let counters = &c.counters;
+    if !counters.recorded.is_empty() || !counters.refused.is_empty() {
+        let refused: Vec<String> = counters
+            .refused
+            .iter()
+            .map(|(event, why)| format!("{event} ({why})"))
+            .collect();
+        out += &format!(
+            "counters per repetition: [{}], refused: [{}]\n",
+            counters.recorded.join(", "),
+            refused.join(", ")
+        );
+    }
     if run.noisy.is_empty() {
         out += "quiet throughout\n";
     } else {

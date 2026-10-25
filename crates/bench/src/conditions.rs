@@ -32,6 +32,15 @@ pub struct Conditions {
     pub mem_available_mib_after: Option<u64>,
     /// The process's peak resident set at the end of the run.
     pub peak_rss_mib: Option<u64>,
+    /// The hardware events each benchmark records, and why the others could not be counted.
+    #[serde(default)]
+    pub counters: CounterSupport,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CounterSupport {
+    pub recorded: Vec<String>,
+    pub refused: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,7 +85,7 @@ pub struct Threads {
 impl Conditions {
     /// What can be read before the run; the `after` fields are filled by
     /// [`finish`](Self::finish).
-    pub fn before() -> Self {
+    pub fn before(counters: CounterSupport) -> Self {
         let (commit, dirty, dirty_files) = git();
         Self {
             commit,
@@ -116,6 +125,7 @@ impl Conditions {
             mem_available_mib_before: meminfo_mib("MemAvailable"),
             mem_available_mib_after: None,
             peak_rss_mib: None,
+            counters,
         }
     }
 
