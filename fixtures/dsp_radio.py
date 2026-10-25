@@ -4,12 +4,12 @@ The service's code is restated below as it was, around librosa, scipy and soundf
 segment it decoded the speech into on. The clicks and static are made up, at the rates and
 channels of the real ones (stereo 44.1 kHz, mono 11025 Hz, stereo 8 kHz), and read from WAV
 files as the service read them, and the CRC-32 of each as it matched them to 48 kHz is saved;
-dsp_radio_assets runs it on the real ones. The speech is mono and stereo at 48 kHz, mono at the
-44.1 kHz of the silicon voices, and mono at 8 kHz.
+dsp_radio_assets runs it on the real ones. The speech is mono, stereo and in three channels at
+48 kHz, mono at the 44.1 kHz of the silicon voices, and mono at 8 kHz.
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
-at the 48 kHz it was resampled to, and the clicks and static are matched to 48 kHz, whatever the
-speech's rate was.
+at the 48 kHz it was resampled to, the clicks and static are matched to 48 kHz, whatever the
+speech's rate was, and speech of more than two channels is averaged over them as stereo is.
 """
 
 import io
@@ -42,8 +42,8 @@ assets = None
 def audiosegment_to_numpy(seg):
     samples = np.array(seg.get_array_of_samples())
 
-    if seg.channels == 2:
-        samples = samples.reshape((-1, 2))
+    if seg.channels > 1:
+        samples = samples.reshape((-1, seg.channels))
 
     samples = samples.astype(np.float32) / (1 << (8 * seg.sample_width - 1))
 
@@ -221,6 +221,7 @@ if __name__ == "__main__":
         (voice(0.1, 48000, 2), 48000, 2),
         (voice(0.1, 44100, 1), 44100, 1),
         (voice(0.1, 8000, 1), 8000, 1),
+        (voice(0.05, 48000, 3), 48000, 3),
     ]
     tensors |= run(files, speeches)
     common.Fixture(seed=0).save("dsp", tensors, **provenance())

@@ -1,7 +1,12 @@
 //! The radio effect: speech narrowed to a radio's band, overdriven, with static under it and mic
 //! clicks around it, as the old radio service made it.
 
-use std::{error, f64::consts::PI, fmt};
+use std::{
+    error,
+    f64::consts::PI,
+    fmt,
+    ops::{Add, Div},
+};
 
 use rustfft::num_complex::Complex;
 
@@ -62,16 +67,21 @@ impl Assets {
     }
 }
 
-/// soundfile's float64 of a WAV's samples, averaged over its channels as numpy's `mean` does.
-fn to_mono(clip: &Pcm) -> Vec<f64> {
-    let channels = usize::from(clip.channels.max(1));
-    clip.samples
-        .chunks(channels)
+/// Each frame of `pcm` scaled to [-1, 1) and averaged over its channels in the precision of `T`,
+/// as numpy's `mean` does: the sum of up to 256 channels is exact in either, whatever its order.
+fn to_mono<T>(pcm: &Pcm) -> Vec<T>
+where
+    T: Copy + From<i16> + From<u16> + Add<Output = T> + Div<Output = T>,
+{
+    let channels = pcm.channels.max(1);
+    pcm.samples
+        .chunks_exact(usize::from(channels))
         .map(|frame| {
-            let sum = frame
-                .iter()
-                .fold(0.0, |sum, &s| sum + f64::from(s) / 32768.0);
-            sum / channels as f64
+            let scaled = frame.iter().map(|&s| T::from(s) / T::from(32768u16));
+            let sum = scaled
+                .reduce(|sum, s| sum + s)
+                .expect("a frame has a sample");
+            sum / T::from(channels)
         })
         .collect()
 }
@@ -103,12 +113,9 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-/// `speech` over the radio, as the old radio service made it: resampled to 8 kHz and on to the
-/// service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with static under it, then
-/// between the mic clicks, with 0.1 s of static before the second.
-///
-/// The old service took a frame of two channels as their mean, and the samples of more as they
-/// were interleaved.
+/// `speech` over the radio, as the old radio service made it: its channels averaged, resampled to
+/// 8 kHz and on to the service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with static
+/// under it, then between the mic clicks, with 0.1 s of static before the second.
 pub fn radio(speech: &Pcm, assets: &Assets) -> Result<Segment, Error> {
     let narrowed = narrow(speech)?;
     finish(narrowed, assets)
@@ -117,18 +124,7 @@ pub fn radio(speech: &Pcm, assets: &Assets) -> Result<Segment, Error> {
 /// The radio's processing of the speech, up to the static: float32 through the resampling and
 /// the first normalization, float64 from the filter on, as numpy has it.
 pub(crate) fn narrow(speech: &Pcm) -> Result<Vec<f64>, Error> {
-    let scaled = speech.samples.iter().map(|&s| f32::from(s) / 32768.0);
-    let samples: Vec<f32> = if speech.channels == 2 {
-        let scaled: Vec<f32> = scaled.collect();
-        scaled
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|[l, r]| (l + r) / 2.0)
-            .collect()
-    } else {
-        scaled.collect()
-    };
+    let samples: Vec<f32> = to_mono(speech);
     let x = resample(&samples, f64::from(speech.rate), 8000.0);
     let x = resample(&x, 8000.0, f64::from(RATE));
     let peak = x.iter().fold(None, |m: Option<f32>, v| {

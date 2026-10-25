@@ -78,6 +78,27 @@ fn check(fx: &Tensors, [on, off, noise]: [Pcm; 3]) {
     }
 }
 
+#[test]
+fn averages_any_number_of_channels() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_radio"));
+    let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
+    let assets = Assets::new(&on, &off, &noise);
+    let mono = Pcm {
+        rate: 48000,
+        channels: 1,
+        samples: fx.pcm("0/input"),
+    };
+    let tripled = Pcm {
+        channels: 3,
+        samples: mono.samples.iter().flat_map(|&s| [s; 3]).collect(),
+        ..mono.clone()
+    };
+    assert_eq!(
+        radio::radio(&tripled, &assets),
+        radio::radio(&mono, &assets)
+    );
+}
+
 /// Making the golden needs the real assets, so a run of every generator leaves it as it is: this
 /// refuses one that such a run has left behind.
 #[test]
