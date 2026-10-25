@@ -5,6 +5,7 @@ pkgs.writeShellApplication {
     pkgs.findutils
     pkgs.git
     pkgs.nixfmt
+    pkgs.ruff
     rustToolchain
   ];
   text = ''
@@ -22,6 +23,7 @@ pkgs.writeShellApplication {
     status=0
     cargo fmt --all -- "''${check[@]}" || status=1
     git ls-files -z '*.nix' | xargs -0 -r nixfmt "''${check[@]}" || status=1
+    git ls-files -z '*.py' | xargs -0 -r ruff format --no-cache "''${check[@]}" || status=1
     exit "$status"
   '';
 }
