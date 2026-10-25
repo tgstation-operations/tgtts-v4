@@ -11,7 +11,7 @@ dsp = { path = "../dsp" }
 rand = { workspace = true, features = ["thread_rng"] }
 # The SQLite built in, so the binary needs no library at run time.
 rusqlite = { workspace = true, features = ["bundled"] }
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
