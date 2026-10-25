@@ -115,23 +115,39 @@ fn merge(mut spans: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
 /// `speech` over the radio as [`radio::radio`] makes it, but ducked under static over `spans`,
 /// in seconds, as the old radio-gibberish service made it: the speech faded out over 25 ms from
 /// 60 ms before each span and back in over 50 ms to 80 ms after it, with the static, at 0.85,
-/// faded in and out alike. Spans are cut to the speech.
+/// faded in and out alike. Spans are cut to the speech, and those whose margins overlap are
+/// ducked as one.
 pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Segment {
     let ducked = duck(&narrow(speech), spans, assets.noise());
     radio::finish(ducked, assets)
 }
 
-/// The old service's `apply_corruption_static` with `build_static_mask`, at its settings.
+/// The old service's `apply_corruption_static` with `build_static_mask`, at its settings, but
+/// over the spans as one where their margins overlap: the old service faded each span in turn,
+/// so a span's fade in brought the speech back over the end of the last.
 fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Vec<f64> {
     let total = speech.len();
     let rate = f64::from(RATE);
     let ms = |ms: u32| (f64::from(ms * RATE) / 1000.0) as i64;
     let (pre, post, fade) = (ms(60), ms(80), ms(25));
+    let mut windows: Vec<(i64, i64)> = spans
+        .iter()
+        .map(|&(start, end)| {
+            let e = ((end * rate) as i64 + post).clamp(0, total as i64);
+            (((start * rate) as i64 - pre).clamp(0, e), e)
+        })
+        .collect();
+    windows.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (s, e) in windows {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
     let mut envelope = vec![1.0; total];
     let mut mask = vec![0.0; total];
-    for &(start, end) in spans {
-        let e = ((end * rate) as i64 + post).clamp(0, total as i64);
-        let s = ((start * rate) as i64 - pre).clamp(0, e);
+    for (s, e) in merged {
         let half = (e - s) / 2;
         let (s, e) = (s as usize, e as usize);
         let (fade_in, fade_out) = (fade.min(half) as usize, (fade * 2).min(half) as usize);

@@ -6,8 +6,9 @@ random recorded. The letters' times are made up, as are the speech and the click
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
 and ducked at the 48 kHz it was resampled to, the static loops under speech longer than it, and
-the static after the speech goes on from where the static under it left off, and a span starting
-past the speech's end is cut to nothing where numpy could not fade it.
+the static after the speech goes on from where the static under it left off, a span starting past
+the speech's end is cut to nothing where numpy could not fade it, and spans whose margins overlap
+are ducked as one.
 """
 
 import json
@@ -103,6 +104,24 @@ def merge_spans(spans, gap_threshold=0.05):
     return merged
 
 
+def windows(spans, total, sr, pre_ms, post_ms):
+    """The spans in samples, widened by their margins, cut to the speech and merged where they
+    meet, as the port ducks them."""
+    pre = int(pre_ms * sr / 1000)
+    post = int(post_ms * sr / 1000)
+    widened = []
+    for start_sec, end_sec in spans:
+        e = min(total, int(end_sec * sr) + post)
+        widened.append((min(max(0, int(start_sec * sr) - pre), e), e))
+    merged = []
+    for s, e in sorted(widened):
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 def apply_corruption_static(
     speech_audio,
     corrupted_spans,
@@ -117,14 +136,9 @@ def apply_corruption_static(
     total = len(speech_audio)
     duck_envelope = np.ones(total)
 
-    pre = int(pre_mask_ms * sr / 1000)
-    post = int(post_mask_ms * sr / 1000)
     fade = int(fade_ms * sr / 1000)
 
-    for start_sec, end_sec in corrupted_spans:
-        e = min(total, int(end_sec * sr) + post)
-        s = min(max(0, int(start_sec * sr) - pre), e)
-
+    for s, e in windows(corrupted_spans, total, sr, pre_mask_ms, post_mask_ms):
         duck_envelope[s:e] = duck_gain
 
         # Fade in (speech -> ducked)
@@ -159,16 +173,11 @@ def build_static_mask(
     fade_ms=25,
     static_gain=0.8,
 ):
-    pre = int(pre_ms * sr / 1000)
-    post = int(post_ms * sr / 1000)
     fade = int(fade_ms * sr / 1000)
 
     mask_envelope = np.zeros(total_samples)
 
-    for start_sec, end_sec in corrupted_spans:
-        e = min(total_samples, int(end_sec * sr) + post)
-        s = min(max(0, int(start_sec * sr) - pre), e)
-
+    for s, e in windows(corrupted_spans, total_samples, sr, pre_ms, post_ms):
         mask_envelope[s:e] = 1.0
 
         fade_in_len = min(fade, (e - s) // 2)

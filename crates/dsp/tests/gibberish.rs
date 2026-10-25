@@ -114,6 +114,18 @@ fn ducks_as_the_old_service() {
 }
 
 #[test]
+fn spans_whose_margins_overlap_duck_as_one() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_gibberish"));
+    let (assets, speech) = (assets(&fx), speech(&fx, "radio/0"));
+    // The first span's 80 ms after it meets the second's 60 ms before it.
+    let apart = [(0.02, 0.05), (0.13, 0.16)];
+    assert_eq!(
+        gibberish::gibberish(&speech, &assets, &apart),
+        gibberish::gibberish(&speech, &assets, &[(0.02, 0.16)])
+    );
+}
+
+#[test]
 fn spans_past_the_speech_duck_nothing() {
     let fx = Tensors::new(&testkit::fixture!("dsp_gibberish"));
     let (assets, speech) = (assets(&fx), speech(&fx, "radio/2"));
