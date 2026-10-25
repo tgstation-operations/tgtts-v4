@@ -5,13 +5,14 @@ segment it decoded the speech into on. The clicks and static are made up, at the
 channels of the real ones (stereo 44.1 kHz, mono 11025 Hz, stereo 8 kHz), and read from WAV
 files as the service read them, and the CRC-32 of each as it matched them to 48 kHz is saved;
 dsp_radio_assets runs it on the real ones. The speech is mono, stereo and in three channels at
-48 kHz, mono at the 44.1 kHz of the silicon voices, and mono at 8 kHz.
+48 kHz, mono at the 44.1 kHz of the silicon voices, mono at 8 kHz, and none at all.
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
 at the 48 kHz it was resampled to, the clicks and static are matched to 48 kHz, whatever the
 speech's rate was, speech of more than two channels is averaged over them as stereo is, the
-static loops under speech longer than it, and the static after the speech goes on from where the
-static under it left off.
+static loops under speech longer than it, the static after the speech goes on from where the
+static under it left off, and speech of no samples is put between the clicks as any other, where
+numpy could not take its peak.
 """
 
 import io
@@ -73,7 +74,7 @@ def saturate(x, drive=2.5):
 
 
 def normalize(x, peak=0.8):
-    m = np.max(np.abs(x))
+    m = np.max(np.abs(x), initial=0)
     if m > 0:
         x = x / m * peak
     return x
@@ -135,7 +136,8 @@ def wav(samples, rate, channels):
 
 
 def pcm(x):
-    return torch.from_numpy(x.astype(np.float32))
+    # torch.from_numpy gives an empty array a stride of 0, which safetensors cannot view as bytes.
+    return torch.from_numpy(x.astype(np.float32)) if x.size else torch.zeros(0)
 
 
 def f64(x):
@@ -221,6 +223,7 @@ if __name__ == "__main__":
         (voice(0.1, 44100, 1), 44100, 1),
         (voice(0.1, 8000, 1), 8000, 1),
         (voice(0.05, 48000, 3), 48000, 3),
+        (np.zeros(0, dtype=np.int16), 48000, 1),
     ]
     tensors |= run(files, speeches)
     common.Fixture(seed=0).save("dsp", tensors, **provenance())

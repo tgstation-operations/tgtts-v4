@@ -557,11 +557,7 @@ fn dsp(r: &mut Runner, data: &Data) -> Result<(), String> {
         let assets = r.measure(spec, || (), |()| match_assets());
         let assets = assets.unwrap_or_else(match_assets);
         let spec = Spec::new("dsp.radio", 2, 20).audio(seconds);
-        r.measure(
-            spec,
-            || (),
-            |()| dsp::radio::radio(&speech, &assets).expect("speech shorter than the static"),
-        );
+        r.measure(spec, || (), |()| dsp::radio::radio(&speech, &assets));
         let spec = Spec::new("dsp.gibberish", 2, 20)
             .audio(seconds)
             .param("spans", GIBBERISH_SPANS.len());

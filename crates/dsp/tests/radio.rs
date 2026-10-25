@@ -59,7 +59,7 @@ fn check(fx: &Tensors, [on, off, noise]: [Pcm; 3]) {
             channels: fx.int(&format!("{name}/channels")) as u16,
             samples: fx.pcm(&format!("{name}/input")),
         };
-        let actual = radio::radio(&speech, &assets).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let actual = radio::radio(&speech, &assets);
         assert_eq!(actual.rate, 48000);
         let expected = fx.pcm(&format!("{name}/output"));
         assert_pcm_close(
@@ -104,10 +104,31 @@ fn loops_the_static_under_speech_longer_than_it() {
         samples: fx.pcm("0/input").repeat(8),
     };
     assert!(speech.samples.len() > assets.noise().len());
-    let radio = radio::radio(&speech, &assets).unwrap();
+    let radio = radio::radio(&speech, &assets);
     let tail = 4800;
     let around = assets.click_on().len() + tail + assets.click_off().len();
     assert_eq!(radio.samples.len(), around + speech.samples.len());
+}
+
+/// The radio of `len` samples of silence at 48 kHz, which narrowing leaves silent: the static at
+/// 0.2 under it and on for 0.1 s after, between the clicks.
+fn around_silence(assets: &Assets, len: usize) -> Vec<i16> {
+    let noise = assets.noise();
+    let mut expected = assets.click_on().to_vec();
+    expected.extend(noise[..len].iter().map(|n| n * 0.2));
+    expected.extend(&noise[len..len + 4800]);
+    expected.extend(assets.click_off());
+    let peak = expected.iter().fold(0f64, |m, v| m.max(v.abs()));
+    let expected: Vec<f64> = expected.iter().map(|v| v / peak * 0.9).collect();
+    to_pcm(&expected)
+}
+
+fn silence(len: usize) -> Pcm {
+    Pcm {
+        rate: 48000,
+        channels: 1,
+        samples: vec![0; len],
+    }
 }
 
 #[test]
@@ -115,20 +136,17 @@ fn the_static_goes_on_after_the_speech() {
     let fx = Tensors::new(&testkit::fixture!("dsp_radio"));
     let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
     let assets = Assets::new(&on, &off, &noise);
-    let silence = Pcm {
-        rate: 48000,
-        channels: 1,
-        samples: vec![0; 2400],
-    };
-    let noise = assets.noise();
-    let mut expected = assets.click_on().to_vec();
-    expected.extend(noise[..2400].iter().map(|n| n * 0.2));
-    expected.extend(&noise[2400..2400 + 4800]);
-    expected.extend(assets.click_off());
-    let peak = expected.iter().fold(0f64, |m, v| m.max(v.abs()));
-    let expected: Vec<f64> = expected.iter().map(|v| v / peak * 0.9).collect();
-    let radio = radio::radio(&silence, &assets).unwrap();
-    assert_eq!(radio.samples, to_pcm(&expected));
+    let radio = radio::radio(&silence(2400), &assets);
+    assert_eq!(radio.samples, around_silence(&assets, 2400));
+}
+
+#[test]
+fn puts_the_radio_around_no_speech() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_radio"));
+    let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
+    let assets = Assets::new(&on, &off, &noise);
+    let radio = radio::radio(&silence(0), &assets);
+    assert_eq!(radio.samples, around_silence(&assets, 0));
 }
 
 /// Making the golden needs the real assets, so a run of every generator leaves it as it is: this

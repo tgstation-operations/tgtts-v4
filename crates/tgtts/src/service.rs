@@ -627,8 +627,7 @@ impl Service {
         })
     }
 
-    /// What `source` handed over for the request's identifier, over the radio. Where the radio
-    /// effect fails, the audio is served without it, since failing would drop the whole message.
+    /// What `source` handed over for the request's identifier, over the radio.
     async fn radio(
         self: &Arc<Self>,
         source: Source,
@@ -647,20 +646,14 @@ impl Service {
                 "what was to go on the radio failed",
             ),
         })?;
-        let (service, input) = (self.clone(), audio.clone());
+        let (service, input) = (self.clone(), audio);
         let radio = self
             .cpu(trace, move || {
                 let pcm = input.to_pcm();
                 radio::radio(&pcm, &service.sounds.radio(pcm.rate))
             })
             .await?;
-        let audio = match radio {
-            Ok(radio) => Arc::new(Audio::from_segment(&radio)),
-            Err(e) => {
-                error!(identifier = %params.identifier, "radio effect failed, serving the audio without it: {e}");
-                audio
-            }
-        };
+        let audio = Arc::new(Audio::from_segment(&radio));
         let ogg = self.run_ffmpeg(trace, self.ffmpeg.encode(&audio)).await?;
         Ok(Served {
             ogg,

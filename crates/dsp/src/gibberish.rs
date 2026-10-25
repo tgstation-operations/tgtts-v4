@@ -117,9 +117,8 @@ fn merge(mut spans: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
 /// 60 ms before each span and back in over 50 ms to 80 ms after it, with the static, at 0.85,
 /// faded in and out alike.
 pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Result<Segment, Error> {
-    let narrowed = narrow(speech)?;
-    let ducked = duck(&narrowed, spans, assets.noise())?;
-    radio::finish(ducked, assets)
+    let ducked = duck(&narrow(speech), spans, assets.noise())?;
+    Ok(radio::finish(ducked, assets))
 }
 
 /// The old service's `apply_corruption_static` with `build_static_mask`, at its settings.
