@@ -20,6 +20,9 @@ struct Precision {
     dtypes: Dtypes,
     /// A patch sampled after upstream's before it.
     patch: f32,
+    /// The steps whose patches are held only to being finite: those whose patches a change in
+    /// what conditions them moves furthest.
+    amplified: &'static [usize],
     /// The stop head's logits.
     stop_logits: f32,
     /// How many patches past upstream's last generation run free may go on for.
@@ -39,19 +42,24 @@ const F32: Precision = Precision {
         audio_decoder: FloatDType::F32,
     },
     patch: 1e-2,
+    amplified: &[],
     stop_logits: 1e-4,
     stops_late: 0,
     audio: 1e-4,
 };
 
 // f16 but for the audio decoder (tests/audiovae.rs says why). Autotune picks kernels by timing
-// them in each process, so how they round differs from one process to the next. Over twelve
-// processes, given upstream's patches, each came within 6.3e-2 of upstream's but the two whose
-// quantizer levels sit nearest a boundary, the fifteenth (the CPU's test tells of it) at 5.2e-1
-// and the eighteenth at 2.0e-1, and the stop logits within 1.0e-1; the first two patches decoded
-// within 6.3e-4 of upstream's audio. The dtypes the Python service ran in, bf16 for the LMs and
-// the DiT and f16 for the decoder, came on the CPU within 2.0e-1 but the fifteenth at 1.2,
-// 1.6e-1 and 1.6e-3.
+// them in each process, so how they round differs from one process to the next, and against our
+// f32 on the same inputs 1 to 9 of the scalar quantizer's 512 levels round apart at every step.
+// What that does to a patch depends on the step: in f32 one level over the prompt lies 1.7e-6
+// from a boundary and rounds either way from process to process, which moves the fifteenth and
+// eighteenth patches by up to 1.1e-3 and 2.3e-3 and the others by at most 5.0e-4. Over 22
+// processes, given upstream's patches, those two came within 5.2e-1 and 2.0e-1 of upstream's,
+// with nothing to bound how far other levels rounding apart would take them, and the others
+// within 7.3e-2; the stop logits came within 1.0e-1, and the first two patches decoded within
+// 6.3e-4 of upstream's audio. The dtypes the Python service ran in, bf16 for the LMs and the DiT
+// and f16 for the decoder, came on the CPU within 2.0e-1 but the fifteenth at 1.2, 1.6e-1 and
+// 1.6e-3.
 //
 // Run free, the stop logits drift with the patches, up to 3.5e-1 from upstream's at its last
 // patch over ten processes, where upstream's margin for stopping is 0.070: one of the ten went
@@ -64,7 +72,8 @@ const SERVED: Precision = Precision {
         local_dit: FloatDType::F16,
         audio_decoder: FloatDType::F32,
     },
-    patch: 8e-1,
+    patch: 2e-1,
+    amplified: &[14, 17],
     stop_logits: 2e-1,
     stops_late: 1,
     audio: 2e-3,
@@ -146,7 +155,12 @@ fn generates_as_upstream(precision: &Precision) {
         if decided(i) {
             assert_eq!(step.stops(), i == steps - 1, "patch {i}");
         }
-        assert_close(step.patch, at(&patches, i), precision.patch, 0.0);
+        if precision.amplified.contains(&i) {
+            let patch: Vec<f32> = step.patch.into_data().iter().collect();
+            assert!(patch.iter().all(|x| x.is_finite()), "patch {i}");
+        } else {
+            assert_close(step.patch, at(&patches, i), precision.patch, 0.0);
+        }
         let stop_logits = step.stop_logits.cast(FloatDType::F32);
         assert_close(
             stop_logits,
