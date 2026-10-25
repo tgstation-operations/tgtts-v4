@@ -13,7 +13,7 @@ use common::fixture;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir};
 use voices::Latent;
-use voxcpm::{Dtypes, Params, TextToSpeech};
+use voxcpm::{Dtypes, Noise, Params, SeededNoise, TextToSpeech};
 
 /// How far what generation gives in some dtypes may be from upstream's in f32.
 struct Precision {
@@ -22,13 +22,15 @@ struct Precision {
     patch: f32,
     /// The stop head's logits.
     stop_logits: f32,
+    /// How many patches past upstream's last generation run free may go on for.
+    stops_late: usize,
     /// The audio of the first two patches.
     audio: f32,
 }
 
 // As on the CPU, whose test says why: given upstream's patches, each patch came within 2.3e-3
-// of upstream's and the stop logits within 3.8e-6, and the first two patches decoded within
-// 1.1e-5 of its audio.
+// of upstream's and the stop logits within 3.8e-6, where upstream's last margin for stopping is
+// 0.070, and the first two patches decoded within 1.1e-5 of its audio.
 const F32: Precision = Precision {
     dtypes: Dtypes {
         lm: FloatDType::F32,
@@ -38,15 +40,23 @@ const F32: Precision = Precision {
     },
     patch: 1e-2,
     stop_logits: 1e-4,
+    stops_late: 0,
     audio: 1e-4,
 };
 
-// f16 but for the audio decoder (tests/audiovae.rs says why). Over two runs, given upstream's
-// patches, each came within 4.0e-2 of upstream's but the two whose quantizer levels sit nearest a
-// boundary, the fifteenth (the CPU's test tells of it) at 3.8e-1 and the eighteenth at 1.9e-1,
-// and the stop logits within 8.1e-2; the first two patches decoded within 6.3e-4 of upstream's
-// audio. The dtypes the Python service ran in, bf16 for the LMs and the DiT and f16 for the
-// decoder, came on the CPU within 2.0e-1 but the fifteenth at 1.2, 1.6e-1 and 1.6e-3.
+// f16 but for the audio decoder (tests/audiovae.rs says why). Autotune picks kernels by timing
+// them in each process, so how they round differs from one process to the next. Over twelve
+// processes, given upstream's patches, each came within 6.3e-2 of upstream's but the two whose
+// quantizer levels sit nearest a boundary, the fifteenth (the CPU's test tells of it) at 5.2e-1
+// and the eighteenth at 2.0e-1, and the stop logits within 1.0e-1; the first two patches decoded
+// within 6.3e-4 of upstream's audio. The dtypes the Python service ran in, bf16 for the LMs and
+// the DiT and f16 for the decoder, came on the CPU within 2.0e-1 but the fifteenth at 1.2,
+// 1.6e-1 and 1.6e-3.
+//
+// Run free, the stop logits drift with the patches, up to 3.5e-1 from upstream's at its last
+// patch over ten processes, where upstream's margin for stopping is 0.070: one of the ten went
+// on a patch longer. A patch before, upstream's margin is -6.5, and given upstream's patches the
+// margin a patch after is +3.2, so generation stops at upstream's last patch or the next.
 const SERVED: Precision = Precision {
     dtypes: Dtypes {
         lm: FloatDType::F16,
@@ -56,8 +66,36 @@ const SERVED: Precision = Precision {
     },
     patch: 8e-1,
     stop_logits: 2e-1,
+    stops_late: 1,
     audio: 2e-3,
 };
+
+/// Upstream's noise, then seeded noise for any patch after upstream's last.
+struct Extended {
+    upstream: Recorded,
+    left: usize,
+    after: SeededNoise,
+}
+
+impl Extended {
+    fn new(noise: Tensor<3>) -> Self {
+        Self {
+            left: noise.dims()[0],
+            upstream: Recorded::new(noise),
+            after: SeededNoise::new(0),
+        }
+    }
+}
+
+impl Noise for Extended {
+    fn next(&mut self, len: usize) -> Vec<f32> {
+        if self.left == 0 {
+            return self.after.next(len);
+        }
+        self.left -= 1;
+        self.upstream.next(len)
+    }
+}
 
 fn golden() -> Fixture {
     fixture("voxcpm", "voxcpm_checkpoint")
@@ -95,11 +133,19 @@ fn generates_as_upstream(precision: &Precision) {
     let logits = golden.tensor::<2>("output.stop_logits", &device);
     let steps = patches.dims()[0];
     let at = |tensor: &Tensor<3>, i| tensor.clone().narrow(0, i, 1);
+    // Logits each within `stop_logits` of upstream's move the margin between going on and
+    // stopping by up to twice that, so the decision is checked where upstream's is wider.
+    let decided = |i| {
+        let upstream: Vec<f32> = logits.clone().narrow(0, i, 1).into_data().iter().collect();
+        (upstream[1] - upstream[0]).abs() > 2.0 * precision.stop_logits
+    };
 
     let mut generation = model.start(&prompt, steps).unwrap();
     for i in 0..steps {
         let step = generation.sample(at(&noise, i), &params.sampling);
-        assert_eq!(step.stops(), i == steps - 1, "patch {i}");
+        if decided(i) {
+            assert_eq!(step.stops(), i == steps - 1, "patch {i}");
+        }
         assert_close(step.patch, at(&patches, i), precision.patch, 0.0);
         let stop_logits = step.stop_logits.cast(FloatDType::F32);
         assert_close(
@@ -111,29 +157,41 @@ fn generates_as_upstream(precision: &Precision) {
         generation.advance(at(&patches, i));
     }
 
+    let stops = steps..=steps + precision.stops_late;
     let mut generation = model.start(&prompt, params.max_patches).unwrap();
+    let mut free = Extended::new(noise.clone());
     let mut stopped = None;
-    for i in 0..steps {
-        let step = generation.sample(at(&noise, i), &params.sampling);
+    for i in 0..*stops.end() {
+        let step = generation.sample(model.noise(&mut free), &params.sampling);
         if step.stops() {
-            stopped = Some(i);
+            stopped = Some(i + 1);
             break;
         }
         generation.advance(step.patch);
     }
-    assert_eq!(
-        stopped,
-        Some(steps - 1),
-        "stopped after another patch than upstream"
+    assert!(
+        stopped.is_some_and(|patches| stops.contains(&patches)),
+        "stopped after {stopped:?} patches, not {stops:?}"
     );
 
     let audio = tts
-        .synthesize(text, &voice, &params, &mut Recorded::new(noise))
+        .synthesize(text, &voice, &params, &mut Extended::new(noise))
         .unwrap();
     let samples: usize = golden.metadata()["audio_samples"].parse().unwrap();
-    assert_eq!(audio.len(), samples);
+    let per_patch = samples / steps;
+    assert_eq!(audio.len() % per_patch, 0, "{} samples", audio.len());
+    let spoken = audio.len() / per_patch;
+    assert!(stops.contains(&spoken), "spoke {spoken} patches");
+    assert!(audio.iter().all(|x| x.is_finite()));
     let start = golden.tensor::<1>("output.audio.start", &device);
-    let audio = Tensor::<1>::from_floats(&audio[..start.dims()[0]], &device);
+    let kept = start.dims()[0];
+    // Upstream's last two patches, where its speech trails off, still reach 1.2e-2.
+    let peak = audio[kept..].iter().fold(0f32, |peak, x| peak.max(x.abs()));
+    assert!(
+        peak > 1e-3,
+        "silent after the first two patches, at a peak of {peak}"
+    );
+    let audio = Tensor::<1>::from_floats(&audio[..kept], &device);
     assert_close(audio, start, precision.audio, 0.0);
 }
 
