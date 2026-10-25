@@ -14,9 +14,9 @@ rand_distr.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+voices = { path = "../voices" }
 
 [dev-dependencies]
 crc32fast.workspace = true
 safetensors.workspace = true
 testkit = { path = "../testkit" }
-voices = { path = "../voices" }

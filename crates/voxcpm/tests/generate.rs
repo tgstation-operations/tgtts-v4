@@ -2,15 +2,20 @@ mod common;
 
 use std::collections::VecDeque;
 
-use burn::tensor::{FloatDType, Tensor};
+use audiovae::{Decoder, Weights};
+use burn::{
+    store::SafetensorsStore,
+    tensor::{FloatDType, Tensor},
+};
 use common::tiny;
 use testkit::{Fixture, assert_close, device, fixture};
-use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise};
+use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, decode};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
     local_encoder: FloatDType::F32,
     local_dit: FloatDType::F32,
+    audio_decoder: FloatDType::F32,
 };
 
 /// Upstream's noise, patch by patch.
@@ -155,4 +160,18 @@ fn seeded_noise_is_standard_normal_and_repeats_for_a_seed() {
     // Three and four and a half standard errors of 4096 draws.
     assert!(mean.abs() < 0.05, "mean {mean}");
     assert!((variance - 1.0).abs() < 0.1, "variance {variance}");
+}
+
+#[test]
+fn decodes_after_the_voices_last_frames_as_upstream() {
+    let (fixture, device) = (fixture!("voxcpm_generate"), device());
+    let weights = Weights::from_store(&mut SafetensorsStore::from_file(fixture.path())).unwrap();
+    let decoder = Decoder::load(&tiny().audio_vae(), &weights, FloatDType::F32, &device).unwrap();
+    let voice = floats(fixture.tensor::<2>("input.voice", &device));
+    let audio = decode(&decoder, &voice, fixture.tensor("output.patches", &device));
+    let audio = Tensor::<1>::from_floats(audio.as_slice(), &device);
+    // f32 here and in upstream, summing in other orders: this audio, within (-0.64, 0.64), came
+    // within 1.5e-7 of upstream's.
+    let expected = fixture.tensor::<1>("output.audio", &device);
+    assert_close(audio, expected, 1e-6, 0.0);
 }

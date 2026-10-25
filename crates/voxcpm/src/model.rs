@@ -16,6 +16,8 @@ pub struct Dtypes {
     pub lm: FloatDType,
     pub local_encoder: FloatDType,
     pub local_dit: FloatDType,
+    /// The audio VAE's decoder, which [`TextToSpeech`](crate::TextToSpeech) loads beside the model.
+    pub audio_decoder: FloatDType,
 }
 
 /// VoxCPM2 short of its audio VAE: from a prompt of text and audio latents to the latents that

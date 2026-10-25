@@ -12,10 +12,11 @@ mod local_encoder;
 mod model;
 mod noise;
 mod prompt;
+mod speech;
 mod tokenizer;
 mod weights;
 
-use std::fmt;
+use std::{fmt, io, path::PathBuf};
 
 use burn::store::SafetensorsStoreError;
 
@@ -27,12 +28,15 @@ pub use crate::{
     model::{Dtypes, Generation, Model, Step},
     noise::{Noise, SeededNoise},
     prompt::Prompt,
+    speech::{Params, TextToSpeech, decode},
     tokenizer::Tokenizer,
 };
 
 /// Why a model could not be loaded, or a request served.
 #[derive(Debug)]
 pub enum Error {
+    /// A file of the checkpoint could not be read.
+    Io(PathBuf, io::Error),
     /// `config.json` is not a config upstream would read.
     Config(serde_json::Error),
     /// The config asks for something this crate does not implement.
@@ -41,6 +45,8 @@ pub enum Error {
     Stack(minicpm4::Error),
     /// The weights around the stacks could not be read, or do not fit the config.
     Load(SafetensorsStoreError),
+    /// The audio VAE could not be loaded.
+    AudioVae(audiovae::Error),
     /// `tokenizer.json` is not one this crate implements.
     Tokenizer(String),
     /// A request the model cannot serve.
@@ -50,10 +56,12 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Io(path, e) => write!(f, "{}: {e}", path.display()),
             Self::Config(e) => write!(f, "VoxCPM2 config: {e}"),
             Self::Unsupported(what) => write!(f, "unsupported VoxCPM2 config: {what}"),
             Self::Stack(e) => write!(f, "{e}"),
             Self::Load(e) => write!(f, "loading VoxCPM2 weights: {e}"),
+            Self::AudioVae(e) => write!(f, "{e}"),
             Self::Tokenizer(what) => write!(f, "tokenizer.json: {what}"),
             Self::Request(what) => write!(f, "cannot generate from {what}"),
         }
