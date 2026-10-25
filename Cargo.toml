@@ -9,3 +9,5 @@ version = "0.1.0"
 
 # Shared dependency versions, inherited by members. No entry without a consumer.
 [workspace.dependencies]
+burn = { version = "0.22.1", default-features = false }
+safetensors = "0.8.0"

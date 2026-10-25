@@ -1,0 +1,10 @@
+[package]
+name = "testkit"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+burn = { workspace = true, features = ["flex"] }
+safetensors.workspace = true
