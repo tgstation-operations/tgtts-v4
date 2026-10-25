@@ -54,7 +54,8 @@ class Fixture:
         torch.set_num_threads(1)
         torch.use_deterministic_algorithms(True)
 
-    def save(self, crate, tensors):
+    def save(self, crate, tensors, **provenance):
+        """Write the fixture; provenance adds string metadata on what else it was made from."""
         name = Path(sys.modules["__main__"].__file__).stem
         crate_dir = ROOT / "crates" / crate
         if not (crate_dir / "Cargo.toml").is_file():
@@ -65,6 +66,7 @@ class Fixture:
             "seed": str(self.seed),
             "torch": torch.__version__,
             "upstream": f"OpenBMB/VoxCPM@{REVISION}",
+            **provenance,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(serialize(tensors, metadata))

@@ -245,6 +245,7 @@ name = "audiovae"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "crc32fast",
  "serde",
  "serde_json",
  "testkit",
