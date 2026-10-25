@@ -30,6 +30,9 @@ pkgs.mkShell {
     # Otherwise coreutils' fmt, the paragraph reflower, can shadow ours and
     # sit reading stdin.
     export PATH="${pkgs.lib.makeBinPath (builtins.attrValues scripts)}:$PATH"
+    # wgpu opens the Vulkan loader at run time, which NixOS does not put on the
+    # library path; the loader finds the drivers under /run/opengl-driver.
+    export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
     git config core.hooksPath .githooks 2>/dev/null || true
   '';
