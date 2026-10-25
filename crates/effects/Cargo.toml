@@ -1,0 +1,14 @@
+[package]
+name = "effects"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+dsp = { path = "../dsp" }
+rustfft.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
