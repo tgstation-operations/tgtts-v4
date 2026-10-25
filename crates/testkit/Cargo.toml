@@ -6,5 +6,7 @@ version.workspace = true
 publish = false
 
 [dependencies]
-burn = { workspace = true, features = ["flex"] }
+# Every model crate takes this crate as a dev-dependency, so test builds get burn's threads
+# through it, and the bench and the service keep the workspace's features.
+burn = { workspace = true, features = ["flex", "rayon"] }
 safetensors.workspace = true
