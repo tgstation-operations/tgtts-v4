@@ -14,7 +14,12 @@ mod weights;
 
 use std::fmt;
 
-pub use crate::{config::AudioVaeConfig, decoder::Decoder, encoder::Encoder, weights::Weights};
+pub use crate::{
+    config::AudioVaeConfig,
+    decoder::{DecodeStream, Decoder},
+    encoder::Encoder,
+    weights::Weights,
+};
 
 /// Why a decoder or an encoder could not be built or loaded.
 #[derive(Debug)]

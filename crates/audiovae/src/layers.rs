@@ -1,10 +1,16 @@
+use std::vec;
+
 use burn::{
     module::{Initializer, Module, Param},
     nn::{
         Embedding, EmbeddingConfig, PaddingConfig1d, Tanh,
         conv::{Conv1d, Conv1dConfig},
     },
-    tensor::{Device, Int, Tensor, module::conv_transpose1d, ops::ConvTransposeOptions},
+    tensor::{
+        Device, Int, Tensor,
+        module::{conv_transpose1d, conv1d},
+        ops::{ConvOptions, ConvTransposeOptions, PadMode},
+    },
 };
 
 use crate::{decoder::DecoderBlock, encoder::EncoderBlock};
@@ -34,10 +40,76 @@ impl Layer {
             Self::Tanh(tanh) => tanh.forward(x),
         }
     }
+
+    /// As `forward`, over the next chunk of a sequence whose earlier chunks went through
+    /// `carry`.
+    pub(crate) fn push(&self, x: Tensor<3>, carry: &mut Carry) -> Tensor<3> {
+        match self {
+            Self::Conv(conv) => push_conv(conv, x, carry),
+            Self::ConvTranspose(conv) => conv.push(x, carry),
+            Self::Residual(unit) => unit.push(x, carry),
+            Self::DecoderBlock(block) => block.push(x, carry),
+            Self::EncoderBlock(_) => unreachable!("the encoder is not streamed"),
+            Self::Snake(_) | Self::Tanh(_) => self.forward(x),
+        }
+    }
 }
 
 pub(crate) fn sequential(layers: &[Layer], x: Tensor<3>) -> Tensor<3> {
     layers.iter().fold(x, |x, layer| layer.forward(x))
+}
+
+pub(crate) fn sequential_push(layers: &[Layer], x: Tensor<3>, carry: &mut Carry) -> Tensor<3> {
+    layers.iter().fold(x, |x, layer| layer.push(x, carry))
+}
+
+/// What the layers that reach back across a chunk boundary carry from one chunk to the next:
+/// each one's last inputs, in the order the layers run.
+#[derive(Debug)]
+pub(crate) struct Carry {
+    last: vec::IntoIter<Tensor<3>>,
+    next: Vec<Tensor<3>>,
+}
+
+impl Carry {
+    /// The carry out of the chunk before, `kept` as [`into_kept`](Self::into_kept) gave it, or
+    /// nothing before the first.
+    pub(crate) fn new(kept: Vec<Tensor<3>>) -> Self {
+        Self {
+            last: kept.into_iter(),
+            next: vec![],
+        }
+    }
+
+    /// What the next chunk takes over.
+    pub(crate) fn into_kept(self) -> Vec<Tensor<3>> {
+        self.next
+    }
+
+    /// `x` after the `length` inputs before it: those the next layer to run kept from the
+    /// chunk before, or zeros in the first chunk, as the layer pads a whole sequence. The last
+    /// `length` of the result are kept for that layer's next chunk.
+    fn extend(&mut self, x: Tensor<3>, length: usize) -> Tensor<3> {
+        let x = match self.last.next() {
+            Some(kept) => Tensor::cat(vec![kept, x], 2),
+            None => x.pad([(length, 0)], PadMode::Constant(0.0)),
+        };
+        let total = x.dims()[2];
+        self.next.push(x.clone().narrow(2, total - length, length));
+        x
+    }
+}
+
+/// A convolution of stride 1, padded on the left as [`causal`] pads it, or not at all, over
+/// the next chunk: after the inputs from the chunk before that its kernel reaches back to.
+fn push_conv(conv: &Conv1d, x: Tensor<3>, carry: &mut Carry) -> Tensor<3> {
+    let reach = (conv.kernel_size - 1) * conv.dilation;
+    if reach == 0 {
+        return conv.forward(x);
+    }
+    let options = ConvOptions::new([conv.stride], [0], [conv.dilation], conv.groups);
+    let bias = conv.bias.as_ref().map(Param::val);
+    conv1d(carry.extend(x, reach), conv.weight.val(), bias, options)
 }
 
 /// Upstream's `CausalConv1d`: a convolution padded by `2 * padding - output_padding` on the
@@ -80,6 +152,15 @@ impl CausalConvTranspose1d {
         let y = conv_transpose1d(x, self.weight.val(), Some(self.bias.val()), options);
         let length = y.dims()[2] - self.trim;
         y.narrow(2, 0, length)
+    }
+
+    /// As `forward`, over the next chunk. Its kernel is twice its stride, so that each output
+    /// takes in the input step it falls in and the one before, the last of the chunk before
+    /// at the boundary.
+    pub(crate) fn push(&self, x: Tensor<3>, carry: &mut Carry) -> Tensor<3> {
+        let steps = x.dims()[2];
+        let y = self.forward(carry.extend(x, 1));
+        y.narrow(2, self.stride, steps * self.stride)
     }
 }
 
@@ -130,6 +211,10 @@ impl ResidualUnit {
 
     pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         x.clone() + sequential(&self.block, x)
+    }
+
+    pub(crate) fn push(&self, x: Tensor<3>, carry: &mut Carry) -> Tensor<3> {
+        x.clone() + sequential_push(&self.block, x, carry)
     }
 }
 

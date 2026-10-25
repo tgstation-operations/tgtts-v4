@@ -1,3 +1,5 @@
+use std::mem;
+
 use burn::{
     module::Module,
     nn::{Tanh, conv::Conv1dConfig},
@@ -7,8 +9,8 @@ use burn::{
 use crate::{
     AudioVaeConfig, Error, Weights,
     layers::{
-        CausalConvTranspose1d, Layer, ResidualUnit, SampleRateCondition, Snake1d, causal,
-        sequential,
+        Carry, CausalConvTranspose1d, Layer, ResidualUnit, SampleRateCondition, Snake1d, causal,
+        sequential, sequential_push,
     },
 };
 
@@ -94,20 +96,67 @@ impl Decoder {
     /// Decodes latents `[batch, latent_dim, frames]` into audio `[batch, 1, samples]`, in the
     /// dtype the weights were loaded in, which the latents are cast to.
     pub fn decode(&self, latents: Tensor<3>) -> Tensor<3> {
-        let [batch, ..] = latents.dims();
-        let buckets = Tensor::full([batch], self.bucket as i64, &latents.device());
-        self.forward(latents.cast(self.dtype), buckets)
+        let buckets = self.buckets(&latents);
+        self.forward(latents.cast(self.dtype), buckets, Layer::forward)
     }
 
-    fn forward(&self, x: Tensor<3>, buckets: Tensor<1, Int>) -> Tensor<3> {
+    /// A stream to decode latents through a chunk at a time, as they come.
+    pub fn stream(&self) -> DecodeStream<'_> {
+        DecodeStream {
+            decoder: self,
+            kept: vec![],
+        }
+    }
+
+    fn buckets(&self, latents: &Tensor<3>) -> Tensor<1, Int> {
+        let [batch, ..] = latents.dims();
+        Tensor::full([batch], self.bucket as i64, &latents.device())
+    }
+
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        buckets: Tensor<1, Int>,
+        mut run: impl FnMut(&Layer, Tensor<3>) -> Tensor<3>,
+    ) -> Tensor<3> {
         let layers = self.model.iter().zip(&self.sr_cond_model);
         layers.fold(x, |x, (layer, condition)| {
             let x = match condition {
                 Some(condition) => condition.forward(x, buckets.clone()),
                 None => x,
             };
-            layer.forward(x)
+            run(layer, x)
         })
+    }
+}
+
+/// Latents decoded a chunk at a time into the audio [`Decoder::decode`] gives them whole, to
+/// rounding, whatever the chunks.
+///
+/// The convolutions are the only layers that reach back in time, so a chunk's audio depends
+/// on the chunks before only through the last inputs of each, as many as its kernel reaches
+/// back. The stream keeps those from one chunk to the next, in the decoder's dtype on its
+/// device: for VoxCPM2's decoder, 161856 values a batch item, 632 KiB in f32. The decoder is
+/// causal, so a chunk's audio is whole when it is pushed and nothing is left to flush.
+#[derive(Debug)]
+pub struct DecodeStream<'a> {
+    decoder: &'a Decoder,
+    kept: Vec<Tensor<3>>,
+}
+
+impl DecodeStream<'_> {
+    /// Decodes the next latents `[batch, latent_dim, frames]`, at least a frame, into their
+    /// audio `[batch, 1, samples]`, as [`Decoder::decode`] does. Every chunk must have the
+    /// batch of the first.
+    pub fn push(&mut self, latents: Tensor<3>) -> Tensor<3> {
+        let decoder = self.decoder;
+        let buckets = decoder.buckets(&latents);
+        let mut carry = Carry::new(mem::take(&mut self.kept));
+        let audio = decoder.forward(latents.cast(decoder.dtype), buckets, |layer, x| {
+            layer.push(x, &mut carry)
+        });
+        self.kept = carry.into_kept();
+        audio
     }
 }
 
@@ -151,6 +200,10 @@ impl DecoderBlock {
 
     pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         sequential(&self.block, x)
+    }
+
+    pub(crate) fn push(&self, x: Tensor<3>, carry: &mut Carry) -> Tensor<3> {
+        sequential_push(&self.block, x, carry)
     }
 }
 

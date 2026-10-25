@@ -1,8 +1,11 @@
 //! VoxCPM2's own weights against what upstream computes with them, as
 //! fixtures/audiovae_checkpoint.py records it.
 
+mod chunks;
+
 use audiovae::{AudioVaeConfig, Decoder, Encoder, Weights};
 use burn::tensor::FloatDType;
+use chunks::{Draws, streamed};
 use testkit::{Fixture, assert_close, checkpoint_dir, device, fixture};
 
 fn checkpoint() -> (AudioVaeConfig, Weights) {
@@ -27,6 +30,26 @@ fn decodes_a_speaker_latent_as_upstream() {
     let audio = decoder.decode(golden.tensor("input.decode", &device));
     // Upstream's own f32 result is 2.5e-6 from its f64 one.
     assert_close(audio, golden.tensor("output.decode", &device), 1e-5, 0.0);
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn streams_in_chunks_of_any_length_as_it_decodes_whole() {
+    let device = device();
+    let (config, weights) = checkpoint();
+    let decoder = Decoder::load(&config, &weights, FloatDType::F32, &device).unwrap();
+    let mut draws = Draws::new(5);
+    // Longer than the decoder reaches back: 20 frames before a sample's own.
+    let frames = 48;
+    let latents = draws.latents([1, 64, frames], &device);
+    let whole = decoder.decode(latents.clone());
+    let mut chunkings = vec![vec![1; frames]];
+    chunkings.extend((0..3).map(|_| draws.lengths(frames, 25)));
+    // Chunks of a frame came within 1.8e-7 of the whole, longer ones within 5e-8.
+    for lengths in chunkings {
+        let audio = streamed(&decoder, latents.clone(), &lengths);
+        assert_close(audio, whole.clone(), 1e-6, 0.0);
+    }
 }
 
 #[test]
