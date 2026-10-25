@@ -224,7 +224,7 @@ fn streams_speech_a_patch_at_a_time_as_it_synthesizes() {
     assert!(patches.iter().all(|patch| patch.len() == 4 * 1920));
     let streamed = Tensor::<1>::from_floats(patches.concat().as_slice(), &device);
     let whole = Tensor::from_floats(whole.as_slice(), &device);
-    // Decoded a patch at a time, the first after the voice's frames, this came within 3.3e-9 of
+    // Decoded a patch at a time, the first after the voice's frames, this came within 3.8e-9 of
     // the audio decoded a second at a time.
     assert_close(streamed, whole, 1e-6, 0.0);
 }
