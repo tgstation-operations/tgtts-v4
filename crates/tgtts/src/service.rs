@@ -3,8 +3,8 @@
 //! The game sends GETs with the text in a JSON body and the rest in the query, and plays the Ogg
 //! Vorbis it gets back for as long as the `audio-length` header says, in seconds. For a message
 //! that is not for one player alone it asks all five audio routes at once and drops the message
-//! if any of them fails, so the radio routes fall back to serving what they would otherwise
-//! fail on.
+//! if any of them fails, so the gibberish radio, with no aligner to time the lost words by,
+//! serves the plain radio rather than fail.
 
 use std::{
     fmt, fs, io,
