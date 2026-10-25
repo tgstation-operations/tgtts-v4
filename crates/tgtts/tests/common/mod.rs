@@ -250,6 +250,29 @@ pub fn radio_frames(frames: usize, on: usize, off: usize) -> usize {
     on + resampled(resampled(frames, 48000, 8000), 8000, 48000) + 4800 + off
 }
 
+/// The codec, rate, channels and duration ffprobe reads of the Ogg `ogg`, from a file, since from
+/// a pipe it cannot find the end to time it by.
+pub fn ffprobe(ogg: &[u8]) -> (String, u32, u16, f64) {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), ogg).unwrap();
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-of", "json", "-show_entries"])
+        .args(["stream=codec_name,sample_rate,channels:format=duration"])
+        .arg(file.path())
+        .output()
+        .expect("ffprobe runs");
+    assert!(output.status.success(), "ffprobe could not read the Ogg");
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stream = &probe["streams"][0];
+    let number = |value: &serde_json::Value| value.as_str().unwrap().parse::<f64>().unwrap();
+    (
+        stream["codec_name"].as_str().unwrap().to_owned(),
+        number(&stream["sample_rate"]) as u32,
+        stream["channels"].as_u64().unwrap() as u16,
+        number(&probe["format"]["duration"]),
+    )
+}
+
 /// The Ogg `ogg` decoded by ffmpeg to float samples.
 pub fn decode(ogg: &[u8]) -> Audio {
     let args = [

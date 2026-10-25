@@ -41,9 +41,10 @@ metrics_db = "metrics.sqlite"
 and run `cargo run --release -p tgtts -- tgtts.toml`, adding
 `--features burn/rayon,burn/simd` on the CPU, where they make the model several
 times faster. Point the game's `TTS_HTTP_URL` at `http://127.0.0.1:5002` with
-the token as `TTS_HTTP_TOKEN`. The service runs ffmpeg, which needs libvorbis
-and rubberband, as the devshell's has. The end-to-end test runs on the real
-model with `VOXCPM2_DIR`, `VOICES_DIR` and `ASSETS_DIR` set:
+the token as `TTS_HTTP_TOKEN`. The service runs ffmpeg for the filter strings
+the game sent before effects, which needs rubberband, as the devshell's has.
+The end-to-end test runs on the real model with `VOXCPM2_DIR`, `VOICES_DIR` and
+`ASSETS_DIR` set:
 `cargo test --release -p tgtts --test real -- --ignored`.
 
 Entering the devshell points `core.hooksPath` at `.githooks/`. The pre-commit

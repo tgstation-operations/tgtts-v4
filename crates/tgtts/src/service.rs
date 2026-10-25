@@ -41,6 +41,7 @@ use crate::{
     handoff::{Handoff, Missing, Source},
     metrics::{Leveling, Metrics, Row, Timings},
     synth::{self, Synthesizer},
+    vorbis,
     wav::{self, Audio},
 };
 
@@ -721,11 +722,18 @@ impl Service {
         let audio = Arc::new(audio);
         self.handoff
             .publish(source, &params.identifier, Ok(audio.clone()));
-        let ogg = self.run_ffmpeg(trace, self.ffmpeg.encode(&audio)).await?;
+        let ogg = self.encode(trace, audio.clone()).await?;
         Ok(Served {
             ogg,
             seconds: audio.seconds(),
         })
+    }
+
+    /// `audio` as the Ogg Vorbis the game plays, made at a turn on the CPU.
+    async fn encode(&self, trace: &mut Trace, audio: Arc<Audio>) -> Result<Vec<u8>, Failure> {
+        self.cpu(trace, move || vorbis::encode(&audio))
+            .await?
+            .map_err(Failure::internal)
     }
 
     /// What `source` handed over for the request's identifier, over the radio.
@@ -754,7 +762,7 @@ impl Service {
             })
             .await?;
         let audio = Arc::new(Audio::from_segment(&radio));
-        let ogg = self.run_ffmpeg(trace, self.ffmpeg.encode(&audio)).await?;
+        let ogg = self.encode(trace, audio.clone()).await?;
         Ok(Served {
             ogg,
             seconds: audio.seconds(),

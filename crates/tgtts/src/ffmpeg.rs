@@ -1,9 +1,9 @@
-//! ffmpeg, which runs the game's filter graphs and makes the Vorbis the game plays, with the
-//! arguments the old frontend gave it.
+//! ffmpeg, which runs the filter graphs the game sent before it sent effects, with the arguments
+//! the old frontend gave it.
 //!
 //! The old frontend filtered and encoded in one run and handed its radio services the Ogg, which
 //! they decoded again. Here the filtered audio comes back as float PCM, which the radio routes
-//! take as it is, and a second run encodes it: the encoder is given the same samples as before.
+//! take as it is, and is encoded in process.
 
 use std::{
     error,
@@ -50,25 +50,6 @@ impl Ffmpeg {
         args.extend(["-c:a", "pcm_f32le", "-f", "wav", "pipe:1"].map(OsString::from));
         let output = self.run(&args, input).await?;
         wav::read(&output).map_err(Error::Output)
-    }
-
-    /// `audio` encoded as the old frontend encoded what the game plays: Vorbis at 64 kb/s in Ogg.
-    pub async fn encode(&self, audio: &Audio) -> Result<Vec<u8>, Error> {
-        let args = [
-            "-f",
-            "wav",
-            "-i",
-            "pipe:0",
-            "-c:a",
-            "libvorbis",
-            "-b:a",
-            "64k",
-            "-f",
-            "ogg",
-            "pipe:1",
-        ]
-        .map(OsString::from);
-        self.run(&args, wav::write_float(audio)).await
     }
 
     /// Runs ffmpeg with `args`, `input` on its standard input, and gives its standard output.
@@ -236,40 +217,6 @@ mod tests {
         }
     }
 
-    /// The granule position of the last Ogg page: the frames a decoder should give.
-    fn last_granule(ogg: &[u8]) -> i64 {
-        let at = ogg
-            .windows(4)
-            .rposition(|w| w == b"OggS")
-            .expect("an Ogg page");
-        i64::from_le_bytes(ogg[at + 6..at + 14].try_into().unwrap())
-    }
-
-    /// The Vorbis identification header's channels, rate and nominal bitrate: what `-b:a 64k`
-    /// asked libvorbis for.
-    fn vorbis_header(ogg: &[u8]) -> (u8, u32, i32) {
-        let at = ogg
-            .windows(7)
-            .position(|w| w == b"\x01vorbis")
-            .expect("an identification header");
-        let header = &ogg[at + 7..];
-        let channels = header[4];
-        let rate = u32::from_le_bytes(header[5..9].try_into().unwrap());
-        let nominal = i32::from_le_bytes(header[13..17].try_into().unwrap());
-        (channels, rate, nominal)
-    }
-
-    #[tokio::test]
-    async fn encodes_vorbis_at_64k_declaring_the_length() {
-        for (rate, frames) in [(48000, 24000), (44100, 12345), (48000, 1)] {
-            let audio = sine(rate, frames);
-            let ogg = ffmpeg().encode(&audio).await.unwrap();
-            assert_eq!(&ogg[..4], b"OggS");
-            assert_eq!(vorbis_header(&ogg), (1, rate, 64000));
-            assert_eq!(last_granule(&ogg), frames as i64);
-        }
-    }
-
     #[tokio::test]
     async fn filters_to_float_at_the_graphs_rate() {
         let input = wav::write_pcm16(48000, 1, &sine(48000, 4800).to_pcm().samples);
@@ -349,7 +296,8 @@ mod tests {
         assert!(stderr.contains("nosuchfilter"), "{stderr}");
 
         let missing = Ffmpeg::new("/nonexistent/ffmpeg");
-        let result = missing.encode(&sine(48000, 10)).await;
+        let input = wav::write_pcm16(48000, 1, &[0; 480]);
+        let result = missing.filter(input, "volume=2", &[]).await;
         assert!(matches!(result, Err(Error::Spawn(..))));
     }
 }

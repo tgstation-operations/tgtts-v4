@@ -24,7 +24,7 @@ use tgtts::{
     metrics::Metrics,
     service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::{self, Speech, Synthesizer},
-    wav,
+    vorbis, wav,
 };
 use tracing::level_filters::LevelFilter;
 use voices::{BlipSet, Latent, Voices};
@@ -672,14 +672,13 @@ fn brings_speech_and_blips_to_the_loudness() {
     let finished = dsp::speech::finish(&take, 2);
     let expected = dsp::loudness::normalize(&finished, target, ceiling).segment;
     let expected = wav::Audio::from_segment(&expected);
-    let encoded = h.runtime.block_on(Ffmpeg::new("ffmpeg").encode(&expected));
     assert_eq!(
         common::decode(&speech.body),
-        common::decode(&encoded.unwrap())
+        common::decode(&vorbis::encode(&expected).unwrap())
     );
 
     // The blips are drawn at random, so only their loudness can be checked: Vorbis at 64 kb/s
-    // raises these made-up blips' by 0.6 to 0.7 LU, where unleveled they come 4 to 5 LU over.
+    // raises these made-up blips' by 0.6 to 0.8 LU, where unleveled they come 4 to 5 LU over.
     let blips = message.blips(&h);
     blips.assert_ogg(48000);
     assert!(
@@ -687,6 +686,38 @@ fn brings_speech_and_blips_to_the_loudness() {
         "{}",
         loudness(&blips)
     );
+}
+
+#[test]
+fn ffprobe_reads_every_route() {
+    let h = harness(Fake::default(), limits());
+    let messages = [
+        Message::default(),
+        Message {
+            identifier: "effects",
+            effects: r#"[[{"effect": "tempo", "ratio": 2}]]"#,
+            ..Message::default()
+        },
+        Message {
+            identifier: "silicon",
+            special_filters: "silicon|radio",
+            ..Message::default()
+        },
+        Message {
+            identifier: "filter",
+            filter: "lowpass=f=750,volume=2",
+            ..Message::default()
+        },
+    ];
+    for message in messages {
+        for reply in message.all(&h) {
+            reply.assert_ogg(48000);
+            let (codec, rate, channels, seconds) = common::ffprobe(&reply.body);
+            assert_eq!((codec.as_str(), rate, channels), ("vorbis", 48000, 1));
+            let length: f64 = reply.length.as_deref().unwrap().parse().unwrap();
+            assert!((seconds - length).abs() < 1e-3, "{seconds} s for {length}");
+        }
+    }
 }
 
 #[test]

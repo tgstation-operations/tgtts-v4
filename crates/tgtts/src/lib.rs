@@ -8,4 +8,5 @@ pub mod metrics;
 pub mod model;
 pub mod service;
 pub mod synth;
+pub mod vorbis;
 pub mod wav;
