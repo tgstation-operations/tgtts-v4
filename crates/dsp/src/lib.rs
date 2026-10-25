@@ -9,6 +9,7 @@ pub mod radio;
 pub mod resample;
 pub mod segment;
 pub mod sentences;
+pub mod speech;
 
 /// The random draws the old service made with Python's `random` module, which the service makes
 /// from a generator of its own and a test replays.
