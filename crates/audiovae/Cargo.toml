@@ -1,0 +1,15 @@
+[package]
+name = "audiovae"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+burn = { workspace = true, features = ["std", "pytorch"] }
+serde.workspace = true
+
+[dev-dependencies]
+burn = { workspace = true, features = ["safetensors"] }
+serde_json.workspace = true
+testkit = { path = "../testkit" }
