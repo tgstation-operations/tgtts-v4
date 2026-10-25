@@ -480,7 +480,7 @@ impl Service {
     ) -> Result<Segment, Failure> {
         let spoken = match synth::prepare(text) {
             // The old model service's empty WAV.
-            None => Segment::new(self.synthesizer.sample_rate(), Vec::new()),
+            None => Segment::new(dsp::RATE, Vec::new()),
             Some(text) => self.spoken(voice, text, trace).await?,
         };
         self.cpu(trace, move || dsp::speech::finish(&spoken, pitch))
@@ -537,8 +537,7 @@ impl Service {
                 .synthesizer
                 .synthesize(&text, &latent, seed)
                 .map_err(|e| Failure::internal(format!("synthesis: {e}")))?;
-            let rate = service.synthesizer.sample_rate();
-            let leveled = synth::level(&synth::to_segment(&speech.samples, rate));
+            let leveled = synth::level(&synth::to_segment(&speech.samples));
             if let Err(e) = service
                 .cache
                 .store(&voice, &text, &leveled, &mut rand::rng())

@@ -71,10 +71,6 @@ impl Fake {
 }
 
 impl Synthesizer for Fake {
-    fn sample_rate(&self) -> u32 {
-        48000
-    }
-
     fn synthesize(&self, text: &str, _: &Latent, _: u64) -> Result<Speech, synth::Error> {
         self.texts.lock().unwrap().push(text.to_owned());
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;

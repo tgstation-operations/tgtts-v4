@@ -3,17 +3,14 @@
 
 use std::error;
 
-use dsp::segment::Segment;
+use dsp::{RATE, segment::Segment};
 use voices::Latent;
 
 /// An error from a synthesizer, which the service reports and fails the request on.
 pub type Error = Box<dyn error::Error + Send + Sync>;
 
-/// A text-to-speech model.
+/// A text-to-speech model, speaking at the service's rate.
 pub trait Synthesizer: Send + Sync + 'static {
-    /// The rate of the samples [`synthesize`](Self::synthesize) gives, in Hz.
-    fn sample_rate(&self) -> u32;
-
     /// `text` spoken in `voice`, drawn from `seed`.
     fn synthesize(&self, text: &str, voice: &Latent, seed: u64) -> Result<Speech, Error>;
 }
@@ -21,7 +18,7 @@ pub trait Synthesizer: Send + Sync + 'static {
 /// What a synthesizer said.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Speech {
-    /// Mono samples, full scale at 1.
+    /// Mono samples at [`RATE`], full scale at 1.
     pub samples: Vec<f32>,
     /// How many patches the model generated for them.
     pub patches: usize,
@@ -49,15 +46,15 @@ pub fn prepare(text: &str) -> Option<String> {
     Some(text)
 }
 
-/// `samples` at `rate` as 16-bit PCM, as the old model service wrote them with soundfile:
+/// `samples` as 16-bit PCM, as the old model service wrote them with soundfile:
 /// libsndfile scales by 32767 and rounds in single precision. The audio VAE ends in a tanh, so
 /// that nothing reaches full scale; past it a sample is clipped.
-pub fn to_segment(samples: &[f32], rate: u32) -> Segment {
+pub fn to_segment(samples: &[f32]) -> Segment {
     let pcm = samples
         .iter()
         .map(|&s| (s * 32767.0).round_ties_even() as i16)
         .collect();
-    Segment::new(rate, pcm)
+    Segment::new(RATE, pcm)
 }
 
 /// The level the service gives the model's speech: its peak at -0.1 dBFS, as pydub's
@@ -91,11 +88,8 @@ mod tests {
 
     #[test]
     fn writes_pcm_as_libsndfile() {
-        let segment = to_segment(
-            &[0.0, 1.0, -1.0, 0.5, 1.5 / 32767.0, 2.5 / 32767.0, 2.0],
-            48000,
-        );
-        assert_eq!(segment.rate, 48000);
+        let segment = to_segment(&[0.0, 1.0, -1.0, 0.5, 1.5 / 32767.0, 2.5 / 32767.0, 2.0]);
+        assert_eq!(segment.rate, RATE);
         assert_eq!(segment.samples, [0, 32767, -32767, 16384, 2, 2, 32767]);
     }
 
