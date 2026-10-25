@@ -1,9 +1,9 @@
 //! The gibberish radio: a message over the radio with some of its words lost in static, as the
 //! old radio-gibberish service made it.
 //!
-//! The service masked words of the message at random, aligned the message to the speech with
-//! wav2vec2 to time each letter, and ducked the speech under static where the masked words fell.
-//! The alignment is not here: [`corrupted_spans`] takes the letters' times it gives.
+//! The service masked some words of the message, aligned the message to the speech with wav2vec2
+//! to time each letter, and ducked the speech under static where the masked words fell. The
+//! alignment is not here: [`corrupted_spans`] takes the letters' times it gives.
 
 use crate::{
     RATE, Random,
@@ -11,17 +11,55 @@ use crate::{
     segment::Segment,
 };
 
-/// The old service's `mask_string`: from 35 to 65% of the words of `text`, drawn by `random`,
-/// replaced with as many `#`, and the words joined with single spaces. The service ignored the
-/// masked text the game sent and made its own this way.
-pub fn mask(text: &str, random: &mut impl Random) -> String {
-    let mut words: Vec<String> = words(text).map(str::to_owned).collect();
-    let percent = 0.35 + (0.65 - 0.35) * random.random();
-    let count = (words.len() as f64 * percent) as usize;
-    for i in sample(words.len(), count, random) {
+/// The words of `text` joined with single spaces, those of them that `gibberish`, the game's
+/// garbled copy of `text`, changed replaced with as many `#`. Where the copy is the same text, as
+/// the game sends today, from 35 to 65% of the words, drawn by `random`, are replaced instead, as
+/// the old service's `mask_string` replaced them, ignoring the copy.
+pub fn mask(text: &str, gibberish: &str, random: &mut impl Random) -> String {
+    let plain: Vec<&str> = words(text).collect();
+    let garbled: Vec<&str> = words(gibberish).collect();
+    let masked = if garbled == plain {
+        let percent = 0.35 + (0.65 - 0.35) * random.random();
+        let count = (plain.len() as f64 * percent) as usize;
+        sample(plain.len(), count, random)
+    } else {
+        changed(&plain, &garbled)
+    };
+    let mut words: Vec<String> = plain.into_iter().map(str::to_owned).collect();
+    for i in masked {
         words[i] = "#".repeat(words[i].chars().count());
     }
     words.join(" ")
+}
+
+/// The indices of the words of `plain` left out of a longest alignment of them, in order, with
+/// the same words of `garbled`, which aligns each word to the earliest it can.
+fn changed(plain: &[&str], garbled: &[&str]) -> Vec<usize> {
+    let (n, m) = (plain.len(), garbled.len());
+    // The most words of plain[i..] that align with words of garbled[j..].
+    let mut aligned = vec![vec![0; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            aligned[i][j] = if plain[i] == garbled[j] {
+                aligned[i + 1][j + 1] + 1
+            } else {
+                aligned[i + 1][j].max(aligned[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut changed = Vec::new();
+    while i < n {
+        if j < m && plain[i] == garbled[j] {
+            (i, j) = (i + 1, j + 1);
+        } else if j == m || aligned[i + 1][j] >= aligned[i][j + 1] {
+            changed.push(i);
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    changed
 }
 
 /// Python's `random.sample(range(n), k)`, taking the same draws: from a pool of what is left. It

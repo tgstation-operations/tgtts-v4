@@ -38,6 +38,36 @@ impl Random for Replay {
     }
 }
 
+/// No draws, which masking the words the game garbled takes.
+struct Never;
+
+impl Random for Never {
+    fn random(&mut self) -> f64 {
+        unreachable!("a draw")
+    }
+
+    fn below(&mut self, _: usize) -> usize {
+        unreachable!("a draw")
+    }
+}
+
+#[test]
+fn masks_the_words_the_game_garbled() {
+    // The old service warmed up on these, but masked its own words of the first.
+    let text = "The quick brown fox jumps over the lazy dog.";
+    let garbled = "T&e q#$ck $%#!@ fox ju### ov2r 32e $$zy *(g.";
+    assert_eq!(
+        gibberish::mask(text, garbled, &mut Never),
+        "### ##### ##### fox ##### #### ### #### ####"
+    );
+    // A space the game garbled joins the words beside it, which neither is any longer.
+    assert_eq!(
+        gibberish::mask("help me  now", "help#me now", &mut Never),
+        "#### ## now"
+    );
+    assert_eq!(gibberish::mask("a a b", "a ## b", &mut Never), "a # b");
+}
+
 fn pairs(fx: &Tensors, name: &str) -> Vec<(f64, f64)> {
     let values = if fx.contains(name) {
         fx.f64s(name)
@@ -55,7 +85,7 @@ fn masks_and_finds_spans_as_the_old_service() {
     for (i, case) in cases.iter().enumerate() {
         let mut random = Replay(fx.int_rows(&format!("mask/{i}/draws")), 0);
         let text = case["text"].as_str().unwrap();
-        let masked = gibberish::mask(text, &mut random);
+        let masked = gibberish::mask(text, text, &mut random);
         assert_eq!(masked, case["masked"].as_str().unwrap(), "{i}: mask");
         assert_eq!(random.1, random.0.len(), "{i}: draws taken");
         let letters = pairs(&fx, &format!("mask/{i}/letters"));
