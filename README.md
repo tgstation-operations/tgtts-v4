@@ -15,6 +15,10 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   compare against. A rerun writes the same bytes.
 - Tests that need the real weights are ignored by default: point `VOXCPM2_DIR`
   at a VoxCPM2 checkpoint and run `cargo test -- --ignored`.
+- The gate runs nothing on a GPU. On a Vulkan GPU, `cargo test -p gpu
+  --features vulkan` runs the models' fixtures there, and with
+  `-- --include-ignored` their goldens on the real weights, which also need
+  `VOICES_DIR`.
 - `nix run .#bench` times release builds of the hot paths on the real data
   (`VOXCPM2_DIR`, `VOICES_DIR` for a converted voices directory and `ASSETS_DIR`
   for the radio's sounds) and writes each run as JSON;

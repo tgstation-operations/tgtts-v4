@@ -65,9 +65,13 @@ pkgs.writeShellApplication {
     stage ascii ascii
     stage deadnix deadnix_files
     stage statix statix_files
-    stage clippy cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-    stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
-    stage test cargo test --locked --workspace --all-features
+    # Each crate's default features, those of the CPU: a GPU feature compiles
+    # wgpu into every crate it reaches, and its tests need the GPU. The GPU
+    # code is linted on its own.
+    stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
+    stage clippy-vulkan cargo clippy --locked -p gpu --all-targets --features vulkan -- -D warnings
+    stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+    stage test cargo test --locked --workspace
 
     if [ "''${#failed[@]}" -gt 0 ]; then
       echo "audit: FAILED: ''${failed[*]}" >&2

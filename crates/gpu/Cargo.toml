@@ -1,0 +1,18 @@
+[package]
+name = "gpu"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+vulkan = ["burn/autotune", "burn/vulkan"]
+
+[dependencies]
+burn = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+audiovae = { path = "../audiovae" }
+minicpm4 = { path = "../minicpm4" }
+serde_json.workspace = true
+testkit = { path = "../testkit" }
