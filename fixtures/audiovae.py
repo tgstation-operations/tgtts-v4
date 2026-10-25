@@ -106,6 +106,10 @@ decoder["sr_bin_boundaries"] = decoder["sr_bin_boundaries"].long()
 tensors.update({f"decoder.{key}": value for key, value in decoder.items()})
 tensors["input.decode.z"] = z
 tensors["output.decode"] = model.decode(z).detach()
+# Upstream's streaming decoder, a frame at a time at first.
+with model.streaming_decode() as stream:
+    streamed = [stream.decode_chunk(chunk) for chunk in z.split([1, 1, 2, 4], dim=2)]
+tensors["output.decode_streamed"] = torch.cat(streamed, dim=2).detach()
 
 randomize(model.encoder)
 # Upstream pads 97 samples to whole frames of 10, and encodes 10 frames.

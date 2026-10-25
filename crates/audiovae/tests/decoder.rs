@@ -19,6 +19,19 @@ fn decodes_as_upstream_in_the_bucket_of_out_sample_rate() {
 }
 
 #[test]
+fn streams_as_upstreams_streaming_decoder() {
+    let device = device();
+    let decoder = Decoder::load(&tiny(), &weights(), FloatDType::F32, &device).unwrap();
+    let fixture = fixture!("audiovae");
+    let latents = fixture.tensor("input.decode.z", &device);
+    let audio = streamed(&decoder, latents, &[1, 1, 2, 4]);
+    // Upstream's streamed audio is 4.8e-6 from its whole, and this 1.9e-5 from it: rounding
+    // that the random weights amplify, as they do decoding whole.
+    let expected = fixture.tensor("output.decode_streamed", &device);
+    assert_close(audio, expected, 1e-4, 0.0);
+}
+
+#[test]
 fn streams_in_chunks_of_any_length_as_it_decodes_whole() {
     let device = device();
     // In f64, where chunks of a frame come within 5e-13 of the whole: the random weights
