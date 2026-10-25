@@ -9,8 +9,9 @@ detuned, and their blips are pydub's integer arithmetic alone; the rest are shif
 often is saved beside them.
 
 Where the port fixes the old service, the restatement takes the fix too: text with a letter or
-digit of either case makes a sound, and a crossfade is no longer than either side, so a sentence
-can start past its first character and take blips shorter than a crossfade.
+digit of either case makes a sound, a crossfade is no longer than either side, so a sentence can
+start past its first character and take blips shorter than a crossfade, and the blips of ? and !
+are faded as the letters' are.
 """
 
 import importlib.metadata
@@ -97,6 +98,13 @@ def append(result_sound, blip):
     return result_sound.append(blip, crossfade=min(150, len(result_sound), len(blip)))
 
 
+def fade(blip):
+    """`blip` faded in over 3 ms and out over 8, or over all of it where it is shorter."""
+    if len(blip) == 0:
+        return blip
+    return blip.fade_in(min(3, len(blip))).fade_out(min(8, len(blip)))
+
+
 def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
     """The service's /generate-tts-blips, from the text on, returning the WAV it sent."""
     skip_these = " ,:;'\""
@@ -150,7 +158,7 @@ def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
                         )
                         speech_audio = change_volume(speech_audio, 0.6)
                         stripped_sound = strip_silence(speech_audio)
-                        result_sound = append(result_sound, stripped_sound)
+                        result_sound = append(result_sound, fade(stripped_sound))
             else:
                 if not i % 2 == 0:
                     continue
@@ -187,7 +195,7 @@ def text_to_speech_blips(text, voice, blip_base, blip_number, pitch):
                 )
                 new_audio = change_volume(new_audio, 0.7 if letter.isupper() else 0.5)
                 stripped_sound = strip_silence(new_audio)  # noqa: F841
-                result_sound = append(result_sound, new_audio.fade_in(3).fade_out(8))
+                result_sound = append(result_sound, fade(new_audio))
         result_sound.export(data_bytes, format="wav")
         rawsound = AudioSegment.from_file(io.BytesIO(data_bytes.getvalue()), "wav")
         normalizedsound = normalize_to_target(rawsound, -25)

@@ -87,7 +87,8 @@ pub fn message(
 /// makes the blip of its lowercase, detuned by up to 0.6 semitones either way, a capital by 1.6
 /// semitones more and up to 1.05 either way, and lowered by 6 dB, a capital by 3; `?` and `!`
 /// make the `Deska` and `Gwah` blips, detuned by up to 1.2 semitones, lowered by 4.4 dB and
-/// stripped of their silence; nothing else makes a sound. Each detuning is a draw from `random`.
+/// stripped of their silence; nothing else makes a sound. Each blip is faded in over 3 ms and out
+/// over 8. Each detuning is a draw from `random`.
 pub fn sentence(
     text: &str,
     blips: &Blips,
@@ -126,11 +127,11 @@ pub fn sentence(
                 if upper { 0.7 } else { 0.5 },
             );
             // The old service also strips this blip of its silence, then uses it unstripped.
-            blip.fade_in(3)?.fade_out(8)?
+            fade(&blip)?
         } else if letter == '?' || letter == '!' {
             let blip = sample(if letter == '?' { "Deska" } else { "Gwah" }.to_owned())?;
             let blip = detune(blip, rate, 0.0, 0.2 + 0.2, random);
-            change_volume(&Segment::new(rate, to_pcm(&blip)), 0.6).strip_silence()?
+            fade(&change_volume(&Segment::new(rate, to_pcm(&blip)), 0.6).strip_silence()?)?
         } else {
             continue;
         };
@@ -162,6 +163,16 @@ fn detune(
     } else {
         pitch_shift(&blip, rate, semitones, 12)
     }
+}
+
+/// `blip` faded in over 3 ms and out over 8, or over all of it where it is shorter: pydub's fade
+/// out of a shorter segment repeats its first frames.
+fn fade(blip: &Segment) -> Result<Segment, Error> {
+    let len = blip.len_ms();
+    if len == 0 {
+        return Ok(blip.clone());
+    }
+    Ok(blip.fade_in(3.min(len))?.fade_out(8.min(len))?)
 }
 
 /// The old service's `change_volume`: a gain of the amplitude ratio `multiplier`, through dB.

@@ -50,11 +50,19 @@ struct Voice(PathBuf, Blips);
 
 impl Voice {
     fn new(fx: &Tensors, test: &str) -> Self {
+        Self::with(fx, test, &[])
+    }
+
+    /// The fixture's voice with the samples of `replaced` in place of its own.
+    fn with(fx: &Tensors, test: &str, replaced: &[(&str, Vec<i16>)]) -> Self {
         let samples: BTreeMap<_, _> = KEYS
             .iter()
             .map(|&key| {
                 let id = ("male".to_owned(), "1".to_owned(), key.to_owned());
-                (id, fx.pcm(&format!("voice/{key}")))
+                let sample = replaced.iter().find(|(k, _)| *k == key);
+                let sample =
+                    sample.map_or_else(|| fx.pcm(&format!("voice/{key}")), |s| s.1.clone());
+                (id, sample)
             })
             .collect();
         let set = BlipSet {
@@ -197,6 +205,35 @@ fn crossfades_are_no_longer_than_either_side() {
         let blips = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still);
         assert!(blips.is_ok_and(|b| !b.samples.is_empty()), "{text}");
     }
+}
+
+/// A blip loud from its first sample to its last, `ms` long, which stripping leaves whole.
+fn loud(ms: u32) -> Vec<i16> {
+    (0..RATE * ms / 1000)
+        .map(|i| if i % 2 == 0 { 8000 } else { -8000 })
+        .collect()
+}
+
+#[test]
+fn question_marks_are_faded() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::with(&fx, "faded", &[("Deska", loud(100))]);
+    // The b, at an odd index, makes no sound.
+    let blips = blips::sentence("?b", &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let peak = blips.max() as i16;
+    let ends = [blips.samples[0], blips.samples[blips.samples.len() - 1]];
+    assert!(
+        ends.iter().all(|s| s.abs() < peak / 10),
+        "{ends:?} of {peak}"
+    );
+}
+
+#[test]
+fn blips_shorter_than_their_fades_keep_their_length() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::with(&fx, "short", &[("Deska", loud(5))]);
+    let blips = blips::sentence("?b", &voice.1, "male", "1", 0, &mut Still).unwrap();
+    assert_eq!(blips.samples.len(), loud(5).len());
 }
 
 /// Making the golden needs a real voice, so a run of every generator leaves it as it is: this
