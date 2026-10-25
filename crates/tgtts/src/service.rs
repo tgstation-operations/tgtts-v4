@@ -22,7 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use dsp::{radio, resample::resample, segment::Segment};
+use dsp::{loudness::Normalized, radio, resample::resample, segment::Segment};
 use rand::{Rng, RngExt};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -34,7 +34,7 @@ use crate::{
     cache::Cache,
     ffmpeg::{self, Ffmpeg},
     handoff::{Handoff, Missing, Source},
-    metrics::{Metrics, Row, Timings},
+    metrics::{Leveling, Metrics, Row, Timings},
     synth::{self, Synthesizer},
     wav::{self, Audio},
 };
@@ -331,6 +331,7 @@ struct Trace {
     timings: Timings,
     cache_hit: Option<bool>,
     patches: Option<usize>,
+    leveling: Option<Leveling>,
 }
 
 impl Service {
@@ -415,6 +416,9 @@ impl Service {
                 dsp_ms = ms(t.dsp),
                 ffmpeg_ms = ms(t.ffmpeg),
                 total_ms = ms(t.total),
+                gain_db = trace.leveling.map(|l| l.gain),
+                limiter_db = trace.leveling.map(|l| l.reduction),
+                limited = trace.leveling.map(|l| l.limited),
                 "served"
             ),
             Err(failure) => warn!(
@@ -442,6 +446,7 @@ impl Service {
                 audio_seconds: result.as_ref().ok().map(|served| served.seconds),
                 timings: trace.timings,
                 patches: trace.patches,
+                leveling: trace.leveling,
             });
         }
     }
@@ -497,11 +502,13 @@ impl Service {
             Some(text) => self.spoken(voice, text, trace).await?,
         };
         let loudness = self.loudness;
-        self.cpu(trace, move || {
-            let finished = dsp::speech::finish(&spoken, pitch);
-            dsp::loudness::normalize(&finished, loudness.target, loudness.ceiling).segment
-        })
-        .await
+        let normalized = self
+            .cpu(trace, move || {
+                let finished = dsp::speech::finish(&spoken, pitch);
+                dsp::loudness::normalize(&finished, loudness.target, loudness.ceiling)
+            })
+            .await?;
+        Ok(leveled(normalized, trace))
     }
 
     /// What the model says for `text` in `voice`, from the cache once it has said it often
@@ -591,9 +598,14 @@ impl Service {
             let mut draws = Draws(rand::rng());
             let blips = dsp::blips::message(&text, &blips, &base, &number, pitch, &mut draws)
                 .map_err(|e| Failure::internal(format!("blips: {e}")))?;
-            Ok(dsp::loudness::normalize(&blips, loudness.target, loudness.ceiling).segment)
+            Ok(dsp::loudness::normalize(
+                &blips,
+                loudness.target,
+                loudness.ceiling,
+            ))
         })
         .await?
+        .map(|normalized| leveled(normalized, trace))
     }
 
     /// `audio` through the request's filter and special filters and encoded, handed over to the
@@ -712,6 +724,16 @@ impl Service {
         trace.timings.ffmpeg += started.elapsed();
         result.map_err(Failure::internal)
     }
+}
+
+/// The audio `normalized` holds, what it took recorded in `trace`.
+fn leveled(normalized: Normalized, trace: &mut Trace) -> Segment {
+    trace.leveling = Some(Leveling {
+        gain: normalized.gain,
+        reduction: normalized.reduction,
+        limited: normalized.limited,
+    });
+    normalized.segment
 }
 
 async fn blocking<T: Send + 'static>(

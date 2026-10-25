@@ -274,7 +274,7 @@ impl Harness {
         let mut select = connection
             .prepare(
                 "SELECT route, voice, identifier, status, cache_hit, text_length, audio_seconds, \
-                 patches FROM requests ORDER BY id",
+                 patches, gain_db, limiter_reduction_db, limited_fraction FROM requests ORDER BY id",
             )
             .unwrap();
         select
@@ -288,6 +288,13 @@ impl Harness {
                     text_length: r.get(5)?,
                     audio_seconds: r.get(6)?,
                     patches: r.get(7)?,
+                    leveling: match (r.get(8)?, r.get(9)?, r.get(10)?) {
+                        (Some(gain), Some(reduction), Some(limited)) => {
+                            Some((gain, reduction, limited))
+                        }
+                        (None, None, None) => None,
+                        some => panic!("leveling recorded in part: {some:?}"),
+                    },
                 })
             })
             .unwrap()
@@ -306,6 +313,8 @@ struct Row {
     text_length: i64,
     audio_seconds: Option<f64>,
     patches: Option<i64>,
+    /// The gain, the limiter's largest reduction and the fraction it limited.
+    leveling: Option<(f64, f64, f64)>,
 }
 
 /// The length of `frames` of speech over the radio, between the test's clicks.
@@ -767,7 +776,17 @@ fn toggles_logging_as_the_old_service() {
 
 #[test]
 fn records_metrics_without_the_text() {
-    let h = harness(Fake::default(), limits());
+    // Loud enough that the fake's speech takes the limiter to reach it.
+    let (target, ceiling) = (-4.5, -1.0);
+    let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
+    let take = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
+    let speech_leveling = dsp::loudness::normalize(&dsp::speech::finish(&take, 0), target, ceiling);
+    assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);
+    let speech_leveling = Some((
+        speech_leveling.gain,
+        speech_leveling.reduction,
+        speech_leveling.limited,
+    ));
     let message = Message {
         identifier: "metrics.42",
         text: "Zebra quartz nightingale.",
@@ -782,7 +801,10 @@ fn records_metrics_without_the_text() {
     assert_eq!(unknown.status, 400);
     let mut rows = h.rows();
     rows[..5].sort_by_key(|row| row.route.clone());
-    let row = |route: &str, reply: &Reply, cache_hit, patches| Row {
+    // The blips are drawn at random, so only that they were leveled can be checked.
+    let blips_leveling = rows[1].leveling;
+    assert!(blips_leveling.is_some());
+    let row = |route: &str, reply: &Reply, cache_hit, patches, leveling| Row {
         route: route.to_owned(),
         voice: VOICE.to_owned(),
         identifier: "metrics.42".to_owned(),
@@ -791,22 +813,23 @@ fn records_metrics_without_the_text() {
         text_length: 25,
         audio_seconds: Some(reply.length.as_deref().unwrap().parse().unwrap()),
         patches,
+        leveling,
     };
     assert_eq!(
         rows,
         [
-            row("tts", &speech, Some(false), Some(25)),
-            row("tts-blips", &blips, None, None),
-            row("tts-blips-radio", &blips_radio, None, None),
-            row("tts-radio", &radio, None, None),
-            row("tts-radio-gibberish", &gibberish, None, None),
+            row("tts", &speech, Some(false), Some(25), speech_leveling),
+            row("tts-blips", &blips, None, None, blips_leveling),
+            row("tts-blips-radio", &blips_radio, None, None, None),
+            row("tts-radio", &radio, None, None, None),
+            row("tts-radio-gibberish", &gibberish, None, None, None),
             Row {
                 voice: "Nobody".to_owned(),
                 status: 400,
                 cache_hit: None,
                 audio_seconds: None,
                 patches: None,
-                ..row("tts", &speech, None, None)
+                ..row("tts", &speech, None, None, None)
             },
         ]
     );

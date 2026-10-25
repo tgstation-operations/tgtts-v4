@@ -44,15 +44,22 @@ const SCHEMA: &str = "
         ffmpeg_ms REAL NOT NULL,
         total_ms REAL NOT NULL,
         -- The patches the model generated, NULL where it did not run.
-        patches INTEGER
+        patches INTEGER,
+        -- Bringing the audio to the service's loudness, NULL where it was not: the gain before
+        -- the true-peak limiter, the most the limiter took off, and the fraction of the samples
+        -- it lowered.
+        gain_db REAL,
+        limiter_reduction_db REAL,
+        limited_fraction REAL
     );
 ";
 
 const INSERT: &str = "
     INSERT INTO requests (
         time_unix_ms, route, voice, identifier, status, cache_hit, text_length, audio_seconds,
-        queue_ms, handoff_ms, synthesis_ms, dsp_ms, ffmpeg_ms, total_ms, patches
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        queue_ms, handoff_ms, synthesis_ms, dsp_ms, ffmpeg_ms, total_ms, patches, gain_db,
+        limiter_reduction_db, limited_fraction
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
 ";
 
 /// One request's metrics.
@@ -71,6 +78,18 @@ pub struct Row {
     pub audio_seconds: Option<f64>,
     pub timings: Timings,
     pub patches: Option<usize>,
+    pub leveling: Option<Leveling>,
+}
+
+/// What bringing a request's audio to the service's loudness took.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Leveling {
+    /// The gain before the limiter, in dB.
+    pub gain: f64,
+    /// The most the limiter took off, in dB.
+    pub reduction: f64,
+    /// The fraction of the samples the limiter lowered.
+    pub limited: f64,
 }
 
 /// Where a request's time went.
@@ -193,6 +212,7 @@ fn insert<'a>(
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
             let time = row.time.duration_since(UNIX_EPOCH).unwrap_or_default();
             let t = &row.timings;
+            let leveling = row.leveling.as_ref();
             insert.execute(params![
                 i64::try_from(time.as_millis()).unwrap_or(i64::MAX),
                 row.route,
@@ -209,6 +229,9 @@ fn insert<'a>(
                 ms(t.ffmpeg),
                 ms(t.total),
                 row.patches.map(|p| p as i64),
+                leveling.map(|l| l.gain),
+                leveling.map(|l| l.reduction),
+                leveling.map(|l| l.limited),
             ])?;
         }
     }
@@ -240,6 +263,11 @@ mod tests {
                 total: Duration::from_millis(1002),
             },
             patches: Some(25),
+            leveling: Some(Leveling {
+                gain: -12.5,
+                reduction: 0.75,
+                limited: 0.03125,
+            }),
         }
     }
 
@@ -267,6 +295,7 @@ mod tests {
         radio.cache_hit = None;
         radio.audio_seconds = None;
         radio.patches = None;
+        radio.leveling = None;
         assert!(metrics.record(radio));
         metrics.flush();
         use Value::{Integer as I, Null, Real as R, Text as T};
@@ -291,6 +320,9 @@ mod tests {
                     R(60.0),
                     R(1002.0),
                     I(25),
+                    R(-12.5),
+                    R(0.75),
+                    R(0.03125),
                 ],
                 vec![
                     I(2),
@@ -308,6 +340,9 @@ mod tests {
                     R(40.0),
                     R(60.0),
                     R(1002.0),
+                    Null,
+                    Null,
+                    Null,
                     Null,
                 ],
             ]
