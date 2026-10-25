@@ -4,13 +4,14 @@ use std::{fs, path::Path};
 
 use audiovae::{AudioVaeConfig, Decoder, Encoder, Weights};
 use burn::module::Module;
+use dsp::radio::{Assets, Pcm};
 use minicpm4::{Config, KvCache, LocalShape, Mask, Model};
 use serde_json::Value;
 use voices::Voices;
 
 use crate::{
     conditions::BIGMEM_LOCK,
-    runner::{Runner, Spec},
+    runner::{Runner, Spec, SplitMix, uniform},
 };
 
 pub const NAMES: &[&str] = &[
@@ -35,6 +36,12 @@ pub const NAMES: &[&str] = &[
     "voices.latent",
     "voices.blips.open",
     "voices.blips.sample",
+    "dsp.speech.finish",
+    "dsp.radio.assets",
+    "dsp.radio",
+    "dsp.gibberish",
+    "dsp.blips.message",
+    "dsp.sentences.segment",
 ];
 
 /// The positions of the prompt prod builds for the median voice of the converted set: the
@@ -57,12 +64,21 @@ const UTTERANCE_PATCHES: usize = 25;
 /// Prod decodes each new patch with the 12 frames before it as context.
 const DECODE_CONTEXT_FRAMES: usize = 12;
 const ENCODE_SECONDS: usize = 10;
+/// The line the prompt's 15 tokens stand for.
+const LINE: &str = "Hello there, could someone please come to medbay? I need help.";
+/// The rate the model's speech is at.
+const SPEECH_RATE: u32 = 48000;
+/// The quarter tones a voice is shifted by; any but 0 costs the same.
+const PITCH: i32 = 2;
+/// Spans of an utterance the gibberish radio ducks, in seconds.
+const GIBBERISH_SPANS: [(f64, f64); 3] = [(0.5, 0.9), (1.6, 2.2), (3.0, 3.4)];
 
-/// Where a run reads the real weights and voices from.
+/// Where a run reads the real weights, voices and sounds from.
 pub struct Data<'a> {
     pub checkpoint: Option<&'a Path>,
     pub voices: Option<&'a Path>,
     pub voice: Option<&'a str>,
+    pub assets: Option<&'a Path>,
 }
 
 /// Refuses, before anything is timed, a selection that could not run to the end.
@@ -75,8 +91,13 @@ pub fn check(r: &Runner, data: &Data) -> Result<(), String> {
     if needs_checkpoint && data.checkpoint.is_none() {
         missing.push("VOXCPM2_DIR to name the VoxCPM2 checkpoint");
     }
-    if r.any_selected("voices.") && data.voices.is_none() {
+    let needs_voices = r.any_selected("voices.") || r.any_selected("dsp.blips");
+    if needs_voices && data.voices.is_none() {
         missing.push("VOICES_DIR to name a converted voices directory");
+    }
+    let needs_assets = r.any_selected("dsp.radio") || r.any_selected("dsp.gibberish");
+    if needs_assets && data.assets.is_none() {
+        missing.push("ASSETS_DIR to name the directory of the radio's sounds");
     }
     if !missing.is_empty() {
         return Err(format!(
@@ -108,6 +129,9 @@ pub fn run(r: &mut Runner, data: &Data) -> Result<(), String> {
     }
     if r.any_selected("voices.") {
         voices(r, data.voices.expect("checked"), data.voice)?;
+    }
+    if r.any_selected("dsp.") {
+        dsp(r, data)?;
     }
     Ok(())
 }
@@ -335,17 +359,22 @@ fn audiovae(r: &mut Runner, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn voices(r: &mut Runner, dir: &Path, voice: Option<&str>) -> Result<(), String> {
-    let open = || Voices::open(dir).map_err(|e| e.to_string());
-    let table = open()?;
-    let voice = match voice {
-        Some(voice) => voice.to_owned(),
-        None => table
+/// `voice`, or the first voice of the table.
+fn pick(table: &Voices, voice: Option<&str>) -> Result<String, String> {
+    match voice {
+        Some(voice) => Ok(voice.to_owned()),
+        None => Ok(table
             .names()
             .next()
             .ok_or("the voices table is empty")?
-            .to_owned(),
-    };
+            .to_owned()),
+    }
+}
+
+fn voices(r: &mut Runner, dir: &Path, voice: Option<&str>) -> Result<(), String> {
+    let open = || Voices::open(dir).map_err(|e| e.to_string());
+    let table = open()?;
+    let voice = pick(&table, voice)?;
     let latent = table.latent(&voice).map_err(|e| e.to_string())?;
     let blips = table.blips(&voice).map_err(|e| e.to_string())?;
     let sample = ["male", "1", "a"];
@@ -382,6 +411,122 @@ fn voices(r: &mut Runner, dir: &Path, voice: Option<&str>) -> Result<(), String>
         },
     );
     Ok(())
+}
+
+impl dsp::Random for SplitMix {
+    fn random(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.random() * n as f64) as usize
+    }
+}
+
+fn dsp(r: &mut Runner, data: &Data) -> Result<(), String> {
+    let seconds = (UTTERANCE_PATCHES * FRAMES_PER_PATCH) as f64 * FRAME_SECONDS;
+    let samples = uniform(12, (seconds * f64::from(SPEECH_RATE)) as usize);
+    let speech = Pcm {
+        rate: SPEECH_RATE,
+        channels: 1,
+        samples: samples.iter().map(|&s| (s * 8000.0) as i16).collect(),
+    };
+
+    if r.selected("dsp.speech.finish") {
+        let segment = dsp::segment::Segment::new(speech.rate, speech.samples.clone());
+        let spec = Spec::new("dsp.speech.finish", 2, 20)
+            .audio(seconds)
+            .param("pitch", PITCH);
+        r.measure(spec, || (), |()| dsp::speech::finish(&segment, PITCH));
+    }
+
+    if r.any_selected("dsp.radio") || r.any_selected("dsp.gibberish") {
+        let dir = data.assets.expect("checked");
+        let [on, off, noise] =
+            ["mic_click_on.wav", "mic_click_off.wav", "diffstatic.wav"].map(|f| dir.join(f));
+        let (on, off, noise) = (read_wav(&on)?, read_wav(&off)?, read_wav(&noise)?);
+        let match_assets = || Assets::new(&on, &off, &noise, SPEECH_RATE);
+        let spec = Spec::new("dsp.radio.assets", 1, 5).param("rate", SPEECH_RATE);
+        let assets = r.measure(spec, || (), |()| match_assets());
+        let assets = assets.unwrap_or_else(match_assets);
+        let spec = Spec::new("dsp.radio", 2, 20).audio(seconds);
+        r.measure(
+            spec,
+            || (),
+            |()| dsp::radio::radio(&speech, &assets).expect("speech shorter than the static"),
+        );
+        let spec = Spec::new("dsp.gibberish", 2, 20)
+            .audio(seconds)
+            .param("spans", GIBBERISH_SPANS.len());
+        r.measure(
+            spec,
+            || (),
+            |()| {
+                dsp::gibberish::gibberish(&speech, &assets, &GIBBERISH_SPANS)
+                    .expect("spans within the speech")
+            },
+        );
+    }
+
+    if r.selected("dsp.blips.message") {
+        let table = Voices::open(data.voices.expect("checked")).map_err(|e| e.to_string())?;
+        let voice = pick(&table, data.voice)?;
+        let blips = table.blips(&voice).map_err(|e| e.to_string())?;
+        let mut draws = SplitMix(13);
+        let spec = Spec::new("dsp.blips.message", 3, 30)
+            .param("voice", voice.as_str())
+            .param("text", LINE);
+        r.measure(
+            spec,
+            || (),
+            |()| dsp::blips::message(LINE, &blips, "male", "1", &mut draws).expect("a known voice"),
+        );
+    }
+
+    if r.selected("dsp.sentences.segment") {
+        let spec = Spec::new("dsp.sentences.segment", 10, 100).param("text", LINE);
+        r.measure(spec, || (), |()| dsp::sentences::segment(LINE));
+    }
+    Ok(())
+}
+
+/// A WAV file of 16-bit PCM.
+fn read_wav(path: &Path) -> Result<Pcm, String> {
+    let invalid = |why: &str| format!("{}: {why}", path.display());
+    let bytes = fs::read(path).map_err(|e| invalid(&e.to_string()))?;
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(invalid("not a RIFF WAVE file"));
+    }
+    let (mut format, mut samples, mut at) = (None, None, 12);
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes")) as usize;
+        let body = bytes
+            .get(at + 8..at + 8 + size)
+            .ok_or_else(|| invalid("a chunk runs past the end"))?;
+        let u16_at = |i: usize| u16::from_le_bytes([body[i], body[i + 1]]);
+        match id {
+            b"fmt " if size >= 16 => {
+                let rate = u32::from_le_bytes(body[4..8].try_into().expect("4 bytes"));
+                format = Some((u16_at(0), u16_at(2), rate, u16_at(14)));
+            }
+            b"data" => {
+                let pcm = body.as_chunks().0.iter().map(|&s| i16::from_le_bytes(s));
+                samples = Some(pcm.collect());
+            }
+            _ => {}
+        }
+        at += 8 + size + size % 2;
+    }
+    match (format, samples) {
+        (Some((1, channels, rate, 16)), Some(samples)) => Ok(Pcm {
+            rate,
+            channels,
+            samples,
+        }),
+        (Some(_), Some(_)) => Err(invalid("not 16-bit PCM")),
+        _ => Err(invalid("no fmt or data chunk")),
+    }
 }
 
 fn config_json(dir: &Path) -> Result<Value, String> {

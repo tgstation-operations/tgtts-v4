@@ -9,6 +9,7 @@ pkgs.writeShellApplication {
     pkgs.git
     pkgs.gnugrep
     pkgs.gnused
+    pkgs.pkg-config
   ];
   text = ''
     # bench [CARGO_ARGS... --] [BENCH_ARGS...]: arguments before a `--` go to cargo, such as
@@ -18,6 +19,8 @@ pkgs.writeShellApplication {
     # As the devshell sets them, or alternating with it would rebuild everything each time.
     export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true CARGO_BUILD_FINGERPRINT=content \
       CARGO_UNSTABLE_RUSTDOC_DEPINFO=true
+    # The C libraries the devshell's buildInputs give, which a bare `nix run` lacks.
+    export PKG_CONFIG_PATH=${pkgs.lib.getDev pkgs.soxr}/lib/pkgconfig
 
     cargo_args=()
     for arg; do

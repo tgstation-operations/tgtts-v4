@@ -39,7 +39,8 @@ usage: bench [run] [--filter TEXT]... [--quick] [--warmup N] [--reps N] [--dtype
        bench list
 
 run times the benchmarks whose names contain any --filter (all by default), with VOXCPM2_DIR
-naming the VoxCPM2 checkpoint and VOICES_DIR a converted voices directory, and writes
+naming the VoxCPM2 checkpoint, VOICES_DIR a converted voices directory and ASSETS_DIR the
+radio's sounds, and writes
 <commit>-<time>.json to --out (target/bench by default). --quick is 1 warmup and 3 timed
 repetitions, for trying the harness, not for measuring. It refuses to start, with exit status 3,
 while the 1-minute load average or the CPUs others keep busy exceed --max-load (default 1);
@@ -197,11 +198,12 @@ fn run(args: &[String]) -> Result<(), Failure> {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
     };
-    let (checkpoint, voices) = (dir("VOXCPM2_DIR"), dir("VOICES_DIR"));
+    let (checkpoint, voices, assets) = (dir("VOXCPM2_DIR"), dir("VOICES_DIR"), dir("ASSETS_DIR"));
     let data = Data {
         checkpoint: checkpoint.as_deref(),
         voices: voices.as_deref(),
         voice: options.voice.as_deref(),
+        assets: assets.as_deref(),
     };
     suite::check(&runner, &data).map_err(Failure::Usage)?;
 
