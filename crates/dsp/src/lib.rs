@@ -4,6 +4,7 @@
 pub mod blips;
 pub mod float;
 pub mod pitch;
+pub mod radio;
 pub mod resample;
 pub mod segment;
 pub mod sentences;

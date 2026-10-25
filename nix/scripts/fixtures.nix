@@ -14,6 +14,8 @@ let
     ps.pydub
     ps.pysbd
     ps.safetensors
+    ps.scipy
+    ps.soundfile
     ps.torch
   ]);
 in

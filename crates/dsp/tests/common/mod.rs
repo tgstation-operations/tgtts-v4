@@ -117,3 +117,60 @@ pub fn first_difference<T: PartialEq + std::fmt::Debug>(actual: &[T], expected: 
         None => format!("lengths {} and {}", actual.len(), expected.len()),
     }
 }
+
+/// Asserts that 16-bit `actual` is `expected` but for samples at most `max` apart, no more than
+/// `fraction` of them.
+#[track_caller]
+pub fn assert_pcm_close(name: &str, actual: &[i16], expected: &[i16], max: i32, fraction: f64) {
+    assert_eq!(actual.len(), expected.len(), "{name}: lengths");
+    let differences: Vec<i32> = (actual.iter().zip(expected))
+        .map(|(a, e)| (i32::from(*a) - i32::from(*e)).abs())
+        .collect();
+    let worst = differences.iter().copied().max().unwrap_or(0);
+    assert!(worst <= max, "{name}: samples {worst} apart");
+    let differing = differences.iter().filter(|&&d| d != 0).count();
+    let share = differing as f64 / expected.len().max(1) as f64;
+    assert!(
+        share <= fraction,
+        "{name}: {differing} of {} samples differ",
+        expected.len()
+    );
+}
+
+/// The rate, channels and samples of a 16-bit PCM WAV file.
+pub fn read_wav(path: &std::path::Path) -> (u32, u16, Vec<i16>) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "{}: not a WAV",
+        path.display()
+    );
+    let (mut format, mut data) = (None, None);
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let body = &bytes[at + 8..(at + 8 + len).min(bytes.len())];
+        match &bytes[at..at + 4] {
+            b"fmt " => format = Some(body),
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        at += 8 + len + len % 2;
+    }
+    let (format, data) = (format.unwrap(), data.unwrap());
+    let word = |i: usize| u16::from_le_bytes([format[i], format[i + 1]]);
+    assert_eq!(
+        (word(0), word(14)),
+        (1, 16),
+        "{}: not 16-bit PCM",
+        path.display()
+    );
+    let rate = u32::from_le_bytes(format[4..8].try_into().unwrap());
+    let samples = data
+        .as_chunks()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
+        .collect();
+    (rate, word(2), samples)
+}
