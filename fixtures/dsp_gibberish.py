@@ -6,7 +6,8 @@ random recorded. The letters' times are made up, as are the speech and the click
 
 Where the port fixes the old service, the restatement takes the fix too: the speech is filtered
 and ducked at the 48 kHz it was resampled to, the static loops under speech longer than it, and
-the static after the speech goes on from where the static under it left off.
+the static after the speech goes on from where the static under it left off, and a span starting
+past the speech's end is cut to nothing where numpy could not fade it.
 """
 
 import json
@@ -34,8 +35,6 @@ from dsp_radio import (  # noqa: E402
     numpy_to_audiosegment,
     saturate,
 )
-
-SPAN_PAST_END = 1
 
 
 # The old service's code, as it had it.
@@ -123,8 +122,8 @@ def apply_corruption_static(
     fade = int(fade_ms * sr / 1000)
 
     for start_sec, end_sec in corrupted_spans:
-        s = max(0, int(start_sec * sr) - pre)
         e = min(total, int(end_sec * sr) + post)
+        s = min(max(0, int(start_sec * sr) - pre), e)
 
         duck_envelope[s:e] = duck_gain
 
@@ -167,8 +166,8 @@ def build_static_mask(
     mask_envelope = np.zeros(total_samples)
 
     for start_sec, end_sec in corrupted_spans:
-        s = max(0, int(start_sec * sr) - pre)
         e = min(total_samples, int(end_sec * sr) + post)
+        s = min(max(0, int(start_sec * sr) - pre), e)
 
         mask_envelope[s:e] = 1.0
 
@@ -320,12 +319,7 @@ for case, (samples, rate, spans) in enumerate(radios):
     seg = AudioSegment(
         samples.astype("<i2").tobytes(), frame_rate=rate, sample_width=2, channels=1
     )
-    try:
-        out = numpy_to_audiosegment(radio_effect(seg, spans), OUTPUT_SR)
-    except ValueError:
-        tensors[f"{name}/error"] = torch.tensor(SPAN_PAST_END)
-        continue
-    tensors[f"{name}/error"] = torch.tensor(0)
+    out = numpy_to_audiosegment(radio_effect(seg, spans), OUTPUT_SR)
     tensors[f"{name}/output"] = dsp_radio.pcm(
         np.frombuffer(out.raw_data, dtype=np.int16)
     )

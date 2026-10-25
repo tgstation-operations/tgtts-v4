@@ -2,9 +2,8 @@
 //! clicks around it, as the old radio service made it.
 
 use std::{
-    error,
     f64::consts::PI,
-    fmt, iter,
+    iter,
     ops::{Add, Div},
 };
 
@@ -85,24 +84,6 @@ where
         })
         .collect()
 }
-
-/// Why the radio failed, where the old service failed the request.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Error {
-    /// A span to duck, starting at this many seconds, starts past the end of the speech, where
-    /// numpy could not fade it.
-    SpanPastEnd(f64),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SpanPastEnd(start) => write!(f, "span at {start} s starts past the speech"),
-        }
-    }
-}
-
-impl error::Error for Error {}
 
 /// `speech` over the radio, as the old radio service made it: its channels averaged, resampled to
 /// 8 kHz and on to the service's 48 kHz, band-passed to 300 to 3000 Hz, overdriven, with the

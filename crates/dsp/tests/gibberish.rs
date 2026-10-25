@@ -5,7 +5,7 @@ mod common;
 use common::{Tensors, assert_pcm_close};
 use dsp::{
     Random, gibberish,
-    radio::{Assets, Error, Pcm},
+    radio::{Assets, Pcm},
 };
 use serde_json::Value;
 
@@ -13,7 +13,6 @@ use serde_json::Value;
 /// one apart.
 const MAX_DIFFERENCE: i32 = 1;
 const MAX_DIFFERING: f64 = 0.001;
-const SPAN_PAST_END: i64 = 1;
 
 /// Python's draws, replayed in order: each a kind, 0 for `random()` and 1 for `_randbelow`, its
 /// bound, and its value, a double's bits for `random()`.
@@ -74,42 +73,54 @@ fn masks_and_finds_spans_as_the_old_service() {
     }
 }
 
-#[test]
-fn ducks_as_the_old_service() {
-    let fixture = testkit::fixture!("dsp_gibberish");
-    let fx = Tensors::new(&fixture);
+/// The fixture's clicks and static.
+fn assets(fx: &Tensors) -> Assets {
     let clip = |stem: &str| Pcm {
         rate: fx.int(&format!("{stem}/rate")) as u32,
         channels: fx.int(&format!("{stem}/channels")) as u16,
         samples: fx.pcm(&format!("{stem}/samples")),
     };
     let [on, off, noise] = ["mic_click_on", "mic_click_off", "diffstatic"].map(clip);
-    let assets = Assets::new(&on, &off, &noise);
+    Assets::new(&on, &off, &noise)
+}
+
+fn speech(fx: &Tensors, name: &str) -> Pcm {
+    Pcm {
+        rate: fx.int(&format!("{name}/rate")) as u32,
+        channels: 1,
+        samples: fx.pcm(&format!("{name}/input")),
+    }
+}
+
+#[test]
+fn ducks_as_the_old_service() {
+    let fixture = testkit::fixture!("dsp_gibberish");
+    let fx = Tensors::new(&fixture);
+    let assets = assets(&fx);
     let radios: usize = fixture.metadata()["radios"].parse().unwrap();
     for case in 0..radios {
         let name = format!("radio/{case}");
-        let speech = Pcm {
-            rate: fx.int(&format!("{name}/rate")) as u32,
-            channels: 1,
-            samples: fx.pcm(&format!("{name}/input")),
-        };
         let spans = pairs(&fx, &format!("{name}/spans"));
-        match (
-            gibberish::gibberish(&speech, &assets, &spans),
-            fx.int(&format!("{name}/error")),
-        ) {
-            (Ok(actual), 0) => {
-                let expected = fx.pcm(&format!("{name}/output"));
-                assert_pcm_close(
-                    &name,
-                    &actual.samples,
-                    &expected,
-                    MAX_DIFFERENCE,
-                    MAX_DIFFERING,
-                );
-            }
-            (Err(Error::SpanPastEnd(_)), SPAN_PAST_END) => {}
-            (actual, error) => panic!("{name}: {actual:?} where the service gave error {error}"),
-        }
+        let actual = gibberish::gibberish(&speech(&fx, &name), &assets, &spans);
+        let expected = fx.pcm(&format!("{name}/output"));
+        assert_pcm_close(
+            &name,
+            &actual.samples,
+            &expected,
+            MAX_DIFFERENCE,
+            MAX_DIFFERING,
+        );
     }
+}
+
+#[test]
+fn spans_past_the_speech_duck_nothing() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_gibberish"));
+    let (assets, speech) = (assets(&fx), speech(&fx, "radio/2"));
+    let within = (0.02, 0.03);
+    let past = (speech.samples.len() as f64 / 48000.0 + 0.1, 1.0);
+    assert_eq!(
+        gibberish::gibberish(&speech, &assets, &[within, past]),
+        gibberish::gibberish(&speech, &assets, &[within])
+    );
 }

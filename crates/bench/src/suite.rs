@@ -564,10 +564,7 @@ fn dsp(r: &mut Runner, data: &Data) -> Result<(), String> {
         r.measure(
             spec,
             || (),
-            |()| {
-                dsp::gibberish::gibberish(&speech, &assets, &GIBBERISH_SPANS)
-                    .expect("spans within the speech")
-            },
+            |()| dsp::gibberish::gibberish(&speech, &assets, &GIBBERISH_SPANS),
         );
     }
 

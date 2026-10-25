@@ -7,7 +7,7 @@
 
 use crate::{
     RATE, Random,
-    radio::{self, Assets, Error, Pcm, narrow},
+    radio::{self, Assets, Pcm, narrow},
     segment::Segment,
 };
 
@@ -115,14 +115,14 @@ fn merge(mut spans: Vec<(f64, f64)>, gap: f64) -> Vec<(f64, f64)> {
 /// `speech` over the radio as [`radio::radio`] makes it, but ducked under static over `spans`,
 /// in seconds, as the old radio-gibberish service made it: the speech faded out over 25 ms from
 /// 60 ms before each span and back in over 50 ms to 80 ms after it, with the static, at 0.85,
-/// faded in and out alike.
-pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Result<Segment, Error> {
-    let ducked = duck(&narrow(speech), spans, assets.noise())?;
-    Ok(radio::finish(ducked, assets))
+/// faded in and out alike. Spans are cut to the speech.
+pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Segment {
+    let ducked = duck(&narrow(speech), spans, assets.noise());
+    radio::finish(ducked, assets)
 }
 
 /// The old service's `apply_corruption_static` with `build_static_mask`, at its settings.
-fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Result<Vec<f64>, Error> {
+fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Vec<f64> {
     let total = speech.len();
     let rate = f64::from(RATE);
     let ms = |ms: u32| (f64::from(ms * RATE) / 1000.0) as i64;
@@ -130,16 +130,12 @@ fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Result<Vec<f64>,
     let mut envelope = vec![1.0; total];
     let mut mask = vec![0.0; total];
     for &(start, end) in spans {
-        let s = ((start * rate) as i64 - pre).max(0);
-        let e = ((end * rate) as i64 + post).min(total as i64);
-        // numpy's linspace of a negative length, where the span starts past the speech's end.
-        let half = (e - s).div_euclid(2);
-        if half < 0 {
-            return Err(Error::SpanPastEnd(start));
-        }
+        let e = ((end * rate) as i64 + post).clamp(0, total as i64);
+        let s = ((start * rate) as i64 - pre).clamp(0, e);
+        let half = (e - s) / 2;
         let (s, e) = (s as usize, e as usize);
         let (fade_in, fade_out) = (fade.min(half) as usize, (fade * 2).min(half) as usize);
-        let range = s..e.max(s);
+        let range = s..e;
         envelope[range.clone()].fill(0.0);
         envelope[s..s + fade_in].copy_from_slice(&linspace(1.0, 0.0, fade_in));
         envelope[e - fade_out..e].copy_from_slice(&linspace(0.0, 1.0, fade_out));
@@ -157,10 +153,10 @@ fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Result<Vec<f64>,
             *m *= f;
         }
     }
-    Ok((speech.iter().zip(&envelope))
+    (speech.iter().zip(&envelope))
         .zip(radio::looped(noise).zip(&mask))
         .map(|((s, d), (n, m))| s * d + n * m * 0.85)
-        .collect())
+        .collect()
 }
 
 /// numpy's `linspace(start, stop, n)`: `i * step + start`, but the last exactly `stop`.
