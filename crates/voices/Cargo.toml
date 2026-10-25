@@ -1,0 +1,10 @@
+[package]
+name = "voices"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+safetensors.workspace = true
+serde_json.workspace = true
