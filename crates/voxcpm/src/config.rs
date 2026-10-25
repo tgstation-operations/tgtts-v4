@@ -187,7 +187,7 @@ impl Config {
         Ok(config)
     }
 
-    fn check(&self) -> Result<(), Error> {
+    pub(crate) fn check(&self) -> Result<(), Error> {
         let unsupported = |what: String| Err(Error::Unsupported(what));
         if let Some(architecture) = &self.architecture
             && architecture != "voxcpm2"

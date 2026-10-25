@@ -6430,6 +6430,8 @@ dependencies = [
  "audiovae",
  "burn",
  "minicpm4",
+ "rand 0.10.3",
+ "rand_distr",
  "regex",
  "serde",
  "serde_json",

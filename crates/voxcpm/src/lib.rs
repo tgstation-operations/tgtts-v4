@@ -9,6 +9,9 @@ mod cfm;
 mod config;
 mod local_dit;
 mod local_encoder;
+mod model;
+mod noise;
+mod prompt;
 mod weights;
 
 use std::fmt;
@@ -20,9 +23,12 @@ pub use crate::{
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
     local_dit::LocalDit,
     local_encoder::LocalEncoder,
+    model::{Dtypes, Generation, Model, Step},
+    noise::{Noise, SeededNoise},
+    prompt::Prompt,
 };
 
-/// Why a model could not be loaded.
+/// Why a model could not be loaded, or a request served.
 #[derive(Debug)]
 pub enum Error {
     /// `config.json` is not a config upstream would read.
@@ -33,6 +39,8 @@ pub enum Error {
     Stack(minicpm4::Error),
     /// The weights around the stacks could not be read, or do not fit the config.
     Load(SafetensorsStoreError),
+    /// A request the model cannot serve.
+    Request(String),
 }
 
 impl fmt::Display for Error {
@@ -42,6 +50,7 @@ impl fmt::Display for Error {
             Self::Unsupported(what) => write!(f, "unsupported VoxCPM2 config: {what}"),
             Self::Stack(e) => write!(f, "{e}"),
             Self::Load(e) => write!(f, "loading VoxCPM2 weights: {e}"),
+            Self::Request(what) => write!(f, "cannot generate from {what}"),
         }
     }
 }
