@@ -8,6 +8,7 @@ let
   };
   python = pkgs.python3.withPackages (ps: [
     ps.einops
+    ps.librosa
     ps.numpy
     ps.pydantic
     ps.pydub

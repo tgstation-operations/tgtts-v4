@@ -18,9 +18,11 @@ pkgs.mkShell {
     rustToolchain
     pkgs.deadnix
     pkgs.nixfmt
+    pkgs.pkg-config
     pkgs.statix
   ]
   ++ builtins.attrValues scripts;
+  buildInputs = [ pkgs.soxr ];
 
   shellHook = ''
     # Otherwise coreutils' fmt, the paragraph reflower, can shadow ours and

@@ -5,6 +5,10 @@ license.workspace = true
 version.workspace = true
 publish = false
 
+[build-dependencies]
+pkg-config.workspace = true
+
 [dev-dependencies]
+crc32fast.workspace = true
 safetensors.workspace = true
 testkit = { path = "../testkit" }
