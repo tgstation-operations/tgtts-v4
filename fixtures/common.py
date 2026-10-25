@@ -67,6 +67,32 @@ def voxcpm2(config):
     return model
 
 
+def record_steps(model):
+    """Record what upstream's VoxCPM2Model computes for each patch it generates, in lists it
+    appends to: the noise the patch is sampled from, drawn here as upstream draws it with the
+    generator put back after, the patch, and the stop head's input and logits."""
+    steps = {"noise": [], "patches": [], "stop_inputs": [], "stop_logits": []}
+    sample = model.feat_decoder.forward
+
+    def record_patch(**kwargs):
+        mu = kwargs["mu"]
+        state = torch.get_rng_state()
+        shape = (mu.size(0), model.feat_dim, kwargs["patch_size"])
+        steps["noise"].append(torch.randn(shape, dtype=mu.dtype))
+        torch.set_rng_state(state)
+        patch = sample(**kwargs)
+        steps["patches"].append(patch.transpose(1, 2))
+        return patch
+
+    def record_stop(module, inputs, output):
+        steps["stop_inputs"].append(inputs[0])
+        steps["stop_logits"].append(output)
+
+    model.feat_decoder.forward = record_patch
+    model.stop_head.register_forward_hook(record_stop)
+    return steps
+
+
 class Fixture:
     """One generator's run, seeded when it is made."""
 

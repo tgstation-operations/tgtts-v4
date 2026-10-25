@@ -1,6 +1,5 @@
 mod common;
-
-use std::collections::VecDeque;
+mod recorded;
 
 use audiovae::{Decoder, Weights};
 use burn::{
@@ -8,6 +7,7 @@ use burn::{
     tensor::{FloatDType, Tensor},
 };
 use common::tiny;
+use recorded::Recorded;
 use testkit::{Fixture, assert_close, device, fixture};
 use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, decode};
 
@@ -18,25 +18,8 @@ const F32: Dtypes = Dtypes {
     audio_decoder: FloatDType::F32,
 };
 
-/// Upstream's noise, patch by patch.
-struct Recorded(VecDeque<Vec<f32>>);
-
-impl Noise for Recorded {
-    fn next(&mut self, len: usize) -> Vec<f32> {
-        let noise = self.0.pop_front().expect("upstream drew no more noise");
-        assert_eq!(noise.len(), len);
-        noise
-    }
-}
-
 fn recorded(fixture: &Fixture) -> Recorded {
-    let noise = fixture.tensor::<3>("input.noise", &device());
-    let steps = noise.dims()[0];
-    Recorded(
-        (0..steps)
-            .map(|i| floats(noise.clone().narrow(0, i, 1)))
-            .collect(),
-    )
+    Recorded::new(fixture.tensor("input.noise", &device()))
 }
 
 fn floats<const D: usize>(tensor: Tensor<D>) -> Vec<f32> {

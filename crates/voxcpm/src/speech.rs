@@ -92,13 +92,26 @@ impl TextToSpeech {
         params: &Params,
         noise: &mut impl Noise,
     ) -> Result<Vec<f32>, Error> {
-        let tokens = self.tokenizer.encode(&format!("{}{text}", voice.text));
-        let frames = voice.frames.as_flattened();
-        let prompt = Prompt::cloning(&tokens, frames, &self.config)?;
+        let prompt = self.prompt(text, voice)?;
         let patches = self
             .model
             .generate(&prompt, &params.sampling, params.max_patches, noise)?;
-        Ok(decode(&self.decoder, frames, patches))
+        Ok(decode(&self.decoder, voice.frames.as_flattened(), patches))
+    }
+
+    /// The prompt [`synthesize`](Self::synthesize) generates from.
+    ///
+    /// # Errors
+    ///
+    /// If the voice is not a whole number of patches.
+    pub fn prompt(&self, text: &str, voice: &Latent) -> Result<Prompt, Error> {
+        let tokens = self.tokenizer.encode(&format!("{}{text}", voice.text));
+        Prompt::cloning(&tokens, voice.frames.as_flattened(), &self.config)
+    }
+
+    /// The model, to generate from a prompt a patch at a time.
+    pub fn model(&self) -> &Model {
+        &self.model
     }
 }
 

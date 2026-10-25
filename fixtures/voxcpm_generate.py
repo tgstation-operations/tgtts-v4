@@ -53,31 +53,7 @@ def record_prompt(text, text_mask, feat, feat_mask, **kwargs):
 
 model._inference = record_prompt
 
-steps = {"noise": [], "patches": [], "stop_inputs": [], "stop_logits": []}
-sample = model.feat_decoder.forward
-
-
-def record_step(**kwargs):
-    """Samples a patch as upstream does, recording the noise it draws."""
-    mu = kwargs["mu"]
-    state = torch.get_rng_state()
-    shape = (mu.size(0), model.feat_dim, kwargs["patch_size"])
-    steps["noise"].append(torch.randn(shape, dtype=mu.dtype))
-    torch.set_rng_state(state)
-    patch = sample(**kwargs)
-    steps["patches"].append(patch.transpose(1, 2))
-    return patch
-
-
-model.feat_decoder.forward = record_step
-
-
-def record_stop(module, inputs, output):
-    steps["stop_inputs"].append(inputs[0])
-    steps["stop_logits"].append(output)
-
-
-model.stop_head.register_forward_hook(record_stop)
+steps = common.record_steps(model)
 
 
 def generate(min_len):
