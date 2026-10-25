@@ -4,3 +4,10 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 publish = false
+
+[dependencies]
+dsp = { path = "../dsp" }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true
