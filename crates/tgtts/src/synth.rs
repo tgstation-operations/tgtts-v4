@@ -57,9 +57,10 @@ pub fn to_segment(samples: &[f32]) -> Segment {
     Segment::new(RATE, pcm)
 }
 
-/// The level the service gives the model's speech: its peak at -0.1 dBFS, as pydub's
-/// `effects.normalize` at its default headroom brought it in the old model service. That service
-/// also computed a -25 dBFS loudness and a -5 dBFS cap, then threw both away.
+/// The level the model's speech is cached at: its peak at -0.1 dBFS, as pydub's
+/// `effects.normalize` at its default headroom brought it in the old model service, so that the
+/// cache's 16 bits hold as much of it as they can; the service brings it to its loudness after.
+/// That service also computed a -25 dBFS loudness and a -5 dBFS cap, then threw both away.
 pub fn level(speech: &Segment) -> Segment {
     speech.normalize(0.1)
 }

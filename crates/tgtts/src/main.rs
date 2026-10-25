@@ -90,6 +90,7 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error>> {
         sounds,
         metrics,
         logging,
+        loudness: config.loudness,
         limits: Limits {
             synthesis: config.synthesis_limit,
             cpu: config.cpu_limit,

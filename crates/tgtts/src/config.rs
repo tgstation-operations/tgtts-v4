@@ -14,6 +14,10 @@
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
 //! - `radio_wait_seconds`: how long a radio route waits for what it puts on the radio, 10 by
 //!   default.
+//! - `loudness_target_lufs`: the integrated loudness speech and blips are brought to before the
+//!   game's filters, -16 by default.
+//! - `loudness_ceiling_dbtp`: the true peak they are held under, at most 0, EBU R128's -1 by
+//!   default.
 //! - `log_level`: `DEBUG`, `INFO`, `WARNING` or `ERROR`, `INFO` by default.
 
 use std::{
@@ -28,9 +32,9 @@ use std::{
 
 use tracing::level_filters::LevelFilter;
 
-use crate::service::parse_level;
+use crate::service::{Loudness, parse_level};
 
-const KEYS: [&str; 13] = [
+const KEYS: [&str; 15] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -43,6 +47,8 @@ const KEYS: [&str; 13] = [
     "cpu_limit",
     "queue_timeout_seconds",
     "radio_wait_seconds",
+    "loudness_target_lufs",
+    "loudness_ceiling_dbtp",
     "log_level",
 ];
 
@@ -61,6 +67,7 @@ pub struct Config {
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
     pub radio_wait: Duration,
+    pub loudness: Loudness,
     pub log_level: LevelFilter,
 }
 
@@ -114,6 +121,16 @@ impl Config {
             radio_wait: settings
                 .seconds("radio_wait_seconds")?
                 .unwrap_or(Duration::from_secs(10)),
+            loudness: Loudness {
+                target: settings.decibels("loudness_target_lufs")?.unwrap_or(-16.0),
+                ceiling: match settings.decibels("loudness_ceiling_dbtp")? {
+                    Some(ceiling) if ceiling > 0.0 => {
+                        let reason = format!("loudness_ceiling_dbtp: {ceiling} is over full scale");
+                        return Err(Error(reason));
+                    }
+                    ceiling => ceiling.unwrap_or(dsp::loudness::CEILING),
+                },
+            },
             log_level: match settings.0.get("log_level") {
                 None => LevelFilter::INFO,
                 Some(name) => parse_level(&name.to_uppercase())
@@ -153,6 +170,13 @@ impl Settings {
         match self.parse(key)? {
             Some(0) => Err(Error(format!("{key}: 0 would never run anything"))),
             limit => Ok(limit),
+        }
+    }
+
+    fn decibels(&self, key: &str) -> Result<Option<f64>, Error> {
+        match self.parse::<f64>(key)? {
+            Some(db) if !db.is_finite() => Err(Error(format!("{key}: {db} is not a level"))),
+            db => Ok(db),
         }
     }
 
@@ -229,6 +253,10 @@ mod tests {
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),
+                loudness: Loudness {
+                    target: -16.0,
+                    ceiling: -1.0,
+                },
                 log_level: LevelFilter::INFO,
             }
         );
@@ -245,6 +273,8 @@ mod tests {
             cpu_limit = 8
             queue_timeout_seconds = 2.5
             radio_wait_seconds = 10
+            loudness_target_lufs = -18
+            loudness_ceiling_dbtp = -1.5
             log_level = \"debug\"
             "
         );
@@ -257,6 +287,11 @@ mod tests {
         assert_eq!(config.ffmpeg, Path::new("/usr/bin/ffmpeg"));
         assert_eq!((config.synthesis_limit, config.cpu_limit), (4, 8));
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
+        let loudness = Loudness {
+            target: -18.0,
+            ceiling: -1.5,
+        };
+        assert_eq!(config.loudness, loudness);
         assert_eq!(config.log_level, LevelFilter::DEBUG);
 
         let env = [
@@ -264,12 +299,14 @@ mod tests {
             ("TGTTS_SYNTHESIS_LIMIT", "2"),
             ("TGTTS_LOG_LEVEL", "WARNING"),
             ("TGTTS_TOKEN_FILE", "/etc/token"),
+            ("TGTTS_LOUDNESS_TARGET_LUFS", "-14.5"),
         ];
         let config = load(&toml, &env).unwrap();
         assert_eq!(config.listen, "[::1]:6000".parse().unwrap());
         assert_eq!(config.synthesis_limit, 2);
         assert_eq!(config.log_level, LevelFilter::WARN);
         assert_eq!(config.token_file, Path::new("/etc/token"));
+        assert_eq!(config.loudness.target, -14.5);
     }
 
     #[test]
@@ -296,6 +333,15 @@ mod tests {
         assert!(error(REQUIRED, &[("TGTTS_CPU_LIMIT", "0")]).starts_with("cpu_limit:"));
         assert!(error(REQUIRED, &[("TGTTS_RADIO_WAIT_SECONDS", "-1")]).starts_with("radio_wait"));
         assert!(error(REQUIRED, &[("TGTTS_LOG_LEVEL", "loud")]).starts_with("log_level:"));
+        for (key, value) in [
+            ("TGTTS_LOUDNESS_TARGET_LUFS", "NaN"),
+            ("TGTTS_LOUDNESS_TARGET_LUFS", "-inf"),
+            ("TGTTS_LOUDNESS_CEILING_DBTP", "0.5"),
+            ("TGTTS_LOUDNESS_CEILING_DBTP", "loud"),
+        ] {
+            let error = error(REQUIRED, &[(key, value)]);
+            assert!(error.starts_with("loudness_"), "{value}: {error}");
+        }
         assert!(error("x = [", &[]).contains("tgtts.toml"));
     }
 

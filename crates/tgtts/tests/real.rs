@@ -16,7 +16,7 @@ use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
     model::VoxCpm,
-    service::{Limits, Logging, Setup, Sounds},
+    service::{Limits, Logging, Loudness, Setup, Sounds},
     wav,
 };
 use tracing::level_filters::LevelFilter;
@@ -64,6 +64,10 @@ fn serves_a_message_on_the_real_model() {
         sounds: Sounds::open(&assets).unwrap(),
         metrics: None,
         logging: Logging::new(LevelFilter::INFO, |_| {}),
+        loudness: Loudness {
+            target: -16.0,
+            ceiling: dsp::loudness::CEILING,
+        },
         limits: Limits {
             synthesis: 1,
             cpu: 4,

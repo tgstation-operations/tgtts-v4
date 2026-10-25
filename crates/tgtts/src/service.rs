@@ -114,6 +114,15 @@ pub struct Limits {
     pub radio_wait: Duration,
 }
 
+/// The loudness the service brings speech and blips to, before the game's filters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Loudness {
+    /// The integrated loudness, in LUFS.
+    pub target: f64,
+    /// The true peak it is held under, in dBTP.
+    pub ceiling: f64,
+}
+
 /// What a [`Service`] is made of.
 pub struct Setup {
     /// What the game sends as its `Authorization` header.
@@ -125,6 +134,7 @@ pub struct Setup {
     pub sounds: Sounds,
     pub metrics: Option<Metrics>,
     pub logging: Logging,
+    pub loudness: Loudness,
     pub limits: Limits,
 }
 
@@ -138,6 +148,7 @@ pub struct Service {
     sounds: Sounds,
     metrics: Option<Metrics>,
     logging: Logging,
+    loudness: Loudness,
     handoff: Handoff,
     model: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
@@ -155,6 +166,7 @@ impl Service {
             sounds: setup.sounds,
             metrics: setup.metrics,
             logging: setup.logging,
+            loudness: setup.loudness,
             handoff: Handoff::new(setup.limits.radio_wait),
             model: Arc::new(Semaphore::new(setup.limits.synthesis)),
             cpu: Arc::new(Semaphore::new(setup.limits.cpu)),
@@ -470,7 +482,8 @@ impl Service {
         }
     }
 
-    /// The speech of `text` in `voice`, finished as the old frontend finished it.
+    /// The speech of `text` in `voice`, finished as the old frontend finished it and brought to
+    /// the service's loudness.
     async fn speech(
         self: &Arc<Self>,
         voice: &str,
@@ -483,8 +496,12 @@ impl Service {
             None => Segment::new(dsp::RATE, Vec::new()),
             Some(text) => self.spoken(voice, text, trace).await?,
         };
-        self.cpu(trace, move || dsp::speech::finish(&spoken, pitch))
-            .await
+        let loudness = self.loudness;
+        self.cpu(trace, move || {
+            let finished = dsp::speech::finish(&spoken, pitch);
+            dsp::loudness::normalize(&finished, loudness.target, loudness.ceiling).segment
+        })
+        .await
     }
 
     /// What the model says for `text` in `voice`, from the cache once it has said it often
@@ -555,6 +572,7 @@ impl Service {
 
     /// The blips of `text` in the request's voice, `pitch` quarter tones up, as the old frontend
     /// had them made: at the request's base and number, `male` and `1` where they are not given.
+    /// They are brought to the service's loudness.
     async fn blips(
         self: &Arc<Self>,
         params: &Params,
@@ -567,11 +585,13 @@ impl Service {
         let base = or(&params.blip_base, "male");
         let number = or(&params.blip_number, "1");
         let (service, voice, text) = (self.clone(), params.voice.clone(), text.to_owned());
+        let loudness = self.loudness;
         self.cpu(trace, move || {
             let blips = service.voices.blips(&voice).map_err(Failure::internal)?;
             let mut draws = Draws(rand::rng());
-            dsp::blips::message(&text, &blips, &base, &number, pitch, &mut draws)
-                .map_err(|e| Failure::internal(format!("blips: {e}")))
+            let blips = dsp::blips::message(&text, &blips, &base, &number, pitch, &mut draws)
+                .map_err(|e| Failure::internal(format!("blips: {e}")))?;
+            Ok(dsp::loudness::normalize(&blips, loudness.target, loudness.ceiling).segment)
         })
         .await?
     }

@@ -22,7 +22,7 @@ use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
     metrics::Metrics,
-    service::{Limits, Logging, Setup, Sounds},
+    service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::{self, Speech, Synthesizer},
     wav,
 };
@@ -83,14 +83,18 @@ impl Synthesizer for Fake {
         if text.contains("Fail") {
             return Err("the fake fails on request".into());
         }
-        let samples = (0..FRAMES_PER_CHAR * text.len())
-            .map(|i| 0.5 * (TAU * 220.0 * i as f32 / 48000.0).sin())
-            .collect();
         Ok(Speech {
-            samples,
+            samples: said(text),
             patches: text.len(),
         })
     }
+}
+
+/// What the fake model says for `text`: a tone as long as it.
+fn said(text: &str) -> Vec<f32> {
+    (0..FRAMES_PER_CHAR * text.len())
+        .map(|i| 0.5 * (TAU * 220.0 * i as f32 / 48000.0).sin())
+        .collect()
 }
 
 fn tone(rate: u32, frames: usize, frequency: f32, amplitude: f32) -> Vec<i16> {
@@ -194,6 +198,11 @@ fn write_assets(dir: &Path) {
     write_wav(&dir.join("RoomImpulse.wav"), 44100, 2, &impulse);
 }
 
+const LOUDNESS: Loudness = Loudness {
+    target: -16.0,
+    ceiling: dsp::loudness::CEILING,
+};
+
 fn limits() -> Limits {
     Limits {
         synthesis: 4,
@@ -214,6 +223,10 @@ struct Harness {
 }
 
 fn harness(fake: Fake, limits: Limits) -> Harness {
+    harness_at(fake, limits, LOUDNESS)
+}
+
+fn harness_at(fake: Fake, limits: Limits, loudness: Loudness) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (voices, assets) = (dir.path().join("voices"), dir.path().join("assets"));
     write_voices(&voices);
@@ -233,6 +246,7 @@ fn harness(fake: Fake, limits: Limits) -> Harness {
         logging: Logging::new(LevelFilter::INFO, move |level| {
             set.lock().unwrap().push(level);
         }),
+        loudness,
         limits,
     });
     Harness {
@@ -540,6 +554,49 @@ fn shifts_the_blips_by_the_pitch() {
     let (level, octave_up) = (blips("0"), blips("24"));
     let ratio = cycles(&octave_up) as f64 / cycles(&level) as f64;
     assert!((1.8..2.2).contains(&ratio), "{ratio} times the cycles");
+}
+
+/// The integrated loudness of what `reply` plays, as ffmpeg decodes it.
+fn loudness(reply: &Reply) -> f64 {
+    let audio = common::decode(&reply.body);
+    let samples: Vec<f64> = audio.samples.iter().map(|&s| f64::from(s)).collect();
+    dsp::loudness::integrated(&samples, audio.rate)
+}
+
+#[test]
+fn brings_speech_and_blips_to_the_loudness() {
+    let (target, ceiling) = (-24.0, -1.0);
+    let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
+    let message = Message {
+        pitch: "2",
+        ..Message::default()
+    };
+    let speech = message.speech(&h);
+    speech.assert_ogg(48000);
+    // The cache keeps the take as the model said it, its peak at -0.1 dBFS.
+    let take = synth::level(&synth::to_segment(&said("Hello there.")));
+    let entry = Cache::open(&h.cache).unwrap().entry(VOICE, "Hello there.");
+    let cached = std::fs::read(entry.join("0.wav")).unwrap();
+    assert_eq!(cached, wav::write_pcm16(dsp::RATE, 1, &take.samples));
+    // What is played is the take finished, then brought to the loudness.
+    let finished = dsp::speech::finish(&take, 2);
+    let expected = dsp::loudness::normalize(&finished, target, ceiling).segment;
+    let expected = wav::Audio::from_segment(&expected);
+    let encoded = h.runtime.block_on(Ffmpeg::new("ffmpeg").encode(&expected));
+    assert_eq!(
+        common::decode(&speech.body),
+        common::decode(&encoded.unwrap())
+    );
+
+    // The blips are drawn at random, so only their loudness can be checked: Vorbis at 64 kb/s
+    // raises these made-up blips' by 0.6 to 0.7 LU, where unleveled they come 4 to 5 LU over.
+    let blips = message.blips(&h);
+    blips.assert_ogg(48000);
+    assert!(
+        (loudness(&blips) - target).abs() < 1.0,
+        "{}",
+        loudness(&blips)
+    );
 }
 
 #[test]
