@@ -11,6 +11,12 @@
 //!
 //! A latent is read whole when it is asked for. A blips file is opened per voice and its samples
 //! are read one at a time, so that no voice's set, about 14 MB, has to be held in memory.
+//!
+//! [`legacy`] reads the torch.save files the Python service kept its voices in.
+
+mod archive;
+pub mod legacy;
+pub mod pickle;
 
 use std::{
     collections::{BTreeMap, HashMap},
