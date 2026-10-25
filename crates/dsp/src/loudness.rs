@@ -137,7 +137,7 @@ fn biquad(x: &[f64], [b0, b1, b2, a1, a2]: [f64; 5]) -> Vec<f64> {
 }
 
 /// BS.1770-4's 48-tap filter for four times oversampling, a row of 12 taps per phase.
-const INTERPOLATOR: [[f64; 12]; 4] = [
+pub(crate) const INTERPOLATOR: [[f64; 12]; 4] = [
     [
         0.0017089843750,
         0.0109863281250,
