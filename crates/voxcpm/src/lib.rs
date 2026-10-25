@@ -28,7 +28,7 @@ pub use crate::{
     model::{Dtypes, Generation, Model, Step},
     noise::{Noise, SeededNoise},
     prompt::Prompt,
-    speech::{Params, TextToSpeech, decode},
+    speech::{Params, SpeechDecoder, TextToSpeech},
     tokenizer::Tokenizer,
 };
 

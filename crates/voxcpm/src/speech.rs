@@ -1,6 +1,6 @@
-use std::{fs, path::Path};
+use std::{fs, mem, num::NonZeroUsize, path::Path};
 
-use audiovae::{Decoder, Weights};
+use audiovae::{DecodeStream, Decoder, Weights};
 use burn::tensor::{Device, FloatDType, Tensor, TensorData};
 use voices::{LATENT_DIM, Latent};
 
@@ -11,12 +11,16 @@ use crate::{Config, Dtypes, Error, Model, Noise, Prompt, Sampling, Tokenizer};
 const DECODE_CONTEXT_FRAMES: usize = 12;
 
 /// What a request asks for beyond its text and voice. The default is what the Python service
-/// asked for.
+/// asked for, decoded a second at a time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Params {
     pub sampling: Sampling,
     /// The most patches to generate, nanovllm-voxcpm's `max_generate_length`.
     pub max_patches: usize,
+    /// The most latent frames the audio VAE decodes in one call, so that no call holds a GPU
+    /// long enough for its driver to reset it. The audio is the same, to rounding, however the
+    /// frames are split.
+    pub decode_chunk_frames: NonZeroUsize,
 }
 
 impl Default for Params {
@@ -24,6 +28,7 @@ impl Default for Params {
         Self {
             sampling: Sampling::default(),
             max_patches: 256,
+            decode_chunk_frames: NonZeroUsize::new(25).expect("not zero"),
         }
     }
 }
@@ -96,7 +101,14 @@ impl TextToSpeech {
         let patches = self
             .model
             .generate(&prompt, &params.sampling, params.max_patches, noise)?;
-        Ok(decode(&self.decoder, voice.frames.as_flattened(), patches))
+        Ok(self.speech_decoder(voice, params).push(patches))
+    }
+
+    /// A decoder of the patches generated from the [`prompt`](Self::prompt) of `voice`, in
+    /// calls of at most `params.decode_chunk_frames` frames.
+    pub fn speech_decoder(&self, voice: &Latent, params: &Params) -> SpeechDecoder<'_> {
+        let (frames, chunk_frames) = (voice.frames.as_flattened(), params.decode_chunk_frames);
+        SpeechDecoder::new(&self.decoder, frames, LATENT_DIM, chunk_frames)
     }
 
     /// The prompt [`synthesize`](Self::synthesize) generates from.
@@ -115,29 +127,62 @@ impl TextToSpeech {
     }
 }
 
-/// The audio of `patches` `[n, patch_size, channels]` as mono samples, decoded after the last
-/// frames of `voice`, frames of `channels` one after another, as nanovllm-voxcpm primes its
-/// streaming decoder with them.
+/// Speech decoded from its patches as they come, after the last frames of the voice it goes on
+/// from, as nanovllm-voxcpm primes its streaming decoder with them, in calls of at most a given
+/// number of frames.
 ///
-/// The decoder being causal, this is what that streaming decoder gives a patch at a time,
-/// computed at once.
-pub fn decode(decoder: &Decoder, voice: &[f32], patches: Tensor<3>) -> Vec<f32> {
-    let [n, patch_size, channels] = patches.dims();
-    let device = patches.device();
-    let context = (voice.len() / channels).min(DECODE_CONTEXT_FRAMES);
-    let voice = &voice[voice.len() - context * channels..];
-    let voice = Tensor::<2>::from_data(
-        TensorData::new(voice.to_vec(), [context, channels]),
-        &device,
-    );
-    let frames = Tensor::cat(vec![voice, patches.reshape([n * patch_size, channels])], 0);
-    let audio = decoder.decode(frames.swap_dims(0, 1).unsqueeze_dim(0));
-    let [_, _, samples] = audio.dims();
-    let per_frame = samples / (context + n * patch_size);
-    let audio = audio.narrow(2, context * per_frame, samples - context * per_frame);
-    audio
-        .cast(FloatDType::F32)
-        .into_data()
-        .iter::<f32>()
-        .collect()
+/// The decoder being causal, the audio is what decoding the voice's frames and every patch at
+/// once and cutting off the voice's samples gives, to rounding, however the patches come.
+#[derive(Debug)]
+pub struct SpeechDecoder<'a> {
+    stream: DecodeStream<'a>,
+    /// The voice's last frames, until they are decoded before the first patches.
+    context: Vec<f32>,
+    chunk_frames: NonZeroUsize,
+}
+
+impl<'a> SpeechDecoder<'a> {
+    /// Decodes with `decoder` the speech that goes on from `voice`, its latent frames of
+    /// `channels` channels one after another, at most `chunk_frames` frames a call.
+    pub fn new(
+        decoder: &'a Decoder,
+        voice: &[f32],
+        channels: usize,
+        chunk_frames: NonZeroUsize,
+    ) -> Self {
+        let context = (voice.len() / channels).min(DECODE_CONTEXT_FRAMES);
+        Self {
+            stream: decoder.stream(),
+            context: voice[voice.len() - context * channels..].to_vec(),
+            chunk_frames,
+        }
+    }
+
+    /// The audio of the next `patches` `[n, patch_size, channels]`, as mono samples.
+    pub fn push(&mut self, patches: Tensor<3>) -> Vec<f32> {
+        let [n, patch_size, channels] = patches.dims();
+        let device = patches.device();
+        let mut frames = patches.reshape([n * patch_size, channels]);
+        let context = mem::take(&mut self.context);
+        let context_frames = context.len() / channels;
+        if context_frames > 0 {
+            let context = TensorData::new(context, [context_frames, channels]);
+            frames = Tensor::cat(vec![Tensor::from_data(context, &device), frames], 0);
+        }
+        let [total, _] = frames.dims();
+        let chunk = self.chunk_frames.get();
+        let audio = (0..total).step_by(chunk).map(|start| {
+            let chunk = frames.clone().narrow(0, start, chunk.min(total - start));
+            self.stream.push(chunk.swap_dims(0, 1).unsqueeze_dim(0))
+        });
+        let audio = Tensor::cat(audio.collect(), 2);
+        let [_, _, samples] = audio.dims();
+        let cut = samples / total * context_frames;
+        audio
+            .narrow(2, cut, samples - cut)
+            .cast(FloatDType::F32)
+            .into_data()
+            .iter::<f32>()
+            .collect()
+    }
 }

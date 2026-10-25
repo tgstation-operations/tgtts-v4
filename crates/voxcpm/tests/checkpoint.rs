@@ -10,7 +10,7 @@ use burn::tensor::{FloatDType, Tensor};
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir, device, fixture};
 use voices::Latent;
-use voxcpm::{Config, Dtypes, Params, SeededNoise, TextToSpeech, decode};
+use voxcpm::{Config, Dtypes, Params, SeededNoise, SpeechDecoder, TextToSpeech};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
@@ -185,7 +185,14 @@ fn decodes_upstreams_patches_as_upstream_on_the_real_weights() {
     let weights = Weights::open(dir.join("audiovae.pth")).unwrap();
     let decoder = Decoder::load(&config.audio_vae(), &weights, FloatDType::F32, &device).unwrap();
     let patches = golden.tensor::<3>("output.patches", &device);
-    let audio = decode(&decoder, voice.frames.as_flattened(), patches);
+    let chunk_frames = Params::default().decode_chunk_frames;
+    let mut speech = SpeechDecoder::new(
+        &decoder,
+        voice.frames.as_flattened(),
+        config.feat_dim,
+        chunk_frames,
+    );
+    let audio = speech.push(patches);
     let samples: usize = golden.metadata()["audio_samples"].parse().unwrap();
     assert_eq!(audio.len(), samples);
     let start = golden.tensor::<1>("output.audio.start", &device);

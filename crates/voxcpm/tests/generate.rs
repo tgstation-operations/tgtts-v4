@@ -1,6 +1,8 @@
 mod common;
 mod recorded;
 
+use std::num::NonZeroUsize;
+
 use audiovae::{Decoder, Weights};
 use burn::{
     store::SafetensorsStore,
@@ -9,7 +11,7 @@ use burn::{
 use common::tiny;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, device, fixture};
-use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, decode};
+use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechDecoder};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
@@ -151,10 +153,21 @@ fn decodes_after_the_voices_last_frames_as_upstream() {
     let weights = Weights::from_store(&mut SafetensorsStore::from_file(fixture.path())).unwrap();
     let decoder = Decoder::load(&tiny().audio_vae(), &weights, FloatDType::F32, &device).unwrap();
     let voice = floats(fixture.tensor::<2>("input.voice", &device));
-    let audio = decode(&decoder, &voice, fixture.tensor("output.patches", &device));
-    let audio = Tensor::<1>::from_floats(audio.as_slice(), &device);
-    // f32 here and in upstream, summing in other orders: this audio, within (-0.64, 0.64), came
-    // within 1.5e-7 of upstream's.
+    let patches = fixture.tensor::<3>("output.patches", &device);
     let expected = fixture.tensor::<1>("output.audio", &device);
-    assert_close(audio, expected, 1e-6, 0.0);
+    let count = patches.dims()[0];
+    // Chunks of the 12 frames of the voice and the 32 of the patches, whole and split, and patches
+    // pushed at once and one or a few at a time.
+    for (chunk_frames, per_push) in [(44, count), (25, count), (1, 1), (3, 1), (5, 3), (12, 2)] {
+        let chunk_frames = NonZeroUsize::new(chunk_frames).unwrap();
+        let mut speech = SpeechDecoder::new(&decoder, &voice, 8, chunk_frames);
+        let audio: Vec<f32> = (0..count)
+            .step_by(per_push)
+            .flat_map(|i| speech.push(patches.clone().narrow(0, i, per_push.min(count - i))))
+            .collect();
+        let audio = Tensor::<1>::from_floats(audio.as_slice(), &device);
+        // f32 here and in upstream, summing in other orders: this audio, within (-0.64, 0.64), came
+        // within 1.8e-7 of upstream's.
+        assert_close(audio, expected.clone(), 1e-6, 0.0);
+    }
 }
