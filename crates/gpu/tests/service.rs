@@ -106,6 +106,9 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
     );
 }
 
+// The service replays graphs on CUDA alone: on Vulkan, replayed, 16 requests' first patches came
+// out NaN.
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
 fn holds_the_memory_it_warmed_up_with_on_the_real_model() {

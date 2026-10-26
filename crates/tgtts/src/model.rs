@@ -114,8 +114,8 @@ impl VoxCpm {
             .spawn(move || {
                 let tts = match TextToSpeech::load(&dir, &dtypes, &on) {
                     Ok(mut tts) => {
-                        if !batching.graphs {
-                            tts.set_stepping(Stepping::Eager);
+                        if batching.graphs {
+                            tts.set_stepping(Stepping::for_device(&on));
                         }
                         Arc::new(tts)
                     }

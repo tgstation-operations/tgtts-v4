@@ -133,7 +133,9 @@ fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send
     let batching = Batching {
         window: config.batch_window,
         requests: config.synthesis_limit,
-        graphs: config.step_graphs,
+        // Replayed on Vulkan, 16 requests' first patches came out NaN, and replays saved nothing
+        // on the Radeon they were measured on.
+        graphs: config.step_graphs && config.device == device::Kind::Cuda,
     };
     let model = VoxCpm::load(
         &config.checkpoint_dir,

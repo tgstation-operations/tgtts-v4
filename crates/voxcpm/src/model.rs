@@ -125,14 +125,13 @@ impl Model {
             max_positions: lm.max_position_embeddings,
             lm_dtype: dtypes.lm.into(),
             device: device.clone(),
-            stepping: Stepping::for_device(device),
+            stepping: Stepping::Eager,
             graphs: Graphs::default(),
             loaded_on: thread::current().id(),
         })
     }
 
-    /// How [`patches`](Self::patches) computes each patch: by default
-    /// [`Stepping::for_device`].
+    /// How [`patches`](Self::patches) computes each patch: eagerly by default.
     pub fn stepping(&self) -> Stepping {
         self.stepping
     }

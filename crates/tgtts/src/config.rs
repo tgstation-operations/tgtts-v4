@@ -19,8 +19,8 @@
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
 //! - `batch_window_seconds`: how long a request to an idle model waits for others to generate
 //!   with it, 0.1 by default.
-//! - `step_graphs`: whether the model steps by replaying graphs of its step where the device
-//!   records them, as CUDA and Vulkan do, `true` by default.
+//! - `step_graphs`: whether the model steps by replaying graphs of its step on CUDA, `true` by
+//!   default; it steps eagerly on any other device.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
 //! - `radio_wait_seconds`: how long a radio route waits for the route that makes what it puts on
