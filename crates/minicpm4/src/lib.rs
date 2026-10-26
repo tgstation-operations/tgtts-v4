@@ -197,6 +197,52 @@ impl Model {
         self.norm.forward(x)
     }
 
+    /// Runs the stack causally over `x` `[batch, 1, hidden]` as the next position of each row of
+    /// `cache`, as [`forward_cached`](Self::forward_cached) does, but at `positions` `[batch]`
+    /// given on the device and attending over the whole capacity of each row, the keys after its
+    /// position hidden: every operation and shape is the same whatever the positions, so that a
+    /// graph of it captured at one position can be replayed at the next.
+    ///
+    /// The cache counts the position only once [`KvCache::extend`] says to, as a replay of the
+    /// graph could not. A key after a row's position is weighed by exactly zero, which leaves it
+    /// out unless it is NaN or infinite.
+    ///
+    /// # Panics
+    ///
+    /// If `cache` has another number of rows, or the stack has RoPE and the cache has positions
+    /// past `max_position_embeddings`.
+    pub fn forward_at(
+        &self,
+        x: Tensor<3>,
+        cache: &mut KvCache,
+        positions: Tensor<1, Int>,
+    ) -> Tensor<3> {
+        let [batch, len, _] = x.dims();
+        assert_eq!(len, 1, "a step of {len} positions");
+        assert_eq!(batch, cache.rows(), "a cache of {} rows", cache.rows());
+        let capacity = cache.capacity;
+        let (heads, dim) = (self.config.num_key_value_heads, self.config.head_dim());
+        let groups = self.config.num_attention_heads / heads;
+        let rotation = self
+            .rope
+            .as_ref()
+            .map(|rope| rope.select(positions.clone(), capacity));
+        let at = positions.reshape([batch, 1, 1, 1]);
+        // Once for each query head of a group, as attention stacks them along the sequence.
+        let mask = [batch, 1, groups, capacity];
+        let keys = cache.slots.clone().reshape([1, 1, 1, capacity]);
+        let mask = keys.expand(mask).greater(at.clone().expand(mask));
+        let append = Append {
+            at: Slots::Rows(Box::new(at.expand([batch, heads, 1, dim]))),
+            total: capacity,
+        };
+        let layers = self.layers.iter().zip(&mut cache.layers);
+        let x = layers.fold(x, |x, (layer, cache)| {
+            layer.forward(x, rotation.as_ref(), Some(&mask), Some((cache, &append)))
+        });
+        self.norm.forward(x)
+    }
+
     /// Hides from each of the next `len` positions of each row, after its `starts`, the keys
     /// after it, once for each query head of a group, as attention stacks them along the
     /// sequence. None when `len` is 1 and the rows are as long: each sees every key.

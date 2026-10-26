@@ -12,6 +12,9 @@ pub struct KvCache {
     pub(crate) layers: Vec<LayerCache>,
     pub(crate) capacity: usize,
     pub(crate) lens: Vec<Option<usize>>,
+    /// The index of each position, `[capacity]`, by which a step at positions on the device
+    /// hides the keys after them.
+    pub(crate) slots: Tensor<1, Int>,
 }
 
 impl KvCache {
@@ -28,6 +31,7 @@ impl KvCache {
             layers: (0..layers).map(|_| layer()).collect(),
             capacity,
             lens: vec![Some(0); batch],
+            slots: slots(capacity, options.0),
         }
     }
 
@@ -92,6 +96,7 @@ impl KvCache {
                 .collect(),
             capacity: len,
             lens: vec![Some(len)],
+            slots: slots(len, &self.slots.device()),
         }
     }
 
@@ -147,6 +152,23 @@ impl KvCache {
         self.lens[row] = Some(len);
     }
 
+    /// Counts `len` more positions in each row that holds a sequence, as
+    /// [`Model::forward_at`](crate::Model::forward_at) leaves its caller to.
+    ///
+    /// # Panics
+    ///
+    /// If that is past its capacity.
+    pub fn extend(&mut self, len: usize) {
+        for held in self.lens.iter_mut().flatten() {
+            *held += len;
+            assert!(
+                *held <= self.capacity,
+                "{held} positions in a cache of {}",
+                self.capacity
+            );
+        }
+    }
+
     /// Makes `row` hold no sequence: [`Model::forward_cached`](crate::Model::forward_cached)
     /// computes over it as if it held an empty one, and leaves it holding none.
     pub fn clear(&mut self, row: usize) {
@@ -194,8 +216,15 @@ impl KvCache {
         }
         self.lens = lens;
         self.lens.resize(rows, None);
+        if capacity != self.capacity {
+            self.slots = slots(capacity, &self.slots.device());
+        }
         self.capacity = capacity;
     }
+}
+
+fn slots(capacity: usize, device: &Device) -> Tensor<1, Int> {
+    Tensor::arange(0..capacity as i64, device)
 }
 
 /// Where a call writes its keys and values: the positions after each row's sequence.

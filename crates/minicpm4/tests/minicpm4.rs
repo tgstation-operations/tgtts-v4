@@ -174,6 +174,52 @@ fn residual_lm_rows_of_different_lengths_go_on_as_alone() {
     rows_go_on_as_alone(&tiny().residual_lm, "residual_lm.", "input.residual_lm.x");
 }
 
+/// Rows prefilled to 3 and 5 positions, then stepped on at positions given on the device over
+/// the whole cache, the first row's positions after 3 holding keys it has yet to reach: what a
+/// row holds past its position is weighed by exactly zero, so each comes out bit for bit as it
+/// does stepped alone by `forward_cached`.
+fn steps_at_positions_as_alone(config: &Config, prefix: &str, input: &str) {
+    let (fixture, device) = (fixture!("minicpm4"), device());
+    let model = load(config, &fixture, prefix).unwrap();
+    let x = fixture.tensor::<3>(input, &device);
+    let first = alone(&model, &x, 0, &[3, 1, 1, 1]);
+    let second = alone(&model, &x, 1, &[5, 1, 1]);
+
+    let mut batch = model.cache(2, 7);
+    let mut ahead = prefilled(&model, &x, 0, 7);
+    ahead.truncate(0, 3);
+    batch.insert(0, &ahead, 0);
+    batch.insert(1, &prefilled(&model, &x, 1, 5), 0);
+    let step = |starts: &[(usize, usize)], at: [i64; 2], batch: &mut KvCache| {
+        let at = Tensor::from_data(at, &device);
+        let out = model.forward_at(positions(&x, starts, 1), batch, at);
+        batch.extend(1);
+        out
+    };
+    let out = step(&[(0, 3), (1, 5)], [3, 5], &mut batch);
+    assert_as_alone(out.clone(), 0, &first[1]);
+    assert_as_alone(out, 1, &second[1]);
+    assert_eq!((batch.len(0), batch.len(1)), (Some(4), Some(6)));
+    let out = step(&[(0, 4), (1, 6)], [4, 6], &mut batch);
+    assert_as_alone(out.clone(), 0, &first[2]);
+    assert_as_alone(out, 1, &second[2]);
+
+    batch.clear(1);
+    let out = step(&[(0, 5), (1, 0)], [5, 0], &mut batch);
+    assert_as_alone(out, 0, &first[3]);
+    assert_eq!((batch.len(0), batch.len(1)), (Some(6), None));
+}
+
+#[test]
+fn base_lm_steps_at_positions_as_alone() {
+    steps_at_positions_as_alone(&tiny().lm, "base_lm.", "output.base_lm.embeds");
+}
+
+#[test]
+fn residual_lm_steps_at_positions_as_alone() {
+    steps_at_positions_as_alone(&tiny().residual_lm, "residual_lm.", "input.residual_lm.x");
+}
+
 /// The prefix of a sequence prefilled in runs of 2 and 2, and the sequence prefilled in runs of
 /// 2 and 3: a prefill of other runs would round otherwise, by up to 2.4e-7 here.
 #[test]
