@@ -96,7 +96,7 @@ impl KvCache {
     }
 
     /// Makes `row` hold a copy of the sequence in row `from_row` of `from`, a cache of the same
-    /// stack, in place of whatever it held.
+    /// stack, in place of whatever it held, of which nothing is left.
     ///
     /// # Panics
     ///
@@ -114,15 +114,22 @@ impl KvCache {
             "a cache of another stack"
         );
         self.lens[row] = Some(len);
-        if len == 0 {
-            return;
-        }
+        let capacity = self.capacity;
         for (layer, from) in self.layers.iter_mut().zip(&from.layers) {
             let copy = |cache: &mut Tensor<4>, from: &Tensor<4>| {
                 let [_, heads, _, dim] = from.dims();
+                let options = (&cache.device(), cache.dtype());
+                // Attention hides the positions past the sequence but still weighs them, by
+                // zero, and zero times a NaN the row's last sequence left there is NaN.
+                let rest = Tensor::zeros([1, heads, capacity - len, dim], options);
                 let sequence = from.clone().narrow(0, from_row, 1).narrow(2, 0, len);
-                let at = [row..row + 1, 0..heads, 0..len, 0..dim];
-                cache.inplace(|cache| cache.slice_assign(at, sequence));
+                let held = if len == 0 {
+                    rest
+                } else {
+                    Tensor::cat(vec![sequence, rest], 2)
+                };
+                let at = [row..row + 1, 0..heads, 0..capacity, 0..dim];
+                cache.inplace(|cache| cache.slice_assign(at, held));
             };
             copy(&mut layer.keys, &from.keys);
             copy(&mut layer.values, &from.values);

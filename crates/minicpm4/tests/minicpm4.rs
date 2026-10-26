@@ -203,6 +203,30 @@ fn a_sequence_goes_on_from_a_copy_of_its_prefix() {
     assert_close(out, whole[1].clone(), 0.0, 0.0);
 }
 
+/// A row whose sequence went NaN, cleared and taken by a shorter one, beside a row long enough
+/// that attention reaches past the new sequence into what the old one left.
+#[test]
+fn a_sequence_sees_nothing_of_what_its_row_held_before() {
+    let (fixture, device) = (fixture!("minicpm4"), device());
+    let model = load(&tiny().lm, &fixture, "base_lm.").unwrap();
+    let x = fixture.tensor::<3>("output.base_lm.embeds", &device);
+    let first = alone(&model, &x, 0, &[2, 1]);
+    let mut batch = model.cache(2, 7);
+    let mut diverged = model.cache(1, 7);
+    let nan = x
+        .clone()
+        .narrow(0, 0, 1)
+        .narrow(1, 0, 6)
+        .mul_scalar(f32::NAN);
+    model.forward_cached(nan, &mut diverged);
+    batch.insert(0, &diverged, 0);
+    batch.clear(0);
+    batch.insert(0, &prefilled(&model, &x, 0, 2), 0);
+    batch.insert(1, &prefilled(&model, &x, 1, 5), 0);
+    let out = model.forward_cached(positions(&x, &[(0, 2), (1, 5)], 1), &mut batch);
+    assert_as_alone(out, 0, &first[1]);
+}
+
 #[test]
 fn reshaping_keeps_the_rows_it_is_told_to() {
     let (fixture, device) = (fixture!("minicpm4"), device());
