@@ -60,6 +60,9 @@ pub enum Error {
     /// The patch, by its index, came out NaN or infinite, as an overflow or a kernel that wrote
     /// nothing leaves it, after which the stop head might never say to stop.
     NotFinite(usize),
+    /// A graph of the step would be captured on another thread than the model loaded on, whose
+    /// weights it would then read from another cubecl stream, which cubecl-cuda has crashed on.
+    OtherThread,
 }
 
 impl fmt::Display for Error {
@@ -74,6 +77,9 @@ impl fmt::Display for Error {
             Self::Tokenizer(what) => write!(f, "tokenizer.json: {what}"),
             Self::Request(what) => write!(f, "cannot generate from {what}"),
             Self::NotFinite(patch) => write!(f, "patch {patch} came out NaN or infinite"),
+            Self::OtherThread => f.write_str(
+                "a graph of the step would read the model's weights from another thread's stream",
+            ),
         }
     }
 }

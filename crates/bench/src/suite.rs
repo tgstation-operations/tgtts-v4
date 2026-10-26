@@ -511,7 +511,9 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
             .start(&prompt, params.max_patches)
             .expect("the prompt fits the LM");
         let mut noise = SeededNoise::new(14);
-        let mut stepper = generation.stepper(&params.sampling, stepping, &mut noise);
+        let mut stepper = generation
+            .stepper(&params.sampling, stepping, &mut noise)
+            .map_err(|e| e.to_string())?;
         let spec = Spec::new(name, 2, 10)
             .work(1.0, "patches")
             .audio(FRAMES_PER_PATCH as f64 * FRAME_SECONDS)

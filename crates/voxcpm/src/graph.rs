@@ -293,6 +293,10 @@ impl<'a> Generation<'a> {
     /// The generation going on alone as `stepping` says, sampled as `sampling` says from
     /// `noise`, as [`Stepper::join`] takes it.
     ///
+    /// # Errors
+    ///
+    /// As [`Stepper::join`].
+    ///
     /// # Panics
     ///
     /// If `stepping` is [`Stepping::Eager`], which needs no stepper.
@@ -301,12 +305,10 @@ impl<'a> Generation<'a> {
         sampling: &Sampling,
         stepping: Stepping,
         noise: &mut impl Noise,
-    ) -> Stepper<'a> {
+    ) -> Result<Stepper<'a>, Error> {
         let mut stepper = Stepper::new(self.model, stepping, sampling.timesteps);
-        stepper
-            .join(self, sampling, noise)
-            .expect("the stepper samples in as many steps");
-        stepper
+        stepper.join(self, sampling, noise)?;
+        Ok(stepper)
     }
 }
 
@@ -341,7 +343,9 @@ impl<'a> Stepper<'a> {
     ///
     /// # Errors
     ///
-    /// If `sampling` takes another number of steps.
+    /// If `sampling` takes another number of steps, or the stepper captures graphs and this is
+    /// not the thread the model loaded on: cubecl gives each thread a stream of its own, and a
+    /// graph reading buffers of another stream is what cubecl-cuda has crashed on.
     ///
     /// # Panics
     ///
@@ -357,6 +361,9 @@ impl<'a> Stepper<'a> {
             std::ptr::eq(model, generation.model),
             "a generation of another model"
         );
+        if self.stepping == Stepping::Captured && thread::current().id() != model.loaded_on {
+            return Err(Error::OtherThread);
+        }
         if sampling.timesteps != self.timesteps {
             return Err(Error::Request(format!(
                 "patches sampled in {} steps among patches sampled in {}",

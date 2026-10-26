@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    thread::{self, ThreadId},
+};
 
 use burn::{
     module::Module,
@@ -42,6 +45,8 @@ pub struct Model {
     pub(crate) device: Device,
     stepping: Stepping,
     pub(crate) graphs: Graphs,
+    /// The thread the weights were loaded on, whose cubecl stream holds them.
+    pub(crate) loaded_on: ThreadId,
 }
 
 /// The layers between the stacks, under their names in the checkpoint.
@@ -122,6 +127,7 @@ impl Model {
             device: device.clone(),
             stepping: Stepping::for_device(device),
             graphs: Graphs::default(),
+            loaded_on: thread::current().id(),
         })
     }
 
@@ -131,7 +137,8 @@ impl Model {
         self.stepping
     }
 
-    /// Has [`patches`](Self::patches) compute each patch as `stepping` says.
+    /// Has [`patches`](Self::patches) compute each patch as `stepping` says. Steps are captured
+    /// only on the thread the model loaded on.
     pub fn set_stepping(&mut self, stepping: Stepping) {
         self.stepping = stepping;
     }
@@ -280,7 +287,7 @@ impl Model {
         let generating = match self.stepping {
             Stepping::Eager => Generating::Eager(Box::new(generation)),
             stepping => {
-                let stepper = generation.stepper(sampling, stepping, &mut *noise);
+                let stepper = generation.stepper(sampling, stepping, &mut *noise)?;
                 Generating::Stable(Box::new(stepper))
             }
         };

@@ -141,6 +141,26 @@ fn steps_as_the_eager_step() {
     }
 }
 
+/// A graph of the step reads the model's weights, which live on the stream of the thread that
+/// loaded them, so steps are captured on that thread alone.
+#[test]
+fn steps_are_captured_only_on_the_thread_the_model_loaded_on() {
+    let fixture = fixture!("voxcpm_generate");
+    let mut model = model(&fixture);
+    model.set_stepping(Stepping::Captured);
+    let (model, prompt) = (&model, &prompt(&fixture));
+    let generate = move || {
+        let mut noise = SeededNoise::new(3);
+        model.generate(prompt, &Sampling::default(), 2, &mut noise)
+    };
+    let elsewhere = std::thread::scope(|scope| scope.spawn(generate).join().unwrap());
+    assert!(
+        matches!(elsewhere, Err(Error::OtherThread)),
+        "{elsewhere:?}"
+    );
+    assert!(generate().is_ok());
+}
+
 #[test]
 fn a_voice_of_part_of_a_patch_is_refused() {
     let voice = vec![0.0; 3 * 8];

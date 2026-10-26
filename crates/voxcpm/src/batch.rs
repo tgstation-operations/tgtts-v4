@@ -304,8 +304,8 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
     ///
     /// # Errors
     ///
-    /// As [`Model::prefill`], and if the other requests' patches are sampled in another number
-    /// of steps.
+    /// As [`Model::prefill`], if the other requests' patches are sampled in another number of
+    /// steps, and as [`Stepper::join`] where the model's stepping is captured.
     pub fn add(
         &mut self,
         key: K,
@@ -314,6 +314,11 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         max_patches: usize,
         noise: N,
     ) -> Result<(), Error> {
+        if self.model.stepping() == Stepping::Captured
+            && std::thread::current().id() != self.model.loaded_on
+        {
+            return Err(Error::OtherThread);
+        }
         let others = self.waiting.iter().map(|(request, _)| request);
         let other = others.chain(self.running.values()).next();
         if let Some(other) = other.filter(|other| other.sampling.timesteps != sampling.timesteps) {
