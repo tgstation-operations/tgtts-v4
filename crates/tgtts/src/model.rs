@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    fs,
+    fs, io,
     num::NonZeroUsize,
     path::Path,
     sync::{
@@ -50,24 +50,36 @@ pub struct Batching {
 }
 
 /// VoxCPM2, synthesizing with the same parameters for every request: the requests generate
-/// together, in a batch a thread of its own runs, and each decodes its own speech.
+/// together, in a batch a thread of its own runs, which loads the model and decodes each one's
+/// speech too. That thread is the only one to use the device, as cubecl gives each thread a
+/// stream of its own, and work on several streams at once has faulted the GPU.
 #[derive(Debug)]
 pub struct VoxCpm {
     tts: Arc<TextToSpeech>,
     config: Config,
     params: Params,
     batching: Batching,
-    requests: Sender<Request>,
+    jobs: Sender<Job>,
     samples_per_patch: usize,
-    device: Device,
 }
 
-/// A prompt to generate from, and where its patches go.
+/// What the thread that generates is asked to do.
+enum Job {
+    Generate(Request),
+    /// Generate from each run of prompts in turn, a batch of each, then decode each chunk
+    /// length, as the warm-up does, and say how long generating took.
+    WarmUp(Vec<Vec<Prompt>>, Sender<Result<Duration, voxcpm::Error>>),
+}
+
+/// A prompt to generate from in a voice, and where its speech goes.
 struct Request {
     prompt: Prompt,
+    voice: Latent,
     seed: u64,
-    patches: PatchesSender,
+    speech: SpeechSender,
 }
+
+type SpeechSender = Sender<Result<Vec<f32>, voxcpm::Error>>;
 
 impl VoxCpm {
     /// Loads the VoxCPM2 checkpoint in `dir`, each part in its dtype from `dtypes`, on
@@ -89,21 +101,43 @@ impl VoxCpm {
             return Err(voxcpm::Error::Unsupported(reason));
         }
         let hop: usize = config.audio_vae().decoder_rates.iter().product();
-        let tts = Arc::new(TextToSpeech::load(dir, dtypes, device)?);
-        let (requests, received) = mpsc::channel();
-        let (generating, generation) = (tts.clone(), params.clone());
+        let (jobs, received) = mpsc::channel();
+        let (loaded, loading) = mpsc::channel();
+        let (dir, dtypes, on) = (dir.to_owned(), *dtypes, device.clone());
+        let (model_config, model_params) = (config.clone(), params.clone());
+        // The weights are loaded on the thread that uses them, whose stream holds them.
         thread::Builder::new()
             .name("voxcpm".into())
-            .spawn(move || generate(&generating, &generation, batching, &received))
+            .spawn(move || {
+                let tts = match TextToSpeech::load(&dir, &dtypes, &on) {
+                    Ok(tts) => Arc::new(tts),
+                    Err(e) => {
+                        let _ = loaded.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = loaded.send(Ok(tts.clone()));
+                let generating = Generating {
+                    tts,
+                    config: model_config,
+                    params: model_params,
+                    device: on,
+                };
+                generate(&generating, batching, &received);
+            })
             .map_err(|e| voxcpm::Error::Io("a thread to generate on".into(), e))?;
+        let stopped = || {
+            let stopped = io::ErrorKind::BrokenPipe.into();
+            voxcpm::Error::Io("the thread VoxCPM2 loads on".into(), stopped)
+        };
+        let tts = loading.recv().map_err(|_| stopped())??;
         Ok(Self {
             tts,
             samples_per_patch: config.patch_size * hop,
             config,
             params,
             batching,
-            requests,
-            device: device.clone(),
+            jobs,
         })
     }
 
@@ -113,7 +147,7 @@ impl VoxCpm {
     /// gives to the longest, twice, the second time from what the prompt cache kept; one request
     /// and as many as run at once going past each power of two the KV length goes past before
     /// the longest's last patch, where a GPU takes other kernels; and the audio decoder's every
-    /// chunk length. Logs what it ran and how long it took.
+    /// chunk length, all on the thread that generates. Logs what it ran and how long it took.
     ///
     /// # Errors
     ///
@@ -136,7 +170,6 @@ impl VoxCpm {
             prompts[at].0.clone()
         });
         let spread: Vec<Prompt> = spread.collect();
-        let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
         let mut runs = vec![spread.clone(), spread];
         let mut boundary = (shortest.len() + 1).next_power_of_two();
         let mut boundaries = vec![];
@@ -149,44 +182,19 @@ impl VoxCpm {
             boundaries.push(boundary);
             boundary *= 2;
         }
-        let max_patches = WARM_UP_PATCHES.min(self.params.max_patches);
-        for run in &runs {
-            let model = self.tts.model();
-            let mut scheduler = Scheduler::new(model, cache, PREFILL_POSITIONS);
-            for (i, prompt) in run.iter().enumerate() {
-                let noise = SeededNoise::new(i as u64);
-                scheduler.add(i, prompt, &self.params.sampling, max_patches, noise)?;
-            }
-            while scheduler.requests() > 0 {
-                for patch in scheduler.step() {
-                    patch.patch?;
-                }
-            }
-            cache = scheduler.into_cache();
-        }
-        let generated = started.elapsed();
-        let silent = Latent {
-            frames: Vec::new(),
-            text: String::new(),
-        };
-        let chunks = self.params.decode_chunk_frames.get();
-        let patch_size = self.config.patch_size;
-        for chunk in 1..=chunks {
-            let params = Params {
-                decode_chunk_frames: NonZeroUsize::new(chunk).expect("not zero"),
-                ..self.params.clone()
-            };
-            let shape = [chunk.div_ceil(patch_size), patch_size, self.config.feat_dim];
-            let patches = Tensor::zeros(shape, &self.device);
-            self.tts.speech_decoder(&silent, &params).push(patches);
-        }
+        let (done, warmed) = mpsc::channel();
+        let stopped = "the thread VoxCPM2 generates on has stopped";
+        self.jobs
+            .send(Job::WarmUp(runs, done))
+            .map_err(|_| stopped)?;
+        let generated = warmed.recv().map_err(|_| stopped)??;
         let seconds = started.elapsed().as_secs_f64();
         info!(
             prompts = %format!("{}..={}", shortest.len(), longest.len()),
             requests,
             past = ?boundaries,
-            patches = max_patches,
-            decoder_chunks = %format!("1..={chunks}"),
+            patches = WARM_UP_PATCHES.min(self.params.max_patches),
+            decoder_chunks = %format!("1..={}", self.params.decode_chunk_frames),
             generation_seconds = generated.as_secs_f64(),
             decoder_seconds = seconds - generated.as_secs_f64(),
             seconds,
@@ -215,66 +223,124 @@ fn lengthened(
     Prompt::cloning(&tokens, voice, config)
 }
 
-/// Generates the patches of each request `requests` brings, in a batch, until every sender of
-/// requests is gone: an idle model waits up to `batching.window` after a request for others to
-/// start with it.
-fn generate(tts: &TextToSpeech, params: &Params, batching: Batching, requests: &Receiver<Request>) {
+/// What the thread that generates holds.
+struct Generating {
+    tts: Arc<TextToSpeech>,
+    config: Config,
+    params: Params,
+    device: Device,
+}
+
+/// Does each job `jobs` brings, generating the patches of requests in a batch and decoding the
+/// speech of each, until every sender of jobs is gone: an idle model waits up to
+/// `batching.window` after a request for others to start with it.
+fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
     let cache = PromptCache::new(PROMPT_CACHE_BYTES);
     let mut batch = Batch {
-        scheduler: Scheduler::new(tts.model(), cache, PREFILL_POSITIONS),
+        scheduler: Scheduler::new(generating.tts.model(), cache, PREFILL_POSITIONS),
         generating: HashMap::new(),
         next: 0,
-        params,
+        on: generating,
     };
     loop {
         if batch.scheduler.requests() == 0 {
-            let Ok(request) = requests.recv() else {
+            let Ok(job) = jobs.recv() else {
                 return;
             };
-            batch.add(request);
+            batch.take(job);
             let until = Instant::now() + batching.window;
-            while batch.scheduler.requests() < batching.requests {
+            while (1..batching.requests).contains(&batch.scheduler.requests()) {
                 let Some(left) = until.checked_duration_since(Instant::now()) else {
                     break;
                 };
-                match requests.recv_timeout(left) {
-                    Ok(request) => batch.add(request),
+                match jobs.recv_timeout(left) {
+                    Ok(job) => batch.take(job),
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
         }
-        while let Ok(request) = requests.try_recv() {
-            batch.add(request);
+        while let Ok(job) = jobs.try_recv() {
+            batch.take(job);
         }
         batch.step();
     }
 }
 
-/// The requests generating, each with where its patches go and those it has so far.
-struct Batch<'a> {
-    scheduler: Scheduler<'a, u64, SeededNoise>,
-    generating: HashMap<u64, (PatchesSender, Vec<Tensor<3>>)>,
-    next: u64,
-    params: &'a Params,
+impl Generating {
+    /// Generates from each run of `prompts` in turn, a batch of each, as `params` says but for
+    /// [`WARM_UP_PATCHES`], from a prompt cache of their own, then decodes silence in every
+    /// chunk length; gives how long generating took.
+    fn warm_up(&self, runs: &[Vec<Prompt>]) -> Result<Duration, voxcpm::Error> {
+        let started = Instant::now();
+        let (tts, params) = (&*self.tts, &self.params);
+        let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
+        let max_patches = WARM_UP_PATCHES.min(params.max_patches);
+        for run in runs {
+            let mut scheduler = Scheduler::new(tts.model(), cache, PREFILL_POSITIONS);
+            for (i, prompt) in run.iter().enumerate() {
+                let noise = SeededNoise::new(i as u64);
+                scheduler.add(i, prompt, &params.sampling, max_patches, noise)?;
+            }
+            while scheduler.requests() > 0 {
+                for patch in scheduler.step() {
+                    patch.patch?;
+                }
+            }
+            cache = scheduler.into_cache();
+        }
+        let generated = started.elapsed();
+        let silent = Latent {
+            frames: Vec::new(),
+            text: String::new(),
+        };
+        let patch_size = self.config.patch_size;
+        for chunk in 1..=params.decode_chunk_frames.get() {
+            let params = Params {
+                decode_chunk_frames: NonZeroUsize::new(chunk).expect("not zero"),
+                ..params.clone()
+            };
+            let shape = [chunk.div_ceil(patch_size), patch_size, self.config.feat_dim];
+            let patches = Tensor::zeros(shape, &self.device);
+            tts.speech_decoder(&silent, &params).push(patches);
+        }
+        Ok(generated)
+    }
 }
 
-type PatchesSender = Sender<Result<Vec<Tensor<3>>, voxcpm::Error>>;
+/// The requests generating, each with its voice, where its speech goes and the patches it has
+/// so far.
+struct Batch<'a> {
+    scheduler: Scheduler<'a, u64, SeededNoise>,
+    generating: HashMap<u64, (Request, Vec<Tensor<3>>)>,
+    next: u64,
+    on: &'a Generating,
+}
 
 impl Batch<'_> {
+    fn take(&mut self, job: Job) {
+        match job {
+            Job::Generate(request) => self.add(request),
+            Job::WarmUp(runs, done) => {
+                let _ = done.send(self.on.warm_up(&runs));
+            }
+        }
+    }
+
     fn add(&mut self, request: Request) {
         let (key, noise) = (self.next, SeededNoise::new(request.seed));
         self.next += 1;
-        let (sampling, max_patches) = (&self.params.sampling, self.params.max_patches);
+        let params = &self.on.params;
+        let (sampling, max_patches) = (&params.sampling, params.max_patches);
         match self
             .scheduler
             .add(key, &request.prompt, sampling, max_patches, noise)
         {
             Ok(()) => {
-                self.generating.insert(key, (request.patches, vec![]));
+                self.generating.insert(key, (request, vec![]));
             }
             Err(e) => {
-                let _ = request.patches.send(Err(e));
+                let _ = request.speech.send(Err(e));
             }
         }
     }
@@ -290,8 +356,16 @@ impl Batch<'_> {
                 Err(e) => Some(e),
             };
             if last {
-                let (sender, patches) = self.generating.remove(&key).expect("generating");
-                let _ = sender.send(failed.map_or(Ok(patches), Err));
+                let (request, patches) = self.generating.remove(&key).expect("generating");
+                let speech = failed.map_or_else(
+                    || {
+                        let mut decoder =
+                            self.on.tts.speech_decoder(&request.voice, &self.on.params);
+                        Ok(decoder.push(Tensor::cat(patches, 0)))
+                    },
+                    Err,
+                );
+                let _ = request.speech.send(speech);
             }
         }
     }
@@ -300,22 +374,21 @@ impl Batch<'_> {
 impl Synthesizer for VoxCpm {
     fn synthesize(&self, text: &str, voice: &Latent, seed: u64) -> Result<Speech, synth::Error> {
         let prompt = self.tts.prompt(text, voice)?;
-        let (patches, received) = mpsc::channel();
+        let (speech, received) = mpsc::channel();
         let request = Request {
             prompt,
+            voice: voice.clone(),
             seed,
-            patches,
+            speech,
         };
         let stopped = "the thread VoxCPM2 generates on has stopped";
-        self.requests.send(request).map_err(|_| stopped)?;
-        let patches = received.recv().map_err(|_| {
+        self.jobs
+            .send(Job::Generate(request))
+            .map_err(|_| stopped)?;
+        let samples = received.recv().map_err(|_| {
             error!("{stopped}");
             stopped
         })??;
-        let samples = self
-            .tts
-            .speech_decoder(voice, &self.params)
-            .push(Tensor::cat(patches, 0));
         Ok(Speech {
             patches: samples.len() / self.samples_per_patch,
             samples,
