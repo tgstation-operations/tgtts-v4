@@ -228,6 +228,12 @@ fn harness(fake: Fake, limits: Limits) -> Harness {
 }
 
 fn harness_at(fake: Fake, limits: Limits, loudness: Loudness) -> Harness {
+    serve_fake(fake, limits, loudness, true)
+}
+
+/// The service with the fake model, given it from the start if `ready`, as the service is once
+/// its model has loaded.
+fn serve_fake(fake: Fake, limits: Limits, loudness: Loudness, ready: bool) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (voices, assets) = (dir.path().join("voices"), dir.path().join("assets"));
     write_voices(&voices);
@@ -239,7 +245,7 @@ fn harness_at(fake: Fake, limits: Limits, loudness: Loudness) -> Harness {
     let server = common::serve(Setup {
         token: String::new(),
         voices: Voices::open(&voices).unwrap(),
-        synthesizer: fake.clone(),
+        synthesizer: ready.then(|| fake.clone() as Arc<dyn Synthesizer>),
         cache: Cache::open(&cache).unwrap(),
         ffmpeg: Ffmpeg::new("ffmpeg"),
         sounds: Sounds::open(&assets).unwrap(),
@@ -334,6 +340,30 @@ fn serves_what_the_game_asks_for_at_startup() {
     assert_eq!((pitch.status, pitch.text()), (200, "Pitch available"));
     let health = call(&format!("{}/health-check", h.base), None, "");
     assert_eq!((health.status, health.text()), (200, "OK"));
+}
+
+#[test]
+fn answers_503_for_speech_and_health_until_the_model_is_ready() {
+    let h = serve_fake(Fake::default(), limits(), LOUDNESS, false);
+    let health = || call(&format!("{}/health-check", h.base), None, "");
+    let loading = health();
+    assert_eq!(
+        (loading.status, loading.text()),
+        (503, "the model is loading")
+    );
+    let [speech, blips, radio, blips_radio, gibberish] = Message::default().all(&h);
+    for reply in [&speech, &radio, &gibberish] {
+        assert_eq!(reply.status, 503, "{}", reply.text());
+    }
+    blips.assert_ogg(48000);
+    blips_radio.assert_ogg(48000);
+    assert_eq!(h.fake.texts(), Vec::<String>::new());
+
+    h.service.ready(h.fake.clone());
+    let ready = health();
+    assert_eq!((ready.status, ready.text()), (200, "OK"));
+    Message::default().speech(&h).assert_ogg(48000);
+    assert_eq!(h.fake.texts(), ["Hello there."]);
 }
 
 #[test]

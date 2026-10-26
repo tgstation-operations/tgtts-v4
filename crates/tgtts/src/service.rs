@@ -9,7 +9,7 @@
 use std::{
     fmt, fs, io,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -141,7 +141,9 @@ pub struct Setup {
     /// What the game sends as its `Authorization` header.
     pub token: String,
     pub voices: Voices,
-    pub synthesizer: Arc<dyn Synthesizer>,
+    /// The model, or none while it loads, until [`Service::ready`] gives it: until then the
+    /// health check answers 503, and so does speech the cache does not hold.
+    pub synthesizer: Option<Arc<dyn Synthesizer>>,
     pub cache: Cache,
     pub ffmpeg: Ffmpeg,
     pub sounds: Sounds,
@@ -158,7 +160,7 @@ pub struct Setup {
 pub struct Service {
     token: Vec<u8>,
     voices: Voices,
-    synthesizer: Arc<dyn Synthesizer>,
+    synthesizer: OnceLock<Arc<dyn Synthesizer>>,
     cache: Cache,
     ffmpeg: Ffmpeg,
     sounds: Sounds,
@@ -177,7 +179,7 @@ impl Service {
         Arc::new(Self {
             token: setup.token.into_bytes(),
             voices: setup.voices,
-            synthesizer: setup.synthesizer,
+            synthesizer: setup.synthesizer.map_or_else(OnceLock::new, OnceLock::from),
             cache: setup.cache,
             ffmpeg: setup.ffmpeg,
             sounds: setup.sounds,
@@ -195,6 +197,17 @@ impl Service {
     /// Where requests' metrics go, if anywhere.
     pub fn metrics(&self) -> Option<&Metrics> {
         self.metrics.as_ref()
+    }
+
+    /// Speaks with `synthesizer` from now on, the model the service started without.
+    ///
+    /// # Panics
+    ///
+    /// If the service has a model already.
+    pub fn ready(&self, synthesizer: Arc<dyn Synthesizer>) {
+        if self.synthesizer.set(synthesizer).is_err() {
+            panic!("the service has a model already");
+        }
     }
 }
 
@@ -298,8 +311,11 @@ async fn pitch_available() -> &'static str {
     "Pitch available"
 }
 
-async fn health_check() -> &'static str {
-    "OK"
+async fn health_check(State(service): State<Arc<Service>>) -> Response {
+    match service.synthesizer.get() {
+        Some(_) => "OK".into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "the model is loading").into_response(),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -570,6 +586,12 @@ impl Service {
             Err(e) => warn!("reading the cache, speaking anew: {e}"),
         }
         trace.cache_hit = Some(false);
+        let Some(synthesizer) = self.synthesizer.get().cloned() else {
+            return Err(Failure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the model is loading",
+            ));
+        };
 
         let queued = Instant::now();
         let turn = tokio::time::timeout(self.queue_timeout, self.model.clone().acquire_owned());
@@ -591,8 +613,7 @@ impl Service {
         let spoken = blocking(move || {
             let _permit = permit;
             let latent = service.voices.latent(&voice).map_err(Failure::internal)?;
-            let speech = service
-                .synthesizer
+            let speech = synthesizer
                 .synthesize(&text, &latent, seed)
                 .map_err(|e| Failure::internal(format!("synthesis: {e}")))?;
             let leveled = synth::level(&synth::to_segment(&speech.samples));

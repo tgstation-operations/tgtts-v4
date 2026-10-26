@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod real;
+
 use std::{
     io::Write,
     process::{Command, Stdio},

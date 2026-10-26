@@ -1,8 +1,12 @@
 //! `tgtts [CONFIG]`: serves the game's TTS routes, configured by the TOML file `CONFIG` and the
 //! environment, as the `config` module describes.
 
-use std::{env, error::Error, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    env, error::Error, future::IntoFuture, path::PathBuf, process::ExitCode, sync::Arc, thread,
+    time::Instant,
+};
 
+use burn::tensor::Device;
 use tgtts::{
     cache::Cache,
     config::{self, Config},
@@ -12,7 +16,10 @@ use tgtts::{
     model::VoxCpm,
     service::{self, Limits, Logging, Service, Setup, Sounds},
 };
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    sync::oneshot,
+};
 use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 use voices::Voices;
@@ -58,7 +65,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error>> {
+fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sync>> {
     let token = config::read_token(&config.token_file)?;
     let voices = Voices::open(&config.voices_dir)?;
     let sounds = Sounds::open(&config.assets_dir)?;
@@ -69,22 +76,10 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error>> {
     };
     let autotune_dir = config.autotune_cache_dir.as_deref();
     let device = device::open(config.device, &config.dtypes, autotune_dir)?;
-    info!(
-        checkpoint = %config.checkpoint_dir.display(),
-        device = %config.device,
-        dtypes = ?config.dtypes,
-        "loading VoxCPM2"
-    );
-    let model = VoxCpm::load(
-        &config.checkpoint_dir,
-        &config.dtypes,
-        &device,
-        Params::default(),
-    )?;
     let service = Service::new(Setup {
         token,
         voices,
-        synthesizer: Arc::new(model),
+        synthesizer: None,
         cache,
         ffmpeg: Ffmpeg::new(&config.ffmpeg),
         sounds,
@@ -103,17 +98,57 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error>> {
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(config.listen).await?;
         info!(address = %config.listen, "listening");
-        let shutdown = async {
-            let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM can be handled");
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-            info!("shutting down");
-        };
-        axum::serve(listener, service::router(service))
-            .with_graceful_shutdown(shutdown)
-            .await
-    })?;
-    Ok(())
+        let (loaded, loading) = oneshot::channel();
+        let ready = service.clone();
+        // A thread of its own, which shutting down does not wait for as it would for the
+        // runtime's blocking pool.
+        thread::spawn(move || {
+            let model = load(&config, &device).map(|model| ready.ready(Arc::new(model)));
+            let _ = loaded.send(model);
+        });
+        let serve = axum::serve(listener, service::router(service))
+            .with_graceful_shutdown(shutdown())
+            .into_future();
+        tokio::pin!(serve);
+        tokio::select! {
+            served = &mut serve => return Ok(served?),
+            loaded = loading => loaded.map_err(|_| "loading VoxCPM2 panicked")??,
+        }
+        serve.await?;
+        Ok(())
+    })
+}
+
+/// VoxCPM2 as `config` asks for it, on `device`, warmed up where its kernels are chosen as each
+/// shape first runs.
+fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send + Sync>> {
+    info!(
+        checkpoint = %config.checkpoint_dir.display(),
+        device = %config.device,
+        dtypes = ?config.dtypes,
+        "loading VoxCPM2"
+    );
+    let started = Instant::now();
+    let model = VoxCpm::load(
+        &config.checkpoint_dir,
+        &config.dtypes,
+        device,
+        Params::default(),
+    )?;
+    info!(seconds = started.elapsed().as_secs_f64(), "loaded VoxCPM2");
+    if config.device.autotunes() {
+        let voices = Voices::open(&config.voices_dir)?;
+        model.warm_up(&voices)?;
+    }
+    info!("ready");
+    Ok(model)
+}
+
+async fn shutdown() {
+    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM can be handled");
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    info!("shutting down");
 }

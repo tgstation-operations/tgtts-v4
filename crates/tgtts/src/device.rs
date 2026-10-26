@@ -16,6 +16,12 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Whether autotune chooses its kernels for each shape as it first runs, by timing them,
+    /// which the first request of each shape would wait for.
+    pub fn autotunes(self) -> bool {
+        matches!(self, Self::Vulkan)
+    }
+
     /// What each part of the model runs in by default: f32 on the CPU, and on a GPU f16 but for
     /// the audio decoder, whose first transposed convolution sums in f16 there and takes its
     /// audio to 46 dB of upstream's, where the CPU in f16 reaches 56 dB.
