@@ -32,7 +32,11 @@ fn serves_a_message_on_the_real_model() {
         &dtypes,
         &device,
         real::params(),
-        real::batching(),
+        // As the service runs it: graphs are replayed on CUDA alone.
+        Batching {
+            graphs: cfg!(feature = "cuda"),
+            ..real::batching()
+        },
     )
     .unwrap();
     real::serves_a_message(model, |model, voices| model.warm_up(voices).unwrap());

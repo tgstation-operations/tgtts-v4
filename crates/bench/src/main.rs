@@ -30,7 +30,7 @@ use crate::{
     counters::Counters,
     device::{dtype_name, parse_dtype},
     runner::{Counts, Measurement, Runner, line},
-    suite::{CPU_ONLY, Data, NAMES},
+    suite::{CPU_ONLY, Data, NAMES, NOT_ON_VULKAN},
 };
 
 const USAGE: &str = "\
@@ -248,8 +248,10 @@ fn run(args: &[String]) -> Result<(), Failure> {
         options.max_load,
         counters,
     );
-    if gpu.is_some() {
-        runner.on_gpu(CPU_ONLY);
+    match &gpu {
+        Some(gpu) if gpu.cuda.is_some() => runner.on_gpu(CPU_ONLY),
+        Some(_) => runner.on_gpu(NOT_ON_VULKAN),
+        None => {}
     }
     let dir = |var| {
         env::var_os(var)

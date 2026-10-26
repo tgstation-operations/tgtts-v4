@@ -66,6 +66,16 @@ pub const NAMES: &[&str] = &[
 /// the display runs on when it ran there.
 pub const CPU_ONLY: &[&str] = &["audiovae.encoder.load", "audiovae.encode"];
 
+/// The benchmarks never run on Vulkan: those of [`CPU_ONLY`], and those that replay graphs of the
+/// step, which read memory the device had unmapped there and reset the GPU the display runs on.
+pub const NOT_ON_VULKAN: &[&str] = &[
+    "audiovae.encoder.load",
+    "audiovae.encode",
+    "voxcpm.patch.graph",
+    "voxcpm.synthesize.graph",
+    "voxcpm.scheduler.graph",
+];
+
 /// The positions of the prompt prod builds for the median voice of the converted set: the
 /// reference prefix (179 patches between two markers), a 105-token transcript, a 15-token
 /// line, the audio start, and the 179 patches again as the continuation.
