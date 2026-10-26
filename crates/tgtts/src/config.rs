@@ -17,6 +17,8 @@
 //! - `metrics_db`: the SQLite database the metrics go to, none by default.
 //! - `ffmpeg`: the ffmpeg to run, `ffmpeg` on the `PATH` by default.
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
+//! - `batch_window_seconds`: how long a request to an idle model waits for others to generate
+//!   with it, 0.1 by default.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
 //! - `radio_wait_seconds`: how long a radio route waits for what it puts on the radio, 10 by
@@ -46,7 +48,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 21] = [
+const KEYS: [&str; 22] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -62,6 +64,7 @@ const KEYS: [&str; 21] = [
     "metrics_db",
     "ffmpeg",
     "synthesis_limit",
+    "batch_window_seconds",
     "cpu_limit",
     "queue_timeout_seconds",
     "radio_wait_seconds",
@@ -85,6 +88,7 @@ pub struct Config {
     pub metrics_db: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     pub synthesis_limit: usize,
+    pub batch_window: Duration,
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
     pub radio_wait: Duration,
@@ -156,6 +160,9 @@ impl Config {
             metrics_db: settings.parse("metrics_db")?,
             ffmpeg: settings.parse("ffmpeg")?.unwrap_or_else(|| "ffmpeg".into()),
             synthesis_limit: settings.limit("synthesis_limit")?.unwrap_or(16),
+            batch_window: settings
+                .seconds("batch_window_seconds")?
+                .unwrap_or(Duration::from_millis(100)),
             cpu_limit: settings.limit("cpu_limit")?.unwrap_or(cpus),
             queue_timeout: settings
                 .seconds("queue_timeout_seconds")?
@@ -304,6 +311,7 @@ mod tests {
                 metrics_db: None,
                 ffmpeg: "ffmpeg".into(),
                 synthesis_limit: 16,
+                batch_window: Duration::from_millis(100),
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),
@@ -324,6 +332,7 @@ mod tests {
             metrics_db = \"/var/lib/tgtts/metrics.sqlite\"
             ffmpeg = \"/usr/bin/ffmpeg\"
             synthesis_limit = 4
+            batch_window_seconds = 0.05
             cpu_limit = 8
             queue_timeout_seconds = 2.5
             radio_wait_seconds = 10
@@ -353,6 +362,7 @@ mod tests {
         );
         assert_eq!(config.ffmpeg, Path::new("/usr/bin/ffmpeg"));
         assert_eq!((config.synthesis_limit, config.cpu_limit), (4, 8));
+        assert_eq!(config.batch_window, Duration::from_millis(50));
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
         let loudness = Loudness {
             target: -18.0,

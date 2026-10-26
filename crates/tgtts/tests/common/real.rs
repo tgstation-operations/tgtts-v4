@@ -11,7 +11,7 @@ use std::{
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
-    model::VoxCpm,
+    model::{Batching, VoxCpm},
     service::{Limits, Logging, Loudness, Setup, Sounds},
     wav,
 };
@@ -31,6 +31,15 @@ pub fn params() -> Params {
     Params {
         max_patches: 12,
         ..Params::default()
+    }
+}
+
+/// How the model batches: as the service does by default, but for the one request a test sends
+/// at a time.
+pub fn batching() -> Batching {
+    Batching {
+        window: Duration::from_millis(100),
+        requests: 1,
     }
 }
 

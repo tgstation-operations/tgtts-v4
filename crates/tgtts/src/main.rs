@@ -13,7 +13,7 @@ use tgtts::{
     device,
     ffmpeg::Ffmpeg,
     metrics::Metrics,
-    model::VoxCpm,
+    model::{Batching, VoxCpm},
     service::{self, Limits, Logging, Service, Setup, Sounds},
 };
 use tokio::{
@@ -129,11 +129,16 @@ fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send
         "loading VoxCPM2"
     );
     let started = Instant::now();
+    let batching = Batching {
+        window: config.batch_window,
+        requests: config.synthesis_limit,
+    };
     let model = VoxCpm::load(
         &config.checkpoint_dir,
         &config.dtypes,
         device,
         Params::default(),
+        batching,
     )?;
     info!(seconds = started.elapsed().as_secs_f64(), "loaded VoxCPM2");
     if config.device.autotunes() {

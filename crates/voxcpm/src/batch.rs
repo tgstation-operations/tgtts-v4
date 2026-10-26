@@ -328,6 +328,11 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         &self.cache
     }
 
+    /// What it kept of the voices of the prompts, for another scheduler to go on from.
+    pub fn into_cache(self) -> PromptCache {
+        self.cache
+    }
+
     /// Runs the prompts of waiting requests, all of the first if no request is generating to
     /// wait for it, then samples the next patch of every generating request. A request whose
     /// patch comes out NaN or infinite ends with an error in its place.
