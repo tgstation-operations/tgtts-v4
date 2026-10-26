@@ -51,6 +51,16 @@ impl Audio {
     pub fn seconds(&self) -> f64 {
         self.frames() as f64 / f64::from(self.rate)
     }
+
+    /// The RMS level of all the samples, in dB from full scale: 0 for a full-scale square wave,
+    /// -3 for a full-scale sine, and negative infinity for digital silence or no samples at all.
+    pub fn rms_dbfs(&self) -> f64 {
+        let energy: f64 = self.samples.iter().map(|&s| f64::from(s).powi(2)).sum();
+        if energy == 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        10.0 * (energy / self.samples.len() as f64).log10()
+    }
 }
 
 fn from_i16(sample: i16) -> f32 {
@@ -230,6 +240,27 @@ mod tests {
             samples: vec![1.0, -1.0, 2.0, -2.0, 0.5 / 32768.0, 1.5 / 32768.0],
         };
         assert_eq!(audio.to_pcm().samples, [32767, -32768, 32767, -32768, 0, 2]);
+    }
+
+    #[test]
+    fn measures_the_rms_level() {
+        let audio = |samples: Vec<f32>| Audio {
+            rate: 48000,
+            channels: 2,
+            samples,
+        };
+        let sine: Vec<f32> = (0..48000)
+            .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 48000.0).sin())
+            .collect();
+        assert!((audio(sine).rms_dbfs() + 3.0103).abs() < 1e-4);
+        assert_eq!(
+            audio(vec![0.5, -0.5, 0.5, -0.5]).rms_dbfs(),
+            20.0 * 0.5f64.log10()
+        );
+        let lsb = audio(vec![1.0 / 32768.0, -1.0 / 32768.0]).rms_dbfs();
+        assert!((lsb + 90.309).abs() < 1e-3, "{lsb}");
+        assert_eq!(audio(vec![0.0; 12000]).rms_dbfs(), f64::NEG_INFINITY);
+        assert_eq!(audio(Vec::new()).rms_dbfs(), f64::NEG_INFINITY);
     }
 
     /// The header ffmpeg 8.1 writes for pcm_f32le to a pipe: unknown sizes, an 18-byte format

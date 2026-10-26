@@ -24,6 +24,15 @@ pub struct Cache {
     dir: PathBuf,
 }
 
+/// What the cache holds of a voice and text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lookup {
+    /// How many takes it holds, up to [`TAKES`].
+    pub takes: usize,
+    /// One of them, once it holds all of them.
+    pub take: Option<Segment>,
+}
+
 impl Cache {
     /// The cache in `dir`, created if it does not exist.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
@@ -45,21 +54,20 @@ impl Cache {
         self.dir.join(hasher.finalize().to_hex().as_str())
     }
 
-    /// One of the takes of `text` in `voice`, drawn from `rng`, once all [`TAKES`] have been
-    /// made, or `None` while fewer have, when another is to be made.
-    pub fn lookup(
-        &self,
-        voice: &str,
-        text: &str,
-        rng: &mut impl Rng,
-    ) -> io::Result<Option<Segment>> {
+    /// How many takes of `text` in `voice` have been made, and once all [`TAKES`] have, one of
+    /// them drawn from `rng`; while fewer have, another is to be made.
+    pub fn lookup(&self, voice: &str, text: &str, rng: &mut impl Rng) -> io::Result<Lookup> {
         let entry = self.entry(voice, text);
         let taken = takes(&entry)?;
-        if taken.len() < TAKES {
-            return Ok(None);
-        }
-        let path = &taken[rng.random_range(0..taken.len())];
-        read(path).map(Some)
+        let take = if taken.len() < TAKES {
+            None
+        } else {
+            Some(read(&taken[rng.random_range(0..taken.len())])?)
+        };
+        Ok(Lookup {
+            takes: taken.len(),
+            take,
+        })
     }
 
     /// Keeps `speech` as a take of `text` in `voice`, unless all [`TAKES`] are kept already.
@@ -152,14 +160,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let mut rng = rand::rng();
-        for n in 1..=5 {
-            assert_eq!(cache.lookup("v", "hello", &mut rng).unwrap(), None);
+        for (made, n) in (1..=5).enumerate() {
+            let lookup = cache.lookup("v", "hello", &mut rng).unwrap();
+            let none = Lookup {
+                takes: made,
+                take: None,
+            };
+            assert_eq!(lookup, none);
             assert!(cache.store("v", "hello", &speech(n), &mut rng).unwrap());
         }
         assert!(!cache.store("v", "hello", &speech(6), &mut rng).unwrap());
         let mut seen = HashSet::new();
         for _ in 0..200 {
-            let take = cache.lookup("v", "hello", &mut rng).unwrap().unwrap();
+            let lookup = cache.lookup("v", "hello", &mut rng).unwrap();
+            assert_eq!(lookup.takes, TAKES);
+            let take = lookup.take.unwrap();
             assert_eq!(take.rate, 48000);
             seen.insert(take.samples[0]);
         }
@@ -175,7 +190,8 @@ mod tests {
             fs::read(entry.join("0.wav")).unwrap(),
             wav::write_pcm16(48000, 1, &[1, -1, 1])
         );
-        assert_eq!(cache.lookup("v", "other", &mut rng).unwrap(), None);
+        let other = cache.lookup("v", "other", &mut rng).unwrap();
+        assert_eq!((other.takes, other.take), (0, None));
     }
 
     #[test]

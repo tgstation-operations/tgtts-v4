@@ -283,7 +283,8 @@ impl Harness {
         let mut select = connection
             .prepare(
                 "SELECT route, voice, identifier, status, cache_hit, text_length, audio_seconds, \
-                 patches, gain_db, limiter_reduction_db, limited_fraction FROM requests ORDER BY id",
+                 patches, gain_db, limiter_reduction_db, limited_fraction, cache_takes, rms_dbfs \
+                 FROM requests ORDER BY id",
             )
             .unwrap();
         select
@@ -304,6 +305,8 @@ impl Harness {
                         (None, None, None) => None,
                         some => panic!("leveling recorded in part: {some:?}"),
                     },
+                    cache_takes: r.get(11)?,
+                    rms_dbfs: r.get(12)?,
                 })
             })
             .unwrap()
@@ -324,6 +327,8 @@ struct Row {
     patches: Option<i64>,
     /// The gain, the limiter's largest reduction and the fraction it limited.
     leveling: Option<(f64, f64, f64)>,
+    cache_takes: Option<i64>,
+    rms_dbfs: Option<f64>,
 }
 
 /// The length of `frames` of speech over the radio, between the test's clicks.
@@ -863,6 +868,8 @@ fn caches_five_takes_then_reuses_them() {
     let hits: Vec<_> = h.rows().iter().map(|row| row.cache_hit).collect();
     let (miss, hit) = (Some(false), Some(true));
     assert_eq!(hits, [miss, miss, miss, miss, miss, hit, hit]);
+    let takes: Vec<_> = h.rows().iter().map(|row| row.cache_takes).collect();
+    assert_eq!(takes, [0, 1, 2, 3, 4, 5, 5].map(Some));
     let entries = std::fs::read_dir(&h.cache).unwrap().count();
     assert_eq!(entries, 1);
 
@@ -944,6 +951,47 @@ fn toggles_logging_as_the_old_service() {
 }
 
 #[test]
+fn records_silence_as_silence() {
+    let h = harness(Fake::default(), limits());
+    let silent = Message {
+        identifier: "silent",
+        text: "...",
+        ..Message::default()
+    };
+    let replies = silent.all(&h);
+    let beeped = Message {
+        identifier: "beeped",
+        special_filters: "radio",
+        ..silent.clone()
+    };
+    let beeped = beeped.speech(&h);
+    let spoken = Message::default().speech(&h);
+    for reply in replies.iter().chain([&beeped, &spoken]) {
+        reply.assert_ogg(48000);
+    }
+    let level = |route: &str, identifier: &str| {
+        let rows = h.rows();
+        let row = rows
+            .iter()
+            .find(|row| row.route == route && row.identifier == identifier);
+        row.unwrap().rms_dbfs.unwrap()
+    };
+    // Speech and blips of nothing are digital silence, and so is speech with no sound between
+    // the radio special filter's clicks.
+    assert_eq!(level("tts", "silent"), f64::NEG_INFINITY);
+    assert_eq!(level("tts-blips", "silent"), f64::NEG_INFINITY);
+    assert_eq!(level("tts", "beeped"), f64::NEG_INFINITY);
+    let identifier = Message::default().identifier;
+    let speech = level("tts", identifier);
+    assert!((-30.0..0.0).contains(&speech), "{speech}");
+    // The radio's static is under whatever it puts on the radio.
+    for route in ["tts-radio", "tts-radio-gibberish", "tts-blips-radio"] {
+        let radio = level(route, "silent");
+        assert!((-30.0..0.0).contains(&radio), "{route}: {radio}");
+    }
+}
+
+#[test]
 fn records_metrics_without_the_text() {
     // Loud enough that the fake's speech takes the limiter to reach it.
     let (target, ceiling) = (-4.5, -1.0);
@@ -951,6 +999,7 @@ fn records_metrics_without_the_text() {
     let take = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
     let speech_leveling = dsp::loudness::normalize(&dsp::speech::finish(&take, 0), target, ceiling);
     assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);
+    let speech_rms = wav::Audio::from_segment(&speech_leveling.segment).rms_dbfs();
     let speech_leveling = Some((
         speech_leveling.gain,
         speech_leveling.reduction,
@@ -973,6 +1022,15 @@ fn records_metrics_without_the_text() {
     // The blips are drawn at random, so only that they were leveled can be checked.
     let blips_leveling = rows[1].leveling;
     assert!(blips_leveling.is_some());
+    let levels: Vec<_> = rows.iter_mut().map(|row| row.rms_dbfs.take()).collect();
+    assert_eq!(levels[0], Some(speech_rms));
+    for level in &levels[1..5] {
+        assert!(
+            level.is_some_and(|l| (-30.0..0.0).contains(&l)),
+            "{levels:?}"
+        );
+    }
+    assert_eq!(levels[5], None);
     let row = |route: &str, reply: &Reply, cache_hit, patches, leveling| Row {
         route: route.to_owned(),
         voice: VOICE.to_owned(),
@@ -983,11 +1041,16 @@ fn records_metrics_without_the_text() {
         audio_seconds: Some(reply.length.as_deref().unwrap().parse().unwrap()),
         patches,
         leveling,
+        cache_takes: None,
+        rms_dbfs: None,
     };
     assert_eq!(
         rows,
         [
-            row("tts", &speech, Some(false), Some(25), speech_leveling),
+            Row {
+                cache_takes: Some(0),
+                ..row("tts", &speech, Some(false), Some(25), speech_leveling)
+            },
             row("tts-blips", &blips, None, None, blips_leveling),
             row("tts-blips-radio", &blips_radio, None, None, None),
             row("tts-radio", &radio, None, None, None),

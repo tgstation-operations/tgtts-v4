@@ -12,16 +12,22 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use tracing::{error, warn};
 
 /// The most rows written in one transaction.
 const BATCH: usize = 256;
 
-const SCHEMA: &str = "
+const PRAGMAS: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
-    CREATE TABLE IF NOT EXISTS requests (
+";
+
+/// What each version of the schema adds to the one before. A database records the version it is
+/// at as its `user_version`, which databases made before there were versions have at 0, with the
+/// first version's table.
+const MIGRATIONS: [&str; 2] = [
+    "CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY,
         -- When the request arrived, in milliseconds since the Unix epoch.
         time_unix_ms INTEGER NOT NULL,
@@ -51,15 +57,27 @@ const SCHEMA: &str = "
         gain_db REAL,
         limiter_reduction_db REAL,
         limited_fraction REAL
-    );
-";
+    );",
+    "
+    -- On the route that synthesizes, how many takes of the voice and text the cache held when
+    -- the speech was looked up, 0 to 5; it is given one of them once it holds all 5.
+    ALTER TABLE requests ADD COLUMN cache_takes INTEGER;
+    -- The RMS level of the audio served, over all of it, in dB from full scale, a full-scale
+    -- square wave at 0 and digital silence at -Inf: on the routes that make speech or blips, of
+    -- them without the clicks the radio special filter puts around them, and on the radio routes,
+    -- of the radio, static and all.
+    ALTER TABLE requests ADD COLUMN rms_dbfs REAL;
+    ",
+];
 
 const INSERT: &str = "
     INSERT INTO requests (
         time_unix_ms, route, voice, identifier, status, cache_hit, text_length, audio_seconds,
         queue_ms, handoff_ms, synthesis_ms, dsp_ms, ffmpeg_ms, total_ms, patches, gain_db,
-        limiter_reduction_db, limited_fraction
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        limiter_reduction_db, limited_fraction, cache_takes, rms_dbfs
+    ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+    )
 ";
 
 /// One request's metrics.
@@ -73,9 +91,13 @@ pub struct Row {
     pub identifier: String,
     pub status: u16,
     pub cache_hit: Option<bool>,
+    /// How many takes the cache held when it was looked up.
+    pub cache_takes: Option<usize>,
     /// The length of the text in characters.
     pub text_length: usize,
     pub audio_seconds: Option<f64>,
+    /// The RMS level of the audio served, in dBFS.
+    pub rms_dbfs: Option<f64>,
     pub timings: Timings,
     pub patches: Option<usize>,
     pub leveling: Option<Leveling>,
@@ -118,11 +140,12 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Opens the database at `path`, creating it and its table if need be, with a queue of up to
-    /// `capacity` rows waiting to be written.
+    /// Opens the database at `path`, creating it and its table if need be and bringing it to the
+    /// latest schema, with a queue of up to `capacity` rows waiting to be written.
     pub fn open(path: &Path, capacity: usize) -> rusqlite::Result<Self> {
-        let connection = Connection::open(path)?;
-        connection.execute_batch(SCHEMA)?;
+        let mut connection = Connection::open(path)?;
+        connection.execute_batch(PRAGMAS)?;
+        migrate(&mut connection)?;
         let (queue, rows) = mpsc::sync_channel(capacity);
         let writer = thread::Builder::new()
             .name("metrics".into())
@@ -175,6 +198,20 @@ impl Drop for Metrics {
             let _ = writer.join();
         }
     }
+}
+
+/// Brings the database to the latest version of the schema. One a later build has brought
+/// further is left as it is, since the rows this one writes name their columns.
+fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    for (to, migration) in (1..).zip(MIGRATIONS) {
+        if version < to {
+            transaction.execute_batch(migration)?;
+            transaction.pragma_update(None, "user_version", to)?;
+        }
+    }
+    transaction.commit()
 }
 
 fn write(mut connection: Connection, messages: mpsc::Receiver<Message>) {
@@ -232,6 +269,8 @@ fn insert<'a>(
                 leveling.map(|l| l.gain),
                 leveling.map(|l| l.reduction),
                 leveling.map(|l| l.limited),
+                row.cache_takes.map(|t| t as i64),
+                row.rms_dbfs,
             ])?;
         }
     }
@@ -252,8 +291,10 @@ mod tests {
             identifier: format!("id{n}"),
             status: 200 + n,
             cache_hit: Some(false),
+            cache_takes: Some(3),
             text_length: 13,
             audio_seconds: Some(1.25),
+            rms_dbfs: Some(-21.5),
             timings: Timings {
                 queue: Duration::from_micros(1500),
                 handoff: Duration::ZERO,
@@ -293,7 +334,9 @@ mod tests {
         let mut radio = row(1);
         radio.route = "tts-radio";
         radio.cache_hit = None;
+        radio.cache_takes = None;
         radio.audio_seconds = None;
+        radio.rms_dbfs = None;
         radio.patches = None;
         radio.leveling = None;
         assert!(metrics.record(radio));
@@ -323,6 +366,8 @@ mod tests {
                     R(-12.5),
                     R(0.75),
                     R(0.03125),
+                    I(3),
+                    R(-21.5),
                 ],
                 vec![
                     I(2),
@@ -344,6 +389,8 @@ mod tests {
                     Null,
                     Null,
                     Null,
+                    Null,
+                    Null,
                 ],
             ]
         );
@@ -353,6 +400,56 @@ mod tests {
         metrics.record(row(2));
         drop(metrics);
         assert_eq!(rows(&path).len(), 3);
+    }
+
+    /// A database as the service made it before the schema had versions.
+    #[test]
+    fn keeps_a_database_from_before_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.sqlite");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(PRAGMAS).unwrap();
+        old.execute_batch(MIGRATIONS[0]).unwrap();
+        old.execute_batch(
+            "INSERT INTO requests (
+                time_unix_ms, route, voice, identifier, status, text_length, queue_ms,
+                handoff_ms, synthesis_ms, dsp_ms, ffmpeg_ms, total_ms
+            ) VALUES (1, 'tts', 'v', 'old', 200, 5, 0, 0, 0, 0, 0, 0)",
+        )
+        .unwrap();
+        drop(old);
+        let metrics = Metrics::open(&path, 16).unwrap();
+        let mut silent = row(0);
+        silent.rms_dbfs = Some(f64::NEG_INFINITY);
+        metrics.record(silent);
+        drop(metrics);
+        let written = rows(&path);
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0][4], Value::Text("old".into()));
+        assert_eq!(written[0][19..], [Value::Null, Value::Null]);
+        assert_eq!(
+            written[1][19..],
+            [Value::Integer(3), Value::Real(f64::NEG_INFINITY)]
+        );
+        let latest = MIGRATIONS.len() as i64;
+        let version = |path: &Path| -> i64 {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&path), latest);
+        // Reopening migrates nothing again.
+        drop(Metrics::open(&path, 16).unwrap());
+        assert_eq!(rows(&path).len(), 2);
+        // A database a later build has brought further keeps its version.
+        let later = Connection::open(&path).unwrap();
+        later
+            .pragma_update(None, "user_version", latest + 1)
+            .unwrap();
+        drop(later);
+        drop(Metrics::open(&path, 16).unwrap());
+        assert_eq!(version(&path), latest + 1);
     }
 
     /// With the database locked, the writer is held in its first transaction with at most a

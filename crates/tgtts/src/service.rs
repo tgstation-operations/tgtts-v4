@@ -378,8 +378,11 @@ struct Served {
 struct Trace {
     timings: Timings,
     cache_hit: Option<bool>,
+    cache_takes: Option<usize>,
     patches: Option<usize>,
     leveling: Option<Leveling>,
+    /// The level of the audio served, as the metrics record it.
+    rms_dbfs: Option<f64>,
 }
 
 impl Service {
@@ -460,7 +463,9 @@ impl Service {
                 identifier = %params.identifier,
                 voice = %params.voice,
                 cache_hit = trace.cache_hit,
+                cache_takes = trace.cache_takes,
                 seconds = served.seconds,
+                rms_dbfs = trace.rms_dbfs,
                 queue_ms = ms(t.queue),
                 handoff_ms = ms(t.handoff),
                 synthesis_ms = ms(t.synthesis),
@@ -493,8 +498,10 @@ impl Service {
                     Err(failure) => failure.status.as_u16(),
                 },
                 cache_hit: trace.cache_hit,
+                cache_takes: trace.cache_takes,
                 text_length,
                 audio_seconds: result.as_ref().ok().map(|served| served.seconds),
+                rms_dbfs: result.as_ref().ok().and(trace.rms_dbfs),
                 timings: trace.timings,
                 patches: trace.patches,
                 leveling: trace.leveling,
@@ -583,11 +590,13 @@ impl Service {
         .await?;
         let (voice, cached) = cached;
         match cached {
-            Ok(Some(speech)) => {
-                trace.cache_hit = Some(true);
-                return Ok(speech);
+            Ok(lookup) => {
+                trace.cache_takes = Some(lookup.takes);
+                if let Some(speech) = lookup.take {
+                    trace.cache_hit = Some(true);
+                    return Ok(speech);
+                }
             }
-            Ok(None) => {}
             Err(e) => warn!("reading the cache, speaking anew: {e}"),
         }
         trace.cache_hit = Some(false);
@@ -743,6 +752,7 @@ impl Service {
             }
             Treatment::None => Audio::from_segment(&audio),
         };
+        trace.rms_dbfs = Some(audio.rms_dbfs());
         if specials.contains(&"radio") {
             let service = self.clone();
             audio = self
@@ -794,6 +804,7 @@ impl Service {
             })
             .await?;
         let audio = Arc::new(Audio::from_segment(&radio));
+        trace.rms_dbfs = Some(audio.rms_dbfs());
         let ogg = self.encode(trace, audio.clone()).await?;
         Ok(Served {
             ogg,
