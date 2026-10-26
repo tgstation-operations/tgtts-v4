@@ -43,9 +43,8 @@ impl RmsNorm {
 
 #[derive(Module, Debug)]
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    /// Upstream's q_proj, k_proj and v_proj, joined along their outputs to run as one matmul.
+    qkv_proj: Linear,
     o_proj: Linear,
     heads: usize,
     kv_heads: usize,
@@ -58,9 +57,7 @@ impl Attention {
         let (heads, kv_heads) = (config.num_attention_heads, config.num_key_value_heads);
         let linear = |d_in, d_out| LinearConfig::new(d_in, d_out).with_bias(false).init(device);
         Self {
-            q_proj: linear(hidden, heads * head_dim),
-            k_proj: linear(hidden, kv_heads * head_dim),
-            v_proj: linear(hidden, kv_heads * head_dim),
+            qkv_proj: linear(hidden, (heads + 2 * kv_heads) * head_dim),
             o_proj: linear(heads * head_dim, hidden),
             heads,
             kv_heads,
@@ -76,14 +73,15 @@ impl Attention {
         cache: Option<(&mut LayerCache, &Append)>,
     ) -> Tensor<3> {
         let [batch, len, _] = x.dims();
-        let project = |proj: &Linear, heads| {
-            proj.forward(x.clone())
-                .reshape([batch, len, heads, self.head_dim])
-                .swap_dims(1, 2)
-        };
-        let mut q = project(&self.q_proj, self.heads);
-        let mut k = project(&self.k_proj, self.kv_heads);
-        let v = project(&self.v_proj, self.kv_heads);
+        let (heads, kv_heads) = (self.heads, self.kv_heads);
+        let qkv = self
+            .qkv_proj
+            .forward(x)
+            .reshape([batch, len, heads + 2 * kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let mut q = qkv.clone().narrow(1, 0, heads);
+        let mut k = qkv.clone().narrow(1, heads, kv_heads);
+        let v = qkv.narrow(1, heads + kv_heads, kv_heads);
         if let Some(rotation) = rotation {
             q = rotation.apply(q);
             k = rotation.apply(k);
@@ -108,8 +106,8 @@ impl Attention {
 
 #[derive(Module, Debug)]
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    /// Upstream's gate_proj and up_proj, joined along their outputs to run as one matmul.
+    gate_up_proj: Linear,
     down_proj: Linear,
 }
 
@@ -118,15 +116,17 @@ impl Mlp {
         let (hidden, inner) = (config.hidden_size, config.intermediate_size);
         let linear = |d_in, d_out| LinearConfig::new(d_in, d_out).with_bias(false).init(device);
         Self {
-            gate_proj: linear(hidden, inner),
-            up_proj: linear(hidden, inner),
+            gate_up_proj: linear(hidden, 2 * inner),
             down_proj: linear(inner, hidden),
         }
     }
 
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let gate = silu(self.gate_proj.forward(x.clone()));
-        self.down_proj.forward(gate * self.up_proj.forward(x))
+        let gate_up = self.gate_up_proj.forward(x);
+        let inner = gate_up.dims()[2] / 2;
+        let gate = silu(gate_up.clone().narrow(2, 0, inner));
+        let up = gate_up.narrow(2, inner, inner);
+        self.down_proj.forward(gate * up)
     }
 }
 

@@ -11,16 +11,16 @@ mod config;
 mod layer;
 mod rope;
 
-use std::{fmt, iter, path::Path};
+use std::{collections::BTreeMap, fmt, iter, path::Path};
 
 use burn::{
     module::Module,
     nn::{Embedding, EmbeddingConfig},
     store::{
-        FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
-        SafetensorsStoreError,
+        FloatCastAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
+        SafetensorsStore, SafetensorsStoreError, bridge, burn_pack::Tensor as PackTensor,
     },
-    tensor::{Bool, Device, FloatDType, Int, Tensor, TensorData},
+    tensor::{Bool, Device, FloatDType, Int, Shape, Tensor, TensorData},
 };
 
 pub use crate::{
@@ -75,12 +75,17 @@ impl Model {
     ) -> Result<Self, Error> {
         config.check()?;
         let mut model = Self::init(config, device);
-        let adapter = PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype.into()));
-        let mut store = SafetensorsStore::from_file(path.as_ref()).with_from_adapter(adapter);
+        let mut store = SafetensorsStore::from_file(path.as_ref());
         if !prefix.is_empty() {
             store = store.with_key_remapping(format!("^{}", regex::escape(prefix)), "");
         }
-        model.load_from(&mut store).map_err(Error::Load)?;
+        let tensors = joined(store.get_all_tensors().map_err(Error::Load)?)?;
+        let adapter = PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype.into()));
+        let result = model.apply(tensors, None, Some(Box::new(adapter)), false);
+        if !result.errors.is_empty() || !result.missing.is_empty() {
+            let error = SafetensorsStoreError::ValidationFailed(result.to_string());
+            return Err(Error::Load(error));
+        }
         Ok(model)
     }
 
@@ -235,6 +240,59 @@ impl Model {
         let shape = [starts.len(), heads, len, dim];
         Tensor::from_data(TensorData::new(at.collect(), shape), device)
     }
+}
+
+/// The projections a layer runs as one, and upstream's, whose weights are joined along their
+/// outputs in that order.
+const JOINED: [(&str, &[&str]); 2] = [
+    ("qkv_proj", &["q_proj", "k_proj", "v_proj"]),
+    ("gate_up_proj", &["gate_proj", "up_proj"]),
+];
+
+/// The checkpoint's `tensors`, with the weights of each set of projections in [`JOINED`]
+/// joined as the layers hold them. A joined weight is read only when it is loaded, as the
+/// checkpoint's own are, so it is on the host only while it goes to the device.
+fn joined(tensors: &BTreeMap<String, PackTensor>) -> Result<Vec<PackTensor>, Error> {
+    let mut all: Vec<PackTensor> = tensors.values().cloned().collect();
+    for name in tensors.keys() {
+        for (into, parts) in JOINED {
+            let Some(stem) = name.strip_suffix(&format!(".{}.weight", parts[0])) else {
+                continue;
+            };
+            let weight = |part| tensors.get(&format!("{stem}.{part}.weight"));
+            if let Some(parts) = parts.iter().map(weight).collect() {
+                all.push(join(format!("{stem}.{into}.weight"), parts)?);
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// PyTorch Linear weights `[out, in]`, joined along their outputs as `name`.
+fn join(name: String, parts: Vec<&PackTensor>) -> Result<PackTensor, Error> {
+    let (dtype, inputs) = (parts[0].dtype, parts[0].shape.get(1).copied());
+    let fits = |part: &&PackTensor| {
+        part.dtype == dtype && part.shape.len() == 2 && Some(part.shape[1]) == inputs
+    };
+    let Some(inputs) = inputs.filter(|_| parts.iter().all(fits)) else {
+        let parts: Vec<_> = parts
+            .iter()
+            .map(|part| (&part.name, part.dtype, &part.shape))
+            .collect();
+        let error = format!("{name} cannot join {parts:?}");
+        return Err(Error::Load(SafetensorsStoreError::ValidationFailed(error)));
+    };
+    let outputs = parts.iter().map(|part| part.shape[0]).sum();
+    let parts: Vec<PackTensor> = parts.into_iter().cloned().collect();
+    let read = move || {
+        let mut bytes = Vec::new();
+        for part in &parts {
+            bytes.extend_from_slice(&part.to_bytes()?);
+        }
+        Ok(TensorData::from_bytes_vec(bytes, [outputs, inputs], dtype))
+    };
+    let shape = Shape::new([outputs, inputs]);
+    Ok(bridge::deferred(name, dtype, shape, None, read))
 }
 
 /// The start the rows share, if they do.
