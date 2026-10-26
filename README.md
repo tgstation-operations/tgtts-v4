@@ -17,8 +17,8 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   at a VoxCPM2 checkpoint and run `cargo test -- --ignored`.
 - The gate runs nothing on a GPU. On a Vulkan GPU, `cargo test -p gpu
   --features vulkan` runs the models' fixtures there, and with
-  `-- --include-ignored` their goldens on the real weights, which also need
-  `VOICES_DIR`.
+  `-- --include-ignored` their goldens on the real weights and the service end
+  to end, which also need `VOICES_DIR` and `ASSETS_DIR`.
 - `nix run .#bench` times release builds of the hot paths on the real data
   (`VOXCPM2_DIR`, `VOICES_DIR` for a converted voices directory and `ASSETS_DIR`
   for the radio's sounds) and writes each run as JSON;
@@ -51,8 +51,10 @@ device = "vulkan"
 autotune_cache_dir = "autotune"
 ```
 
-where autotune keeps the kernels it chose, which takes half a minute the first
-time. Point the game's `TTS_HTTP_URL` at `http://127.0.0.1:5002` with
+where autotune keeps the kernels it chose. `/health-check` answers 503 until the
+model has loaded and warmed up: a minute after the first start, half a minute
+once autotune has kept its choices.
+Point the game's `TTS_HTTP_URL` at `http://127.0.0.1:5002` with
 the token as `TTS_HTTP_TOKEN`. The service runs ffmpeg for the filter strings
 the game sent before effects, which needs rubberband, as the devshell's has.
 The end-to-end test runs on the real model with `VOXCPM2_DIR`, `VOICES_DIR` and
