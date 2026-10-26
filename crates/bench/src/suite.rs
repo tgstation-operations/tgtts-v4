@@ -44,6 +44,7 @@ pub const NAMES: &[&str] = &[
     "voxcpm.batch.b4",
     "voxcpm.batch.b16",
     "voxcpm.scheduler",
+    "voxcpm.scheduler.graph",
     "audiovae.decoder.load",
     "audiovae.decode.utterance",
     "audiovae.decode.patch",
@@ -661,33 +662,41 @@ fn voxcpm_batched(
 
     // On a GPU the first run waits for autotune to choose the kernels of each batch, prompt
     // run and KV length it meets.
-    let spec = Spec::new("voxcpm.scheduler", usize::from(r.gpu), 1)
-        .param("requests", CONCURRENT)
-        .param("prefill_positions", PREFILL_POSITIONS)
-        .param("line", LINE);
-    let patches = r.measure(
-        spec,
-        || (),
-        |()| {
-            let cache = PromptCache::new(usize::MAX);
-            let mut scheduler = Scheduler::new(model, cache, PREFILL_POSITIONS);
-            for (i, prompt) in prompts[..CONCURRENT].iter().enumerate() {
-                let noise = SeededNoise::new(i as u64);
-                scheduler
-                    .add(i, prompt, &params.sampling, params.max_patches, noise)
-                    .expect("the prompt fits the LM");
-            }
-            let mut patches = 0;
-            while scheduler.requests() > 0 {
-                patches += scheduler.step().len();
-            }
-            patches
-        },
-    );
-    if let Some(patches) = patches {
-        let seconds = (patches * FRAMES_PER_PATCH) as f64 * FRAME_SECONDS;
-        r.set_work("voxcpm.scheduler", seconds, "audio seconds");
-        r.set_audio("voxcpm.scheduler", seconds);
+    // The same requests stepped by replays: a clone of the model shares its weights.
+    let mut graphed = model.clone();
+    graphed.set_stepping(Stepping::Captured);
+    for (name, model) in [
+        ("voxcpm.scheduler", model),
+        ("voxcpm.scheduler.graph", &graphed),
+    ] {
+        let spec = Spec::new(name, usize::from(r.gpu), 1)
+            .param("requests", CONCURRENT)
+            .param("prefill_positions", PREFILL_POSITIONS)
+            .param("line", LINE);
+        let patches = r.measure(
+            spec,
+            || (),
+            |()| {
+                let cache = PromptCache::new(usize::MAX);
+                let mut scheduler = Scheduler::new(model, cache, PREFILL_POSITIONS);
+                for (i, prompt) in prompts[..CONCURRENT].iter().enumerate() {
+                    let noise = SeededNoise::new(i as u64);
+                    scheduler
+                        .add(i, prompt, &params.sampling, params.max_patches, noise)
+                        .expect("the prompt fits the LM");
+                }
+                let mut patches = 0;
+                while scheduler.requests() > 0 {
+                    patches += scheduler.step().len();
+                }
+                patches
+            },
+        );
+        if let Some(patches) = patches {
+            let seconds = (patches * FRAMES_PER_PATCH) as f64 * FRAME_SECONDS;
+            r.set_work(name, seconds, "audio seconds");
+            r.set_audio(name, seconds);
+        }
     }
     Ok(())
 }
