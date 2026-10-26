@@ -19,6 +19,8 @@
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
 //! - `batch_window_seconds`: how long a request to an idle model waits for others to generate
 //!   with it, 0.1 by default.
+//! - `step_graphs`: whether the model steps by replaying graphs of its step where the device
+//!   records them, as CUDA and Vulkan do, `true` by default.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
 //! - `radio_wait_seconds`: how long a radio route waits for the route that makes what it puts on
@@ -50,7 +52,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 23] = [
+const KEYS: [&str; 24] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -67,6 +69,7 @@ const KEYS: [&str; 23] = [
     "ffmpeg",
     "synthesis_limit",
     "batch_window_seconds",
+    "step_graphs",
     "cpu_limit",
     "queue_timeout_seconds",
     "radio_wait_seconds",
@@ -92,6 +95,7 @@ pub struct Config {
     pub ffmpeg: PathBuf,
     pub synthesis_limit: usize,
     pub batch_window: Duration,
+    pub step_graphs: bool,
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
     pub radio_wait: Duration,
@@ -119,6 +123,7 @@ impl Config {
                     toml::Value::String(s) => s,
                     toml::Value::Integer(n) => n.to_string(),
                     toml::Value::Float(x) => x.to_string(),
+                    toml::Value::Boolean(b) => b.to_string(),
                     other => return Err(Error(format!("{key}: {other} is not a setting's value"))),
                 };
                 values.insert(key, value);
@@ -167,6 +172,7 @@ impl Config {
             batch_window: settings
                 .seconds("batch_window_seconds")?
                 .unwrap_or(Duration::from_millis(100)),
+            step_graphs: settings.parse("step_graphs")?.unwrap_or(true),
             cpu_limit: settings.limit("cpu_limit")?.unwrap_or(cpus),
             queue_timeout: settings
                 .seconds("queue_timeout_seconds")?
@@ -319,6 +325,7 @@ mod tests {
                 ffmpeg: "ffmpeg".into(),
                 synthesis_limit: 16,
                 batch_window: Duration::from_millis(100),
+                step_graphs: true,
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),
@@ -341,6 +348,7 @@ mod tests {
             ffmpeg = \"/usr/bin/ffmpeg\"
             synthesis_limit = 4
             batch_window_seconds = 0.05
+            step_graphs = false
             cpu_limit = 8
             queue_timeout_seconds = 2.5
             radio_wait_seconds = 10
@@ -372,6 +380,7 @@ mod tests {
         assert_eq!(config.ffmpeg, Path::new("/usr/bin/ffmpeg"));
         assert_eq!((config.synthesis_limit, config.cpu_limit), (4, 8));
         assert_eq!(config.batch_window, Duration::from_millis(50));
+        assert!(!config.step_graphs);
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
         assert_eq!(config.radio_wait_ceiling, Duration::from_secs(45));
         let loudness = Loudness {
@@ -389,6 +398,7 @@ mod tests {
             ("TGTTS_LOUDNESS_TARGET_LUFS", "-14.5"),
             ("TGTTS_DEVICE", "cpu"),
             ("TGTTS_LM_DTYPE", "f16"),
+            ("TGTTS_STEP_GRAPHS", "true"),
         ];
         let config = load(&toml, &env).unwrap();
         let dtypes = Dtypes {
@@ -402,6 +412,7 @@ mod tests {
         assert_eq!(config.log_level, LevelFilter::WARN);
         assert_eq!(config.token_file, Path::new("/etc/token"));
         assert_eq!(config.loudness.target, -14.5);
+        assert!(config.step_graphs);
     }
 
     #[test]
@@ -430,6 +441,7 @@ mod tests {
         assert!(error(REQUIRED, &[("TGTTS_LOG_LEVEL", "loud")]).starts_with("log_level:"));
         assert!(error(REQUIRED, &[("TGTTS_DEVICE", "rocm")]).starts_with("device:"));
         assert!(error(REQUIRED, &[("TGTTS_LM_DTYPE", "f64")]).starts_with("lm_dtype:"));
+        assert!(error(REQUIRED, &[("TGTTS_STEP_GRAPHS", "1")]).starts_with("step_graphs:"));
         for device in ["vulkan", "cuda"] {
             let error = error(REQUIRED, &[("TGTTS_DEVICE", device)]);
             assert!(error.starts_with("autotune_cache_dir"), "{error}");

@@ -18,7 +18,8 @@ use dsp::RATE;
 use tracing::{error, info};
 use voices::{Latent, Voices};
 use voxcpm::{
-    Config, Dtypes, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise, TextToSpeech,
+    Config, Dtypes, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise, Stepping,
+    TextToSpeech,
 };
 
 use crate::synth::{self, Speech, Synthesizer};
@@ -47,6 +48,8 @@ pub struct Batching {
     pub window: Duration,
     /// The most requests at once, which stop the wait.
     pub requests: usize,
+    /// Whether a batch steps by replaying graphs of its step where the device records them.
+    pub graphs: bool,
 }
 
 /// VoxCPM2, synthesizing with the same parameters for every request: the requests generate
@@ -110,7 +113,12 @@ impl VoxCpm {
             .name("voxcpm".into())
             .spawn(move || {
                 let tts = match TextToSpeech::load(&dir, &dtypes, &on) {
-                    Ok(tts) => Arc::new(tts),
+                    Ok(mut tts) => {
+                        if !batching.graphs {
+                            tts.set_stepping(Stepping::Eager);
+                        }
+                        Arc::new(tts)
+                    }
                     Err(e) => {
                         let _ = loaded.send(Err(e));
                         return;
@@ -148,6 +156,9 @@ impl VoxCpm {
     /// and as many as run at once going past each power of two the KV length goes past before
     /// the longest's last patch, where a GPU takes other kernels; and the audio decoder's every
     /// chunk length, all on the thread that generates. Logs what it ran and how long it took.
+    ///
+    /// The thread that generates keeps the graphs a GPU records of each number of requests and
+    /// capacity of cache the warm-up reaches, which the requests after it replay.
     ///
     /// # Errors
     ///
@@ -193,7 +204,7 @@ impl VoxCpm {
             prompts = %format!("{}..={}", shortest.len(), longest.len()),
             requests,
             past = ?boundaries,
-            patches = WARM_UP_PATCHES.min(self.params.max_patches),
+            patches = WARM_UP_PATCHES,
             decoder_chunks = %format!("1..={}", self.params.decode_chunk_frames),
             generation_seconds = generated.as_secs_f64(),
             decoder_seconds = seconds - generated.as_secs_f64(),
@@ -268,23 +279,28 @@ fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
 }
 
 impl Generating {
-    /// Generates from each run of `prompts` in turn, a batch of each, as `params` says but for
-    /// [`WARM_UP_PATCHES`], from a prompt cache of their own, then decodes silence in every
-    /// chunk length; gives how long generating took.
+    /// Generates from each run of `prompts` in turn, a batch of each, as `params` says, from a
+    /// prompt cache of their own, until each request has [`WARM_UP_PATCHES`] patches, in caches
+    /// of the capacity a request has, then decodes silence in every chunk length; gives how long
+    /// generating took.
     fn warm_up(&self, runs: &[Vec<Prompt>]) -> Result<Duration, voxcpm::Error> {
         let started = Instant::now();
         let (tts, params) = (&*self.tts, &self.params);
         let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
-        let max_patches = WARM_UP_PATCHES.min(params.max_patches);
         for run in runs {
             let mut scheduler = Scheduler::new(tts.model(), cache, PREFILL_POSITIONS);
             for (i, prompt) in run.iter().enumerate() {
                 let noise = SeededNoise::new(i as u64);
-                scheduler.add(i, prompt, &params.sampling, max_patches, noise)?;
+                scheduler.add(i, prompt, &params.sampling, params.max_patches, noise)?;
             }
-            while scheduler.requests() > 0 {
+            let mut left = vec![WARM_UP_PATCHES; run.len()];
+            while left.iter().any(|&left| left > 0) && scheduler.requests() > 0 {
                 for patch in scheduler.step() {
                     patch.patch?;
+                    left[patch.key] = match patch.last {
+                        true => 0,
+                        false => left[patch.key].saturating_sub(1),
+                    };
                 }
             }
             cache = scheduler.into_cache();
@@ -422,6 +438,7 @@ mod tests {
         let batching = Batching {
             window: Duration::ZERO,
             requests: 1,
+            graphs: true,
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
     }

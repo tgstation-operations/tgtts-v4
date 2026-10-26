@@ -40,6 +40,7 @@ pub fn batching() -> Batching {
     Batching {
         window: Duration::from_millis(100),
         requests: 1,
+        graphs: true,
     }
 }
 

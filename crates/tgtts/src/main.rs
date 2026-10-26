@@ -133,6 +133,7 @@ fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send
     let batching = Batching {
         window: config.batch_window,
         requests: config.synthesis_limit,
+        graphs: config.step_graphs,
     };
     let model = VoxCpm::load(
         &config.checkpoint_dir,
