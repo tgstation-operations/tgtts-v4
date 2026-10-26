@@ -10,7 +10,7 @@ use std::{thread, time::Duration};
 use service::real;
 use tgtts::{
     device::Kind,
-    model::{Batching, VoxCpm},
+    model::{Batching, PROMPT_CACHE_BYTES, VoxCpm},
     synth::Synthesizer,
 };
 use voices::Voices;
@@ -39,9 +39,9 @@ fn serves_a_message_on_the_real_model() {
 }
 
 /// The model warmed up as the service warms it, then rounds of requests at once, 1 to 16 of
-/// them, of lines of mixed lengths in voices across the set: the pools reserve no more of the
-/// GPU's memory than they did after the warm-up, so a service that started does not run out of
-/// it later.
+/// them, of lines of mixed lengths in voices across the set: the pools hold no more pages than
+/// they held at most during the warm-up, but for those the prompt cache fills as it keeps the
+/// voices, up to its budget, so a service that started does not run out of memory later.
 fn holds_the_memory_it_warmed_up_with(graphs: bool) {
     let (checkpoint, device) = (real::dir("VOXCPM2_DIR"), gpu::device());
     let kind = if cfg!(feature = "cuda") {
@@ -58,8 +58,18 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
     let model = VoxCpm::load(&checkpoint, &kind.dtypes(), &device, params, batching).unwrap();
     let voices = Voices::open(real::dir("VOICES_DIR")).unwrap();
     model.warm_up(&voices).unwrap();
-    let mib = || device.memory_pool_usage().unwrap().bytes_reserved >> 20;
-    let warmed = mib();
+    // Each pool's pages, at most and now, in bytes.
+    let pools = || {
+        let pools = device.memory_pool_report().unwrap();
+        let peak = pools.iter().map(|pool| pool.pages_peak * pool.page_size);
+        let now = pools.iter().map(|pool| pool.pages * pool.page_size);
+        let largest = pools.iter().map(|pool| pool.page_size).max().unwrap_or(1);
+        (peak.sum::<u64>(), now.sum::<u64>(), largest)
+    };
+    let (warmed, _, page) = pools();
+    // The cache's budget in whole pages of the largest pool, where it keeps its keys and values.
+    let cache = (PROMPT_CACHE_BYTES as u64).div_ceil(page) * page;
+    let mib = |bytes: u64| bytes >> 20;
     let names: Vec<&str> = voices.names().collect();
     let lines = [
         "Help.",
@@ -69,7 +79,8 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
          not a drill, I repeat, this is not a drill.",
     ];
     let mut rounds = vec![];
-    for (round, size) in [16, 1, 5, 16, 2, 9, 16, 3, 12, 16].into_iter().enumerate() {
+    let sizes = [16, 1, 5, 16, 2, 9, 16, 3, 12, 16].repeat(2);
+    for (round, size) in sizes.into_iter().enumerate() {
         thread::scope(|scope| {
             for i in 0..size {
                 let (voices, names, model) = (&voices, &names, &model);
@@ -81,12 +92,17 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
                 });
             }
         });
-        rounds.push(mib());
+        rounds.push(mib(pools().1));
     }
-    eprintln!("reserved {warmed} MiB after the warm-up, then after each round {rounds:?}");
+    let (warmed, cache) = (mib(warmed), mib(cache));
+    eprintln!(
+        "pages of {warmed} MiB at most during the warm-up, the cache's {cache} MiB of pages, then \
+         after each round {rounds:?}"
+    );
     assert!(
-        rounds.iter().all(|&reserved| reserved <= warmed),
-        "reserved {warmed} MiB after the warm-up, then {rounds:?}"
+        rounds.iter().all(|&held| held <= warmed + cache),
+        "pages of {warmed} MiB at most during the warm-up and {cache} MiB for the cache, then \
+         {rounds:?}"
     );
 }
 

@@ -35,7 +35,7 @@ const WARM_UP_PATCHES: usize = 9;
 
 /// The bytes on the device the prompt cache keeps of the voices: on a GPU in f16 a median voice
 /// takes about 11 MB, so about 90 of them.
-const PROMPT_CACHE_BYTES: usize = 1 << 30;
+pub const PROMPT_CACHE_BYTES: usize = 1 << 30;
 
 /// The positions of prompts run between two patches while other requests generate: on a GPU in
 /// f16 a run of 128 takes about as long as a patch of one request.
