@@ -10,7 +10,7 @@ use burn::tensor::{FloatDType, Tensor};
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir, device, fixture};
 use voices::Latent;
-use voxcpm::{Config, Dtypes, Params, SeededNoise, SpeechDecoder, TextToSpeech};
+use voxcpm::{Config, Dtypes, Params, PromptCache, SeededNoise, SpeechDecoder, TextToSpeech};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
@@ -172,6 +172,98 @@ fn generates_as_upstream_on_the_real_weights() {
     let kept = start.dims()[0];
     let audio = Tensor::<1>::from_floats(&audio[..kept], &device);
     assert_close(audio, start, 1e-4, 0.0);
+}
+
+/// The golden's line run from what a prompt cache keeps of its voice, against the line run whole:
+/// first with nothing kept but the voice, then from the transcript and line another prompt left
+/// there, and a line of its own from the transcript alone, each prompt run 64 positions at a time.
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn goes_on_from_a_cached_prompt_as_from_the_whole_on_the_real_weights() {
+    let (golden, device) = (golden(), device());
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let tts = TextToSpeech::load(&checkpoint_dir(), &F32, &device).unwrap();
+    let (model, params) = (tts.model(), Params::default());
+    let noise = golden.tensor::<3>("input.noise", &device);
+    let patches = golden.tensor::<3>("output.patches", &device);
+    let steps = patches.dims()[0];
+    let at = |tensor: &Tensor<3>, i| tensor.clone().narrow(0, i, 1);
+    let other = "Someone set the kitchen on fire again.";
+    let mut cache = PromptCache::new(usize::MAX);
+    for (line, kept) in [
+        (text.as_str(), "the voice"),
+        (text, "the line"),
+        (other, "the transcript"),
+    ] {
+        let prompt = tts.prompt(line, &voice).unwrap();
+        let mut whole = model.start(&prompt, params.max_patches).unwrap();
+        let mut prefill = model
+            .prefill(&prompt, params.max_patches, &mut cache)
+            .unwrap();
+        let cached = prompt.len() - prefill.left();
+        let started = Instant::now();
+        while !prefill.run(64, &mut cache) {}
+        eprintln!(
+            "{kept}: {cached} of {} positions kept, the rest run in {:.1?}",
+            prompt.len(),
+            started.elapsed()
+        );
+        let mut cached = prefill.finish();
+        // Each sampled after the same patches, upstream's for its line and the whole's own for
+        // the other.
+        let (mut patch, mut logits) = (vec![], vec![]);
+        for i in 0..steps {
+            let (a, b) = (
+                whole.sample(at(&noise, i), &params.sampling),
+                cached.sample(at(&noise, i), &params.sampling),
+            );
+            patch.push(max_diff(a.patch.clone(), b.patch));
+            logits.push(max_diff(a.stop_logits, b.stop_logits));
+            let next = if line == text {
+                at(&patches, i)
+            } else {
+                a.patch
+            };
+            whole.advance(next.clone());
+            cached.advance(next);
+        }
+        // Built as the tests build it, each came out bit for bit as the whole. A level of the
+        // quantizer as near a boundary as the prompt's would round apart for a change of an ulp,
+        // so they are held as close as the golden holds the model to upstream.
+        let worst = |diffs: &[f32]| diffs.iter().fold(0f32, |worst, d| worst.max(*d));
+        eprintln!(
+            "{kept}: patches within {:.1e}, stop logits within {:.1e}",
+            worst(&patch),
+            worst(&logits)
+        );
+        assert!(worst(&patch) <= PATCH, "{kept}: patches {patch:?}");
+        assert!(
+            worst(&logits) <= STOP_LOGITS,
+            "{kept}: stop logits {logits:?}"
+        );
+    }
+
+    // Run free from the line's prompt as cached, as generation goes.
+    let prompt = tts.prompt(text, &voice).unwrap();
+    let mut prefill = model
+        .prefill(&prompt, params.max_patches, &mut cache)
+        .unwrap();
+    prefill.run(usize::MAX, &mut cache);
+    let mut generation = prefill.finish();
+    let mut stopped = None;
+    for i in 0..steps {
+        let step = generation.sample(at(&noise, i), &params.sampling);
+        if step.stops() {
+            stopped = Some(i);
+            break;
+        }
+        generation.advance(step.patch);
+    }
+    assert_eq!(
+        stopped,
+        Some(steps - 1),
+        "stopped after another patch than whole"
+    );
 }
 
 #[test]

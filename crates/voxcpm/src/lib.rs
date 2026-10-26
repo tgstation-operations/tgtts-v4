@@ -11,6 +11,7 @@ mod local_dit;
 mod local_encoder;
 mod model;
 mod noise;
+mod prefill;
 mod prompt;
 mod speech;
 mod tokenizer;
@@ -27,6 +28,7 @@ pub use crate::{
     local_encoder::LocalEncoder,
     model::{Dtypes, Generation, Model, Patches, Step},
     noise::{Noise, SeededNoise},
+    prefill::{Prefill, PromptCache},
     prompt::Prompt,
     speech::{Params, SpeechDecoder, TextToSpeech},
     tokenizer::Tokenizer,

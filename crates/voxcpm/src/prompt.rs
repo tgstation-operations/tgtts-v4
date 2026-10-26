@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::{Config, Error};
 
 const AUDIO_START: u32 = 101;
@@ -62,6 +64,34 @@ impl Prompt {
     /// Whether there are no positions.
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
+    }
+
+    /// The positions of the voice as reference audio, and the voice's patches there, if the
+    /// prompt is as [`cloning`](Self::cloning) lays it out: the voice spoken again at the end,
+    /// after the text and the audio start token.
+    pub(crate) fn voice(&self) -> Option<(Range<usize>, &[f32])> {
+        let len = self.len();
+        let voice = self.audio.iter().skip(1).take_while(|&&a| a).count();
+        let text = len.checked_sub(3 + 2 * voice)?;
+        let patch = self.patches.len() / len.max(1);
+        let reference = 1..1 + voice;
+        let continuation = len - voice..len;
+        let patches = |range: &Range<usize>| &self.patches[range.start * patch..range.end * patch];
+        let laid_out = voice > 0
+            && self.tokens[0] == REF_AUDIO_START
+            && self.tokens[1 + voice] == REF_AUDIO_END
+            && self.tokens[2 + voice + text] == AUDIO_START
+            && self.audio[continuation.clone()].iter().all(|&a| a)
+            && self.audio.iter().filter(|&&a| a).count() == 2 * voice
+            && patches(&reference) == patches(&continuation);
+        laid_out.then(|| (reference.clone(), patches(&reference)))
+    }
+
+    /// The positions of the text, between the reference audio and the audio start token, of a
+    /// prompt [`voice`](Self::voice) finds laid out.
+    pub(crate) fn text(&self) -> Range<usize> {
+        let voice = self.audio.iter().skip(1).take_while(|&&a| a).count();
+        2 + voice..self.len() - voice - 1
     }
 
     fn push_token(&mut self, token: u32, patch: usize) {

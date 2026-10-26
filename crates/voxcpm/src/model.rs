@@ -24,17 +24,17 @@ pub struct Dtypes {
 /// follow, as upstream's `VoxCPM2Model._inference` computes them and nanovllm-voxcpm stops.
 #[derive(Debug)]
 pub struct Model {
-    base_lm: minicpm4::Model,
-    residual_lm: minicpm4::Model,
+    pub(crate) base_lm: minicpm4::Model,
+    pub(crate) residual_lm: minicpm4::Model,
     encoder: LocalEncoder,
     cfm: Cfm,
     heads: Heads,
-    hidden: usize,
-    patch_size: usize,
-    feat_dim: usize,
+    pub(crate) hidden: usize,
+    pub(crate) patch_size: usize,
+    pub(crate) feat_dim: usize,
     max_positions: usize,
     lm_dtype: DType,
-    device: Device,
+    pub(crate) device: Device,
 }
 
 /// The layers between the stacks, under their names in the checkpoint.
@@ -123,6 +123,34 @@ impl Model {
     /// If the prompt is empty, no patch is asked for, or the prompt and the patches would run
     /// past the positions the base LM has.
     pub fn start(&self, prompt: &Prompt, max_patches: usize) -> Result<Generation<'_>, Error> {
+        let capacity = self.capacity(prompt, max_patches)?;
+        let (device, len) = (&self.device, prompt.len());
+        let tokens = prompt
+            .tokens
+            .iter()
+            .map(|&token| i64::from(token))
+            .collect();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(tokens, [1, len]), device);
+        let shape = [1, len, self.patch_size, self.feat_dim];
+        let patches =
+            Tensor::<4>::from_data(TensorData::new(prompt.patches.clone(), shape), device);
+        let audio = TensorData::new(prompt.audio.clone(), [1, len, 1]);
+        let audio = Tensor::<3, Bool>::from_data(audio, device);
+
+        let audio_embeds = self.embed_patches(patches);
+        let mut base_cache = self.base_lm.cache(1, capacity);
+        let mut residual_cache = self.residual_lm.cache(1, capacity);
+        let (outputs, residual) = self.run_prompt(
+            tokens,
+            audio,
+            audio_embeds,
+            (&mut base_cache, &mut residual_cache),
+        );
+        Ok(self.generation((base_cache, residual_cache), (outputs, residual), prompt))
+    }
+
+    /// The positions the LMs' caches need for `prompt` and `max_patches` patches after it.
+    pub(crate) fn capacity(&self, prompt: &Prompt, max_patches: usize) -> Result<usize, Error> {
         let len = prompt.len();
         let capacity = len + max_patches;
         if len == 0 || max_patches == 0 {
@@ -137,48 +165,64 @@ impl Model {
                 self.max_positions
             )));
         }
-        let (device, hidden) = (&self.device, self.hidden);
-        let tokens = prompt
-            .tokens
-            .iter()
-            .map(|&token| i64::from(token))
-            .collect();
-        let tokens = Tensor::<2, Int>::from_data(TensorData::new(tokens, [1, len]), device);
-        let shape = [1, len, self.patch_size, self.feat_dim];
-        let patches =
-            Tensor::<4>::from_data(TensorData::new(prompt.patches.clone(), shape), device);
-        let audio = TensorData::new(prompt.audio.clone(), [1, len, 1]);
-        let audio = Tensor::<3, Bool>::from_data(audio, device).expand([1, len, hidden]);
+        Ok(capacity)
+    }
 
+    /// Runs positions of a prompt through the LMs after those in `caches`: their `tokens`
+    /// `[1, len]`, whether each is `audio` `[1, len, 1]`, and the embeddings of their patches
+    /// `[1, len, hidden]`, which only audio positions take. Gives the base LM's outputs,
+    /// quantized where audio, and the residual LM's.
+    pub(crate) fn run_prompt(
+        &self,
+        tokens: Tensor<2, Int>,
+        audio: Tensor<3, Bool>,
+        audio_embeds: Tensor<3>,
+        (base_cache, residual_cache): (&mut KvCache, &mut KvCache),
+    ) -> (Tensor<3>, Tensor<3>) {
+        let [_, len] = tokens.dims();
+        let audio = audio.expand([1, len, self.hidden]);
         let heads = &self.heads;
-        let audio_embeds = self.embed_patches(patches.clone());
         let embeds = self
             .base_lm
             .embed(tokens)
             .mask_where(audio.clone(), audio_embeds.clone());
-        let mut base_cache = self.base_lm.cache(1, capacity);
-        let outputs = self.base_lm.forward_cached(embeds, &mut base_cache);
+        let outputs = self.base_lm.forward_cached(embeds, base_cache);
         let quantized = heads.fsq_layer.forward(outputs.clone());
         let outputs = outputs.mask_where(audio.clone(), quantized);
         let audio_embeds = audio_embeds.mask_fill(audio.bool_not(), 0.0);
         let residual_inputs = heads
             .fusion_concat_proj
             .forward(Tensor::cat(vec![outputs.clone(), audio_embeds], 2));
-        let mut residual_cache = self.residual_lm.cache(1, capacity);
         let residual = self
             .residual_lm
-            .forward_cached(residual_inputs, &mut residual_cache);
-        let last = |x: Tensor<3>| x.narrow(1, len - 1, 1).reshape([1, hidden]);
-        Ok(Generation {
+            .forward_cached(residual_inputs, residual_cache);
+        (outputs, residual)
+    }
+
+    /// The generation that goes on from `prompt`, given the LMs' caches over it and their
+    /// outputs over its last positions.
+    pub(crate) fn generation(
+        &self,
+        (base_cache, residual_cache): (KvCache, KvCache),
+        (outputs, residual): (Tensor<3>, Tensor<3>),
+        prompt: &Prompt,
+    ) -> Generation<'_> {
+        let hidden = self.hidden;
+        let last = |x: Tensor<3>| {
+            let [_, len, _] = x.dims();
+            x.narrow(1, len - 1, 1).reshape([1, hidden])
+        };
+        let patch = self.patch_size * self.feat_dim;
+        let cond = prompt.patches[prompt.patches.len() - patch..].to_vec();
+        let cond = TensorData::new(cond, [1, self.patch_size, self.feat_dim]);
+        Generation {
             model: self,
             base_cache,
             residual_cache,
             lm_hidden: last(outputs),
             residual_hidden: last(residual),
-            cond: patches
-                .narrow(1, len - 1, 1)
-                .reshape([1, self.patch_size, self.feat_dim]),
-        })
+            cond: Tensor::from_data(cond, &self.device),
+        }
     }
 
     /// The patches `[n, patch_size, feat_dim]` that follow `prompt`, each sampled from the
@@ -228,8 +272,8 @@ impl Model {
         Tensor::from_data(TensorData::new(values, shape), &self.device)
     }
 
-    /// The LMs' embeddings of patches `[1, len, patch_size, feat_dim]`.
-    fn embed_patches(&self, patches: Tensor<4>) -> Tensor<3> {
+    /// The LMs' embeddings of patches `[batch, len, patch_size, feat_dim]`.
+    pub(crate) fn embed_patches(&self, patches: Tensor<4>) -> Tensor<3> {
         let embeds = self.encoder.forward(patches).cast(self.lm_dtype);
         self.heads.enc_to_lm_proj.forward(embeds)
     }
