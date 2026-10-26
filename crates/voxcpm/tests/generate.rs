@@ -11,7 +11,7 @@ use burn::{
 use common::tiny;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, device, fixture};
-use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechDecoder};
+use voxcpm::{Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechDecoder, Stepping};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
@@ -112,6 +112,33 @@ fn stops_at_max_patches() {
     };
     assert_eq!(generate(2).unwrap().dims(), [2, 4, 8]);
     assert!(matches!(generate(0), Err(Error::Request(_))));
+}
+
+/// The patches of the stable step, kernel by kernel and replayed, at the default sampling and at
+/// another, twice, the second time in the caches the first left: at this size they come out bit
+/// for bit as the eager step's.
+#[test]
+fn steps_as_the_eager_step() {
+    let fixture = fixture!("voxcpm_generate");
+    let mut model = model(&fixture);
+    let prompt = prompt(&fixture);
+    let other = Sampling {
+        timesteps: 6,
+        temperature: 0.7,
+        cfg_value: 1.5,
+    };
+    for sampling in [Sampling::default(), other] {
+        let mut generate = |stepping| {
+            model.set_stepping(stepping);
+            let mut noise = SeededNoise::new(3);
+            model.generate(&prompt, &sampling, 8, &mut noise).unwrap()
+        };
+        let eager = generate(Stepping::Eager);
+        assert!(eager.dims()[0] > 1);
+        for stepping in [Stepping::Stable, Stepping::Captured, Stepping::Captured] {
+            assert_close(generate(stepping), eager.clone(), 0.0, 0.0);
+        }
+    }
 }
 
 #[test]

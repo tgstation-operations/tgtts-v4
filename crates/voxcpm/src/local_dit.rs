@@ -12,11 +12,12 @@ use crate::{Config, Error, weights};
 /// VoxCPM2's local DiT, upstream's `VoxCPMLocDiT` of `local_dit_v2.py`: the velocity of the
 /// flow at a noisy patch, from a bidirectional MiniCPM-4 stack over the LMs' hidden states, the
 /// time, the previous patch and the noisy one.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocalDit {
     head: Head,
     decoder: minicpm4::Model,
-    hidden: usize,
+    /// The frequencies of the time embedding, `[hidden / 2]`.
+    frequencies: Tensor<1>,
     dtype: DType,
 }
 
@@ -74,10 +75,18 @@ impl LocalDit {
             time_mlp: TimestepEmbedding::new(hidden, device),
             delta_time_mlp: TimestepEmbedding::new(hidden, device),
         };
+        // Upstream's `SinusoidalPosEmb`, in the order its operations round.
+        let half = hidden / 2;
+        let rate = 10000f64.ln() / (half - 1) as f64;
+        let frequencies = Tensor::<1, Int>::arange(0..half as i64, device)
+            .float()
+            .cast(dtype)
+            .mul_scalar(-rate)
+            .exp();
         Ok(Self {
             head: weights::load(head, path, "feat_decoder.estimator.", dtype)?,
             decoder,
-            hidden,
+            frequencies,
             dtype: dtype.into(),
         })
     }
@@ -122,16 +131,8 @@ impl LocalDit {
 
     /// Upstream's `SinusoidalPosEmb` at scale 1000, in the order its operations round.
     fn time_embedding(&self, t: Tensor<1>) -> Tensor<2> {
-        let half = self.hidden / 2;
-        let rate = 10000f64.ln() / (half - 1) as f64;
-        let device = t.device();
-        let frequencies = Tensor::<1, Int>::arange(0..half as i64, &device)
-            .float()
-            .cast(self.dtype)
-            .mul_scalar(-rate)
-            .exp();
         let t = t.cast(self.dtype).mul_scalar(1000).unsqueeze_dim::<2>(1);
-        let angles = t * frequencies.unsqueeze_dim(0);
+        let angles = t * self.frequencies.clone().unsqueeze_dim(0);
         Tensor::cat(vec![angles.clone().sin(), angles.cos()], 1)
     }
 }

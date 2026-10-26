@@ -8,6 +8,7 @@
 mod batch;
 mod cfm;
 mod config;
+mod graph;
 mod local_dit;
 mod local_encoder;
 mod model;
@@ -26,6 +27,7 @@ pub use crate::{
     batch::{Batch, Patch, RowId, Scheduler},
     cfm::{Cfm, Sampling, schedule},
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
+    graph::{Stepper, Stepping},
     local_dit::LocalDit,
     local_encoder::LocalEncoder,
     model::{Dtypes, Generation, Model, Patches, Step},

@@ -7,7 +7,10 @@ use burn::{
 };
 use minicpm4::KvCache;
 
-use crate::{Cfm, Config, Error, LocalEncoder, Noise, Prompt, Sampling, weights};
+use crate::{
+    Cfm, Config, Error, LocalEncoder, Noise, Prompt, Sampling, Stepper, Stepping, graph::Graphs,
+    weights,
+};
 
 /// The dtype each part of the model is held and computed in.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -22,7 +25,9 @@ pub struct Dtypes {
 
 /// VoxCPM2 short of its audio VAE: from a prompt of text and audio latents to the latents that
 /// follow, as upstream's `VoxCPM2Model._inference` computes them and nanovllm-voxcpm stops.
-#[derive(Debug)]
+///
+/// A clone shares its weights.
+#[derive(Clone, Debug)]
 pub struct Model {
     pub(crate) base_lm: minicpm4::Model,
     pub(crate) residual_lm: minicpm4::Model,
@@ -32,9 +37,11 @@ pub struct Model {
     pub(crate) hidden: usize,
     pub(crate) patch_size: usize,
     pub(crate) feat_dim: usize,
-    max_positions: usize,
+    pub(crate) max_positions: usize,
     pub(crate) lm_dtype: DType,
     pub(crate) device: Device,
+    stepping: Stepping,
+    pub(crate) graphs: Graphs,
 }
 
 /// The layers between the stacks, under their names in the checkpoint.
@@ -113,7 +120,20 @@ impl Model {
             max_positions: lm.max_position_embeddings,
             lm_dtype: dtypes.lm.into(),
             device: device.clone(),
+            stepping: Stepping::for_device(device),
+            graphs: Graphs::default(),
         })
+    }
+
+    /// How [`patches`](Self::patches) computes each patch: by default
+    /// [`Stepping::for_device`].
+    pub fn stepping(&self) -> Stepping {
+        self.stepping
+    }
+
+    /// Has [`patches`](Self::patches) compute each patch as `stepping` says.
+    pub fn set_stepping(&mut self, stepping: Stepping) {
+        self.stepping = stepping;
     }
 
     /// Runs `prompt` through the LMs, ready to sample up to `max_patches` patches after it.
@@ -256,8 +276,14 @@ impl Model {
         max_patches: usize,
         noise: &'a mut N,
     ) -> Result<Patches<'a, N>, Error> {
+        let generation = self.start(prompt, max_patches)?;
+        let generating = match self.stepping {
+            Stepping::Eager => Generating::Eager(Box::new(generation)),
+            stepping => Generating::Stable(Box::new(generation.stepper(sampling, stepping))),
+        };
         Ok(Patches {
-            generation: self.start(prompt, max_patches)?,
+            model: self,
+            generating,
             sampling,
             noise,
             left: max_patches,
@@ -296,15 +322,22 @@ pub struct Generation<'a> {
 /// as an error.
 #[derive(Debug)]
 pub struct Patches<'a, N> {
-    generation: Generation<'a>,
+    model: &'a Model,
+    generating: Generating<'a>,
     sampling: &'a Sampling,
     noise: &'a mut N,
     /// How many more patches may follow, none once the stop head has said to stop.
     left: usize,
     given: usize,
-    /// The patch given last, which the LMs take in only before the next is sampled, so that
-    /// the caller has it sooner.
+    /// The patch given last, which the eager step's LMs take in only before the next is
+    /// sampled, so that the caller has it sooner.
     last: Option<Tensor<3>>,
+}
+
+#[derive(Debug)]
+enum Generating<'a> {
+    Eager(Box<Generation<'a>>),
+    Stable(Box<Stepper<'a>>),
 }
 
 impl<N: Noise> Iterator for Patches<'_, N> {
@@ -314,18 +347,24 @@ impl<N: Noise> Iterator for Patches<'_, N> {
         if self.left == 0 {
             return None;
         }
-        if let Some(patch) = self.last.take() {
-            self.generation.advance(patch);
-        }
-        let noise = self.generation.model.noise(self.noise);
-        let step = self.generation.sample(noise, self.sampling);
+        let noise = self.model.noise(self.noise);
+        let step = match &mut self.generating {
+            Generating::Eager(generation) => {
+                if let Some(patch) = self.last.take() {
+                    generation.advance(patch);
+                }
+                let step = generation.sample(noise, self.sampling);
+                self.last = Some(step.patch.clone());
+                step
+            }
+            Generating::Stable(stepper) => stepper.step(noise),
+        };
         self.given += 1;
         if !step.is_finite() {
             self.left = 0;
             return Some(Err(Error::NotFinite(self.given - 1)));
         }
         self.left = if step.stops() { 0 } else { self.left - 1 };
-        self.last = Some(step.patch.clone());
         Some(Ok(step.patch))
     }
 }
@@ -368,7 +407,9 @@ impl Generation<'_> {
     pub fn advance(&mut self, patch: Tensor<3>) {
         let embed = self.model.embed_patches(patch.clone().unsqueeze_dim(1));
         let caches = (&mut self.base_cache, &mut self.residual_cache);
-        (self.lm_hidden, self.residual_hidden) = self.model.advance_lms(embed, caches);
+        (self.lm_hidden, self.residual_hidden) =
+            self.model
+                .advance_lms(embed, caches, minicpm4::Model::forward_cached);
         self.cond = patch;
     }
 }
@@ -401,22 +442,22 @@ impl Model {
     }
 
     /// Runs the LMs a position further over each row of `caches`, from the embedding of its
-    /// patch `[rows, 1, hidden]`, and gives their last hidden states `[rows, hidden]`.
+    /// patch `[rows, 1, hidden]`, each stack as `step` runs it, and gives their last hidden
+    /// states `[rows, hidden]`.
     pub(crate) fn advance_lms(
         &self,
         embeds: Tensor<3>,
         (base_cache, residual_cache): (&mut KvCache, &mut KvCache),
+        step: impl Fn(&minicpm4::Model, Tensor<3>, &mut KvCache) -> Tensor<3>,
     ) -> (Tensor<2>, Tensor<2>) {
         let heads = &self.heads;
         let [rows, ..] = embeds.dims();
-        let outputs = self.base_lm.forward_cached(embeds.clone(), base_cache);
+        let outputs = step(&self.base_lm, embeds.clone(), base_cache);
         let outputs = heads.fsq_layer.forward(outputs);
         let residual_inputs = heads
             .fusion_concat_proj
             .forward(Tensor::cat(vec![outputs.clone(), embeds], 2));
-        let residual = self
-            .residual_lm
-            .forward_cached(residual_inputs, residual_cache);
+        let residual = step(&self.residual_lm, residual_inputs, residual_cache);
         (
             outputs.reshape([rows, self.hidden]),
             residual.reshape([rows, self.hidden]),

@@ -177,7 +177,8 @@ impl<'a> Batch<'a> {
             None => (embeds, patches),
         };
         let caches = (&mut self.caches.0, &mut self.caches.1);
-        (self.lm_hidden, self.residual_hidden) = model.advance_lms(embeds, caches);
+        (self.lm_hidden, self.residual_hidden) =
+            model.advance_lms(embeds, caches, minicpm4::Model::forward_cached);
         self.cond = cond;
     }
 

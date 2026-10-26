@@ -4,7 +4,7 @@ use audiovae::{DecodeStream, Decoder, Weights};
 use burn::tensor::{Device, FloatDType, Tensor, TensorData};
 use voices::{LATENT_DIM, Latent};
 
-use crate::{Config, Dtypes, Error, Model, Noise, Prompt, Sampling, Tokenizer};
+use crate::{Config, Dtypes, Error, Model, Noise, Prompt, Sampling, Stepping, Tokenizer};
 
 /// The voice's last frames that nanovllm-voxcpm's streaming decoder is primed with, its
 /// `n_decode_pad_frames`, so that speech starts as if it went on from the voice.
@@ -145,6 +145,11 @@ impl TextToSpeech {
     /// The model, to generate from a prompt a patch at a time.
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// Has synthesis compute each patch as `stepping` says.
+    pub fn set_stepping(&mut self, stepping: Stepping) {
+        self.model.set_stepping(stepping);
     }
 }
 

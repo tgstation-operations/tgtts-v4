@@ -30,7 +30,7 @@ impl Default for Sampling {
 /// classifier-free guidance as CFG-Zero* has it.
 ///
 /// It integrates in f32 whatever dtype the DiT computes in.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Cfm {
     dit: LocalDit,
 }
@@ -97,8 +97,22 @@ impl Cfm {
             let values: Vec<f32> = sampling.iter().map(value).collect();
             Tensor::<1>::from_floats(values.as_slice(), &device).reshape([batch, 1, 1])
         };
-        let x = noise.cast(FloatDType::F32) * per_row(|row| row.temperature);
-        let cfg = per_row(|row| row.cfg_value);
+        let (temperature, cfg) = (per_row(|row| row.temperature), per_row(|row| row.cfg_value));
+        self.sample_scaled(mu, cond, noise, (temperature, cfg), timesteps)
+    }
+
+    /// Patches sampled as [`sample_rows`](Self::sample_rows) samples them in `timesteps` steps,
+    /// each row at its temperature and classifier-free guidance scale, `[batch, 1, 1]` on the
+    /// device.
+    pub(crate) fn sample_scaled(
+        &self,
+        mu: Tensor<2>,
+        cond: Tensor<3>,
+        noise: Tensor<3>,
+        (temperature, cfg): (Tensor<3>, Tensor<3>),
+        timesteps: usize,
+    ) -> Tensor<3> {
+        let x = noise.cast(FloatDType::F32) * temperature;
         self.solve(x, &schedule(timesteps), mu, cond, |v| v * cfg.clone())
     }
 

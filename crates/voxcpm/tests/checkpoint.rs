@@ -12,7 +12,7 @@ use testkit::{Fixture, assert_close, checkpoint_dir, device, fixture};
 use voices::Latent;
 use voxcpm::{
     Batch, Config, Dtypes, Noise, Params, PromptCache, Scheduler, SeededNoise, SpeechDecoder,
-    TextToSpeech,
+    Stepping, TextToSpeech,
 };
 
 const F32: Dtypes = Dtypes {
@@ -479,6 +479,32 @@ fn streams_speech_a_patch_at_a_time_as_it_synthesizes() {
     // Decoded a patch at a time, the first after the voice's frames, this came within 3.8e-9 of
     // the audio decoded a second at a time.
     assert_close(streamed, whole, 1e-6, 0.0);
+}
+
+/// The golden's line by the stable step, kernel by kernel and replayed, against the eager step,
+/// from the same noise: over 6 patches, the LMs attending over 1024 positions with all but the
+/// sequence's hidden, the patches came out bit for bit as the eager step's.
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn steps_as_the_eager_step_on_the_real_weights() {
+    let golden = golden();
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let mut tts = TextToSpeech::load(&checkpoint_dir(), &F32, &device()).unwrap();
+    let (params, prompt) = (Params::default(), tts.prompt(text, &voice).unwrap());
+    let mut generate = |stepping| {
+        tts.set_stepping(stepping);
+        let mut noise = SeededNoise::new(2);
+        let mut patches = tts
+            .model()
+            .patches(&prompt, &params.sampling, params.max_patches, &mut noise)
+            .unwrap();
+        let patches = (0..6).map(|_| patches.next().unwrap().unwrap());
+        Tensor::cat(patches.collect(), 0)
+    };
+    let eager = generate(Stepping::Eager);
+    for stepping in [Stepping::Stable, Stepping::Captured] {
+        assert_close(generate(stepping), eager.clone(), 0.0, 0.0);
+    }
 }
 
 /// Each part in a dtype of its own, so that what passes between them has to be cast: the LMs and

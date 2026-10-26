@@ -12,7 +12,7 @@ use crate::{Config, Error, weights};
 /// VoxCPM2's local encoder, upstream's `VoxCPMLocEnc`: it embeds a patch of latent frames for
 /// the LMs, as the output at a learned token that leads the patch through a bidirectional
 /// MiniCPM-4 stack.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocalEncoder {
     head: Head,
     encoder: minicpm4::Model,
