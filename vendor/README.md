@@ -3,9 +3,16 @@
 The projects the GPU kernels and their toolchain read or build against, each a
 git submodule pinned to one commit. Nothing builds from them: Nix does not see
 submodules in this flake's source, and a build that needs an upstream takes it
-as a flake input at the same commit. A clone does not need them to build or
-test; `git submodule update --init --recursive` fetches them all, about 14 GB,
-most of it the LLVM forks IREE and iree-amd-aie nest.
+as a flake input at the same commit, as `llvm-project` is. A clone does not
+need them to build or test, but the gate's `vendor-pins` stage reads three of
+them, and fails until they are fetched; their history is enough:
+
+```sh
+git submodule update --init --filter=blob:none vendor/mlir-aie vendor/mlir-air vendor/IRON
+```
+
+`git submodule update --init --recursive` fetches them all, about 14 GB, most of
+it the LLVM forks IREE and iree-amd-aie nest.
 
 | path | upstream | license | commit | why |
 | -- | -- | -- | -- | -- |

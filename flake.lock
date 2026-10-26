@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "llvm-project": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790825590,
+        "narHash": "sha256-iAdnkgu9Gfe+V4A1In/40xgJmnkFPyxVgbemeLLi80M=",
+        "owner": "ROCm",
+        "repo": "llvm-project",
+        "rev": "bdf04ebb32d7a5dce853f9b399dcbd3ed11a5aa7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ROCm",
+        "repo": "llvm-project",
+        "rev": "bdf04ebb32d7a5dce853f9b399dcbd3ed11a5aa7",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1792898606,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "llvm-project": "llvm-project",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

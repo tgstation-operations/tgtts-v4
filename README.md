@@ -8,8 +8,8 @@ game's TTS subsystem talks to today.
 Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
 
 - `nix run .#fmt` formats the tree: rustfmt, nixfmt and ruff.
-- `nix run .#audit` is the gate: formatting, ASCII, the Nix lints, clippy with
-  warnings denied, rustdoc and the full test suite.
+- `nix run .#audit` is the gate: formatting, ASCII, the Nix lints, the vendored
+  upstreams' pins, clippy with warnings denied, rustdoc and the full test suite.
 - `nix run .#fixtures [NAME...]` runs the generators `fixtures/<NAME>.py`, all
   of them by default, which write what upstream VoxCPM computes for the tests to
   compare against. A rerun writes the same bytes.
