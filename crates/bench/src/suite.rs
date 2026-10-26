@@ -3,12 +3,15 @@
 use std::{fs, path::Path};
 
 use audiovae::{AudioVaeConfig, Decoder, Encoder, Weights};
-use burn::{module::Module, tensor::FloatDType};
+use burn::{
+    module::Module,
+    tensor::{FloatDType, Tensor},
+};
 use dsp::radio::{Assets, Pcm};
 use minicpm4::{Config, KvCache, LocalShape, Mask, Model};
 use serde_json::Value;
 use voices::{Latent, Voices};
-use voxcpm::{Params, SeededNoise, TextToSpeech};
+use voxcpm::{Batch, Params, Prompt, PromptCache, Scheduler, SeededNoise, TextToSpeech};
 
 use crate::{
     conditions::BIGMEM_LOCK,
@@ -32,6 +35,12 @@ pub const NAMES: &[&str] = &[
     "voxcpm.prefill",
     "voxcpm.patch",
     "voxcpm.synthesize",
+    "voxcpm.first_patch",
+    "voxcpm.first_patch.cached",
+    "voxcpm.batch.b1",
+    "voxcpm.batch.b4",
+    "voxcpm.batch.b16",
+    "voxcpm.scheduler",
     "audiovae.decoder.load",
     "audiovae.decode.utterance",
     "audiovae.decode.patch",
@@ -70,6 +79,14 @@ const ENCODER_TOKENS: usize = 1 + FRAMES_PER_PATCH;
 const DIT_TOKENS: usize = 3 + 2 * FRAMES_PER_PATCH;
 /// About the patches a 15-token line comes to.
 const UTTERANCE_PATCHES: usize = 25;
+/// The batch sizes a step is timed at, up to the requests the Python service ran at once.
+const BATCHES: [usize; 3] = [1, 4, 16];
+/// Requests at once in the scheduler's benchmark.
+const CONCURRENT: usize = 16;
+/// Positions of prompts the scheduler runs between two patches.
+const PREFILL_POSITIONS: usize = 128;
+/// Another line in the voice, which leaves its transcript in the prompt cache.
+const OTHER_LINE: &str = "Someone set the kitchen on fire again.";
 /// Prod decodes each new patch with the 12 frames before it as context.
 const DECODE_CONTEXT_FRAMES: usize = 12;
 const ENCODE_SECONDS: usize = 10;
@@ -124,8 +141,12 @@ pub fn check(r: &Runner, data: &Data) -> Result<(), String> {
         .map(|spec| r.counts(spec))
         .map(|(warmup, reps)| warmup + reps)
         .sum::<usize>();
-    let (warmup, reps) = r.counts(&patch_step_spec());
-    let steps = steps.max(warmup + reps);
+    let steps = [patch_step_spec()]
+        .into_iter()
+        .chain(BATCHES.map(batch_spec))
+        .map(|spec| r.counts(&spec))
+        .map(|(warmup, reps)| warmup + reps)
+        .fold(steps, usize::max);
     if steps > MAX_PATCHES {
         return Err(format!(
             "the step and patch benchmarks would take {steps} decode steps, more than the \
@@ -380,17 +401,32 @@ fn lm_benches(
 /// The voice whose latent has the median length, as the prompt's length sets the prefill's
 /// cost: of the table's voices sorted by frames, then name.
 fn median_voice(table: &Voices) -> Result<(String, Latent), String> {
+    let mut voices = median_voices(table, 1)?;
+    Ok(voices.remove(0))
+}
+
+/// The `count` voices whose latents' lengths are nearest the median, from the median on in the
+/// same order, then those before it.
+fn median_voices(table: &Voices, count: usize) -> Result<Vec<(String, Latent)>, String> {
     let mut lengths = Vec::new();
     for name in table.names() {
         let latent = table.latent(name).map_err(|e| e.to_string())?;
         lengths.push((latent.frames.len(), name.to_owned()));
     }
     lengths.sort();
-    let (_, name) = lengths
-        .get(lengths.len() / 2)
-        .ok_or("the voices table is empty")?;
-    let latent = table.latent(name).map_err(|e| e.to_string())?;
-    Ok((name.clone(), latent))
+    if lengths.len() < count {
+        return Err(format!("the voices table has fewer than {count} voices"));
+    }
+    let start = (lengths.len() / 2).min(lengths.len() - count.div_ceil(2));
+    let start = start.saturating_sub(count / 2);
+    let mut voices = Vec::new();
+    for (_, name) in &lengths[start..start + count] {
+        let latent = table.latent(name).map_err(|e| e.to_string())?;
+        voices.push((name.clone(), latent));
+    }
+    let median = lengths.len() / 2 - start;
+    voices.rotate_left(median.min(count - 1));
+    Ok(voices)
 }
 
 fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
@@ -455,6 +491,8 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
         );
     }
 
+    voxcpm_batched(r, &tts, &table, (&voice, &latent))?;
+
     // On a GPU the first synthesis waits for autotune to choose the kernels of each KV length
     // and decoder chunk it runs.
     let spec = Spec::new("voxcpm.synthesize", usize::from(r.gpu), 2)
@@ -478,6 +516,146 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
 
 fn patch_step_spec() -> Spec {
     Spec::new("voxcpm.patch", 2, 10)
+}
+
+fn batch_spec(batch: usize) -> Spec {
+    Spec::new(&format!("voxcpm.batch.b{batch}"), 2, 10)
+}
+
+/// Time to the first patch with and without what a prompt cache keeps of the voice, then a step
+/// of a batch of requests in different voices, and requests run together as the service runs
+/// them.
+fn voxcpm_batched(
+    r: &mut Runner,
+    tts: &TextToSpeech,
+    table: &Voices,
+    (voice, latent): (&str, &Latent),
+) -> Result<(), String> {
+    let (model, params) = (tts.model(), Params::default());
+    let prompt = tts.prompt(LINE, latent).map_err(|e| e.to_string())?;
+    let spec = Spec::new("voxcpm.first_patch", 1, 3)
+        .param("voice", voice)
+        .param("positions", prompt.len())
+        .param("cached", 0);
+    r.measure(
+        spec,
+        || SeededNoise::new(16),
+        |mut noise| {
+            let generation = model
+                .start(&prompt, params.max_patches)
+                .expect("the prompt fits the LM");
+            generation.sample(model.noise(&mut noise), &params.sampling)
+        },
+    );
+
+    let mut cache = PromptCache::new(usize::MAX);
+    let other = tts.prompt(OTHER_LINE, latent).map_err(|e| e.to_string())?;
+    let mut prefill = model
+        .prefill(&other, params.max_patches, &mut cache)
+        .map_err(|e| e.to_string())?;
+    prefill.run(usize::MAX, &mut cache);
+    let start = |cache: &mut PromptCache| {
+        model
+            .prefill(&prompt, params.max_patches, cache)
+            .expect("the prompt fits the LM")
+    };
+    let kept = prompt.len() - start(&mut cache).left();
+    let spec = Spec::new("voxcpm.first_patch.cached", 1, 3)
+        .param("voice", voice)
+        .param("positions", prompt.len())
+        .param("cached", kept)
+        .param("cache_bytes", cache.bytes());
+    r.measure(
+        spec,
+        || SeededNoise::new(16),
+        |mut noise| {
+            let mut prefill = start(&mut cache);
+            prefill.run(usize::MAX, &mut cache);
+            let generation = prefill.finish();
+            generation.sample(model.noise(&mut noise), &params.sampling)
+        },
+    );
+
+    let batched = BATCHES
+        .iter()
+        .any(|&b| r.selected(&format!("voxcpm.batch.b{b}")));
+    let largest = BATCHES.iter().copied().max().unwrap_or(1).max(CONCURRENT);
+    let voices = if batched || r.selected("voxcpm.scheduler") {
+        median_voices(table, largest)?
+    } else {
+        vec![]
+    };
+    let prompts = voices
+        .iter()
+        .map(|(_, latent)| tts.prompt(LINE, latent))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for batch in BATCHES {
+        if !r.selected(&format!("voxcpm.batch.b{batch}")) {
+            continue;
+        }
+        let mut rows = Batch::new(model);
+        let mut noise: Vec<_> = (0..batch as u64).map(SeededNoise::new).collect();
+        for prompt in &prompts[..batch] {
+            let generation = model
+                .start(prompt, params.max_patches)
+                .expect("the prompt fits the LM");
+            rows.join(generation, &params.sampling)
+                .expect("sampled alike");
+        }
+        let lengths = prompts[..batch].iter().map(Prompt::len);
+        let spec = batch_spec(batch)
+            .work(batch as f64, "patches")
+            .audio(FRAMES_PER_PATCH as f64 * FRAME_SECONDS)
+            .param("batch", batch)
+            .param("positions_from", lengths.clone().min().unwrap_or(0))
+            .param("positions_to", lengths.max().unwrap_or(0))
+            .param("timesteps", params.sampling.timesteps);
+        r.measure(
+            spec,
+            || {
+                let draws = noise.iter_mut().map(|noise| model.noise(noise));
+                Tensor::cat(draws.collect(), 0)
+            },
+            |noise| {
+                let step = rows.sample(noise);
+                rows.advance(step.patch.clone());
+                step
+            },
+        );
+    }
+
+    // On a GPU the first run waits for autotune to choose the kernels of each batch, prompt
+    // run and KV length it meets.
+    let spec = Spec::new("voxcpm.scheduler", usize::from(r.gpu), 1)
+        .param("requests", CONCURRENT)
+        .param("prefill_positions", PREFILL_POSITIONS)
+        .param("line", LINE);
+    let patches = r.measure(
+        spec,
+        || (),
+        |()| {
+            let cache = PromptCache::new(usize::MAX);
+            let mut scheduler = Scheduler::new(model, cache, PREFILL_POSITIONS);
+            for (i, prompt) in prompts[..CONCURRENT].iter().enumerate() {
+                let noise = SeededNoise::new(i as u64);
+                scheduler
+                    .add(i, prompt, &params.sampling, params.max_patches, noise)
+                    .expect("the prompt fits the LM");
+            }
+            let mut patches = 0;
+            while scheduler.requests() > 0 {
+                patches += scheduler.step().len();
+            }
+            patches
+        },
+    );
+    if let Some(patches) = patches {
+        let seconds = (patches * FRAMES_PER_PATCH) as f64 * FRAME_SECONDS;
+        r.set_work("voxcpm.scheduler", seconds, "audio seconds");
+        r.set_audio("voxcpm.scheduler", seconds);
+    }
+    Ok(())
 }
 
 fn audiovae(r: &mut Runner, dir: &Path) -> Result<(), String> {
