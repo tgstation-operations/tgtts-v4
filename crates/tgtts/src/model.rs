@@ -15,14 +15,14 @@ use std::{
 
 use burn::tensor::{Device, Tensor};
 use dsp::RATE;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use voices::{Latent, Voices};
 use voxcpm::{
     Config, Dtypes, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise, Stepping,
     TextToSpeech,
 };
 
-use crate::synth::{self, Speech, Synthesizer};
+use crate::synth::{self, Speech, Start, Synthesizer};
 
 /// The line the warm-up gives each voice to find the shortest and longest prompts, as long as a
 /// median line.
@@ -79,10 +79,12 @@ struct Request {
     prompt: Prompt,
     voice: Latent,
     seed: u64,
+    /// When it was sent to the thread that generates.
+    sent: Instant,
     speech: SpeechSender,
 }
 
-type SpeechSender = Sender<Result<Vec<f32>, voxcpm::Error>>;
+type SpeechSender = Sender<Result<(Vec<f32>, Option<Start>), voxcpm::Error>>;
 
 impl VoxCpm {
     /// Loads the VoxCPM2 checkpoint in `dir`, each part in its dtype from `dtypes`, on
@@ -252,6 +254,7 @@ fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
         generating: HashMap::new(),
         next: 0,
         on: generating,
+        stepped: Instant::now(),
     };
     loop {
         if batch.scheduler.requests() == 0 {
@@ -270,6 +273,7 @@ fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
+            batch.stepped = Instant::now();
         }
         while let Ok(job) = jobs.try_recv() {
             batch.take(job);
@@ -324,13 +328,21 @@ impl Generating {
     }
 }
 
-/// The requests generating, each with its voice, where its speech goes and the patches it has
-/// so far.
+/// The requests generating, each with its voice, where its speech goes, how it started and the
+/// patches it has so far.
 struct Batch<'a> {
     scheduler: Scheduler<'a, u64, SeededNoise>,
-    generating: HashMap<u64, (Request, Vec<Tensor<3>>)>,
+    generating: HashMap<u64, Generation>,
     next: u64,
     on: &'a Generating,
+    /// When the last step returned.
+    stepped: Instant,
+}
+
+struct Generation {
+    request: Request,
+    start: Option<Start>,
+    patches: Vec<Tensor<3>>,
 }
 
 impl Batch<'_> {
@@ -353,7 +365,12 @@ impl Batch<'_> {
             .add(key, &request.prompt, sampling, max_patches, noise)
         {
             Ok(()) => {
-                self.generating.insert(key, (request, vec![]));
+                let generation = Generation {
+                    request,
+                    start: None,
+                    patches: vec![],
+                };
+                self.generating.insert(key, generation);
             }
             Err(e) => {
                 let _ = request.speech.send(Err(e));
@@ -362,28 +379,61 @@ impl Batch<'_> {
     }
 
     fn step(&mut self) {
-        for Patch { key, patch, last } in self.scheduler.step() {
-            let (_, patches) = self.generating.get_mut(&key).expect("generating");
+        let between = self.stepped.elapsed();
+        let patches = self.scheduler.step();
+        let stepped = Instant::now();
+        for Patch {
+            key,
+            patch,
+            last,
+            started,
+        } in patches
+        {
+            let generation = self.generating.get_mut(&key).expect("generating");
+            if let Some(started) = started {
+                generation.start = Some(Start {
+                    waited: generation.request.sent.elapsed(),
+                    prompt: started.prompt,
+                    prefilled: started.prefilled,
+                });
+            }
             let failed = match patch {
                 Ok(patch) => {
-                    patches.push(patch);
+                    generation.patches.push(patch);
                     None
                 }
                 Err(e) => Some(e),
             };
             if last {
-                let (request, patches) = self.generating.remove(&key).expect("generating");
+                let generation = self.generating.remove(&key).expect("generating");
+                let (request, start) = (generation.request, generation.start);
                 let speech = failed.map_or_else(
                     || {
                         let mut decoder =
                             self.on.tts.speech_decoder(&request.voice, &self.on.params);
-                        Ok(decoder.push(Tensor::cat(patches, 0)))
+                        Ok((decoder.push(Tensor::cat(generation.patches, 0)), start))
                     },
                     Err,
                 );
                 let _ = request.speech.send(speech);
             }
         }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let report = self.scheduler.last_step();
+        self.stepped = Instant::now();
+        debug!(
+            rows = report.rows,
+            waiting = report.waiting,
+            joined = report.joined,
+            positions = report.positions,
+            prefill_ms = ms(report.prefill),
+            step_ms = ms(report.step),
+            read_ms = ms(report.read),
+            retire_ms = ms(report.retire),
+            decode_ms = ms(self.stepped - stepped),
+            between_ms = ms(between),
+            "stepped"
+        );
     }
 }
 
@@ -395,19 +445,21 @@ impl Synthesizer for VoxCpm {
             prompt,
             voice: voice.clone(),
             seed,
+            sent: Instant::now(),
             speech,
         };
         let stopped = "the thread VoxCPM2 generates on has stopped";
         self.jobs
             .send(Job::Generate(request))
             .map_err(|_| stopped)?;
-        let samples = received.recv().map_err(|_| {
+        let (samples, start) = received.recv().map_err(|_| {
             error!("{stopped}");
             stopped
         })??;
         Ok(Speech {
             patches: samples.len() / self.samples_per_patch,
             samples,
+            start,
         })
     }
 }

@@ -15,6 +15,8 @@ use std::{
 use rusqlite::{Connection, TransactionBehavior, params};
 use tracing::{error, warn};
 
+use crate::synth::Start;
+
 /// The most rows written in one transaction.
 const BATCH: usize = 256;
 
@@ -26,7 +28,7 @@ const PRAGMAS: &str = "
 /// What each version of the schema adds to the one before. A database records the version it is
 /// at as its `user_version`, which databases made before there were versions have at 0, with the
 /// first version's table.
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY,
         -- When the request arrived, in milliseconds since the Unix epoch.
@@ -68,15 +70,26 @@ const MIGRATIONS: [&str; 2] = [
     -- of the radio, static and all.
     ALTER TABLE requests ADD COLUMN rms_dbfs REAL;
     ",
+    "
+    -- Where the model ran, from when it was asked for the speech to its first patch: what a
+    -- request waits for the others it generates with to let its prompt run.
+    ALTER TABLE requests ADD COLUMN wait_to_first_patch_ms REAL;
+    -- The positions of the model's prompt, and those that ran through it, the rest coming from
+    -- what it kept of the voice.
+    ALTER TABLE requests ADD COLUMN prompt_positions INTEGER;
+    ALTER TABLE requests ADD COLUMN prefilled_positions INTEGER;
+    ",
 ];
 
 const INSERT: &str = "
     INSERT INTO requests (
         time_unix_ms, route, voice, identifier, status, cache_hit, text_length, audio_seconds,
         queue_ms, handoff_ms, synthesis_ms, dsp_ms, ffmpeg_ms, total_ms, patches, gain_db,
-        limiter_reduction_db, limited_fraction, cache_takes, rms_dbfs
+        limiter_reduction_db, limited_fraction, cache_takes, rms_dbfs, wait_to_first_patch_ms,
+        prompt_positions, prefilled_positions
     ) VALUES (
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+        ?21, ?22, ?23
     )
 ";
 
@@ -100,6 +113,8 @@ pub struct Row {
     pub rms_dbfs: Option<f64>,
     pub timings: Timings,
     pub patches: Option<usize>,
+    /// How the model came to the first patch, where it ran.
+    pub start: Option<Start>,
     pub leveling: Option<Leveling>,
 }
 
@@ -271,6 +286,9 @@ fn insert<'a>(
                 leveling.map(|l| l.limited),
                 row.cache_takes.map(|t| t as i64),
                 row.rms_dbfs,
+                row.start.map(|s| ms(s.waited)),
+                row.start.map(|s| s.prompt as i64),
+                row.start.map(|s| s.prefilled as i64),
             ])?;
         }
     }
@@ -304,6 +322,11 @@ mod tests {
                 total: Duration::from_millis(1002),
             },
             patches: Some(25),
+            start: Some(Start {
+                waited: Duration::from_millis(250),
+                prompt: 481,
+                prefilled: 120,
+            }),
             leveling: Some(Leveling {
                 gain: -12.5,
                 reduction: 0.75,
@@ -338,6 +361,7 @@ mod tests {
         radio.audio_seconds = None;
         radio.rms_dbfs = None;
         radio.patches = None;
+        radio.start = None;
         radio.leveling = None;
         assert!(metrics.record(radio));
         metrics.flush();
@@ -368,6 +392,9 @@ mod tests {
                     R(0.03125),
                     I(3),
                     R(-21.5),
+                    R(250.0),
+                    I(481),
+                    I(120),
                 ],
                 vec![
                     I(2),
@@ -385,6 +412,9 @@ mod tests {
                     R(40.0),
                     R(60.0),
                     R(1002.0),
+                    Null,
+                    Null,
+                    Null,
                     Null,
                     Null,
                     Null,
@@ -426,9 +456,9 @@ mod tests {
         let written = rows(&path);
         assert_eq!(written.len(), 2);
         assert_eq!(written[0][4], Value::Text("old".into()));
-        assert_eq!(written[0][19..], [Value::Null, Value::Null]);
+        assert!(written[0][19..].iter().all(|v| *v == Value::Null));
         assert_eq!(
-            written[1][19..],
+            written[1][19..21],
             [Value::Integer(3), Value::Real(f64::NEG_INFINITY)]
         );
         let latest = MIGRATIONS.len() as i64;

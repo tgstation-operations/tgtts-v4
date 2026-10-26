@@ -143,6 +143,7 @@ fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
     let mut scheduler = Scheduler::new(&model, PromptCache::new(usize::MAX), 8);
     let mut got: Vec<Vec<Tensor<3>>> = vec![vec![]; 4];
     let (mut first, mut done, mut most) = ([None; 4], [false; 4], 0);
+    let mut started = [None; 4];
     for t in 0..20 {
         for i in 0..4 {
             if t == arrivals[i] {
@@ -162,6 +163,14 @@ fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
                 patch.key
             );
             first[patch.key].get_or_insert(t);
+            let first_patch = got[patch.key].is_empty();
+            assert_eq!(
+                patch.started.is_some(),
+                first_patch,
+                "request {}",
+                patch.key
+            );
+            started[patch.key] = started[patch.key].or(patch.started);
             got[patch.key].push(patch.patch.unwrap());
             done[patch.key] = patch.last;
         }
@@ -176,6 +185,10 @@ fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
     // having stopped.
     assert_eq!(first, [Some(0), Some(2), Some(3), Some(5)]);
     assert_eq!(most, 3);
+    let prefilled = started.map(|started| started.map(|s| (s.prompt, s.prefilled)));
+    let whole = |i: usize| Some((prompts[i].len(), prompts[i].len()));
+    let cached = Some((prompts[2].len(), 8));
+    assert_eq!(prefilled, [whole(0), whole(1), cached, whole(3)]);
     drop(scheduler);
     model.set_stepping(Stepping::Eager);
     for (i, prompt) in prompts.iter().enumerate() {

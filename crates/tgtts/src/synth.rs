@@ -1,7 +1,7 @@
 //! Speech from the model, and what the old model service did to the text before it and to the
 //! audio after it.
 
-use std::error;
+use std::{error, time::Duration};
 
 use dsp::{RATE, segment::Segment};
 use voices::Latent;
@@ -22,6 +22,19 @@ pub struct Speech {
     pub samples: Vec<f32>,
     /// How many patches the model generated for them.
     pub patches: usize,
+    /// How the model came to their first patch, where it says.
+    pub start: Option<Start>,
+}
+
+/// How a synthesizer came to a speech's first patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Start {
+    /// From when it was asked for the speech.
+    pub waited: Duration,
+    /// The positions of the prompt.
+    pub prompt: usize,
+    /// Those that ran through the model, the rest coming from what it kept of the voice.
+    pub prefilled: usize,
 }
 
 /// The text the old model service gave the model for `text`, or `None` for text it made silence

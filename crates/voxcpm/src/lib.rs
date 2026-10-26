@@ -24,7 +24,7 @@ use std::{fmt, io, path::PathBuf};
 use burn::store::SafetensorsStoreError;
 
 pub use crate::{
-    batch::{Batch, Patch, RowId, Scheduler},
+    batch::{Batch, Patch, RowId, Scheduler, Started, StepReport},
     cfm::{Cfm, Sampling, schedule},
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
     graph::{Stepper, Stepping},

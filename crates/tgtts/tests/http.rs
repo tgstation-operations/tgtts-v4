@@ -88,6 +88,7 @@ impl Synthesizer for Fake {
         Ok(Speech {
             samples: said(text),
             patches: text.len(),
+            start: None,
         })
     }
 }

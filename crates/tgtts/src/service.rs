@@ -40,7 +40,7 @@ use crate::{
     ffmpeg::{self, Ffmpeg},
     handoff::{Handoff, Missing, Source},
     metrics::{Leveling, Metrics, Row, Timings},
-    synth::{self, Synthesizer},
+    synth::{self, Start, Synthesizer},
     vorbis,
     wav::{self, Audio},
 };
@@ -380,6 +380,7 @@ struct Trace {
     cache_hit: Option<bool>,
     cache_takes: Option<usize>,
     patches: Option<usize>,
+    start: Option<Start>,
     leveling: Option<Leveling>,
     /// The level of the audio served, as the metrics record it.
     rms_dbfs: Option<f64>,
@@ -504,6 +505,7 @@ impl Service {
                 rms_dbfs: result.as_ref().ok().and(trace.rms_dbfs),
                 timings: trace.timings,
                 patches: trace.patches,
+                start: trace.start,
                 leveling: trace.leveling,
             });
         }
@@ -637,12 +639,13 @@ impl Service {
             {
                 warn!("caching: {e}");
             }
-            Ok((leveled, speech.patches))
+            Ok((leveled, speech.patches, speech.start))
         })
         .await?;
         trace.timings.synthesis += started.elapsed();
-        let (speech, patches) = spoken?;
+        let (speech, patches, start) = spoken?;
         trace.patches = Some(patches);
+        trace.start = start;
         Ok(speech)
     }
 

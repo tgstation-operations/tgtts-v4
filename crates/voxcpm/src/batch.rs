@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ptr,
+    time::{Duration, Instant},
 };
 
 use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorData};
@@ -253,6 +254,30 @@ pub struct Scheduler<'a, K, N> {
     waiting: VecDeque<(Request<K, N>, Prefill<'a>)>,
     running: HashMap<RowId, Request<K, N>>,
     prefill_positions: usize,
+    last_step: StepReport,
+}
+
+/// Where the time of a [`Scheduler::step`] went, on the host: issuing work returns before the
+/// device has run it, so the device's time shows where the host waits for its results.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepReport {
+    /// The generations the step sampled a patch of.
+    pub rows: usize,
+    /// The requests still waiting for their prompts to run after it.
+    pub waiting: usize,
+    /// The requests whose prompts finished running and that joined before it.
+    pub joined: usize,
+    /// The positions of prompts run before it.
+    pub positions: usize,
+    /// Running prompts and joining their generations.
+    pub prefill: Duration,
+    /// Issuing the step.
+    pub step: Duration,
+    /// Waiting for the step's patches and stop logits, as long as the device took to run what
+    /// was issued before them, less what the host took issuing it.
+    pub read: Duration,
+    /// Retiring the generations that stopped and feeding the others their patches.
+    pub retire: Duration,
 }
 
 #[derive(Debug)]
@@ -265,6 +290,11 @@ enum Rows<'a> {
 #[derive(Debug)]
 struct Request<K, N> {
     key: K,
+    added: Instant,
+    /// The positions of its prompt, and those that run through the LMs rather than coming from
+    /// the prompt cache.
+    prompt: usize,
+    prefilled: usize,
     sampling: Sampling,
     /// The patches it may still have.
     left: usize,
@@ -279,6 +309,19 @@ pub struct Patch<K> {
     pub key: K,
     pub patch: Result<Tensor<3>, Error>,
     pub last: bool,
+    /// How the request started, given with its first patch.
+    pub started: Option<Started>,
+}
+
+/// How a request came to its first patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Started {
+    /// From when it was added.
+    pub waited: Duration,
+    /// The positions of its prompt.
+    pub prompt: usize,
+    /// Those that ran through the LMs, the rest coming from what the prompt cache kept.
+    pub prefilled: usize,
 }
 
 impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
@@ -296,7 +339,13 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             waiting: VecDeque::new(),
             running: HashMap::new(),
             prefill_positions,
+            last_step: StepReport::default(),
         }
+    }
+
+    /// Where the time of the last [`step`](Self::step) went.
+    pub fn last_step(&self) -> StepReport {
+        self.last_step
     }
 
     /// Adds a request, `key`, for up to `max_patches` patches after `prompt`, sampled as
@@ -330,6 +379,9 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         let prefill = self.model.prefill(prompt, max_patches, &mut self.cache)?;
         let request = Request {
             key,
+            added: Instant::now(),
+            prompt: prompt.len(),
+            prefilled: prefill.left(),
             sampling: sampling.clone(),
             left: max_patches,
             given: 0,
@@ -363,6 +415,8 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
     /// wait for it, then samples the next patch of every generating request. A request whose
     /// patch comes out NaN or infinite ends with an error in its place.
     pub fn step(&mut self) -> Vec<Patch<K>> {
+        let started = Instant::now();
+        let mut report = StepReport::default();
         let mut budget = self.prefill_positions;
         while let Some((_, prefill)) = self.waiting.front_mut() {
             let unbounded = self.running.is_empty();
@@ -371,9 +425,13 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             }
             let positions = if unbounded { usize::MAX } else { budget };
             budget -= prefill.left().min(budget);
-            if !prefill.run(positions, &mut self.cache) {
+            let left = prefill.left();
+            let finished = prefill.run(positions, &mut self.cache);
+            report.positions += left - prefill.left();
+            if !finished {
                 break;
             }
+            report.joined += 1;
             let (mut request, prefill) = self.waiting.pop_front().expect("the front");
             let generation = prefill.finish();
             let row = match &mut self.batch {
@@ -397,6 +455,10 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
                 .insert(row.expect("checked when added"), request);
         }
 
+        report.waiting = self.waiting.len();
+        let stepping = Instant::now();
+        report.prefill = stepping - started;
+        self.last_step = report;
         let (model, len) = (self.model, self.model.feat_dim * self.model.patch_size);
         let (rows, step) = match &mut self.batch {
             Rows::Eager(batch) => {
@@ -419,8 +481,13 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             }
             Rows::Stable(_) => return vec![],
         };
+        let reading = Instant::now();
         let logits: Vec<f32> = step.stop_logits.clone().into_data().iter().collect();
         let values: Vec<f32> = step.patch.clone().into_data().iter().collect();
+        let retiring = Instant::now();
+        report.rows = rows.len();
+        report.step = reading - stepping;
+        report.read = retiring - reading;
         let mut patches = vec![];
         let mut going = vec![];
         for (i, row) in rows.iter().enumerate() {
@@ -435,10 +502,16 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
                 Err(Error::NotFinite(request.given - 1))
             };
             let last = patch.is_err() || logits[1] > logits[0] || request.left == 0;
+            let started = (request.given == 1).then(|| Started {
+                waited: request.added.elapsed(),
+                prompt: request.prompt,
+                prefilled: request.prefilled,
+            });
             patches.push(Patch {
                 key: request.key.clone(),
                 patch,
                 last,
+                started,
             });
             if last {
                 self.running.remove(row);
@@ -462,6 +535,8 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             };
             batch.advance(next);
         }
+        report.retire = retiring.elapsed();
+        self.last_step = report;
         patches
     }
 }
