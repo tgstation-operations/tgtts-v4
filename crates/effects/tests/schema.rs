@@ -110,6 +110,22 @@ fn refuses_what_does_not_parse() {
 }
 
 #[test]
+fn refuses_nodes_and_taps_written_as_arrays() {
+    refused(
+        &format!(r#"[[{GAIN}, ["gain", 1]]]"#),
+        "effects[0], node 1: invalid type: sequence, expected an object",
+    );
+    refused(
+        &wired(r#""a": ["gain", 1]"#, r#"["input", "a"], ["a", "output"]"#),
+        r#"effects[0], node "a": invalid type: sequence, expected an object"#,
+    );
+    refused(
+        r#"[[{"effect": "echo", "taps": [{"delay_ms": 0, "weight": 1}, [100, 0.5]]}]]"#,
+        "effects[0], node 0: invalid type: sequence, expected an object",
+    );
+}
+
+#[test]
 fn refuses_graphs_wired_wrong() {
     let a = format!(r#""a": {GAIN}"#);
     let ab = format!(r#""a": {GAIN}, "b": {GAIN}"#);

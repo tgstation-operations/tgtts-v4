@@ -9,9 +9,12 @@
 //! unknown parameter or a value out of its range is refused, as is a graph that is cyclic or past
 //! the limits in [`crate::graph`].
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+};
 use serde_json::Value;
 
 use crate::graph::Error;
@@ -224,6 +227,7 @@ pub enum Node {
     /// grows by the longest delay.
     Echo {
         /// The copies.
+        #[serde(deserialize_with = "objects")]
         taps: Vec<Tap>,
     },
     /// The signal convolved with one of the service's impulse responses, scaled to unit energy,
@@ -286,6 +290,39 @@ pub enum Waveform {
 pub enum Impulse {
     /// SynthImpulse.wav, a fifth of a second of synthetic resonance.
     Synth,
+}
+
+/// A `T` read only from an object, where a derived `Deserialize` takes an array of its fields in
+/// order as well.
+struct Object<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Fields<T> {
+            type Value = T;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map))
+            }
+        }
+
+        deserializer
+            .deserialize_map(Fields(PhantomData))
+            .map(Object)
+    }
+}
+
+fn objects<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Vec<T>, D::Error> {
+    let objects = Vec::<Object<T>>::deserialize(deserializer)?;
+    Ok(objects.into_iter().map(|Object(t)| t).collect())
 }
 
 fn butterworth() -> f64 {
@@ -433,7 +470,8 @@ pub fn parse(value: &Value) -> Result<Vec<Graph>, Error> {
                     .iter()
                     .enumerate()
                     .map(|(i, node)| {
-                        Node::deserialize(node)
+                        Object::deserialize(node)
+                            .map(|Object(node)| node)
                             .map_err(|e| refuse(at, Some(i.to_string()), e.to_string()))
                     })
                     .collect::<Result<_, _>>()
@@ -450,8 +488,8 @@ pub fn parse(value: &Value) -> Result<Vec<Graph>, Error> {
                     let nodes = nodes
                         .iter()
                         .map(|(id, node)| {
-                            Node::deserialize(node)
-                                .map(|node| (id.clone(), node))
+                            Object::deserialize(node)
+                                .map(|Object(node)| (id.clone(), node))
                                 .map_err(|e| refuse(at, Some(format!("{id:?}")), e.to_string()))
                         })
                         .collect::<Result<_, _>>()?;
