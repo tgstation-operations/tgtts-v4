@@ -18,6 +18,11 @@ use crate::wav;
 /// How many takes of a voice and text are made before they are reused.
 pub const TAKES: usize = 5;
 
+/// The context BLAKE3 derives the cache's keys in, which no other use of BLAKE3 shares, so that
+/// no other hash of the same bytes names an entry. A cache made under another version is not
+/// read.
+const KEY_CONTEXT: &str = "tgstation tgtts speech cache 2026-10-26 v1";
+
 /// A cache directory.
 #[derive(Clone, Debug)]
 pub struct Cache {
@@ -47,7 +52,7 @@ impl Cache {
     /// could name another's; the voice's length goes first here, which no two pairs share with
     /// the same bytes after it.
     pub fn entry(&self, voice: &str, text: &str) -> PathBuf {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = blake3::Hasher::new_derive_key(KEY_CONTEXT);
         hasher.update(&(voice.len() as u64).to_le_bytes());
         hasher.update(voice.as_bytes());
         hasher.update(text.as_bytes());
@@ -153,6 +158,18 @@ mod tests {
         assert_ne!(cache.entry("ab", "c"), cache.entry("a", "bc"));
         assert_ne!(cache.entry("", "x"), cache.entry("x", ""));
         assert_eq!(cache.entry("a", "bc"), cache.entry("a", "bc"));
+    }
+
+    /// The key b3sum gives the voice's length, the voice and the text, in the cache's context
+    /// and as a plain hash.
+    #[test]
+    fn keys_are_derived_for_the_cache_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let derived = "95c4c386a56028463ebfa48a0a7fdd46e3d789e9b9d8c7843dd5eca0f5083f82";
+        let plain = "e5c4acaac8e79ebe4f88e4683b4c6bed38d70e1e0aea9ed411603257545ab3f5";
+        assert_eq!(cache.entry("v", "hello"), dir.path().join(derived));
+        assert_ne!(cache.entry("v", "hello"), dir.path().join(plain));
     }
 
     #[test]
