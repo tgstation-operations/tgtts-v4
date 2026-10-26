@@ -1,4 +1,4 @@
-use burn::tensor::{Device, FloatDType, Tensor, TensorData};
+use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 
 use crate::Config;
 
@@ -57,6 +57,35 @@ impl Rope {
             start + len - 1
         );
         let rows = |table: &Tensor<2>| table.clone().narrow(0, start, len).unsqueeze();
+        Rotation {
+            cos: rows(&self.cos),
+            sin: rows(&self.sin),
+        }
+    }
+
+    /// The rotations of positions `start..start + len` for each row's `start`,
+    /// `[starts.len(), 1, len, head_dim]`.
+    ///
+    /// # Panics
+    ///
+    /// If that reaches past `max_position_embeddings`.
+    pub(crate) fn rows(&self, starts: &[usize], len: usize) -> Rotation {
+        let [positions, dim] = self.cos.dims();
+        let last = starts.iter().max().map_or(0, |start| start + len);
+        assert!(
+            last <= positions,
+            "position {} is past the {positions} RoPE has rotations for",
+            last - 1
+        );
+        let at: Vec<i64> = starts
+            .iter()
+            .flat_map(|&start| (start..start + len).map(|t| t as i64))
+            .collect();
+        let at = Tensor::<1, Int>::from_data(at.as_slice(), &self.cos.device());
+        let rows = |table: &Tensor<2>| {
+            let rows = table.clone().select(0, at.clone());
+            rows.reshape([starts.len(), 1, len, dim])
+        };
         Rotation {
             cos: rows(&self.cos),
             sin: rows(&self.sin),

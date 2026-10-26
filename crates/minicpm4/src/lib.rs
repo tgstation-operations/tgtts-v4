@@ -11,7 +11,7 @@ mod config;
 mod layer;
 mod rope;
 
-use std::{fmt, path::Path};
+use std::{fmt, iter, path::Path};
 
 use burn::{
     module::Module,
@@ -28,6 +28,7 @@ pub use crate::{
     config::{Config, LocalShape, RopeScaling},
 };
 use crate::{
+    cache::{Append, Slots},
     layer::{DecoderLayer, RmsNorm},
     rope::Rope,
 };
@@ -121,7 +122,7 @@ impl Model {
         let [_, len, _] = x.dims();
         let rotation = self.rope.as_ref().map(|rope| rope.at(0, len));
         let mask = match mask {
-            Mask::Causal => self.causal_mask(len, len, &x.device()),
+            Mask::Causal => self.causal_mask(&[0], len, &x.device()),
             Mask::Bidirectional => None,
         };
         let x = self.layers.iter().fold(x, |x, layer| {
@@ -144,46 +145,102 @@ impl Model {
     }
 
     /// Runs the stack causally over `x` `[batch, len, hidden]` as the next `len` positions of
-    /// the sequences in `cache`, adding them to it: a prefill on an empty cache, then a step
-    /// at a time, as upstream's `forward`, `fill_caches` and `forward_step` do.
+    /// the sequences in `cache`, one a row, adding them to it: a prefill on an empty cache, then a
+    /// step at a time, as upstream's `forward`, `fill_caches` and `forward_step` do.
+    ///
+    /// The sequences may be of different lengths, each going on from its own. A row that holds
+    /// none is computed over as if it held an empty one, and still holds none after.
     ///
     /// # Panics
     ///
-    /// If `cache` is for another batch size or has no room for `len` more positions, or the
-    /// stack has RoPE and they would be past `max_position_embeddings`.
+    /// If `cache` has another number of rows or no room for `len` more positions after the
+    /// longest of them, or the stack has RoPE and they would be past
+    /// `max_position_embeddings`.
     pub fn forward_cached(&self, x: Tensor<3>, cache: &mut KvCache) -> Tensor<3> {
         let [batch, len, _] = x.dims();
-        let start = cache.len;
-        assert_eq!(batch, cache.batch, "a cache for {} sequences", cache.batch);
+        assert_eq!(batch, cache.rows(), "a cache of {} rows", cache.rows());
+        let starts: Vec<usize> = cache.lens.iter().map(|held| held.unwrap_or(0)).collect();
+        let longest = starts.iter().copied().max().unwrap_or(0);
         assert!(
-            start + len <= cache.capacity,
-            "KV cache is full: {start} positions and {len} more are past its {}",
+            longest + len <= cache.capacity,
+            "KV cache is full: {longest} positions and {len} more are past its {}",
             cache.capacity
         );
-        let rotation = self.rope.as_ref().map(|rope| rope.at(start, len));
-        let mask = self.causal_mask(len, start + len, &x.device());
+        let device = x.device();
+        let (rotation, at) = match shared(&starts) {
+            Some(start) => (
+                self.rope.as_ref().map(|rope| rope.at(start, len)),
+                Slots::Shared(start),
+            ),
+            None => (
+                self.rope.as_ref().map(|rope| rope.rows(&starts, len)),
+                Slots::Rows(Box::new(self.slots(&starts, len, &device))),
+            ),
+        };
+        let mask = self.causal_mask(&starts, len, &device);
+        let append = Append {
+            at,
+            total: longest + len,
+        };
         let layers = self.layers.iter().zip(&mut cache.layers);
         let x = layers.fold(x, |x, (layer, cache)| {
-            layer.forward(x, rotation.as_ref(), mask.as_ref(), Some((cache, start)))
+            layer.forward(x, rotation.as_ref(), mask.as_ref(), Some((cache, &append)))
         });
-        cache.len += len;
+        for held in cache.lens.iter_mut().flatten() {
+            *held += len;
+        }
         self.norm.forward(x)
     }
 
-    /// Hides from each of the last `len` of `total` positions the keys after it, once for each
-    /// query head of a group, as attention stacks them along the sequence. None when `len` is
-    /// 1: the last position sees every key.
-    fn causal_mask(&self, len: usize, total: usize, device: &Device) -> Option<Tensor<4, Bool>> {
-        if len == 1 {
+    /// Hides from each of the next `len` positions of each row, after its `starts`, the keys
+    /// after it, once for each query head of a group, as attention stacks them along the
+    /// sequence. None when `len` is 1 and the rows are as long: each sees every key.
+    fn causal_mask(
+        &self,
+        starts: &[usize],
+        len: usize,
+        device: &Device,
+    ) -> Option<Tensor<4, Bool>> {
+        let shared = shared(starts);
+        if len == 1 && shared.is_some() {
             return None;
         }
-        let start = total - len;
+        let rows = if shared.is_some() {
+            &starts[..1]
+        } else {
+            starts
+        };
+        let total = rows.iter().max().map_or(0, |start| start + len);
         let groups = self.config.num_attention_heads / self.config.num_key_value_heads;
-        let hidden = (0..len).flat_map(|q| (0..total).map(move |k| k > start + q));
-        let mask = TensorData::new(hidden.collect(), [len, total]);
-        let mask = Tensor::<2, Bool>::from_data(mask, device).repeat_dim(0, groups);
-        Some(mask.reshape([1, 1, groups * len, total]))
+        let hidden = rows.iter().flat_map(|&start| {
+            (0..groups).flat_map(move |_| {
+                (0..len).flat_map(move |q| (0..total).map(move |k| k > start + q))
+            })
+        });
+        let shape = [rows.len(), 1, groups * len, total];
+        Some(Tensor::from_data(
+            TensorData::new(hidden.collect(), shape),
+            device,
+        ))
     }
+
+    /// The positions of each row's next `len` keys and values, as the cache's layers take them.
+    fn slots(&self, starts: &[usize], len: usize, device: &Device) -> Tensor<4, Int> {
+        let (heads, dim) = (self.config.num_key_value_heads, self.config.head_dim());
+        let at = starts.iter().flat_map(|&start| {
+            (0..heads).flat_map(move |_| {
+                (start..start + len).flat_map(move |t| iter::repeat_n(t as i64, dim))
+            })
+        });
+        let shape = [starts.len(), heads, len, dim];
+        Tensor::from_data(TensorData::new(at.collect(), shape), device)
+    }
+}
+
+/// The start the rows share, if they do.
+fn shared(starts: &[usize]) -> Option<usize> {
+    let first = *starts.first()?;
+    starts.iter().all(|&start| start == first).then_some(first)
 }
 
 /// Why a stack could not be loaded.

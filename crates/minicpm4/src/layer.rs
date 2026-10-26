@@ -7,7 +7,11 @@ use burn::{
     },
 };
 
-use crate::{Config, cache::LayerCache, rope::Rotation};
+use crate::{
+    Config,
+    cache::{Append, LayerCache},
+    rope::Rotation,
+};
 
 /// Upstream's `MiniCPMRMSNorm`, which takes the mean square in f32.
 #[derive(Module, Debug)]
@@ -69,7 +73,7 @@ impl Attention {
         x: Tensor<3>,
         rotation: Option<&Rotation>,
         mask: Option<&Tensor<4, Bool>>,
-        cache: Option<(&mut LayerCache, usize)>,
+        cache: Option<(&mut LayerCache, &Append)>,
     ) -> Tensor<3> {
         let [batch, len, _] = x.dims();
         let project = |proj: &Linear, heads| {
@@ -85,7 +89,7 @@ impl Attention {
             k = rotation.apply(k);
         }
         let (k, v) = match cache {
-            Some((cache, start)) => cache.append(start, k, v),
+            Some((cache, append)) => cache.append(append, k, v),
             None => (k, v),
         };
         // Each key-value head serves a run of consecutive query heads, as torch's enable_gqa
@@ -150,7 +154,7 @@ impl DecoderLayer {
         x: Tensor<3>,
         rotation: Option<&Rotation>,
         mask: Option<&Tensor<4, Bool>>,
-        cache: Option<(&mut LayerCache, usize)>,
+        cache: Option<(&mut LayerCache, &Append)>,
     ) -> Tensor<3> {
         let normed = self.input_layernorm.forward(x.clone());
         let attended = self.self_attn.forward(normed, rotation, mask, cache);
