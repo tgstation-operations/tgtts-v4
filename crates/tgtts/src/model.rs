@@ -37,9 +37,8 @@ const WARM_UP_PATCHES: usize = 9;
 /// takes about 11 MB, so about 90 of them.
 pub const PROMPT_CACHE_BYTES: usize = 1 << 30;
 
-/// The positions of prompts run between two patches while other requests generate, unless the
-/// configuration says otherwise: on a GPU in f16 a run of 128 takes about as long as a patch of
-/// one request.
+/// The positions of waiting prompts run between two patches while other requests generate,
+/// unless the configuration says otherwise, past which only the first runs.
 pub const PREFILL_POSITIONS: usize = 128;
 
 /// How requests are batched.

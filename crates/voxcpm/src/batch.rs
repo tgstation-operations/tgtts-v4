@@ -243,9 +243,10 @@ fn held_rows<const D: usize>(all: &Tensor<D>, held: Option<&Tensor<1, Int>>) -> 
 /// its most patches.
 ///
 /// A request's prompt runs through the LMs from where what a [`PromptCache`] keeps of its voice
-/// leaves off, then the request joins the batch. While other requests run, at most a set
-/// number of positions of prompts run between two of their patches, which bounds how much
-/// longer a new request makes their next patch take.
+/// leaves off, in one run with the others waiting, then the request joins the batch. While other
+/// requests run, the prompts run between two of their patches come to at most a set number of
+/// positions, but for the first waiting, which bounds how much longer new requests make their
+/// next patch take.
 #[derive(Debug)]
 pub struct Scheduler<'a, K, N> {
     model: &'a Model,
@@ -325,8 +326,9 @@ pub struct Started {
 }
 
 impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
-    /// Generates from `model`, keeping what prompts compute in `cache`, and running at most
-    /// `prefill_positions` positions of prompts between two patches of the requests that run.
+    /// Generates from `model`, keeping what prompts compute in `cache`, and running between two
+    /// patches of the requests that run the prompts of as many waiting requests as come to at most
+    /// `prefill_positions` positions, but always the first.
     pub fn new(model: &'a Model, cache: PromptCache, prefill_positions: usize) -> Self {
         let batch = match model.stepping() {
             Stepping::Eager => Rows::Eager(Box::new(Batch::new(model))),
@@ -411,50 +413,51 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         self.cache
     }
 
-    /// Runs the prompts of waiting requests, all of the first if no request is generating to
-    /// wait for it, then samples the next patch of every generating request. A request whose
-    /// patch comes out NaN or infinite ends with an error in its place.
+    /// Runs the prompts of waiting requests together, whole, from the first, as many as the
+    /// budget of positions takes, or all if no request is generating to wait for them, then
+    /// samples the next patch of every generating request. A request whose patch comes out NaN or
+    /// infinite ends with an error in its place.
     pub fn step(&mut self) -> Vec<Patch<K>> {
         let started = Instant::now();
         let mut report = StepReport::default();
-        let mut budget = self.prefill_positions;
-        while let Some((_, prefill)) = self.waiting.front_mut() {
-            let unbounded = self.running.is_empty();
-            if budget == 0 && !unbounded {
-                break;
-            }
-            let positions = if unbounded { usize::MAX } else { budget };
-            budget -= prefill.left().min(budget);
+        let (mut joining, mut positions) = (0, 0);
+        for (_, prefill) in &self.waiting {
             let left = prefill.left();
-            let finished = prefill.run(positions, &mut self.cache);
-            report.positions += left - prefill.left();
-            if !finished {
+            let fits = positions + left <= self.prefill_positions || self.running.is_empty();
+            if joining > 0 && !fits {
                 break;
             }
-            report.joined += 1;
-            let (mut request, prefill) = self.waiting.pop_front().expect("the front");
-            let generation = prefill.finish();
-            let row = match &mut self.batch {
-                Rows::Eager(batch) => batch.join(generation, &request.sampling),
-                Rows::Stable(stepper) => {
-                    // An empty one may sample in other steps than the request.
-                    if stepper
-                        .as_ref()
-                        .is_some_and(|stepper| stepper.rows().is_empty())
-                    {
-                        *stepper = None;
-                    }
-                    let (model, timesteps) = (self.model, request.sampling.timesteps);
-                    let stepping = model.stepping();
-                    let stepper = stepper
-                        .get_or_insert_with(|| Box::new(Stepper::new(model, stepping, timesteps)));
-                    stepper.join(generation, &request.sampling, &mut request.noise)
-                }
-            };
-            self.running
-                .insert(row.expect("checked when added"), request);
+            joining += 1;
+            positions += left;
         }
-
+        if joining > 0 {
+            let (requests, prefills): (Vec<_>, Vec<_>) = self.waiting.drain(..joining).unzip();
+            let generations = self.model.prefill_together(prefills, &mut self.cache);
+            for (mut request, generation) in requests.into_iter().zip(generations) {
+                let row = match &mut self.batch {
+                    Rows::Eager(batch) => batch.join(generation, &request.sampling),
+                    Rows::Stable(stepper) => {
+                        // An empty one may sample in other steps than the request.
+                        if stepper
+                            .as_ref()
+                            .is_some_and(|stepper| stepper.rows().is_empty())
+                        {
+                            *stepper = None;
+                        }
+                        let (model, timesteps) = (self.model, request.sampling.timesteps);
+                        let stepping = model.stepping();
+                        let stepper = stepper.get_or_insert_with(|| {
+                            Box::new(Stepper::new(model, stepping, timesteps))
+                        });
+                        stepper.join(generation, &request.sampling, &mut request.noise)
+                    }
+                };
+                self.running
+                    .insert(row.expect("checked when added"), request);
+            }
+        }
+        report.joined = joining;
+        report.positions = positions;
         report.waiting = self.waiting.len();
         let stepping = Instant::now();
         report.prefill = stepping - started;

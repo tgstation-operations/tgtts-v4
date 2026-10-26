@@ -179,12 +179,12 @@ fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
         }
     }
     assert_eq!(done, [true; 4]);
-    // The first prompt ran whole, with nothing to wait for it, and the others eight positions
-    // at a time between patches: the second's 11 by the third step, then the third's 8 left
-    // after what the first kept of its voice, and the last's 19 by the sixth, the others
-    // having stopped.
-    assert_eq!(first, [Some(0), Some(2), Some(3), Some(5)]);
-    assert_eq!(most, 3);
+    // Each prompt ran whole, the first waiting between two patches even past the budget of
+    // eight positions: the second's 11 at the second step, the third's 8 left after what the
+    // first kept of its voice at the third, past the budget with the second's, and the last's 19
+    // at the fourth.
+    assert_eq!(first, [Some(0), Some(1), Some(2), Some(3)]);
+    assert_eq!(most, 4);
     let prefilled = started.map(|started| started.map(|s| (s.prompt, s.prefilled)));
     let whole = |i: usize| Some((prompts[i].len(), prompts[i].len()));
     let cached = Some((prompts[2].len(), 8));

@@ -199,10 +199,10 @@ impl Model {
         Ok(capacity)
     }
 
-    /// Runs positions of a prompt through the LMs after those in `caches`: their `tokens`
-    /// `[1, len]`, whether each is `audio` `[1, len, 1]`, and the embeddings of their patches
-    /// `[1, len, hidden]`, which only audio positions take. Gives the base LM's outputs,
-    /// quantized where audio, and the residual LM's.
+    /// Runs positions of prompts through the LMs after those in each row of `caches`: their
+    /// `tokens` `[rows, len]`, whether each is `audio` `[rows, len, 1]`, and the embeddings of
+    /// their patches `[rows, len, hidden]`, which only audio positions take. Gives the base LM's
+    /// outputs, quantized where audio, and the residual LM's.
     pub(crate) fn run_prompt(
         &self,
         tokens: Tensor<2, Int>,
@@ -210,8 +210,8 @@ impl Model {
         audio_embeds: Tensor<3>,
         (base_cache, residual_cache): (&mut KvCache, &mut KvCache),
     ) -> (Tensor<3>, Tensor<3>) {
-        let [_, len] = tokens.dims();
-        let audio = audio.expand([1, len, self.hidden]);
+        let [rows, len] = tokens.dims();
+        let audio = audio.expand([rows, len, self.hidden]);
         let heads = &self.heads;
         let embeds = self
             .base_lm

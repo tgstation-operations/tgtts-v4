@@ -19,8 +19,8 @@
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
 //! - `batch_window_seconds`: how long a request to an idle model waits for others to generate
 //!   with it, 0.1 by default.
-//! - `prefill_positions`: the positions of prompts run between two patches while other requests
-//!   generate, 128 by default.
+//! - `prefill_positions`: the positions of waiting prompts run together between two patches while
+//!   other requests generate, 128 by default; the first waiting runs whole whatever its length.
 //! - `step_graphs`: whether the model steps by replaying graphs of its step on CUDA, `true` by
 //!   default; it steps eagerly on any other device.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.

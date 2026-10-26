@@ -1,6 +1,6 @@
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, ptr};
 
-use burn::tensor::{Bool, Int, Tensor, TensorData};
+use burn::tensor::{Bool, Int, Tensor, TensorData, kind::Basic};
 use minicpm4::KvCache;
 
 use crate::{Error, Generation, Model, Prompt};
@@ -228,6 +228,95 @@ impl Model {
         })
     }
 
+    /// The generations that go on from the prompts of `prefills`, each run whole through the LMs
+    /// from where it was left, all of them in one run as rows of a batch: each prompt's positions
+    /// are followed by as many as the longest has more, which no position before them attends
+    /// to. What the LMs computed over a text is kept in `cache` as [`Prefill::run`] keeps it.
+    ///
+    /// # Panics
+    ///
+    /// If `prefills` is empty, or one is of another model.
+    pub fn prefill_together<'a>(
+        &'a self,
+        prefills: Vec<Prefill<'a>>,
+        cache: &mut PromptCache,
+    ) -> Vec<Generation<'a>> {
+        assert!(!prefills.is_empty(), "no prompts to run");
+        let rows = prefills.len();
+        let longest = prefills.iter().map(Prefill::left).max().expect("prompts");
+        let held = prefills
+            .iter()
+            .map(|prefill| prefill.done)
+            .max()
+            .expect("prompts");
+        let (device, hidden) = (&self.device, self.hidden);
+        let mut caches = (
+            self.base_lm.cache(rows, held + longest),
+            self.residual_lm.cache(rows, held + longest),
+        );
+        let (mut tokens, mut audio, mut embeds) = (vec![], vec![], vec![]);
+        for (row, prefill) in prefills.iter().enumerate() {
+            assert!(ptr::eq(self, prefill.model), "a prompt of another model");
+            if prefill.done > 0 {
+                caches.0.insert(row, &prefill.caches.0, 0);
+                caches.1.insert(row, &prefill.caches.1, 0);
+            }
+            let (start, left) = (prefill.done, prefill.left());
+            let pad = longest - left;
+            let options = (device, prefill.embeds.dtype());
+            tokens.push(padded(
+                pad,
+                prefill.tokens.clone().narrow(1, start, left),
+                Tensor::zeros([1, pad], device),
+            ));
+            audio.push(padded(
+                pad,
+                prefill.audio.clone().narrow(1, start, left),
+                Tensor::full([1, pad, 1], false, device),
+            ));
+            embeds.push(padded(
+                pad,
+                prefill.embeds.clone().narrow(1, start, left),
+                Tensor::zeros([1, pad, hidden], options),
+            ));
+        }
+        let outputs = self.run_prompt(
+            Tensor::cat(tokens, 0),
+            Tensor::cat(audio, 0),
+            Tensor::cat(embeds, 0),
+            (&mut caches.0, &mut caches.1),
+        );
+        prefills
+            .into_iter()
+            .enumerate()
+            .map(|(row, mut prefill)| {
+                let len = prefill.prompt.len();
+                caches.0.truncate(row, len);
+                caches.1.truncate(row, len);
+                if let Some(key) = prefill.keep.take() {
+                    let text = prefill.text.clone();
+                    let prefix = Prefix {
+                        text: prefill.prompt.tokens[text.clone()].to_vec(),
+                        base: caches.0.prefix(row, text.end),
+                        residual: caches.1.prefix(row, text.end),
+                    };
+                    cache.keep_prefix(&key, prefix);
+                }
+                let capacity = prefill.caches.0.capacity();
+                let mut own = (
+                    self.base_lm.cache(1, capacity),
+                    self.residual_lm.cache(1, capacity),
+                );
+                own.0.insert(0, &caches.0, row);
+                own.1.insert(0, &caches.1, row);
+                let left = prefill.left();
+                let row_of = |t: &Tensor<3>| t.clone().narrow(0, row, 1).narrow(1, 0, left);
+                let outputs = (row_of(&outputs.0), row_of(&outputs.1));
+                self.generation(own, outputs, &prefill.prompt)
+            })
+            .collect()
+    }
+
     /// The LMs' embeddings `[patches, hidden]` of the voice's `patches` patches.
     fn embed_voice(&self, voice: &[f32], patches: usize) -> Tensor<2> {
         let shape = [1, patches, self.patch_size, self.feat_dim];
@@ -284,5 +373,17 @@ impl<'a> Prefill<'a> {
         assert_eq!(self.left(), 0, "positions of the prompt still to run");
         let outputs = self.outputs.expect("a prompt of at least one position");
         self.model.generation(self.caches, outputs, &self.prompt)
+    }
+}
+
+/// `run` followed along its positions by `padding`, which is `pad` positions long.
+fn padded<const D: usize, K: Basic>(
+    pad: usize,
+    run: Tensor<D, K>,
+    padding: Tensor<D, K>,
+) -> Tensor<D, K> {
+    match pad {
+        0 => run,
+        _ => Tensor::cat(vec![run, padding], 1),
     }
 }
