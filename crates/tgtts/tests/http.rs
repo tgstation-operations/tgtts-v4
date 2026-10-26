@@ -210,6 +210,7 @@ fn limits() -> Limits {
         cpu: 4,
         queue_timeout: Duration::from_secs(60),
         radio_wait: Duration::from_secs(60),
+        radio_wait_ceiling: Duration::from_secs(60),
     }
 }
 
@@ -767,16 +768,25 @@ fn serves_a_message_for_everyone_whole() {
     assert_eq!(h.fake.texts(), ["Hello there."]);
 }
 
+/// Limits where a radio route waits 50 ms for its speech to begin.
+fn short_radio_wait() -> Limits {
+    Limits {
+        radio_wait: Duration::from_millis(50),
+        ..limits()
+    }
+}
+
 #[test]
-fn the_radio_waits_for_the_speech() {
+fn the_radio_waits_for_the_speech_as_long_as_it_takes() {
     let (fake, entered, release) = Fake::gated();
-    let h = harness(fake, limits());
+    let h = harness(fake, short_radio_wait());
     let message = Message::default();
     thread::scope(|s| {
         let speech = s.spawn(|| message.speech(&h));
         assert_eq!(entered.recv().unwrap(), "Hello there.");
         let radio = s.spawn(|| message.radio(&h));
         let gibberish = s.spawn(|| message.gibberish(&h));
+        thread::sleep(Duration::from_millis(500));
         release.send(()).unwrap();
         let speech = speech.join().unwrap();
         speech.assert_ogg(48000);
@@ -788,14 +798,27 @@ fn the_radio_waits_for_the_speech() {
 }
 
 #[test]
+fn the_radio_fails_with_the_speech_however_late() {
+    let (fake, entered, release) = Fake::gated();
+    let h = harness(fake, short_radio_wait());
+    let message = Message {
+        text: "Fail now.",
+        ..Message::default()
+    };
+    thread::scope(|s| {
+        let speech = s.spawn(|| message.speech(&h));
+        assert_eq!(entered.recv().unwrap(), "Fail now.");
+        let radio = s.spawn(|| message.radio(&h));
+        thread::sleep(Duration::from_millis(500));
+        release.send(()).unwrap();
+        assert_eq!(speech.join().unwrap().status, 500);
+        assert_eq!(radio.join().unwrap().status, 500);
+    });
+}
+
+#[test]
 fn the_radio_gives_up_after_its_wait() {
-    let h = harness(
-        Fake::default(),
-        Limits {
-            radio_wait: Duration::from_millis(50),
-            ..limits()
-        },
-    );
+    let h = harness(Fake::default(), short_radio_wait());
     let message = Message::default();
     assert_eq!(message.radio(&h).status, 408);
     assert_eq!(message.blips_radio(&h).status, 408);

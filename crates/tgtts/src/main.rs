@@ -91,6 +91,7 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
             cpu: config.cpu_limit,
             queue_timeout: config.queue_timeout,
             radio_wait: config.radio_wait,
+            radio_wait_ceiling: config.radio_wait_ceiling,
         },
         blip_seed: None,
     });

@@ -44,5 +44,6 @@ voxcpm = { path = "../voxcpm" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 # The HTTP client the game's rust-g makes its requests with.
 ureq.workspace = true

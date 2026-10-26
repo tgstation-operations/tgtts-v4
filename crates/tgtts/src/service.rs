@@ -122,9 +122,11 @@ pub struct Limits {
     /// How long a request waits for a turn at the model before it is refused with 503: by then
     /// its message would be too late to play.
     pub queue_timeout: Duration,
-    /// How long a radio route waits for the speech or blips it puts on the radio before it
-    /// answers 408, as the old radio services did after 10 s.
+    /// How long a radio route waits for the route that makes the speech or blips it puts on the
+    /// radio to begin before it answers 408, as the old radio services did after 10 s.
     pub radio_wait: Duration,
+    /// How long a radio route waits in all once that route has begun.
+    pub radio_wait_ceiling: Duration,
 }
 
 /// The loudness the service brings speech and blips to, before the game's filters.
@@ -186,7 +188,7 @@ impl Service {
             metrics: setup.metrics,
             logging: setup.logging,
             loudness: setup.loudness,
-            handoff: Handoff::new(setup.limits.radio_wait),
+            handoff: Handoff::new(setup.limits.radio_wait, setup.limits.radio_wait_ceiling),
             model: Arc::new(Semaphore::new(setup.limits.synthesis)),
             cpu: Arc::new(Semaphore::new(setup.limits.cpu)),
             queue_timeout: setup.limits.queue_timeout,
@@ -396,6 +398,9 @@ impl Service {
     async fn respond(self: Arc<Self>, route: Route, params: Params, body: Bytes) -> Response {
         let time = SystemTime::now();
         let started = Instant::now();
+        if let Some(source) = route.makes() {
+            self.handoff.begin(source, &params.identifier);
+        }
         let mut trace = Trace::default();
         let body: Result<Body, _> = if body.is_empty() {
             Ok(Body::default())

@@ -74,6 +74,7 @@ pub fn serves_a_message(model: VoxCpm, prepare: impl FnOnce(&VoxCpm, &Voices)) {
             cpu: 4,
             queue_timeout: Duration::from_secs(3600),
             radio_wait: Duration::from_secs(3600),
+            radio_wait_ceiling: Duration::from_secs(3600),
         },
         blip_seed: None,
     });

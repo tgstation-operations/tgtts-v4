@@ -21,8 +21,10 @@
 //!   with it, 0.1 by default.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
-//! - `radio_wait_seconds`: how long a radio route waits for what it puts on the radio, 10 by
-//!   default.
+//! - `radio_wait_seconds`: how long a radio route waits for the route that makes what it puts on
+//!   the radio to begin, 10 by default.
+//! - `radio_wait_ceiling_seconds`: how long a radio route waits in all once that route has begun,
+//!   30 by default, as long as the game waits for any route by default.
 //! - `loudness_target_lufs`: the integrated loudness speech and blips are brought to before the
 //!   game's filters, -16 by default.
 //! - `loudness_ceiling_dbtp`: the true peak they are held under, at most 0, EBU R128's -1 by
@@ -48,7 +50,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 23] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -68,6 +70,7 @@ const KEYS: [&str; 22] = [
     "cpu_limit",
     "queue_timeout_seconds",
     "radio_wait_seconds",
+    "radio_wait_ceiling_seconds",
     "loudness_target_lufs",
     "loudness_ceiling_dbtp",
     "log_level",
@@ -92,6 +95,7 @@ pub struct Config {
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
     pub radio_wait: Duration,
+    pub radio_wait_ceiling: Duration,
     pub loudness: Loudness,
     pub log_level: LevelFilter,
 }
@@ -170,6 +174,9 @@ impl Config {
             radio_wait: settings
                 .seconds("radio_wait_seconds")?
                 .unwrap_or(Duration::from_secs(10)),
+            radio_wait_ceiling: settings
+                .seconds("radio_wait_ceiling_seconds")?
+                .unwrap_or(Duration::from_secs(30)),
             loudness: Loudness {
                 target: settings.decibels("loudness_target_lufs")?.unwrap_or(-16.0),
                 ceiling: match settings.decibels("loudness_ceiling_dbtp")? {
@@ -315,6 +322,7 @@ mod tests {
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),
+                radio_wait_ceiling: Duration::from_secs(30),
                 loudness: Loudness {
                     target: -16.0,
                     ceiling: -1.0,
@@ -336,6 +344,7 @@ mod tests {
             cpu_limit = 8
             queue_timeout_seconds = 2.5
             radio_wait_seconds = 10
+            radio_wait_ceiling_seconds = 45
             loudness_target_lufs = -18
             loudness_ceiling_dbtp = -1.5
             log_level = \"debug\"
@@ -364,6 +373,7 @@ mod tests {
         assert_eq!((config.synthesis_limit, config.cpu_limit), (4, 8));
         assert_eq!(config.batch_window, Duration::from_millis(50));
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
+        assert_eq!(config.radio_wait_ceiling, Duration::from_secs(45));
         let loudness = Loudness {
             target: -18.0,
             ceiling: -1.5,
