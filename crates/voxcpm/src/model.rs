@@ -180,6 +180,15 @@ impl Model {
         Ok(self.generation((base_cache, residual_cache), (outputs, residual), prompt))
     }
 
+    /// The capacity of the caches a graph of the step holds a generation from a prompt of
+    /// `len` positions in, with room for `max_patches` patches after it: the first power of two
+    /// they fit in, or the positions the LM has.
+    pub fn graph_capacity(&self, len: usize, max_patches: usize) -> usize {
+        (len + max_patches)
+            .next_power_of_two()
+            .min(self.max_positions)
+    }
+
     /// The positions the LMs' caches need for `prompt` and `max_patches` patches after it.
     pub(crate) fn capacity(&self, prompt: &Prompt, max_patches: usize) -> Result<usize, Error> {
         let len = prompt.len();

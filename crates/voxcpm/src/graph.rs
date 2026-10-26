@@ -413,7 +413,7 @@ impl<'a> Stepper<'a> {
             .base_cache
             .len(0)
             .expect("a generation's row holds it");
-        let needed = end.next_power_of_two().min(model.max_positions);
+        let needed = model.graph_capacity(end, 0);
         let slot = self.rows.iter().position(Option::is_none);
         let rows = match slot {
             Some(_) => self.rows.len(),
@@ -475,7 +475,7 @@ impl<'a> Stepper<'a> {
         let model = self.model;
         let needed = generations.iter().map(|generation| {
             let end = generation.base_cache.capacity();
-            end.next_power_of_two().min(model.max_positions)
+            model.graph_capacity(end, 0)
         });
         let held_capacity = self.graph.as_ref().map_or(0, |(key, _)| key.1);
         let capacity = needed.fold(held_capacity, usize::max);

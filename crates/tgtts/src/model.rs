@@ -161,11 +161,13 @@ impl VoxCpm {
 
     /// Runs the shapes synthesis takes with `voices`, so that a GPU's autotune, which chooses
     /// the kernels of each shape the first time it runs, has chosen them before a request waits
-    /// on it: as many requests as run at once in voices from the shortest prompt a median line
-    /// gives to the longest, twice, the second time from what the prompt cache kept; one request
-    /// and as many as run at once going past each power of two the KV length goes past before
-    /// the longest's last patch, where a GPU takes other kernels; and the audio decoder's every
-    /// chunk length, all on the thread that generates. Logs what it ran and how long it took.
+    /// on it: requests at once in voices from the shortest prompt a median line gives to the
+    /// longest, each number a graph of the step holds them in at each capacity of cache their
+    /// prompts need, later runs going on from what the prompt cache kept of earlier ones; one
+    /// request and as many as run at once going past each power of two the KV length goes past
+    /// before the longest's last patch, where a GPU takes other kernels; and the audio decoder's
+    /// every chunk length, all on the thread that generates. Logs what it ran and how long it
+    /// took.
     ///
     /// The thread that generates keeps the graphs a GPU records of each number of requests and
     /// capacity of cache the warm-up reaches, which the requests after it replay.
@@ -186,12 +188,12 @@ impl VoxCpm {
             return Err("no voices".into());
         };
         let requests = self.batching.requests;
-        let spread = (0..requests).map(|i| {
-            let at = i * (prompts.len() - 1) / requests.saturating_sub(1).max(1);
-            prompts[at].0.clone()
-        });
-        let spread: Vec<Prompt> = spread.collect();
-        let mut runs = vec![spread.clone(), spread];
+        let lengths: Vec<usize> = prompts.iter().map(|(prompt, _)| prompt.len()).collect();
+        let model = self.tts.model();
+        let capacity = |len| model.graph_capacity(len, self.params.max_patches);
+        let runs = bucket_runs(&lengths, requests, capacity);
+        let run = |run: Vec<usize>| run.into_iter().map(|i| prompts[i].0.clone()).collect();
+        let mut runs: Vec<Vec<Prompt>> = runs.into_iter().map(run).collect();
         let mut boundary = (shortest.len() + 1).next_power_of_two();
         let mut boundaries = vec![];
         while boundary < longest.len() + self.params.max_patches {
@@ -224,6 +226,38 @@ impl VoxCpm {
         );
         Ok(())
     }
+}
+
+/// The prompts, by their index among `lengths` in ascending order, of each run of requests at once
+/// the warm-up generates from: for each capacity of cache `capacity` gives the prompts and each
+/// number of rows a graph of the step holds up to `requests` requests in, a run of prompts that
+/// come to it, as many as it holds or `requests`, spread across the lengths that fit it, the
+/// longest of them included. The runs go from the shortest prompts to the longest, each also a
+/// prompt cache's next voices.
+fn bucket_runs(
+    lengths: &[usize],
+    requests: usize,
+    capacity: impl Fn(usize) -> usize,
+) -> Vec<Vec<usize>> {
+    let mut capacities: Vec<usize> = lengths.iter().map(|&len| capacity(len)).collect();
+    capacities.dedup();
+    let mut sizes: Vec<usize> = (0..)
+        .map(|power| 1 << power)
+        .take_while(|&rows| rows < requests)
+        .collect();
+    sizes.push(requests);
+    let mut runs = vec![];
+    for &holds in &capacities {
+        let fits = lengths
+            .iter()
+            .filter(|&&len| capacity(len) <= holds)
+            .count();
+        for &size in &sizes {
+            let at = |i: usize| fits - 1 - i * (fits - 1) / (size - 1).max(1);
+            runs.push((0..size).map(at).collect());
+        }
+    }
+    runs
 }
 
 /// A prompt of `len` positions in the voice of `prompt`, its latent frames `voice` one after
@@ -522,6 +556,34 @@ mod tests {
             prefill_positions: PREFILL_POSITIONS,
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
+    }
+
+    /// Prompts of three capacities and requests of up to 12 at once: each capacity is reached
+    /// with 1, 2, 4, 8 and 12 requests, which a stepper holds in 16 rows.
+    #[test]
+    fn warms_each_graph_up_once() {
+        let lengths = [300, 310, 400, 500, 700, 760, 900, 1500];
+        let capacity = |len: usize| (len + 256).next_power_of_two();
+        let runs = bucket_runs(&lengths, 12, capacity);
+        let mut reached: Vec<(usize, usize)> = runs
+            .iter()
+            .map(|run| {
+                let held = run.iter().map(|&i| capacity(lengths[i])).max().unwrap();
+                (run.len().next_power_of_two(), held)
+            })
+            .collect();
+        let count = reached.len();
+        reached.sort_unstable();
+        reached.dedup();
+        assert_eq!(reached.len(), count, "a graph warmed up twice: {runs:?}");
+        let expected: Vec<_> = [1024, 2048]
+            .into_iter()
+            .flat_map(|held| [1, 2, 4, 8, 16].map(|rows| (rows, held)))
+            .collect();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(reached, expected);
+        assert!(runs.iter().all(|run| run.len() <= 12));
     }
 
     #[test]
