@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    ops::Range,
     sync::{Arc, Mutex, PoisonError},
     thread::{self, ThreadId},
 };
@@ -8,7 +9,7 @@ use std::{
 use burn::tensor::{Device, Graph, Int, Tensor, TensorData, capture, kind::Basic};
 use minicpm4::KvCache;
 
-use crate::{Generation, Model, Sampling, Step};
+use crate::{Generation, Model, Noise, Sampling, Step};
 
 /// How a generation computes each patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +79,10 @@ impl fmt::Debug for Graphs {
 
 /// What the stable step reads and writes, each in a buffer that stays where it is from one step
 /// to the next: a graph replays its kernels on the buffers it was captured on. A row for each
-/// generation, `rows` of them.
+/// generation, `rows` of them, in caches of `capacity` positions.
+///
+/// What a generation brings is written when it starts; between two steps the state moves on
+/// only by copies of what the step gave, nothing written from the host.
 struct StepState {
     caches: (KvCache, KvCache),
     /// The position each row's patch goes to, `[rows]`.
@@ -88,16 +92,24 @@ struct StepState {
     lm_hidden: Tensor<2>,
     residual_hidden: Tensor<2>,
     cond: Tensor<3>,
-    /// The noise of the next patches, `[rows, feat_dim, patch_size]`.
+    /// The noise of each row's patches, `capacity` of them a row, `[rows * capacity, feat_dim,
+    /// patch_size]`, and where in it each row's next patch's is, `[rows]`.
     noise: Tensor<3>,
+    draws: Tensor<1, Int>,
     /// The temperature and the classifier-free guidance scale of each row, `[rows, 1, 1]`.
     temperature: Tensor<3>,
     cfg: Tensor<3>,
 }
 
-/// What the stable step gives: the patch, sampled after the state's, and the LMs' hidden states
-/// after it.
-type StepOutputs = (Step, Tensor<2>, Tensor<2>);
+/// What the stable step gives: the patch, sampled after the state's, and the state after it.
+#[derive(Clone)]
+struct StepOutputs {
+    step: Step,
+    lm_hidden: Tensor<2>,
+    residual_hidden: Tensor<2>,
+    positions: Tensor<1, Int>,
+    draws: Tensor<1, Int>,
+}
 
 type StepFn = Box<dyn FnMut() -> StepOutputs + Send>;
 
@@ -118,18 +130,19 @@ impl Model {
         let StepState {
             caches,
             positions,
-            noise,
+            draws,
             temperature,
             cfg,
             ..
         } = state;
+        let noise = state.noise.clone().select(0, draws.clone());
         let step = self.sample_after(
             state.lm_hidden.clone(),
             state.residual_hidden.clone(),
             state.cond.clone(),
             |cfm, mu, cond| {
                 let scales = (temperature.clone(), cfg.clone());
-                cfm.sample_scaled(mu, cond, noise.clone(), scales, timesteps)
+                cfm.sample_scaled(mu, cond, noise, scales, timesteps)
             },
         );
         let embeds = self.embed_patches(step.patch.clone().unsqueeze_dim(1));
@@ -137,7 +150,13 @@ impl Model {
             self.advance_lms(embeds, (&mut caches.0, &mut caches.1), |lm, x, cache| {
                 lm.forward_at(x, cache, positions.clone())
             });
-        (step, lm_hidden, residual_hidden)
+        StepOutputs {
+            step,
+            lm_hidden,
+            residual_hidden,
+            positions: positions.clone().add_scalar(1),
+            draws: draws.clone().add_scalar(1),
+        }
     }
 
     /// The state of the stable step for one row in caches of `capacity` positions, not yet
@@ -155,7 +174,8 @@ impl Model {
             lm_hidden: hidden(),
             residual_hidden: hidden(),
             cond: Tensor::zeros([1, self.patch_size, self.feat_dim], device),
-            noise: Tensor::zeros([1, self.feat_dim, self.patch_size], device),
+            noise: Tensor::zeros([capacity, self.feat_dim, self.patch_size], device),
+            draws: Tensor::from_data(TensorData::from([0i64]), device),
             temperature: scale(),
             cfg: scale(),
         };
@@ -174,8 +194,9 @@ pub struct Stepper<'a> {
     key: Key,
     graph: Option<StepGraph>,
     captured: bool,
-    /// The positions the caches hold.
+    /// The positions the caches hold, and those they may.
     len: usize,
+    end: usize,
     timesteps: usize,
 }
 
@@ -190,14 +211,20 @@ impl fmt::Debug for Stepper<'_> {
 }
 
 impl<'a> Generation<'a> {
-    /// The generation going on as `stepping` says, sampled as `sampling` says: in caches of a
-    /// capacity of a power of two, those of the graph captured for it on this thread where there
-    /// is one, into which its keys and values are copied.
+    /// The generation going on as `stepping` says, sampled as `sampling` says from `noise`, of
+    /// which it draws all its patches' at once: in caches of a capacity of a power of two, those
+    /// of the graph captured for it on this thread where there is one, into which its keys and
+    /// values are copied.
     ///
     /// # Panics
     ///
     /// If `stepping` is [`Stepping::Eager`], which needs no stepper.
-    pub fn stepper(self, sampling: &Sampling, stepping: Stepping) -> Stepper<'a> {
+    pub fn stepper(
+        self,
+        sampling: &Sampling,
+        stepping: Stepping,
+        noise: &mut impl Noise,
+    ) -> Stepper<'a> {
         assert_ne!(stepping, Stepping::Eager, "a stepper of the eager step");
         let model = self.model;
         let needed = self.base_cache.capacity();
@@ -208,6 +235,10 @@ impl<'a> Generation<'a> {
             .take(&key)
             .unwrap_or_else(|| model.step_graph(capacity));
         let len = self.base_cache.len(0).expect("a generation's row holds it");
+        let (patches, draw) = (needed - len, model.feat_dim * model.patch_size);
+        let draws = (0..patches).flat_map(|_| noise.next(draw)).collect();
+        let draws = TensorData::new(draws, [patches, model.feat_dim, model.patch_size]);
+        let at = |n: usize| TensorData::from([n as i64]);
         {
             let mut guard = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
             let state = &mut *guard;
@@ -216,7 +247,12 @@ impl<'a> Generation<'a> {
             graph.write(&mut state.lm_hidden, self.lm_hidden);
             graph.write(&mut state.residual_hidden, self.residual_hidden);
             graph.write(&mut state.cond, self.cond);
-            let scale = |value| Tensor::full([1, 1, 1], value, &model.device);
+            let device = &model.device;
+            let noise = Tensor::from_data(draws, device);
+            graph.write_at(&mut state.noise, 0..patches, noise);
+            graph.write(&mut state.positions, Tensor::from_data(at(len), device));
+            graph.write(&mut state.draws, Tensor::from_data(at(0), device));
+            let scale = |value| Tensor::full([1, 1, 1], value, device);
             graph.write(&mut state.temperature, scale(sampling.temperature));
             graph.write(&mut state.cfg, scale(sampling.cfg_value));
         }
@@ -226,6 +262,7 @@ impl<'a> Generation<'a> {
             graph: Some(graph),
             captured: stepping == Stepping::Captured,
             len,
+            end: needed,
             timesteps: sampling.timesteps,
         }
     }
@@ -238,11 +275,27 @@ impl StepGraph {
     ///
     /// If the device says `target` shares its buffer, which the write would then move.
     fn write<const D: usize, K: Basic>(&self, target: &mut Tensor<D, K>, value: Tensor<D, K>) {
+        let rows = target.dims()[0];
+        self.write_at(target, 0..rows, value);
+    }
+
+    /// Writes `value` over the `rows` of `target`, in its buffer.
+    ///
+    /// # Panics
+    ///
+    /// As [`write`](Self::write).
+    fn write_at<const D: usize, K: Basic>(
+        &self,
+        target: &mut Tensor<D, K>,
+        rows: Range<usize>,
+        value: Tensor<D, K>,
+    ) {
         assert!(
             !self.shares_known || target.can_mut(),
             "a buffer the step reads is shared, so a write would move it from under the graph"
         );
-        let at = target.dims().map(|n| 0..n);
+        let mut at = target.dims().map(|n| 0..n);
+        at[0] = rows;
         target.inplace(|target| target.slice_assign(at, value));
     }
 
@@ -268,37 +321,33 @@ impl Stepper<'_> {
         graph.is_some_and(Graph::is_hardware)
     }
 
-    /// Samples the next patch from `noise` `[1, feat_dim, patch_size]` and feeds it to the LMs.
+    /// Samples the next patch from its noise and feeds it to the LMs.
     ///
     /// # Panics
     ///
-    /// If the caches are full.
-    pub fn step(&mut self, noise: Tensor<3>) -> Step {
+    /// If it has sampled as many patches as its generation was started for.
+    pub fn step(&mut self) -> Step {
         let graph = self.graph.as_mut().expect("held until dropped");
-        let capacity = self.key.0;
         assert!(
-            self.len < capacity,
-            "KV cache is full at {capacity} positions"
+            self.len < self.end,
+            "a patch past the {} positions",
+            self.end
         );
-        let position = Tensor::from_data(TensorData::from([self.len as i64]), &self.model.device);
-        {
-            let mut state = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
-            graph.write(&mut state.noise, noise);
-            graph.write(&mut state.positions, position);
-        }
-        let (step, lm_hidden, residual_hidden) = match self.captured {
+        let outputs = match self.captured {
             true => {
                 let graph = graph.captured(self.model, self.timesteps);
                 // Safety: the closure owns the state, and with it every buffer it reads and
                 // writes; the inputs were written, and the outputs are read, on this thread, the
                 // one the graph was captured on, as its key says.
-                let (step, lm_hidden, residual_hidden) = unsafe { graph.replay() };
+                let outputs = unsafe { graph.replay() };
                 // The next replay writes its outputs where this one did.
-                let step = Step {
-                    patch: copy(&step.patch),
-                    stop_logits: copy(&step.stop_logits),
-                };
-                (step, lm_hidden.clone(), residual_hidden.clone())
+                StepOutputs {
+                    step: Step {
+                        patch: copy(&outputs.step.patch),
+                        stop_logits: copy(&outputs.step.stop_logits),
+                    },
+                    ..outputs.clone()
+                }
             }
             false => {
                 let mut state = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -307,9 +356,12 @@ impl Stepper<'_> {
         };
         let graph = self.graph.as_ref().expect("held until dropped");
         let mut state = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
-        graph.write(&mut state.lm_hidden, lm_hidden);
-        graph.write(&mut state.residual_hidden, residual_hidden);
-        graph.write(&mut state.cond, step.patch.clone());
+        graph.write(&mut state.lm_hidden, outputs.lm_hidden);
+        graph.write(&mut state.residual_hidden, outputs.residual_hidden);
+        graph.write(&mut state.cond, outputs.step.patch.clone());
+        graph.write(&mut state.positions, outputs.positions);
+        graph.write(&mut state.draws, outputs.draws);
+        let step = outputs.step;
         state.caches.0.extend(1);
         state.caches.1.extend(1);
         self.len += 1;

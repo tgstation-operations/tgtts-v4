@@ -279,7 +279,10 @@ impl Model {
         let generation = self.start(prompt, max_patches)?;
         let generating = match self.stepping {
             Stepping::Eager => Generating::Eager(Box::new(generation)),
-            stepping => Generating::Stable(Box::new(generation.stepper(sampling, stepping))),
+            stepping => {
+                let stepper = generation.stepper(sampling, stepping, &mut *noise);
+                Generating::Stable(Box::new(stepper))
+            }
         };
         Ok(Patches {
             model: self,
@@ -347,17 +350,17 @@ impl<N: Noise> Iterator for Patches<'_, N> {
         if self.left == 0 {
             return None;
         }
-        let noise = self.model.noise(self.noise);
         let step = match &mut self.generating {
             Generating::Eager(generation) => {
                 if let Some(patch) = self.last.take() {
                     generation.advance(patch);
                 }
+                let noise = self.model.noise(self.noise);
                 let step = generation.sample(noise, self.sampling);
                 self.last = Some(step.patch.clone());
                 step
             }
-            Generating::Stable(stepper) => stepper.step(noise),
+            Generating::Stable(stepper) => stepper.step(),
         };
         self.given += 1;
         if !step.is_finite() {
@@ -370,7 +373,7 @@ impl<N: Noise> Iterator for Patches<'_, N> {
 }
 
 /// A patch sampled, and what the stop head said of the state it was sampled in.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Step {
     /// The patch `[1, patch_size, feat_dim]`, in f32.
     pub patch: Tensor<3>,

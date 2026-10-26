@@ -266,9 +266,8 @@ fn replays_as_kernel_by_kernel(precision: &Precision) {
     };
     let run = |stepping| {
         let generation = model.start(&prompt, params.max_patches).unwrap();
-        let mut stepper = generation.stepper(&params.sampling, stepping);
-        let mut noise = SeededNoise::new(0);
-        let steps = (0..REPLAYED).map(|_| stepper.step(model.noise(&mut noise)));
+        let mut stepper = generation.stepper(&params.sampling, stepping, &mut SeededNoise::new(0));
+        let steps = (0..REPLAYED).map(|_| stepper.step());
         let steps = steps.map(|step| [bits(step.patch), bits(step.stop_logits.unsqueeze())]);
         (steps.collect::<Vec<_>>(), stepper.is_recorded())
     };
