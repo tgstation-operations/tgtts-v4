@@ -11,7 +11,7 @@ use dsp::radio::{Assets, Pcm};
 use minicpm4::{Config, KvCache, LocalShape, Mask, Model};
 use serde_json::Value;
 use voices::{Latent, Voices};
-use voxcpm::{Batch, Params, Prompt, PromptCache, Scheduler, SeededNoise, TextToSpeech};
+use voxcpm::{Batch, Params, Prompt, PromptCache, Scheduler, SeededNoise, Stepping, TextToSpeech};
 
 use crate::{
     conditions::BIGMEM_LOCK,
@@ -34,7 +34,10 @@ pub const NAMES: &[&str] = &[
     "voxcpm.load",
     "voxcpm.prefill",
     "voxcpm.patch",
+    "voxcpm.patch.stable",
+    "voxcpm.patch.graph",
     "voxcpm.synthesize",
+    "voxcpm.synthesize.graph",
     "voxcpm.first_patch",
     "voxcpm.first_patch.cached",
     "voxcpm.batch.b1",
@@ -448,7 +451,9 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
     let load =
         || TextToSpeech::load(dir, &dtypes, &device).unwrap_or_else(|e| panic!("VoxCPM2: {e}"));
     let spec = Spec::new("voxcpm.load", 1, 2).param("page_cache", "warm");
-    let tts = r.measure(spec, || (), |()| load()).unwrap_or_else(load);
+    let mut tts = r.measure(spec, || (), |()| load()).unwrap_or_else(load);
+    // Every benchmark but those named for another runs as before graphs.
+    tts.set_stepping(Stepping::Eager);
     let prompt = tts.prompt(LINE, &latent).map_err(|e| e.to_string())?;
     let model = tts.model();
 
@@ -491,25 +496,54 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
         );
     }
 
+    // The same patch step, sampling a patch and feeding it to the LMs, by the step whose shapes
+    // are the same at every position, kernel by kernel and replayed. The graph's is captured in
+    // the first warmup.
+    for (name, stepping) in [
+        ("voxcpm.patch.stable", Stepping::Stable),
+        ("voxcpm.patch.graph", Stepping::Captured),
+    ] {
+        if !r.selected(name) {
+            continue;
+        }
+        let generation = model
+            .start(&prompt, params.max_patches)
+            .expect("the prompt fits the LM");
+        let mut noise = SeededNoise::new(14);
+        let mut stepper = generation.stepper(&params.sampling, stepping, &mut noise);
+        let spec = Spec::new(name, 2, 10)
+            .work(1.0, "patches")
+            .audio(FRAMES_PER_PATCH as f64 * FRAME_SECONDS)
+            .param("timesteps", params.sampling.timesteps)
+            .param("capacity", prompt.len() + params.max_patches);
+        r.measure(spec, || (), |()| stepper.step());
+    }
+
     voxcpm_batched(r, &tts, &table, (&voice, &latent))?;
 
     // On a GPU the first synthesis waits for autotune to choose the kernels of each KV length
-    // and decoder chunk it runs.
-    let spec = Spec::new("voxcpm.synthesize", usize::from(r.gpu), 2)
-        .param("voice", voice.as_str())
-        .param("text", LINE)
-        .param("max_patches", params.max_patches);
-    let audio = r.measure(
-        spec,
-        || SeededNoise::new(15),
-        |mut noise| {
-            tts.synthesize(LINE, &latent, &params, &mut noise)
-                .expect("the prompt fits the LM")
-        },
-    );
-    if let Some(audio) = audio {
-        let seconds = audio.len() as f64 / f64::from(tts.out_sample_rate());
-        r.set_audio("voxcpm.synthesize", seconds);
+    // and decoder chunk it runs, and with graphs for the step's to be captured.
+    for (name, stepping) in [
+        ("voxcpm.synthesize", Stepping::Eager),
+        ("voxcpm.synthesize.graph", Stepping::Captured),
+    ] {
+        tts.set_stepping(stepping);
+        let spec = Spec::new(name, usize::from(r.gpu), 2)
+            .param("voice", voice.as_str())
+            .param("text", LINE)
+            .param("max_patches", params.max_patches);
+        let audio = r.measure(
+            spec,
+            || SeededNoise::new(15),
+            |mut noise| {
+                tts.synthesize(LINE, &latent, &params, &mut noise)
+                    .expect("the prompt fits the LM")
+            },
+        );
+        if let Some(audio) = audio {
+            let seconds = audio.len() as f64 / f64::from(tts.out_sample_rate());
+            r.set_audio(name, seconds);
+        }
     }
     Ok(())
 }
