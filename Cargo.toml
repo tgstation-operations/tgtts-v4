@@ -35,4 +35,4 @@ vorbis_rs = { version = "0.5.6", default-features = false }
 
 # burn as the tgstation fork carries it, pinned by revision: changes to its GPU kernels land there first.
 [patch.crates-io]
-burn = { git = "https://git.scriptis.net/scriptis/burn.git", rev = "38a6e4daba404037ef630106feb58b183fa68b74" }
+burn = { git = "https://git.scriptis.net/scriptis/burn.git", rev = "9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c" }

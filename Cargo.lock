@@ -680,7 +680,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burn"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-core",
  "burn-linalg",
@@ -696,7 +696,7 @@ dependencies = [
 [[package]]
 name = "burn-autodiff"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-std",
@@ -711,7 +711,7 @@ dependencies = [
 [[package]]
 name = "burn-backend"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-std",
  "cubecl",
@@ -729,7 +729,7 @@ dependencies = [
 [[package]]
 name = "burn-backend-extension"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -739,7 +739,7 @@ dependencies = [
 [[package]]
 name = "burn-core"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-backend-extension",
@@ -768,7 +768,7 @@ dependencies = [
 [[package]]
 name = "burn-cpu"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
@@ -778,7 +778,7 @@ dependencies = [
 [[package]]
 name = "burn-cubecl"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-cubecl-fusion",
@@ -797,7 +797,7 @@ dependencies = [
 [[package]]
 name = "burn-cubecl-fusion"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-fusion",
@@ -815,7 +815,7 @@ dependencies = [
 [[package]]
 name = "burn-cuda"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
@@ -825,7 +825,7 @@ dependencies = [
 [[package]]
 name = "burn-derive"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-einsum",
  "derive-new",
@@ -837,7 +837,7 @@ dependencies = [
 [[package]]
 name = "burn-dispatch"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-autodiff",
  "burn-backend",
@@ -853,12 +853,12 @@ dependencies = [
 [[package]]
 name = "burn-einsum"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 
 [[package]]
 name = "burn-flex"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-ir",
@@ -876,7 +876,7 @@ dependencies = [
 [[package]]
 name = "burn-fusion"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-ir",
@@ -892,7 +892,7 @@ dependencies = [
 [[package]]
 name = "burn-ir"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-std",
@@ -903,7 +903,7 @@ dependencies = [
 [[package]]
 name = "burn-linalg"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-core",
  "burn-cubecl",
@@ -915,7 +915,7 @@ dependencies = [
 [[package]]
 name = "burn-ndarray"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "atomic_float",
  "burn-backend",
@@ -935,7 +935,7 @@ dependencies = [
 [[package]]
 name = "burn-nn"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-core",
  "burn-linalg",
@@ -945,7 +945,7 @@ dependencies = [
 [[package]]
 name = "burn-optim"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-core",
  "burn-derive",
@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "burn-pack"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-std",
  "byteorder",
@@ -971,7 +971,7 @@ dependencies = [
 [[package]]
 name = "burn-rocm"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
@@ -981,7 +981,7 @@ dependencies = [
 [[package]]
 name = "burn-signal"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-autodiff",
  "burn-core",
@@ -994,7 +994,7 @@ dependencies = [
 [[package]]
 name = "burn-std"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1019,7 +1019,7 @@ dependencies = [
 [[package]]
 name = "burn-store"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-core",
  "burn-pack",
@@ -1037,7 +1037,7 @@ dependencies = [
 [[package]]
 name = "burn-tch"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "cc",
@@ -1050,7 +1050,7 @@ dependencies = [
 [[package]]
 name = "burn-tensor"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-derive",
@@ -1066,7 +1066,7 @@ dependencies = [
 [[package]]
 name = "burn-vision"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "aligned-vec",
  "bon",
@@ -1086,7 +1086,7 @@ dependencies = [
 [[package]]
 name = "burn-wgpu"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
@@ -4950,7 +4950,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "pytorch-reader"
 version = "0.22.1"
-source = "git+https://git.scriptis.net/scriptis/burn.git?rev=38a6e4daba404037ef630106feb58b183fa68b74#38a6e4daba404037ef630106feb58b183fa68b74"
+source = "git+https://git.scriptis.net/scriptis/burn.git?rev=9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c#9d8780dbc62fc95c305df0a9ed3946b9da1f6e9c"
 dependencies = [
  "byteorder",
  "crc32fast",
