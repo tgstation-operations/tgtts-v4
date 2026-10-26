@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
 use serde::{
     Deserialize, Deserializer,
-    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+    de::{Error as _, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use serde_json::Value;
 
@@ -154,11 +154,12 @@ pub enum Node {
     /// The pitch shifted by `semitones`, in [-24, 24], the duration kept, by `method`. The
     /// formants move with the pitch, as a voice played faster would, unless `keep_formants`,
     /// false by default, keeps them where they were, as the same voice speaking higher would.
+    /// It is true or false, or 1 or 0, as the game's json_encode writes TRUE and FALSE.
     Pitch {
         /// The shift, in semitones, up where positive.
         semitones: f64,
-        /// Whether the formants stay where they are.
-        #[serde(default)]
+        /// Whether the formants stay where they are: true or 1, false or 0.
+        #[serde(default, deserialize_with = "keep_formants")]
         keep_formants: bool,
         /// How the time is stretched.
         #[serde(default)]
@@ -323,6 +324,17 @@ fn objects<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 ) -> Result<Vec<T>, D::Error> {
     let objects = Vec::<Object<T>>::deserialize(deserializer)?;
     Ok(objects.into_iter().map(|Object(t)| t).collect())
+}
+
+fn keep_formants<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::Bool(kept) => Ok(kept),
+        Value::Number(n) if n.as_u64() == Some(1) => Ok(true),
+        Value::Number(n) if n.as_u64() == Some(0) => Ok(false),
+        value => Err(D::Error::custom(format!(
+            "keep_formants {value} is not true, false, 1 or 0"
+        ))),
+    }
 }
 
 fn butterworth() -> f64 {

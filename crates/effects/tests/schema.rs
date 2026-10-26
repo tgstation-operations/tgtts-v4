@@ -5,7 +5,7 @@ use std::sync::Arc;
 use effects::{
     Pipeline,
     convolve::{Impulses, Response},
-    schema,
+    schema::{self, Graph, Method, Node},
 };
 
 fn check(json: &str) -> Result<(), String> {
@@ -123,6 +123,32 @@ fn refuses_nodes_and_taps_written_as_arrays() {
         r#"[[{"effect": "echo", "taps": [{"delay_ms": 0, "weight": 1}, [100, 0.5]]}]]"#,
         "effects[0], node 0: invalid type: sequence, expected an object",
     );
+}
+
+#[test]
+fn takes_keep_formants_as_true_or_false_or_as_the_game_writes_them() {
+    let pitch = |keep: &str| {
+        format!(r#"[[{{"effect": "pitch", "semitones": 2, "keep_formants": {keep}}}]]"#)
+    };
+    for (keep, kept) in [("true", true), ("false", false), ("1", true), ("0", false)] {
+        let value = serde_json::from_str(&pitch(keep)).unwrap();
+        let pitch = Node::Pitch {
+            semitones: 2.0,
+            keep_formants: kept,
+            method: Method::Vocoder,
+        };
+        assert_eq!(
+            schema::parse(&value),
+            Ok(vec![Graph::Chain(vec![pitch])]),
+            "{keep}"
+        );
+    }
+    for keep in ["2", "-1", "0.5", "1.0", r#""true""#, "null"] {
+        refused(
+            &pitch(keep),
+            &format!("effects[0], node 0: keep_formants {keep} is not true, false, 1 or 0"),
+        );
+    }
 }
 
 #[test]
