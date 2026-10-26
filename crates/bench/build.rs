@@ -31,7 +31,7 @@ fn main() {
     set("BENCH_RUSTC", &rustc);
 
     let lock = fs::read_to_string(lock).unwrap_or_default();
-    let versions: Vec<String> = ["burn", "burn-flex", "gemm", "pulp"]
+    let versions: Vec<String> = ["burn", "burn-flex", "gemm", "pulp", "cubecl", "wgpu"]
         .iter()
         .map(|name| format!("{name} {}", locked_versions(&lock, name).join("/")))
         .collect();

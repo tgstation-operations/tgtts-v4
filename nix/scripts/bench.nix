@@ -21,6 +21,8 @@ pkgs.writeShellApplication {
       CARGO_UNSTABLE_RUSTDOC_DEPINFO=true
     # The C libraries the devshell's buildInputs give, which a bare `nix run` lacks.
     export PKG_CONFIG_PATH=${pkgs.lib.getDev pkgs.soxr}/lib/pkgconfig
+    # As the devshell has it: wgpu opens the Vulkan loader at run time.
+    export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
     cargo_args=()
     for arg; do
@@ -52,7 +54,7 @@ pkgs.writeShellApplication {
 
     features=$(
       cargo tree --locked -p bench -e normal "''${tree_args[@]}" --prefix none -f '{p} [{f}]' |
-        grep -E '^(burn-flex|gemm|gemm-common|pulp) ' | sed 's/ (\*)$//' | sort -u
+        grep -E '^(burn-cubecl|burn-flex|gemm|gemm-common|pulp) ' | sed 's/ (\*)$//' | sort -u
     ) || features=unknown
     export BENCH_CARGO_ARGS="''${cargo_args[*]}" BENCH_RESOLVED_FEATURES="$features"
     exec cargo run --locked "''${profile[@]}" -p bench "''${cargo_args[@]}" -- "$@"

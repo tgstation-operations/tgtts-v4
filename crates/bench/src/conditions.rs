@@ -12,10 +12,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::device::Gpu;
+
 /// Taken for the whole of a run, so that two runs never time each other.
 pub const BENCH_LOCK: &str = "/tmp/tts-rs-bench.lock";
 /// Taken by whatever loads whole model stacks, tests included, while it holds them.
 pub const BIGMEM_LOCK: &str = "/tmp/tts-rs-bigmem.lock";
+/// Taken by whatever runs on the GPU, tests included, while it does, after [`BIGMEM_LOCK`].
+pub const GPU_LOCK: &str = "/tmp/tts-rs-gpu.lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conditions {
@@ -35,6 +39,9 @@ pub struct Conditions {
     /// The hardware events each benchmark records, and why the others could not be counted.
     #[serde(default)]
     pub counters: CounterSupport,
+    /// The GPU the run timed, if it timed one.
+    #[serde(default)]
+    pub gpu: Option<Gpu>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -54,7 +61,7 @@ pub struct Build {
     pub target: String,
     pub target_features: String,
     /// What `nix run .#bench` passed to cargo, and the features cargo resolved for burn's CPU
-    /// backend with them; unknown when the binary was run some other way.
+    /// and GPU backends with them; unknown when the binary was run some other way.
     pub cargo_args: Option<String>,
     pub resolved_features: Option<String>,
 }
@@ -85,7 +92,7 @@ pub struct Threads {
 impl Conditions {
     /// What can be read before the run; the `after` fields are filled by
     /// [`finish`](Self::finish).
-    pub fn before(counters: CounterSupport) -> Self {
+    pub fn before(counters: CounterSupport, gpu: Option<Gpu>) -> Self {
         let (commit, dirty, dirty_files) = git();
         Self {
             commit,
@@ -126,6 +133,7 @@ impl Conditions {
             mem_available_mib_after: None,
             peak_rss_mib: None,
             counters,
+            gpu,
         }
     }
 

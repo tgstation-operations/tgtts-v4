@@ -479,6 +479,7 @@ dependencies = [
  "audiovae",
  "burn",
  "dsp",
+ "gpu",
  "libc",
  "minicpm4",
  "serde",

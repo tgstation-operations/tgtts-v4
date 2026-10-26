@@ -69,8 +69,8 @@ pkgs.writeShellApplication {
     # wgpu into every crate it reaches, and its tests need the GPU. The GPU
     # code is linted on its own.
     stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
-    stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts --all-targets \
-      --features gpu/vulkan,tgtts/vulkan -- -D warnings
+    stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts -p bench --all-targets \
+      --features gpu/vulkan,tgtts/vulkan,bench/vulkan -- -D warnings
     stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
     stage test cargo test --locked --workspace
 

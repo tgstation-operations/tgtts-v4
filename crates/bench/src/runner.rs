@@ -3,9 +3,10 @@ use std::{collections::BTreeMap, time::Instant};
 use burn::tensor::{Device, FloatDType, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use voxcpm::Dtypes;
 
 use crate::{
-    conditions::{CpuTimes, Quietness, lock},
+    conditions::{CpuTimes, GPU_LOCK, Quietness, lock},
     counters::Counters,
     stats::{Summary, duration},
 };
@@ -86,8 +87,13 @@ impl Spec {
 
 pub struct Runner {
     pub device: Device,
-    pub dtype: FloatDType,
+    pub dtypes: Dtypes,
     names: &'static [&'static str],
+    /// Whether the device is a GPU, whose autotune chooses the kernels of each shape as it
+    /// first runs, by timing them.
+    pub gpu: bool,
+    /// Names never run, whatever the filters, as those of work the device does not do.
+    skipped: &'static [&'static str],
     filters: Vec<String>,
     warmup: Option<usize>,
     reps: Option<usize>,
@@ -106,7 +112,7 @@ pub struct Counts {
 impl Runner {
     pub fn new(
         device: Device,
-        dtype: FloatDType,
+        dtypes: Dtypes,
         names: &'static [&'static str],
         filters: Vec<String>,
         counts: Counts,
@@ -115,8 +121,10 @@ impl Runner {
     ) -> Self {
         Self {
             device,
-            dtype,
+            dtypes,
             names,
+            gpu: false,
+            skipped: &[],
             filters,
             warmup: counts.warmup,
             reps: counts.reps,
@@ -127,8 +135,19 @@ impl Runner {
         }
     }
 
-    pub fn selected(&self, name: &str) -> bool {
+    /// Times a GPU, on which none of `cpu_only` runs.
+    pub fn on_gpu(&mut self, cpu_only: &'static [&'static str]) {
+        self.gpu = true;
+        self.skipped = cpu_only;
+    }
+
+    /// Whether the filters select `name`, whether or not it runs.
+    pub fn filtered(&self, name: &str) -> bool {
         self.filters.is_empty() || self.filters.iter().any(|f| name.contains(f.as_str()))
+    }
+
+    pub fn selected(&self, name: &str) -> bool {
+        self.filtered(name) && !self.skipped.contains(&name)
     }
 
     pub fn any_selected(&self, prefix: &str) -> bool {
@@ -158,6 +177,11 @@ impl Runner {
             }
         }
         Ok(file)
+    }
+
+    /// Takes [`GPU_LOCK`] if the device is a GPU.
+    pub fn lock_gpu(&mut self) -> Result<Option<std::fs::File>, String> {
+        self.gpu.then(|| self.lock(GPU_LOCK)).transpose()
     }
 
     /// Runs `spec` if the filters select it: `setup` before each repetition, untimed, then
@@ -257,17 +281,21 @@ impl Runner {
         }
     }
 
-    fn sync(&self) {
+    pub fn sync(&self) {
         self.device
             .sync()
             .expect("the device failed to run a benchmark");
     }
 
-    /// A tensor of `shape` in the runner's dtype, uniform in [-1, 1) from `seed`, the same on
-    /// every run.
-    pub fn seeded<const D: usize>(&self, shape: [usize; D], seed: u64) -> Tensor<D> {
+    /// A tensor of `shape` in `dtype`, uniform in [-1, 1) from `seed`, the same on every run.
+    pub fn seeded<const D: usize>(
+        &self,
+        shape: [usize; D],
+        seed: u64,
+        dtype: FloatDType,
+    ) -> Tensor<D> {
         let values = uniform(seed, shape.iter().product());
-        Tensor::<D>::from_data(TensorData::new(values, shape), &self.device).cast(self.dtype)
+        Tensor::<D>::from_data(TensorData::new(values, shape), &self.device).cast(dtype)
     }
 }
 

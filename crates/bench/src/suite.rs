@@ -3,12 +3,12 @@
 use std::{fs, path::Path};
 
 use audiovae::{AudioVaeConfig, Decoder, Encoder, Weights};
-use burn::module::Module;
+use burn::{module::Module, tensor::FloatDType};
 use dsp::radio::{Assets, Pcm};
 use minicpm4::{Config, KvCache, LocalShape, Mask, Model};
 use serde_json::Value;
 use voices::{Latent, Voices};
-use voxcpm::{Dtypes, Params, SeededNoise, TextToSpeech};
+use voxcpm::{Params, SeededNoise, TextToSpeech};
 
 use crate::{
     conditions::BIGMEM_LOCK,
@@ -48,6 +48,10 @@ pub const NAMES: &[&str] = &[
     "dsp.blips.message",
     "dsp.sentences.segment",
 ];
+
+/// The benchmarks of what is never run on a GPU: the audio VAE's encoder, which reset the GPU
+/// the display runs on when it ran there.
+pub const CPU_ONLY: &[&str] = &["audiovae.encoder.load", "audiovae.encode"];
 
 /// The positions of the prompt prod builds for the median voice of the converted set: the
 /// reference prefix (179 patches between two markers), a 105-token transcript, a 15-token
@@ -89,6 +93,9 @@ pub struct Data<'a> {
 /// Refuses, before anything is timed, a selection that could not run to the end.
 pub fn check(r: &Runner, data: &Data) -> Result<(), String> {
     if !NAMES.iter().any(|name| r.selected(name)) {
+        if CPU_ONLY.iter().any(|name| r.filtered(name)) && r.gpu {
+            return Err("the audio VAE's encoder is timed only on the CPU".into());
+        }
         return Err("no benchmark matches the filters".into());
     }
     let mut missing = Vec::new();
@@ -161,6 +168,7 @@ fn minicpm4(r: &mut Runner, dir: &Path) -> Result<(), String> {
     let dit = lm.local(&local_shape(&json["dit_config"])?);
     let weights = dir.join("model.safetensors");
     let _bigmem = r.lock(BIGMEM_LOCK)?;
+    let _gpu = r.lock_gpu()?;
 
     let wanted = |r: &Runner, stack: &str| {
         r.any_selected(&format!("minicpm4.{stack}.")) || r.selected("minicpm4.patch")
@@ -169,26 +177,49 @@ fn minicpm4(r: &mut Runner, dir: &Path) -> Result<(), String> {
         let [prefill, step] = ["prefill", "step"].map(|b| format!("minicpm4.{stack}.{b}"));
         r.selected(&prefill) || r.selected(&step) || r.selected("minicpm4.patch")
     };
-    let load = |r: &mut Runner, stack: &str, config: &Config, prefix: &str| {
-        load_stack(r, stack, config, &weights, prefix)
+    let load = |r: &mut Runner, stack: &str, config: &Config, prefix: &str, dtype| {
+        load_stack(r, stack, config, &weights, prefix, dtype)
+    };
+    let dtypes = r.dtypes;
+    // The steps the step and patch benchmarks take from the prompt, which on a GPU are first
+    // taken untimed.
+    let ahead = |r: &Runner, stack: &str| {
+        let taken = |name: &str, spec| {
+            let (warmup, reps) = r.counts(&spec);
+            if r.selected(name) { warmup + reps } else { 0 }
+        };
+        let name = format!("minicpm4.{stack}.step");
+        taken(&name, step_spec(stack)) + taken("minicpm4.patch", patch_spec())
     };
 
-    let base = wanted(r, "base_lm").then(|| load(r, "base_lm", &lm, "base_lm."));
+    let base = wanted(r, "base_lm").then(|| load(r, "base_lm", &lm, "base_lm.", dtypes.lm));
     let base_cache = base
         .as_ref()
         .filter(|_| stepped(r, "base_lm"))
-        .map(|model| lm_benches(r, "base_lm", model, lm.hidden_size, 1));
+        .map(|model| {
+            let ahead = ahead(r, "base_lm");
+            lm_benches(r, "base_lm", model, lm.hidden_size, 1, ahead)
+        });
 
-    let residual_lm =
-        wanted(r, "residual_lm").then(|| load(r, "residual_lm", &residual, "residual_lm."));
+    let residual_lm = wanted(r, "residual_lm")
+        .then(|| load(r, "residual_lm", &residual, "residual_lm.", dtypes.lm));
     let residual_cache = residual_lm
         .as_ref()
         .filter(|_| stepped(r, "residual_lm"))
-        .map(|model| lm_benches(r, "residual_lm", model, residual.hidden_size, 3));
+        .map(|model| {
+            let ahead = ahead(r, "residual_lm");
+            lm_benches(r, "residual_lm", model, residual.hidden_size, 3, ahead)
+        });
 
-    let local_encoder = wanted(r, "local_encoder")
-        .then(|| load(r, "local_encoder", &encoder, "feat_encoder.encoder."));
-    let encoder_patch = r.seeded([1, ENCODER_TOKENS, encoder.hidden_size], 5);
+    let local_encoder = wanted(r, "local_encoder").then(|| {
+        let prefix = "feat_encoder.encoder.";
+        load(r, "local_encoder", &encoder, prefix, dtypes.local_encoder)
+    });
+    let encoder_patch = r.seeded(
+        [1, ENCODER_TOKENS, encoder.hidden_size],
+        5,
+        dtypes.local_encoder,
+    );
     if let Some(model) = &local_encoder {
         let spec = Spec::new("minicpm4.local_encoder.patch", 5, 30)
             .work(1.0, "patches")
@@ -199,7 +230,8 @@ fn minicpm4(r: &mut Runner, dir: &Path) -> Result<(), String> {
             || (),
             |()| model.forward(encoder_patch.clone(), Mask::Bidirectional),
         );
-        let prompt = r.seeded([PROMPT, ENCODER_TOKENS, encoder.hidden_size], 6);
+        let shape = [PROMPT, ENCODER_TOKENS, encoder.hidden_size];
+        let prompt = r.seeded(shape, 6, dtypes.local_encoder);
         let spec = Spec::new("minicpm4.local_encoder.prompt", 1, 5)
             .work(PROMPT as f64, "patches")
             .param("batch", PROMPT)
@@ -211,10 +243,12 @@ fn minicpm4(r: &mut Runner, dir: &Path) -> Result<(), String> {
         );
     }
 
-    let local_dit = wanted(r, "local_dit")
-        .then(|| load(r, "local_dit", &dit, "feat_decoder.estimator.decoder."));
+    let local_dit = wanted(r, "local_dit").then(|| {
+        let prefix = "feat_decoder.estimator.decoder.";
+        load(r, "local_dit", &dit, prefix, dtypes.local_dit)
+    });
     // A batch of two: the conditioned and the unconditioned halves of classifier-free guidance.
-    let dit_input = r.seeded([2, DIT_TOKENS, dit.hidden_size], 7);
+    let dit_input = r.seeded([2, DIT_TOKENS, dit.hidden_size], 7, dtypes.local_dit);
     if let Some(model) = &local_dit {
         let spec = Spec::new("minicpm4.local_dit.eval", 5, 30)
             .work(1.0, "evals")
@@ -236,7 +270,7 @@ fn minicpm4(r: &mut Runner, dir: &Path) -> Result<(), String> {
         let residual_lm = residual_lm.expect(loaded);
         let mut residual_cache = residual_cache.expect(loaded);
         let (local_encoder, local_dit) = (local_encoder.expect(loaded), local_dit.expect(loaded));
-        let base_input = r.seeded([1, 1, lm.hidden_size], 8);
+        let base_input = r.seeded([1, 1, lm.hidden_size], 8, dtypes.lm);
         let (warmup, reps) = r.counts(&step_spec("base_lm"));
         let stepped = if r.selected("minicpm4.base_lm.step") {
             warmup + reps
@@ -266,8 +300,15 @@ fn minicpm4(r: &mut Runner, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn load_stack(r: &mut Runner, stack: &str, config: &Config, weights: &Path, prefix: &str) -> Model {
-    let (dtype, device) = (r.dtype, r.device.clone());
+fn load_stack(
+    r: &mut Runner,
+    stack: &str,
+    config: &Config,
+    weights: &Path,
+    prefix: &str,
+    dtype: FloatDType,
+) -> Model {
+    let device = r.device.clone();
     let load = || {
         Model::load(config, weights, prefix, dtype, &device)
             .unwrap_or_else(|e| panic!("{prefix}: {e}"))
@@ -291,9 +332,19 @@ fn patch_spec() -> Spec {
 }
 
 /// A causal stack's prefill of the prompt, then steps from its end; gives the cache the steps
-/// left, for the patch to go on from.
-fn lm_benches(r: &mut Runner, stack: &str, model: &Model, hidden: usize, seed: u64) -> KvCache {
-    let prompt = r.seeded([1, PROMPT, hidden], seed);
+/// left, for the patch to go on from. On a GPU the `ahead` steps the benchmarks will take are
+/// first taken untimed in a cache of their own, for autotune to choose the kernels of each KV
+/// length before they are timed.
+fn lm_benches(
+    r: &mut Runner,
+    stack: &str,
+    model: &Model,
+    hidden: usize,
+    seed: u64,
+    ahead: usize,
+) -> KvCache {
+    let dtype = r.dtypes.lm;
+    let prompt = r.seeded([1, PROMPT, hidden], seed, dtype);
     let empty = || model.cache(1, PROMPT + MAX_PATCHES);
     let prefill = |mut cache: KvCache| {
         let out = model.forward_cached(prompt.clone(), &mut cache);
@@ -306,7 +357,14 @@ fn lm_benches(r: &mut Runner, stack: &str, model: &Model, hidden: usize, seed: u
     let filled = r.measure(spec, empty, prefill);
     let (mut cache, _) = filled.unwrap_or_else(|| prefill(empty()));
 
-    let step = r.seeded([1, 1, hidden], seed + 1);
+    let step = r.seeded([1, 1, hidden], seed + 1, dtype);
+    if r.gpu {
+        let (mut scratch, _) = prefill(empty());
+        for _ in 0..ahead {
+            model.forward_cached(step.clone(), &mut scratch);
+        }
+        r.sync();
+    }
     let spec = step_spec(stack)
         .work(1.0, "tokens")
         .param("context_from", PROMPT)
@@ -345,16 +403,11 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
         }
         None => median_voice(&table)?,
     };
-    let dtype = r.dtype;
-    let dtypes = Dtypes {
-        lm: dtype,
-        local_encoder: dtype,
-        local_dit: dtype,
-        audio_decoder: dtype,
-    };
+    let dtypes = r.dtypes;
     let params = Params::default();
     let device = r.device.clone();
     let _bigmem = r.lock(BIGMEM_LOCK)?;
+    let _gpu = r.lock_gpu()?;
 
     let load =
         || TextToSpeech::load(dir, &dtypes, &device).unwrap_or_else(|e| panic!("VoxCPM2: {e}"));
@@ -375,6 +428,17 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
             .param("positions", prompt.len());
         let generation = r.measure(spec, || (), |()| start());
         let mut generation = generation.unwrap_or_else(start);
+        if r.gpu {
+            // The patches the benchmark will sample, first sampled untimed, for autotune to
+            // choose the kernels of each KV length they grow through before they are timed.
+            let (warmup, reps) = r.counts(&patch_step_spec());
+            let (mut scratch, mut noise) = (start(), SeededNoise::new(14));
+            for _ in 0..warmup + reps {
+                let step = scratch.sample(model.noise(&mut noise), &params.sampling);
+                scratch.advance(step.patch);
+            }
+            r.sync();
+        }
         let mut noise = SeededNoise::new(14);
         let spec = patch_step_spec()
             .work(1.0, "patches")
@@ -391,7 +455,9 @@ fn voxcpm(r: &mut Runner, data: &Data) -> Result<(), String> {
         );
     }
 
-    let spec = Spec::new("voxcpm.synthesize", 0, 2)
+    // On a GPU the first synthesis waits for autotune to choose the kernels of each KV length
+    // and decoder chunk it runs.
+    let spec = Spec::new("voxcpm.synthesize", usize::from(r.gpu), 2)
         .param("voice", voice.as_str())
         .param("text", LINE)
         .param("max_patches", params.max_patches);
@@ -419,7 +485,9 @@ fn audiovae(r: &mut Runner, dir: &Path) -> Result<(), String> {
     let config: AudioVaeConfig = serde_json::from_value(json["audio_vae_config"].clone())
         .map_err(|e| format!("config.json: audio_vae_config: {e}"))?;
     let path = dir.join("audiovae.pth");
-    let (dtype, device) = (r.dtype, r.device.clone());
+    // The encoder runs in the decoder's dtype, having none of its own.
+    let (dtype, device) = (r.dtypes.audio_decoder, r.device.clone());
+    let _gpu = r.lock_gpu()?;
     let weights = || Weights::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let frame_seconds =
         config.decoder_rates.iter().product::<usize>() as f64 / f64::from(config.out_sample_rate);
@@ -433,14 +501,14 @@ fn audiovae(r: &mut Runner, dir: &Path) -> Result<(), String> {
         let decoder = r.measure(spec, || (), |()| load()).unwrap_or_else(load);
 
         let frames = UTTERANCE_PATCHES * FRAMES_PER_PATCH;
-        let latents = r.seeded([1, config.latent_dim, frames], 9);
+        let latents = r.seeded([1, config.latent_dim, frames], 9, dtype);
         let spec = Spec::new("audiovae.decode.utterance", 1, 10)
             .audio(frames as f64 * frame_seconds)
             .param("frames", frames);
         r.measure(spec, || (), |()| decoder.decode(latents.clone()));
 
         let frames = DECODE_CONTEXT_FRAMES + FRAMES_PER_PATCH;
-        let latents = r.seeded([1, config.latent_dim, frames], 10);
+        let latents = r.seeded([1, config.latent_dim, frames], 10, dtype);
         let spec = Spec::new("audiovae.decode.patch", 3, 30)
             .audio(FRAMES_PER_PATCH as f64 * frame_seconds)
             .param("frames", frames)
@@ -457,7 +525,7 @@ fn audiovae(r: &mut Runner, dir: &Path) -> Result<(), String> {
         let encoder = r.measure(spec, || (), |()| load()).unwrap_or_else(load);
 
         let samples = ENCODE_SECONDS * config.sample_rate as usize;
-        let audio = r.seeded([1, 1, samples], 11);
+        let audio = r.seeded([1, 1, samples], 11, dtype);
         let spec = Spec::new("audiovae.encode", 1, 5)
             .audio(ENCODE_SECONDS as f64)
             .param("samples", samples);

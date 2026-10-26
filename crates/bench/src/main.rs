@@ -9,6 +9,7 @@
 mod compare;
 mod conditions;
 mod counters;
+mod device;
 mod runner;
 mod stats;
 mod suite;
@@ -20,20 +21,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use burn::tensor::{Device, FloatDType};
+use burn::tensor::FloatDType;
 use serde::{Deserialize, Serialize};
+use voxcpm::Dtypes;
 
 use crate::{
     conditions::{BENCH_LOCK, Conditions, CounterSupport, Quietness, lock},
     counters::Counters,
+    device::{dtype_name, parse_dtype},
     runner::{Counts, Measurement, Runner, line},
-    suite::{Data, NAMES},
+    suite::{CPU_ONLY, Data, NAMES},
 };
 
 const USAGE: &str = "\
-usage: bench [run] [--filter TEXT]... [--quick] [--warmup N] [--reps N] [--dtype f32|f16|bf16]
-             [--device flex] [--voice NAME] [--label TEXT] [--out DIR] [--max-load CPUS]
-             [--noisy-ok]
+usage: bench [run] [--filter TEXT]... [--quick] [--warmup N] [--reps N] [--device flex|vulkan]
+             [--dtype D] [--lm-dtype D] [--local-encoder-dtype D] [--local-dit-dtype D]
+             [--audio-decoder-dtype D] [--autotune-cache DIR] [--voice NAME] [--label TEXT]
+             [--out DIR] [--max-load CPUS] [--noisy-ok]
        bench compare BASE.json NEW.json [--spread RUN.json RUN.json...]
        bench show RUN.json
        bench list
@@ -45,6 +49,15 @@ radio's sounds, and writes
 repetitions, for trying the harness, not for measuring. It refuses to start, with exit status 3,
 while the 1-minute load average or the CPUs others keep busy exceed --max-load (default 1);
 --noisy-ok times anyway and marks the run noisy.
+
+Each part of the model runs in --dtype (f32, f16 or bf16), or in the dtype its own option names.
+--device vulkan, in a build with the vulkan feature (nix run .#bench -- --features vulkan --
+--device vulkan), times the Vulkan GPU wgpu prefers, refusing a CPU that presents itself as one,
+by default in the dtypes the service serves in there, f16 but for the audio decoder's f32. Its
+autotune keeps the kernels it chose in --autotune-cache (target/bench/autotune by default), and
+the benchmarks that grow through KV lengths first run through them untimed; the audio VAE's
+encoder is never timed there. A GPU's times run to the device's having finished, and its
+counters count only the host's share: launching the kernels and waiting for them.
 
 compare says which benchmarks changed between two runs beyond their noise; --spread names runs
 of one commit taken back to back, whose differences measure the run-to-run noise.";
@@ -72,7 +85,12 @@ pub struct Run {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Options {
     pub device: String,
-    pub dtype: String,
+    /// The dtype --dtype gave every part, or `f32` where none was given before parts had
+    /// dtypes of their own.
+    pub dtype: Option<String>,
+    /// What each part ran in, absent from runs before parts had dtypes of their own.
+    #[serde(default)]
+    pub dtypes: Option<PartDtypes>,
     pub filters: Vec<String>,
     pub warmup: Option<usize>,
     pub reps: Option<usize>,
@@ -80,6 +98,25 @@ pub struct Options {
     pub voice: Option<String>,
     pub max_load: f64,
     pub noisy_ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PartDtypes {
+    pub lm: String,
+    pub local_encoder: String,
+    pub local_dit: String,
+    pub audio_decoder: String,
+}
+
+impl From<Dtypes> for PartDtypes {
+    fn from(dtypes: Dtypes) -> Self {
+        Self {
+            lm: dtype_name(dtypes.lm).into(),
+            local_encoder: dtype_name(dtypes.local_encoder).into(),
+            local_dit: dtype_name(dtypes.local_dit).into(),
+            audio_decoder: dtype_name(dtypes.audio_decoder).into(),
+        }
+    }
 }
 
 pub enum Failure {
@@ -130,7 +167,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
     };
     let mut options = Options {
         device: "flex".into(),
-        dtype: "f32".into(),
+        dtype: None,
+        dtypes: None,
         filters: Vec::new(),
         warmup: None,
         reps: None,
@@ -139,7 +177,8 @@ fn run(args: &[String]) -> Result<(), Failure> {
         max_load: DEFAULT_MAX_LOAD,
         noisy_ok: false,
     };
-    let (mut label, mut out) = (None, None);
+    let (mut label, mut out, mut autotune_cache) = (None, None, None);
+    let mut parts: [Option<String>; 4] = Default::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = || {
@@ -151,7 +190,12 @@ fn run(args: &[String]) -> Result<(), Failure> {
             "--quick" => options.quick = true,
             "--warmup" => options.warmup = Some(number(arg, &value()?)?),
             "--reps" => options.reps = Some(number(arg, &value()?)?),
-            "--dtype" => options.dtype = value()?,
+            "--dtype" => options.dtype = Some(value()?),
+            "--lm-dtype" => parts[0] = Some(value()?),
+            "--local-encoder-dtype" => parts[1] = Some(value()?),
+            "--local-dit-dtype" => parts[2] = Some(value()?),
+            "--audio-decoder-dtype" => parts[3] = Some(value()?),
+            "--autotune-cache" => autotune_cache = Some(PathBuf::from(value()?)),
             "--device" => options.device = value()?,
             "--voice" => options.voice = Some(value()?),
             "--label" => label = Some(value()?),
@@ -161,16 +205,26 @@ fn run(args: &[String]) -> Result<(), Failure> {
             other => return Err(Failure::Usage(format!("unknown argument {other}"))),
         }
     }
-    let dtype = match options.dtype.as_str() {
-        "f32" => FloatDType::F32,
-        "f16" => FloatDType::F16,
-        "bf16" => FloatDType::BF16,
-        other => return Err(Failure::Usage(format!("unknown dtype {other}"))),
-    };
-    let device = match options.device.as_str() {
-        "flex" => Device::flex(),
-        other => return Err(Failure::Usage(format!("this build has no device {other}"))),
-    };
+    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    let autotune_cache = autotune_cache.unwrap_or_else(|| target.join("bench/autotune"));
+    let (device, gpu) = device::open(&options.device, &autotune_cache).map_err(Failure::Usage)?;
+    let dtypes = dtypes(gpu.is_some(), options.dtype.as_deref(), &parts).map_err(Failure::Usage)?;
+    for (dtype, part) in [
+        (dtypes.lm, "lm"),
+        (dtypes.local_encoder, "local encoder"),
+        (dtypes.local_dit, "local DiT"),
+        (dtypes.audio_decoder, "audio decoder"),
+    ] {
+        if !device.supports_dtype(dtype) {
+            let name = dtype_name(dtype);
+            let reason = format!(
+                "the {} device does not compute the {part} in {name}",
+                options.device
+            );
+            return Err(Failure::Usage(reason));
+        }
+    }
+    options.dtypes = Some(dtypes.into());
     let counts = if options.quick {
         Counts {
             warmup: Some(options.warmup.unwrap_or(1)),
@@ -186,13 +240,16 @@ fn run(args: &[String]) -> Result<(), Failure> {
     let counters = (!support.recorded.is_empty()).then_some(counters);
     let mut runner = Runner::new(
         device,
-        dtype,
+        dtypes,
         NAMES,
         filters,
         counts,
         options.max_load,
         counters,
     );
+    if gpu.is_some() {
+        runner.on_gpu(CPU_ONLY);
+    }
     let dir = |var| {
         env::var_os(var)
             .filter(|v| !v.is_empty())
@@ -224,7 +281,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     }
     eprintln!("bench: {state}");
 
-    let mut conditions = Conditions::before(support);
+    let mut conditions = Conditions::before(support, gpu);
     let started = now();
     suite::run(&mut runner, &data).map_err(Failure::Failed)?;
     conditions.finish();
@@ -239,8 +296,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
         benchmarks: runner.measurements,
     };
 
-    let out =
-        out.unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bench"));
+    let out = out.unwrap_or_else(|| target.join("bench"));
     fs::create_dir_all(&out).map_err(|e| Failure::Failed(format!("{}: {e}", out.display())))?;
     let out = fs::canonicalize(&out).unwrap_or(out);
     let commit = run.conditions.commit.as_deref().unwrap_or("unknown");
@@ -260,6 +316,48 @@ fn run(args: &[String]) -> Result<(), Failure> {
     print!("{}", summary(&run));
     eprintln!("bench: wrote {}", path.display());
     Ok(())
+}
+
+/// What each part runs in: its own option's dtype, else --dtype's, else f32 on the CPU, and on a
+/// GPU what the service serves in there, f16 but for the audio decoder, whose first transposed
+/// convolution sums in f16 there.
+fn dtypes(gpu: bool, all: Option<&str>, parts: &[Option<String>; 4]) -> Result<Dtypes, String> {
+    let (f32, f16) = (FloatDType::F32, FloatDType::F16);
+    let mut dtypes = match all {
+        Some(name) => {
+            let dtype = parse_dtype(name)?;
+            Dtypes {
+                lm: dtype,
+                local_encoder: dtype,
+                local_dit: dtype,
+                audio_decoder: dtype,
+            }
+        }
+        None if gpu => Dtypes {
+            lm: f16,
+            local_encoder: f16,
+            local_dit: f16,
+            audio_decoder: f32,
+        },
+        None => Dtypes {
+            lm: f32,
+            local_encoder: f32,
+            local_dit: f32,
+            audio_decoder: f32,
+        },
+    };
+    let fields = [
+        &mut dtypes.lm,
+        &mut dtypes.local_encoder,
+        &mut dtypes.local_dit,
+        &mut dtypes.audio_decoder,
+    ];
+    for (field, part) in fields.into_iter().zip(parts) {
+        if let Some(name) = part {
+            *field = parse_dtype(name)?;
+        }
+    }
+    Ok(dtypes)
 }
 
 fn number<T: std::str::FromStr>(arg: &str, value: &str) -> Result<T, Failure> {
@@ -313,10 +411,16 @@ pub fn summary(run: &Run) -> String {
         "host: {}, {} CPUs, governor {}, EPP {}, platform profile {}\n",
         c.host.cpu_model, c.host.logical_cpus, c.host.governor, c.host.epp, c.host.platform_profile
     );
+    let dtypes = match &run.options.dtypes {
+        Some(d) => format!(
+            "lm {}, local encoder {}, local DiT {}, audio decoder {}",
+            d.lm, d.local_encoder, d.local_dit, d.audio_decoder
+        ),
+        None => run.options.dtype.clone().unwrap_or_else(|| "f32".into()),
+    };
     out += &format!(
-        "device {} in {}; threads: {} available, {} at the end; load {} before, {} after\n",
+        "device {} in {dtypes}; threads: {} available, {} at the end; load {} before, {} after\n",
         run.options.device,
-        run.options.dtype,
         c.threads.available_parallelism,
         c.threads
             .process_threads_at_end
@@ -332,9 +436,26 @@ pub fn summary(run: &Run) -> String {
             .map(|(event, why)| format!("{event} ({why})"))
             .collect();
         out += &format!(
-            "counters per repetition: [{}], refused: [{}]\n",
+            "counters per repetition{}: [{}], refused: [{}]\n",
+            if c.gpu.is_some() {
+                ", the host's share only"
+            } else {
+                ""
+            },
             counters.recorded.join(", "),
             refused.join(", ")
+        );
+    }
+    if let Some(gpu) = &c.gpu {
+        out += &format!(
+            "GPU: {} at {}, {} {}, {}; autotune cache {} ({} bytes before)\n",
+            gpu.name,
+            gpu.pci_bus_id,
+            gpu.driver,
+            gpu.driver_info,
+            gpu.fingerprint,
+            gpu.autotune_cache,
+            gpu.autotune_cache_bytes_before
         );
     }
     if run.noisy.is_empty() {

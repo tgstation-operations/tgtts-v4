@@ -5,10 +5,15 @@ license.workspace = true
 version.workspace = true
 publish = false
 
+[features]
+# --device vulkan, keeping what autotune chose from one run to the next.
+vulkan = ["burn/persistence", "dep:gpu", "gpu/vulkan"]
+
 [dependencies]
 audiovae = { path = "../audiovae" }
 burn = { workspace = true, features = ["flex", "std"] }
 dsp = { path = "../dsp" }
+gpu = { path = "../gpu", optional = true }
 libc.workspace = true
 minicpm4 = { path = "../minicpm4" }
 serde.workspace = true
