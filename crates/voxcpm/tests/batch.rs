@@ -190,6 +190,68 @@ fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
     }
 }
 
+/// A scheduler dropped while its requests generate, as the service's warm-up drops it, leaves its
+/// graphs for the next, whose requests still come out as each does alone.
+fn requests_go_on_as_alone_after_a_scheduler_left_off(stepping: Stepping) {
+    let fixture = fixture!("voxcpm_generate");
+    let mut model = model(&fixture);
+    let prompts: Vec<Prompt> = (0..5)
+        .map(|i| {
+            prompt(
+                i,
+                2 + i as usize % 3,
+                &[5, 17, 42, 9],
+                &[77, 3, 64][..1 + i as usize % 3],
+            )
+        })
+        .collect();
+    let sampling = Sampling::default();
+    let expected: Vec<_> = prompts
+        .iter()
+        .enumerate()
+        .map(|(i, prompt)| {
+            let mut noise = SeededNoise::new(10 + i as u64);
+            model.generate(prompt, &sampling, 8, &mut noise).unwrap()
+        })
+        .collect();
+    model.set_stepping(stepping);
+    let mut first = Scheduler::new(&model, PromptCache::new(usize::MAX), 8);
+    for (i, prompt) in prompts.iter().enumerate().take(4) {
+        let noise = SeededNoise::new(20 + i as u64);
+        first.add(i, prompt, &sampling, 8, noise).unwrap();
+    }
+    for _ in 0..4 {
+        first.step();
+    }
+    drop(first);
+    let mut scheduler = Scheduler::new(&model, PromptCache::new(usize::MAX), 8);
+    for (i, prompt) in prompts.iter().enumerate() {
+        let noise = SeededNoise::new(10 + i as u64);
+        scheduler.add(i, prompt, &sampling, 8, noise).unwrap();
+    }
+    let mut got: Vec<Vec<Tensor<3>>> = vec![vec![]; prompts.len()];
+    while scheduler.requests() > 0 {
+        for patch in scheduler.step() {
+            got[patch.key].push(patch.patch.unwrap());
+        }
+    }
+    for (i, expected) in expected.into_iter().enumerate() {
+        let patches = Tensor::cat(got[i].clone(), 0);
+        assert_eq!(patches.dims(), expected.dims(), "request {i}");
+        assert_close(patches, expected, ATOL, RTOL);
+    }
+}
+
+#[test]
+fn requests_go_on_as_alone_after_a_scheduler_left_off_by_the_stable_step() {
+    requests_go_on_as_alone_after_a_scheduler_left_off(Stepping::Stable);
+}
+
+#[test]
+fn requests_go_on_as_alone_after_a_scheduler_left_off_by_replays() {
+    requests_go_on_as_alone_after_a_scheduler_left_off(Stepping::Captured);
+}
+
 /// Noise that is NaN from the `from`th patch on.
 struct Diverging {
     noise: SeededNoise,
