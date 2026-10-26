@@ -6,11 +6,14 @@ mod recorded;
 use std::{fs, path::PathBuf, time::Instant};
 
 use audiovae::{Decoder, Weights};
-use burn::tensor::{FloatDType, Tensor};
+use burn::tensor::{FloatDType, Tensor, TensorData};
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir, device, fixture};
 use voices::Latent;
-use voxcpm::{Config, Dtypes, Params, PromptCache, SeededNoise, SpeechDecoder, TextToSpeech};
+use voxcpm::{
+    Batch, Config, Dtypes, Noise, Params, PromptCache, Scheduler, SeededNoise, SpeechDecoder,
+    TextToSpeech,
+};
 
 const F32: Dtypes = Dtypes {
     lm: FloatDType::F32,
@@ -263,6 +266,163 @@ fn goes_on_from_a_cached_prompt_as_from_the_whole_on_the_real_weights() {
         stopped,
         Some(steps - 1),
         "stopped after another patch than whole"
+    );
+}
+
+/// A voice whose latent is of the median length, four times the golden's.
+const OTHER_VOICE: &str = "creaturesupermutant";
+
+/// The most patches a request runs to in the batch's test.
+const MOST: usize = 40;
+
+/// Requests in a batch against each alone: the golden's line; another line in its voice, run from
+/// what a prompt cache kept of the first, which joins after the first's third patch; and a line in
+/// a voice of four times as many patches, which joins after its sixth. Each is sampled after the
+/// patches it was given alone and leaves after the last of them, then all run free.
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn samples_requests_together_as_alone_on_the_real_weights() {
+    let (golden, device) = (golden(), device());
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let other = Latent::read(&voices::latent_path(&voices_dir(), OTHER_VOICE)).unwrap();
+    let tts = TextToSpeech::load(&checkpoint_dir(), &F32, &device).unwrap();
+    let (model, params) = (tts.model(), Params::default());
+    let requests = [
+        (text.as_str(), &voice, 0),
+        ("Someone set the kitchen on fire again.", &voice, 3),
+        ("Clown in the armory, send security.", &other, 6),
+    ];
+    let prompts: Vec<_> = requests
+        .iter()
+        .map(|(line, voice, _)| tts.prompt(line, voice).unwrap())
+        .collect();
+    let started = Instant::now();
+    let alone: Vec<Vec<_>> = (0..requests.len())
+        .map(|i| {
+            let mut generation = model.start(&prompts[i], MOST).unwrap();
+            let mut noise = SeededNoise::new(i as u64);
+            let mut steps = vec![];
+            loop {
+                let step = generation.sample(model.noise(&mut noise), &params.sampling);
+                let last = step.stops() || steps.len() + 1 == MOST;
+                if !last {
+                    generation.advance(step.patch.clone());
+                }
+                steps.push(step);
+                if last {
+                    break steps;
+                }
+            }
+        })
+        .collect();
+    let lengths: Vec<usize> = alone.iter().map(Vec::len).collect();
+    eprintln!("alone: {lengths:?} patches in {:.1?}", started.elapsed());
+
+    let mut cache = PromptCache::new(usize::MAX);
+    let mut batch = Batch::new(model);
+    let mut noise: Vec<_> = (0..requests.len() as u64).map(SeededNoise::new).collect();
+    let (mut rows, mut sampled) = (vec![], vec![0; requests.len()]);
+    let (mut patch, mut logits) = (vec![0f32; requests.len()], vec![0f32; requests.len()]);
+    let started = Instant::now();
+    for t in 0.. {
+        for (i, &(_, _, join)) in requests.iter().enumerate() {
+            if t == join {
+                let mut prefill = model.prefill(&prompts[i], MOST, &mut cache).unwrap();
+                prefill.run(usize::MAX, &mut cache);
+                rows.push((batch.join(prefill.finish(), &params.sampling).unwrap(), i));
+            }
+        }
+        if rows.is_empty() {
+            break;
+        }
+        let len = 64 * 4;
+        let draws: Vec<f32> = rows.iter().flat_map(|&(_, i)| noise[i].next(len)).collect();
+        let draws = TensorData::new(draws, [rows.len(), 64, 4]);
+        let step = batch.sample(Tensor::from_data(draws, &device));
+        let stops: Vec<i64> = step
+            .stop_logits
+            .clone()
+            .argmax(1)
+            .into_data()
+            .iter()
+            .collect();
+        let mut fed = vec![];
+        for (k, &(id, i)) in rows.iter().enumerate() {
+            let expected = &alone[i][sampled[i]];
+            let row = step.patch.clone().narrow(0, k, 1);
+            patch[i] = patch[i].max(max_diff(row, expected.patch.clone()));
+            let row = step.stop_logits.clone().narrow(0, k, 1);
+            logits[i] = logits[i].max(max_diff(row, expected.stop_logits.clone()));
+            assert_eq!(
+                stops[k] == 1,
+                expected.stops(),
+                "request {i}, patch {}",
+                sampled[i]
+            );
+            sampled[i] += 1;
+            if sampled[i] == alone[i].len() {
+                batch.leave(id);
+            } else {
+                fed.push(expected.patch.clone());
+            }
+        }
+        rows.retain(|&(_, i)| sampled[i] < alone[i].len());
+        if !fed.is_empty() {
+            batch.advance(Tensor::cat(fed, 0));
+        }
+    }
+    eprintln!(
+        "together, after the same patches, in {:.1?}: patches within {patch:?}, stop logits \
+         within {logits:?}",
+        started.elapsed()
+    );
+    // f32 here and alone, a product's rows summed as one or as several: built as the tests build
+    // it, each patch came within 5.8e-5 of alone's and the stop logits within 2.1e-5, run free
+    // the patches drifting up to 6.8e-4 and each stopping where alone did. Held as close as the
+    // golden holds the model to upstream, as a level of the quantizer near a boundary can round
+    // apart.
+    assert!(patch.iter().all(|&d| d <= PATCH), "patches {patch:?}");
+    assert!(
+        logits.iter().all(|&d| d <= STOP_LOGITS),
+        "stop logits {logits:?}"
+    );
+
+    let mut scheduler = Scheduler::new(model, PromptCache::new(usize::MAX), 64);
+    let mut free = vec![vec![]; requests.len()];
+    let started = Instant::now();
+    for t in 0.. {
+        for (i, &(_, _, join)) in requests.iter().enumerate() {
+            if t == join {
+                let noise = SeededNoise::new(i as u64);
+                scheduler
+                    .add(i, &prompts[i], &params.sampling, MOST, noise)
+                    .unwrap();
+            }
+        }
+        for patch in scheduler.step() {
+            free[patch.key].push(patch.patch);
+        }
+        if t >= 6 && scheduler.requests() == 0 {
+            break;
+        }
+    }
+    let drift: Vec<_> = (0..requests.len())
+        .map(|i| {
+            let alone = alone[i].iter().map(|step| step.patch.clone());
+            let alone = Tensor::cat(alone.collect(), 0);
+            let together = Tensor::cat(free[i].clone(), 0);
+            (together.dims() == alone.dims()).then(|| max_diff(together, alone))
+        })
+        .collect();
+    eprintln!(
+        "run free in {:.1?}: {:?} patches, drifting {drift:?} from alone",
+        started.elapsed(),
+        free.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        free.iter().map(Vec::len).collect::<Vec<_>>(),
+        lengths,
+        "stopped after other patches than alone"
     );
 }
 

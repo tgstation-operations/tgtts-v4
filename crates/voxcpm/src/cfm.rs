@@ -67,6 +67,41 @@ impl Cfm {
         self.solve_euler(x, &t_span, mu, cond, sampling.cfg_value)
     }
 
+    /// Patches sampled as [`sample`](Self::sample) samples them, each row of the batch as its
+    /// own of `sampling` says.
+    ///
+    /// # Panics
+    ///
+    /// If `sampling` has another number of rows, or its rows take other numbers of steps.
+    pub fn sample_rows(
+        &self,
+        mu: Tensor<2>,
+        cond: Tensor<3>,
+        noise: Tensor<3>,
+        sampling: &[Sampling],
+    ) -> Tensor<3> {
+        let [batch, ..] = noise.dims();
+        assert_eq!(
+            sampling.len(),
+            batch,
+            "sampling for {} rows",
+            sampling.len()
+        );
+        let timesteps = sampling.first().map_or(0, |row| row.timesteps);
+        assert!(
+            sampling.iter().all(|row| row.timesteps == timesteps),
+            "rows sampled in different numbers of steps"
+        );
+        let device = noise.device();
+        let per_row = |value: fn(&Sampling) -> f32| {
+            let values: Vec<f32> = sampling.iter().map(value).collect();
+            Tensor::<1>::from_floats(values.as_slice(), &device).reshape([batch, 1, 1])
+        };
+        let x = noise.cast(FloatDType::F32) * per_row(|row| row.temperature);
+        let cfg = per_row(|row| row.cfg_value);
+        self.solve(x, &schedule(timesteps), mu, cond, |v| v * cfg.clone())
+    }
+
     /// Integrates from `x` along the times `t_span`, as upstream's `solve_euler` does with
     /// CFG-Zero*: the first steps, 4% of them but at least one, stay where they are, and the
     /// unconditional velocity, the DiT's with `mu` zeroed, is scaled to best match the
@@ -82,6 +117,19 @@ impl Cfm {
         mu: Tensor<2>,
         cond: Tensor<3>,
         cfg_value: f32,
+    ) -> Tensor<3> {
+        self.solve(x, t_span, mu, cond, |v| v.mul_scalar(cfg_value))
+    }
+
+    /// [`solve_euler`](Self::solve_euler), guiding by what `guide` scales the difference
+    /// between the velocities to.
+    fn solve(
+        &self,
+        x: Tensor<3>,
+        t_span: &[f32],
+        mu: Tensor<2>,
+        cond: Tensor<3>,
+        guide: impl Fn(Tensor<3>) -> Tensor<3>,
     ) -> Tensor<3> {
         let mut x = x.cast(FloatDType::F32);
         let [batch, channels, len] = x.dims();
@@ -105,7 +153,7 @@ impl Cfm {
                 let dot = flat(positive.clone() * negative.clone()).sum_dim(1);
                 let norm = flat(negative.clone().square()).sum_dim(1).add_scalar(1e-8);
                 let scaled = negative * (dot / norm).reshape([batch, 1, 1]);
-                let guided = scaled.clone() + (positive - scaled).mul_scalar(cfg_value);
+                let guided = scaled.clone() + guide(positive - scaled);
                 x = x - guided.mul_scalar(dt);
             }
             t -= dt;

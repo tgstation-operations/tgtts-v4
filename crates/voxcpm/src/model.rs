@@ -33,7 +33,7 @@ pub struct Model {
     pub(crate) patch_size: usize,
     pub(crate) feat_dim: usize,
     max_positions: usize,
-    lm_dtype: DType,
+    pub(crate) lm_dtype: DType,
     pub(crate) device: Device,
 }
 
@@ -282,12 +282,12 @@ impl Model {
 /// A generation under way: the LMs' caches and last hidden states, and the last patch.
 #[derive(Debug)]
 pub struct Generation<'a> {
-    model: &'a Model,
-    base_cache: KvCache,
-    residual_cache: KvCache,
-    lm_hidden: Tensor<2>,
-    residual_hidden: Tensor<2>,
-    cond: Tensor<3>,
+    pub(crate) model: &'a Model,
+    pub(crate) base_cache: KvCache,
+    pub(crate) residual_cache: KvCache,
+    pub(crate) lm_hidden: Tensor<2>,
+    pub(crate) residual_hidden: Tensor<2>,
+    pub(crate) cond: Tensor<3>,
 }
 
 /// The patches of a generation, each `[1, patch_size, feat_dim]` in f32, sampled one at a time
@@ -342,39 +342,70 @@ impl Step {
 impl Generation<'_> {
     /// Samples the next patch from `noise` `[1, feat_dim, patch_size]`.
     pub fn sample(&self, noise: Tensor<3>, sampling: &Sampling) -> Step {
-        let heads = &self.model.heads;
+        self.model.sample_after(
+            self.lm_hidden.clone(),
+            self.residual_hidden.clone(),
+            self.cond.clone(),
+            |cfm, mu, cond| cfm.sample(mu, cond, noise, sampling),
+        )
+    }
+
+    /// Feeds `patch` `[1, patch_size, feat_dim]` to the LMs as the next position.
+    pub fn advance(&mut self, patch: Tensor<3>) {
+        let embed = self.model.embed_patches(patch.clone().unsqueeze_dim(1));
+        let caches = (&mut self.base_cache, &mut self.residual_cache);
+        (self.lm_hidden, self.residual_hidden) = self.model.advance_lms(embed, caches);
+        self.cond = patch;
+    }
+}
+
+impl Model {
+    /// A patch for each row of the LMs' last hidden states `[rows, hidden]` after the patches
+    /// `cond` `[rows, patch_size, feat_dim]` before them, which `sample` samples given the
+    /// DiT's conditions, `mu` and `cond` `[rows, feat_dim, patch_size]`.
+    pub(crate) fn sample_after(
+        &self,
+        lm_hidden: Tensor<2>,
+        residual_hidden: Tensor<2>,
+        cond: Tensor<3>,
+        sample: impl FnOnce(&Cfm, Tensor<2>, Tensor<3>) -> Tensor<3>,
+    ) -> Step {
+        let heads = &self.heads;
         let mu = Tensor::cat(
             vec![
-                heads.lm_to_dit_proj.forward(self.lm_hidden.clone()),
-                heads.res_to_dit_proj.forward(self.residual_hidden.clone()),
+                heads.lm_to_dit_proj.forward(lm_hidden.clone()),
+                heads.res_to_dit_proj.forward(residual_hidden),
             ],
             1,
         );
-        let cond = self.cond.clone().swap_dims(1, 2);
-        let patch = self.model.cfm.sample(mu, cond, noise, sampling);
-        let stop = silu(heads.stop_proj.forward(self.lm_hidden.clone()));
+        let patch = sample(&self.cfm, mu, cond.swap_dims(1, 2));
+        let stop = silu(heads.stop_proj.forward(lm_hidden));
         Step {
             patch: patch.swap_dims(1, 2),
             stop_logits: heads.stop_head.forward(stop),
         }
     }
 
-    /// Feeds `patch` `[1, patch_size, feat_dim]` to the LMs as the next position.
-    pub fn advance(&mut self, patch: Tensor<3>) {
-        let (model, heads) = (self.model, &self.model.heads);
-        let embed = model.embed_patches(patch.clone().unsqueeze_dim(1));
-        let outputs = model
-            .base_lm
-            .forward_cached(embed.clone(), &mut self.base_cache);
+    /// Runs the LMs a position further over each row of `caches`, from the embedding of its
+    /// patch `[rows, 1, hidden]`, and gives their last hidden states `[rows, hidden]`.
+    pub(crate) fn advance_lms(
+        &self,
+        embeds: Tensor<3>,
+        (base_cache, residual_cache): (&mut KvCache, &mut KvCache),
+    ) -> (Tensor<2>, Tensor<2>) {
+        let heads = &self.heads;
+        let [rows, ..] = embeds.dims();
+        let outputs = self.base_lm.forward_cached(embeds.clone(), base_cache);
         let outputs = heads.fsq_layer.forward(outputs);
         let residual_inputs = heads
             .fusion_concat_proj
-            .forward(Tensor::cat(vec![outputs.clone(), embed], 2));
-        let residual = model
+            .forward(Tensor::cat(vec![outputs.clone(), embeds], 2));
+        let residual = self
             .residual_lm
-            .forward_cached(residual_inputs, &mut self.residual_cache);
-        self.lm_hidden = outputs.reshape([1, model.hidden]);
-        self.residual_hidden = residual.reshape([1, model.hidden]);
-        self.cond = patch;
+            .forward_cached(residual_inputs, residual_cache);
+        (
+            outputs.reshape([rows, self.hidden]),
+            residual.reshape([rows, self.hidden]),
+        )
     }
 }
