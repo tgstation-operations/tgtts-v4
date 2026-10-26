@@ -3,6 +3,7 @@
   rustToolchain,
   fmt,
   ffmpeg,
+  tracelLlvm,
 }:
 pkgs.writeShellApplication {
   name = "audit";
@@ -71,6 +72,9 @@ pkgs.writeShellApplication {
     stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
     stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts -p bench --all-targets \
       --features gpu/vulkan,tgtts/vulkan,bench/vulkan -- -D warnings
+    # cubecl's CUDA runtime links the LLVM its build script finds there.
+    stage clippy-cuda env XDG_DATA_HOME=${tracelLlvm} cargo clippy --locked -p gpu -p tgtts \
+      -p bench --all-targets --features gpu/nvrtc,tgtts/cuda,bench/cuda -- -D warnings
     stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
     stage test cargo test --locked --workspace
 
