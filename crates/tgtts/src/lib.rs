@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod device;
 pub mod ffmpeg;
 pub mod handoff;
 pub mod metrics;

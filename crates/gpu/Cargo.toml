@@ -6,7 +6,7 @@ version.workspace = true
 publish = false
 
 [features]
-vulkan = ["burn/autotune", "burn/vulkan"]
+vulkan = ["burn/autotune", "burn/cubecl", "burn/vulkan"]
 
 [dependencies]
 burn = { workspace = true, features = ["std"] }

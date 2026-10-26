@@ -3,10 +3,10 @@
 
 use std::{env, error::Error, path::PathBuf, process::ExitCode, sync::Arc};
 
-use burn::tensor::{Device, FloatDType};
 use tgtts::{
     cache::Cache,
     config::{self, Config},
+    device,
     ffmpeg::Ffmpeg,
     metrics::Metrics,
     model::VoxCpm,
@@ -16,7 +16,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 use voices::Voices;
-use voxcpm::{Dtypes, Params};
+use voxcpm::Params;
 
 /// How many metrics rows may wait to be written before more are dropped.
 const METRICS_QUEUE: usize = 1024;
@@ -67,18 +67,18 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error>> {
         Some(path) => Some(Metrics::open(path, METRICS_QUEUE)?),
         None => None,
     };
-    info!(checkpoint = %config.checkpoint_dir.display(), "loading VoxCPM2");
-    let f32 = FloatDType::F32;
-    let dtypes = Dtypes {
-        lm: f32,
-        local_encoder: f32,
-        local_dit: f32,
-        audio_decoder: f32,
-    };
+    let autotune_dir = config.autotune_cache_dir.as_deref();
+    let device = device::open(config.device, &config.dtypes, autotune_dir)?;
+    info!(
+        checkpoint = %config.checkpoint_dir.display(),
+        device = %config.device,
+        dtypes = ?config.dtypes,
+        "loading VoxCPM2"
+    );
     let model = VoxCpm::load(
         &config.checkpoint_dir,
-        &dtypes,
-        &Device::flex(),
+        &config.dtypes,
+        &device,
         Params::default(),
     )?;
     let service = Service::new(Setup {

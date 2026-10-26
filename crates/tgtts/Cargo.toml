@@ -5,12 +5,17 @@ license.workspace = true
 version.workspace = true
 publish = false
 
+[features]
+# The model on a Vulkan GPU, with what autotune chose there kept for the next start.
+vulkan = ["burn/persistence", "dep:gpu", "gpu/vulkan"]
+
 [dependencies]
 axum = { workspace = true, features = ["http1", "query", "tokio"] }
 blake3.workspace = true
 burn = { workspace = true, features = ["flex"] }
 dsp = { path = "../dsp" }
 effects = { path = "../effects" }
+gpu = { path = "../gpu", optional = true }
 rand = { workspace = true, features = ["thread_rng"] }
 # The SQLite built in, so the binary needs no library at run time.
 rusqlite = { workspace = true, features = ["bundled"] }

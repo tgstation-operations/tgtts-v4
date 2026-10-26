@@ -689,6 +689,7 @@ dependencies = [
  "burn-std",
  "burn-store",
  "burn-vision",
+ "cubecl",
 ]
 
 [[package]]
@@ -742,6 +743,7 @@ dependencies = [
  "burn-backend",
  "burn-backend-extension",
  "burn-cpu",
+ "burn-cubecl",
  "burn-cuda",
  "burn-derive",
  "burn-dispatch",
@@ -6013,6 +6015,7 @@ dependencies = [
  "burn",
  "dsp",
  "effects",
+ "gpu",
  "rand 0.10.3",
  "rusqlite",
  "serde",

@@ -6,7 +6,14 @@
 //! - `voices_dir`: the voices directory.
 //! - `assets_dir`: the radio's clicks and static and the silicon effect's impulse responses.
 //! - `checkpoint_dir`: the VoxCPM2 checkpoint.
+//! - `device`: what the model runs on, `cpu` by default or `vulkan`, which needs a build with the
+//!   `vulkan` feature.
+//! - `lm_dtype`, `local_encoder_dtype`, `local_dit_dtype`, `audio_decoder_dtype`: what each part
+//!   of the model computes in, `f32`, `f16` or `bf16`; f32 throughout by default on the CPU, f16
+//!   but for the audio decoder's f32 on a GPU.
 //! - `cache_dir`: where the speech cache is kept.
+//! - `autotune_cache_dir`: where autotune keeps the kernels it chose on a GPU, for the next
+//!   start to skip choosing them again; `vulkan` needs it.
 //! - `metrics_db`: the SQLite database the metrics go to, none by default.
 //! - `ffmpeg`: the ffmpeg to run, `ffmpeg` on the `PATH` by default.
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
@@ -30,17 +37,28 @@ use std::{
     time::Duration,
 };
 
+use burn::tensor::FloatDType;
 use tracing::level_filters::LevelFilter;
+use voxcpm::Dtypes;
 
-use crate::service::{Loudness, parse_level};
+use crate::{
+    device::{self, Kind},
+    service::{Loudness, parse_level},
+};
 
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 21] = [
     "listen",
     "token_file",
     "voices_dir",
     "assets_dir",
     "checkpoint_dir",
+    "device",
+    "lm_dtype",
+    "local_encoder_dtype",
+    "local_dit_dtype",
+    "audio_decoder_dtype",
     "cache_dir",
+    "autotune_cache_dir",
     "metrics_db",
     "ffmpeg",
     "synthesis_limit",
@@ -60,7 +78,10 @@ pub struct Config {
     pub voices_dir: PathBuf,
     pub assets_dir: PathBuf,
     pub checkpoint_dir: PathBuf,
+    pub device: Kind,
+    pub dtypes: Dtypes,
     pub cache_dir: PathBuf,
+    pub autotune_cache_dir: Option<PathBuf>,
     pub metrics_db: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     pub synthesis_limit: usize,
@@ -102,6 +123,13 @@ impl Config {
         }
         let settings = Settings(values);
         let cpus = thread::available_parallelism().map_or(1, |n| n.get());
+        let device = settings.parse("device")?.unwrap_or(Kind::Cpu);
+        let defaults = device.dtypes();
+        let autotune_cache_dir = settings.parse("autotune_cache_dir")?;
+        if device == Kind::Vulkan && autotune_cache_dir.is_none() {
+            let reason = "autotune_cache_dir is not set, which the vulkan device needs";
+            return Err(Error(reason.to_owned()));
+        }
         Ok(Self {
             listen: settings
                 .parse("listen")?
@@ -110,7 +138,21 @@ impl Config {
             voices_dir: settings.required("voices_dir")?,
             assets_dir: settings.required("assets_dir")?,
             checkpoint_dir: settings.required("checkpoint_dir")?,
+            device,
+            dtypes: Dtypes {
+                lm: settings.dtype("lm_dtype")?.unwrap_or(defaults.lm),
+                local_encoder: settings
+                    .dtype("local_encoder_dtype")?
+                    .unwrap_or(defaults.local_encoder),
+                local_dit: settings
+                    .dtype("local_dit_dtype")?
+                    .unwrap_or(defaults.local_dit),
+                audio_decoder: settings
+                    .dtype("audio_decoder_dtype")?
+                    .unwrap_or(defaults.audio_decoder),
+            },
             cache_dir: settings.required("cache_dir")?,
+            autotune_cache_dir,
             metrics_db: settings.parse("metrics_db")?,
             ffmpeg: settings.parse("ffmpeg")?.unwrap_or_else(|| "ffmpeg".into()),
             synthesis_limit: settings.limit("synthesis_limit")?.unwrap_or(16),
@@ -164,6 +206,15 @@ impl Settings {
     {
         self.parse(key)?
             .ok_or_else(|| Error(format!("{key} is not set")))
+    }
+
+    fn dtype(&self, key: &str) -> Result<Option<FloatDType>, Error> {
+        self.0
+            .get(key)
+            .map(|value| {
+                device::parse_dtype(value).map_err(|e| Error(format!("{key}: {value:?}: {e}")))
+            })
+            .transpose()
     }
 
     fn limit(&self, key: &str) -> Result<Option<usize>, Error> {
@@ -246,7 +297,10 @@ mod tests {
                 voices_dir: "/var/lib/tgtts/voices".into(),
                 assets_dir: "/var/lib/tgtts/assets".into(),
                 checkpoint_dir: "/var/lib/tgtts/VoxCPM2".into(),
+                device: Kind::Cpu,
+                dtypes: Kind::Cpu.dtypes(),
                 cache_dir: "/var/cache/tgtts".into(),
+                autotune_cache_dir: None,
                 metrics_db: None,
                 ffmpeg: "ffmpeg".into(),
                 synthesis_limit: 16,
@@ -276,10 +330,23 @@ mod tests {
             loudness_target_lufs = -18
             loudness_ceiling_dbtp = -1.5
             log_level = \"debug\"
+            device = \"vulkan\"
+            local_dit_dtype = \"bf16\"
+            autotune_cache_dir = \"/var/cache/tgtts-autotune\"
             "
         );
         let config = load(&toml, &[]).unwrap();
         assert_eq!(config.listen, "0.0.0.0:5011".parse().unwrap());
+        assert_eq!(config.device, Kind::Vulkan);
+        let dtypes = Dtypes {
+            local_dit: FloatDType::BF16,
+            ..Kind::Vulkan.dtypes()
+        };
+        assert_eq!(config.dtypes, dtypes);
+        assert_eq!(
+            config.autotune_cache_dir.as_deref(),
+            Some(Path::new("/var/cache/tgtts-autotune"))
+        );
         assert_eq!(
             config.metrics_db.as_deref(),
             Some(Path::new("/var/lib/tgtts/metrics.sqlite"))
@@ -300,8 +367,16 @@ mod tests {
             ("TGTTS_LOG_LEVEL", "WARNING"),
             ("TGTTS_TOKEN_FILE", "/etc/token"),
             ("TGTTS_LOUDNESS_TARGET_LUFS", "-14.5"),
+            ("TGTTS_DEVICE", "cpu"),
+            ("TGTTS_LM_DTYPE", "f16"),
         ];
         let config = load(&toml, &env).unwrap();
+        let dtypes = Dtypes {
+            lm: FloatDType::F16,
+            local_dit: FloatDType::BF16,
+            ..Kind::Cpu.dtypes()
+        };
+        assert_eq!((config.device, config.dtypes), (Kind::Cpu, dtypes));
         assert_eq!(config.listen, "[::1]:6000".parse().unwrap());
         assert_eq!(config.synthesis_limit, 2);
         assert_eq!(config.log_level, LevelFilter::WARN);
@@ -333,6 +408,10 @@ mod tests {
         assert!(error(REQUIRED, &[("TGTTS_CPU_LIMIT", "0")]).starts_with("cpu_limit:"));
         assert!(error(REQUIRED, &[("TGTTS_RADIO_WAIT_SECONDS", "-1")]).starts_with("radio_wait"));
         assert!(error(REQUIRED, &[("TGTTS_LOG_LEVEL", "loud")]).starts_with("log_level:"));
+        assert!(error(REQUIRED, &[("TGTTS_DEVICE", "cuda")]).starts_with("device:"));
+        assert!(error(REQUIRED, &[("TGTTS_LM_DTYPE", "f64")]).starts_with("lm_dtype:"));
+        let vulkan = error(REQUIRED, &[("TGTTS_DEVICE", "vulkan")]);
+        assert!(vulkan.starts_with("autotune_cache_dir"), "{vulkan}");
         for (key, value) in [
             ("TGTTS_LOUDNESS_TARGET_LUFS", "NaN"),
             ("TGTTS_LOUDNESS_TARGET_LUFS", "-inf"),

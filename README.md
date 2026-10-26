@@ -44,7 +44,15 @@ metrics_db = "metrics.sqlite"
 
 and run `cargo run --release -p tgtts -- tgtts.toml`, adding
 `--features burn/rayon,burn/simd` on the CPU, where they make the model several
-times faster. Point the game's `TTS_HTTP_URL` at `http://127.0.0.1:5002` with
+times faster. On a Vulkan GPU, build with `--features vulkan` and add
+
+```toml
+device = "vulkan"
+autotune_cache_dir = "autotune"
+```
+
+where autotune keeps the kernels it chose, which takes half a minute the first
+time. Point the game's `TTS_HTTP_URL` at `http://127.0.0.1:5002` with
 the token as `TTS_HTTP_TOKEN`. The service runs ffmpeg for the filter strings
 the game sent before effects, which needs rubberband, as the devshell's has.
 The end-to-end test runs on the real model with `VOXCPM2_DIR`, `VOICES_DIR` and
