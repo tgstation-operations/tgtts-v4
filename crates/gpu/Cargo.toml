@@ -7,7 +7,8 @@ publish = false
 
 [features]
 vulkan = ["burn/autotune", "burn/cubecl", "burn/vulkan"]
-cuda = ["burn/autotune", "burn/cubecl", "burn/cuda", "dep:cubecl", "cubecl/cuda", "dep:cudarc"]
+# Kernel fusion on CUDA only: on Vulkan it is left off, after amdgpu ring resets on a Radeon.
+cuda = ["burn/autotune", "burn/cubecl", "burn/cuda", "burn/fusion", "dep:cubecl", "cubecl/cuda", "dep:cudarc"]
 # CUDA with its kernels compiled as C++ by NVRTC, which needs the CUDA headers at run time,
 # rather than by LLVM to PTX.
 nvrtc = ["cuda", "cubecl/cuda-cpp"]

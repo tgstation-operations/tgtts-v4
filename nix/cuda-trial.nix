@@ -8,8 +8,7 @@
 # NVIDIA host: once with cubecl's default kernel compiler, LLVM to PTX, under
 # llvm/, and once with NVRTC compiling its CUDA C++, under nvrtc/. Each program
 # finds the host driver's libcuda in /run/opengl-driver/lib, as NixOS puts it,
-# and the tests find their fixtures in the store. llvm-fusion, outside the
-# bundle, is the LLVM build with burn's kernel fusion, to measure it against.
+# and the tests find their fixtures in the store.
 let
   inherit (pkgs) lib;
   # 12.9: cubecl-cuda enables what it has for 12.8 and later, and a driver
@@ -114,22 +113,6 @@ let
     features = ",gpu/nvrtc";
     env = "--prefix LD_LIBRARY_PATH : ${cuda.cuda_nvrtc.lib}/lib";
   };
-  # burn-dispatch's fusion feature names burn-remote?/fusion, and cargo
-  # resolves an optional dependency a weak feature names even when nothing
-  # enables it (https://github.com/rust-lang/cargo/issues/10801). Cargo.lock
-  # has no burn-remote, so it is not vendored and the frozen build cannot
-  # resolve; the vendored copy drops the feature instead.
-  llvm-fusion =
-    (build {
-      compiler = "llvm-fusion";
-      features = ",burn/fusion";
-      env = "";
-    }).overrideAttrs
-      {
-        preBuild = ''
-          sed -i '/"burn-remote?\/fusion",/d' $NIX_BUILD_TOP/cargo-vendor-dir/burn-dispatch-*/Cargo.toml
-        '';
-      };
 in
 pkgs.runCommand "cuda-trial" { } ''
   mkdir $out
@@ -140,7 +123,6 @@ pkgs.runCommand "cuda-trial" { } ''
   inherit
     llvm
     nvrtc
-    llvm-fusion
     cudaPath
     ;
 }

@@ -748,6 +748,8 @@ dependencies = [
  "burn-cuda",
  "burn-derive",
  "burn-dispatch",
+ "burn-fusion",
+ "burn-ir",
  "burn-pack",
  "burn-rocm",
  "burn-std",
@@ -772,6 +774,7 @@ source = "git+https://git.scriptis.net/scriptis/burn.git?rev=56d3f4d28b541dd7dda
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -819,6 +822,7 @@ source = "git+https://git.scriptis.net/scriptis/burn.git?rev=56d3f4d28b541dd7dda
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -975,6 +979,7 @@ source = "git+https://git.scriptis.net/scriptis/burn.git?rev=56d3f4d28b541dd7dda
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -1072,6 +1077,7 @@ dependencies = [
  "bon",
  "burn-core",
  "burn-cubecl",
+ "burn-fusion",
  "burn-std",
  "bytemuck",
  "cubecl",
@@ -1090,6 +1096,7 @@ source = "git+https://git.scriptis.net/scriptis/burn.git?rev=56d3f4d28b541dd7dda
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
