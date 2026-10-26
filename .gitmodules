@@ -1,0 +1,24 @@
+[submodule "vendor/llama.cpp"]
+	path = vendor/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "vendor/mlir-aie"]
+	path = vendor/mlir-aie
+	url = https://github.com/Xilinx/mlir-aie.git
+[submodule "vendor/IRON"]
+	path = vendor/IRON
+	url = https://github.com/amd/IRON.git
+[submodule "vendor/llvm-aie"]
+	path = vendor/llvm-aie
+	url = https://github.com/Xilinx/llvm-aie.git
+[submodule "vendor/xdna-driver"]
+	path = vendor/xdna-driver
+	url = https://github.com/amd/xdna-driver.git
+[submodule "vendor/mlir-air"]
+	path = vendor/mlir-air
+	url = https://github.com/Xilinx/mlir-air.git
+[submodule "vendor/iree"]
+	path = vendor/iree
+	url = https://github.com/iree-org/iree.git
+[submodule "vendor/iree-amd-aie"]
+	path = vendor/iree-amd-aie
+	url = https://github.com/nod-ai/iree-amd-aie.git

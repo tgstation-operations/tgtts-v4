@@ -23,6 +23,8 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   (`VOXCPM2_DIR`, `VOICES_DIR` for a converted voices directory and `ASSETS_DIR`
   for the radio's sounds) and writes each run as JSON;
   `nix run .#bench -- --help` tells how to compare two, and how to time a GPU.
+- `vendor/` pins the upstreams the GPU kernels and their toolchain follow, as
+  git submodules that nothing builds from; `vendor/README.md` lists them.
 
 ## Running the service
 
