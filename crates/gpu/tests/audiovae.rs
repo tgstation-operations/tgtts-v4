@@ -67,8 +67,11 @@ fn decodes_a_speaker_latent_as_upstream() {
     let decoder = Decoder::load(&config, &weights, FloatDType::F32, &device).unwrap();
     let golden = fixture("audiovae", "audiovae_checkpoint");
     let audio = decoder.decode(golden.tensor("input.decode", &device));
-    // Within 6.0e-6 of upstream's, which is 2.5e-6 from its own f64 result.
-    assert_close(audio, golden.tensor("output.decode", &device), 1e-5, 0.0);
+    // Within 6.0e-6 of upstream's, which is 2.5e-6 from its own f64 result. Where the GPU computes
+    // f32 convolutions in TF32, which rounds their inputs to f16's mantissa, within 1.4e-3: held
+    // as f16 is, which on the CPU came within 3.3e-3.
+    let atol = if device.tf32() { 4e-3 } else { 1e-5 };
+    assert_close(audio, golden.tensor("output.decode", &device), atol, 0.0);
 }
 
 /// The product encodes voices offline, on the CPU; this checks the GPU's convolutions on a
@@ -81,6 +84,8 @@ fn encodes_speech_as_upstream() {
     let encoder = Encoder::load(&config, &weights, FloatDType::F32, &device).unwrap();
     let golden = fixture("audiovae", "audiovae_checkpoint");
     let latents = encoder.encode(golden.tensor("input.encode", &device));
-    // Within 8.3e-6 of upstream's, which is 6.0e-6 from its own f64 result.
-    assert_close(latents, golden.tensor("output.encode", &device), 3e-5, 0.0);
+    // Within 8.3e-6 of upstream's, which is 6.0e-6 from its own f64 result. In TF32, within
+    // 3.0e-2: held as f16 is, which on the CPU came within 3.2e-2.
+    let atol = if device.tf32() { 4e-2 } else { 3e-5 };
+    assert_close(latents, golden.tensor("output.encode", &device), atol, 0.0);
 }

@@ -7,6 +7,7 @@ use std::fs;
 
 use burn::tensor::{FloatDType, Tensor};
 use common::fixture;
+use gpu::Gpu;
 use minicpm4::{Config, LocalShape, Mask, Model};
 use serde_json::Value;
 use testkit::{Fixture, assert_close, checkpoint_dir};
@@ -17,13 +18,32 @@ struct Precision {
     dtype: FloatDType,
     atol: f32,
     rtol: f32,
+    /// In f32, the precision in f16 whose tolerances hold where the GPU computes f32 matmuls in
+    /// TF32: that rounds their inputs to f16's mantissa, and computes the rest in f32.
+    tf32: Option<&'static Precision>,
 }
 
-// As on the CPU: these outputs, of magnitude under 4.3, came within 7.2e-7 of upstream's.
+impl Precision {
+    /// What it holds on `gpu`.
+    fn on(self, gpu: &Gpu) -> Self {
+        match self.tf32 {
+            Some(f16) if gpu.tf32() => Self {
+                dtype: self.dtype,
+                tf32: None,
+                ..*f16
+            },
+            _ => self,
+        }
+    }
+}
+
+// As on the CPU: these outputs, of magnitude under 4.3, came within 7.2e-7 of upstream's. In
+// TF32 they were as far as 6.5e-4.
 const F32: Precision = Precision {
     dtype: FloatDType::F32,
     atol: 2e-6,
     rtol: 1e-6,
+    tf32: Some(&F16),
 };
 // Inputs and weights rounded to f16 and computed in it, but for RMSNorm and RoPE: these came
 // within 3.7e-3 of upstream's, and at most 7.4e-4 beyond four f16 epsilons of each.
@@ -31,6 +51,7 @@ const F16: Precision = Precision {
     dtype: FloatDType::F16,
     atol: 1.5e-3,
     rtol: 4e-3,
+    tf32: None,
 };
 
 /// The tiny VoxCPM2 config minicpm4's fixture was generated at, and the stacks derived from it.
@@ -80,6 +101,7 @@ fn attends_as_upstream(
     precision: Precision,
 ) {
     let (fixture, device) = (fixture("minicpm4", "minicpm4"), gpu::device());
+    let precision = precision.on(&device);
     let model = Model::load(config, fixture.path(), prefix, precision.dtype, &device).unwrap();
     let x = fixture.tensor::<3>(input, &device).cast(precision.dtype);
     let output = match mask {
@@ -97,6 +119,7 @@ fn attends_as_upstream(
 /// 2 one at a time, where upstream stepped through all 4 one at a time.
 fn decodes_as_upstream(config: &Config, prefix: &str, input: &str, precision: Precision) {
     let (fixture, device) = (fixture("minicpm4", "minicpm4"), gpu::device());
+    let precision = precision.on(&device);
     let model = Model::load(config, fixture.path(), prefix, precision.dtype, &device).unwrap();
     let x = fixture.tensor::<3>(input, &device).cast(precision.dtype);
     let mut cache = model.cache(2, 7);
@@ -114,6 +137,7 @@ fn decodes_as_upstream(config: &Config, prefix: &str, input: &str, precision: Pr
 /// against upstream's output at the same positions.
 fn rows_go_on_as_upstream(config: &Config, prefix: &str, input: &str, precision: Precision) {
     let (fixture, device) = (fixture("minicpm4", "minicpm4"), gpu::device());
+    let precision = precision.on(&device);
     let model = Model::load(config, fixture.path(), prefix, precision.dtype, &device).unwrap();
     let x = fixture.tensor::<3>(input, &device).cast(precision.dtype);
     let causal = fixture.tensor::<3>(&format!("output.{prefix}causal"), &device);
@@ -267,6 +291,7 @@ fn base_lm_embeds_tokens_exactly() {
 /// The residual LM on the real weights at once and a step at a time, against upstream's in f32.
 fn residual_lm_runs_and_decodes_as_upstream(precision: Precision) {
     let (dir, device) = (checkpoint_dir(), gpu::device());
+    let precision = precision.on(&device);
     let json: Value =
         serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let lm: Config = serde_json::from_value(json["lm_config"].clone()).unwrap();
@@ -296,13 +321,19 @@ fn residual_lm_runs_and_decodes_as_upstream(precision: Precision) {
     check(Tensor::cat(decoded, 1), expected, precision);
 }
 
+// Through 8 layers: these came within 2.5e-2 of upstream's, and at most 1.1e-2 beyond four f16
+// epsilons of each.
+const REAL_F16: Precision = Precision { atol: 2e-2, ..F16 };
+
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn residual_lm_on_the_real_weights_runs_and_decodes_as_upstream_in_f32() {
     // As on the CPU: these, of RMS 1.2 and magnitude up to 20, came within 7.2e-5 of upstream's.
+    // In TF32 they were as far as 9.3e-3.
     let precision = Precision {
         atol: 5e-5,
         rtol: 1e-5,
+        tf32: Some(&REAL_F16),
         ..F32
     };
     residual_lm_runs_and_decodes_as_upstream(precision);
@@ -311,8 +342,5 @@ fn residual_lm_on_the_real_weights_runs_and_decodes_as_upstream_in_f32() {
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn residual_lm_on_the_real_weights_runs_and_decodes_as_upstream_in_f16() {
-    // Through 8 layers: these came within 2.5e-2 of upstream's, and at most 1.1e-2 beyond four
-    // f16 epsilons of each.
-    let precision = Precision { atol: 2e-2, ..F16 };
-    residual_lm_runs_and_decodes_as_upstream(precision);
+    residual_lm_runs_and_decodes_as_upstream(REAL_F16);
 }

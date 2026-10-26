@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use burn::tensor::{FloatDType, Tensor, TensorData};
 use common::fixture;
+use gpu::Gpu;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir};
 use voices::Latent;
@@ -18,6 +19,7 @@ use voxcpm::{
 };
 
 /// How far what generation gives in some dtypes may be from upstream's in f32.
+#[derive(Clone, Copy)]
 struct Precision {
     dtypes: Dtypes,
     /// A patch sampled after upstream's before it.
@@ -31,11 +33,30 @@ struct Precision {
     stops_late: usize,
     /// The audio of the first two patches.
     audio: f32,
+    /// In f32, the precision as served, whose tolerances hold where the GPU computes f32 matmuls
+    /// in TF32: that rounds their inputs to f16's mantissa, and computes the rest in f32.
+    tf32: Option<&'static Precision>,
+}
+
+impl Precision {
+    /// What it holds on `gpu`.
+    fn on(&self, gpu: &Gpu) -> Self {
+        match self.tf32 {
+            Some(f16) if gpu.tf32() => Self {
+                dtypes: self.dtypes,
+                tf32: None,
+                ..*f16
+            },
+            _ => *self,
+        }
+    }
 }
 
 // As on the CPU, whose test says why: given upstream's patches, each patch came within 2.3e-3
 // of upstream's and the stop logits within 3.8e-6, where upstream's last margin for stopping is
-// 0.070, and the first two patches decoded within 1.1e-5 of its audio.
+// 0.070, and the first two patches decoded within 1.1e-5 of its audio. In TF32 a patch came
+// 1.1e-2 from upstream's and the stop logits 2.7e-4, the quantizer's levels rounding apart as they
+// do in f16.
 const F32: Precision = Precision {
     dtypes: Dtypes {
         lm: FloatDType::F32,
@@ -48,6 +69,7 @@ const F32: Precision = Precision {
     stop_logits: 1e-4,
     stops_late: 0,
     audio: 1e-4,
+    tf32: Some(&SERVED),
 };
 
 // f16 but for the audio decoder (tests/audiovae.rs says why). Autotune picks kernels by timing
@@ -79,6 +101,7 @@ const SERVED: Precision = Precision {
     stop_logits: 2e-1,
     stops_late: 1,
     audio: 2e-3,
+    tf32: None,
 };
 
 /// Upstream's noise, then seeded noise for any patch after upstream's last.
@@ -134,6 +157,7 @@ fn voice(golden: &Fixture) -> Latent {
 
 fn generates_as_upstream(precision: &Precision) {
     let (golden, device) = (golden(), gpu::device());
+    let precision = &precision.on(&device);
     let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
     let tts = TextToSpeech::load(&checkpoint_dir(), &precision.dtypes, &device).unwrap();
     let (model, params) = (tts.model(), Params::default());
@@ -241,6 +265,7 @@ fn max_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
 /// the last of them, then all run free.
 fn samples_requests_together_as_alone(precision: &Precision) {
     let (golden, device) = (golden(), gpu::device());
+    let precision = &precision.on(&device);
     let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
     let dir = std::path::absolute(PathBuf::from(std::env::var_os("VOICES_DIR").unwrap())).unwrap();
     let other = Latent::read(&voices::latent_path(&dir, OTHER_VOICE)).unwrap();

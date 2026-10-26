@@ -7,14 +7,15 @@ publish = false
 
 [features]
 vulkan = ["burn/autotune", "burn/cubecl", "burn/vulkan"]
-cuda = ["burn/autotune", "burn/cubecl", "burn/cuda", "dep:cudarc"]
+cuda = ["burn/autotune", "burn/cubecl", "burn/cuda", "dep:cubecl", "cubecl/cuda", "dep:cudarc"]
 # CUDA with its kernels compiled as C++ by NVRTC, which needs the CUDA headers at run time,
 # rather than by LLVM to PTX.
-nvrtc = ["cuda", "dep:cubecl", "cubecl/cuda-cpp"]
+nvrtc = ["cuda", "cubecl/cuda-cpp"]
 
 [dependencies]
 burn = { workspace = true, features = ["std"] }
-# As burn's CUDA runtime has them, to ask the driver what it opens before it does.
+# As burn's CUDA runtime has them, to ask the driver what it opens before it does, and the
+# runtime what it computes in.
 cubecl = { version = "0.11.3", default-features = false, optional = true }
 cudarc = { version = "0.19.10", default-features = false, optional = true, features = [
     "cuda-version-from-build-system",

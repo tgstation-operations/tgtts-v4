@@ -123,7 +123,18 @@ mod common {
     /// The GPU, for one test at a time: the device, and the right to run on it until dropped.
     pub struct Gpu {
         device: Device,
+        tf32: bool,
         _exclusive: MutexGuard<'static, ()>,
+    }
+
+    impl Gpu {
+        /// Whether its f32 matmuls and convolutions are computed in TF32, which keeps f32's
+        /// range and sums in f32 but rounds the inputs to f16's 10-bit mantissa: cubecl's run on
+        /// tensor cores in TF32 wherever its runtime has the type, as CUDA's has from compute
+        /// capability 8.0 and its Vulkan runtime never does.
+        pub fn tf32(&self) -> bool {
+            self.tf32
+        }
     }
 
     impl Deref for Gpu {
@@ -148,8 +159,14 @@ mod common {
         let device = crate::cuda();
         #[cfg(not(feature = "cuda"))]
         let device = crate::vulkan();
+        let device = device.unwrap_or_else(|e| panic!("{e}"));
+        #[cfg(feature = "cuda")]
+        let tf32 = crate::cuda::supports_tf32();
+        #[cfg(not(feature = "cuda"))]
+        let tf32 = false;
         Gpu {
-            device: device.unwrap_or_else(|e| panic!("{e}")),
+            device,
+            tf32,
             _exclusive: exclusive,
         }
     }
@@ -208,6 +225,14 @@ mod cuda {
         let device = Device::cuda(0);
         device.identity().expect("a CUDA device says what it is");
         Ok(device)
+    }
+
+    /// Whether cubecl's runtime has TF32 on the device [`cuda`] opened.
+    pub(crate) fn supports_tf32() -> bool {
+        use cubecl::{prelude::Scalar, tf32};
+
+        let client = cubecl::Device::Cuda(cubecl::cuda::CudaDevice::new(0)).client();
+        client.properties().supports_type(tf32::elem_type_native())
     }
 
     /// Checks that NVRTC loads and that the headers it compiles cubecl's kernels with are where
