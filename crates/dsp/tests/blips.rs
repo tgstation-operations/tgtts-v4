@@ -188,6 +188,25 @@ fn lowercase_text_sounds() {
 }
 
 #[test]
+fn letters_outside_ascii_make_no_sound() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
+    let voice = Voice::new(&fx, "non-latin");
+    let blips = |text: &str| blips::sentence(text, &voice.1, "male", "1", 0, &mut Still);
+    let latin = blips("......, Hob!").unwrap();
+    assert!(!latin.samples.is_empty());
+    // "Privet" and "Kak dela" in Cyrillic.
+    let (privet, kak_dela) = (
+        "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+        "\u{41a}\u{430}\u{43a} \u{434}\u{435}\u{43b}\u{430}",
+    );
+    assert_eq!(blips(&format!("{privet}, Hob!")).unwrap(), latin);
+    assert!(blips(kak_dela).unwrap().samples.is_empty());
+    // A voice without an ASCII letter's blip still fails.
+    let missing = blips("x");
+    assert!(matches!(missing, Err(Error::Voice(_))), "{missing:?}");
+}
+
+#[test]
 fn a_sentence_starts_at_its_first_sound() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::new(&fx, "first-sound");

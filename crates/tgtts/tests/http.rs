@@ -652,6 +652,19 @@ fn makes_blips_as_the_game_asks() {
     assert_eq!(h.fake.texts(), Vec::<String>::new());
 }
 
+#[test]
+fn serves_a_message_in_cyrillic_whole() {
+    let h = harness(Fake::default(), limits());
+    // "Privet, stantsiya." in Cyrillic.
+    let message = Message {
+        text: "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}, \u{441}\u{442}\u{430}\u{43d}\u{446}\u{438}\u{44f}. Hello!",
+        ..Message::default()
+    };
+    for reply in message.all(&h) {
+        reply.assert_ogg(48000);
+    }
+}
+
 /// The cycles in `samples`: their swings from over a tenth of their peak to under its negative.
 fn cycles(samples: &[f32]) -> usize {
     let threshold = 0.1 * samples.iter().fold(0f32, |m, s| m.max(s.abs()));

@@ -96,12 +96,15 @@ pub fn message(
 
 /// The blips of `text` as the old blips service made them, `pitch` quarter tones up.
 ///
-/// Text with no letter or digit makes no sound. Each letter or digit at an even index
+/// Text with no letter or digit makes no sound. Each ASCII letter or digit at an even index
 /// makes the blip of its lowercase, detuned by up to 0.6 semitones either way, a capital by 1.6
 /// semitones more and up to 1.05 either way, and lowered by 6 dB, a capital by 3; `?` and `!`
 /// make the `Deska` and `Gwah` blips, detuned by up to 1.2 semitones, lowered by 4.4 dB and
 /// stripped of their silence; nothing else makes a sound. Each blip is faded in over 3 ms and out
 /// over 8. Each detuning is a draw from `random`.
+///
+/// The voices have blips for `a` to `z` and `0` to `9` alone: the old service failed on any
+/// other letter or digit at an even index, such as Cyrillic's, and so dropped the message.
 pub fn sentence(
     text: &str,
     blips: &Blips,
@@ -124,7 +127,7 @@ pub fn sentence(
     };
     let mut result = Segment::new(rate, Vec::new());
     for (i, letter) in text.chars().enumerate() {
-        let blip = if letter.is_alphanumeric() {
+        let blip = if letter.is_ascii_alphanumeric() {
             if i % 2 != 0 {
                 continue;
             }
