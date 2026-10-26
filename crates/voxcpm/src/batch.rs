@@ -256,15 +256,16 @@ struct Request<K, N> {
     sampling: Sampling,
     /// The patches it may still have.
     left: usize,
+    given: usize,
     noise: N,
 }
 
-/// A patch of a request's speech, `[1, patch_size, feat_dim]` in f32, and whether it is its
-/// last.
+/// A patch of a request's speech, `[1, patch_size, feat_dim]` in f32, or why the request ended
+/// without it, and whether it is its last.
 #[derive(Debug)]
 pub struct Patch<K> {
     pub key: K,
-    pub patch: Tensor<3>,
+    pub patch: Result<Tensor<3>, Error>,
     pub last: bool,
 }
 
@@ -310,6 +311,7 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             key,
             sampling: sampling.clone(),
             left: max_patches,
+            given: 0,
             noise,
         };
         self.waiting.push_back((request, prefill));
@@ -327,7 +329,8 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
     }
 
     /// Runs the prompts of waiting requests, all of the first if no request is generating to
-    /// wait for it, then samples the next patch of every generating request.
+    /// wait for it, then samples the next patch of every generating request. A request whose
+    /// patch comes out NaN or infinite ends with an error in its place.
     pub fn step(&mut self) -> Vec<Patch<K>> {
         let mut budget = self.prefill_positions;
         while let Some((_, prefill)) = self.waiting.front_mut() {
@@ -360,14 +363,22 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         let shape = [rows.len(), model.feat_dim, model.patch_size];
         let noise = Tensor::from_data(TensorData::new(noise.collect(), shape), &model.device);
         let step = self.batch.sample(noise);
-        let stops = step.stop_logits.argmax(1).into_data();
+        let logits: Vec<f32> = step.stop_logits.clone().into_data().iter().collect();
+        let values: Vec<f32> = step.patch.clone().into_data().iter().collect();
         let mut patches = vec![];
         let mut going = vec![];
-        for (i, (row, stop)) in rows.iter().zip(stops.iter::<i64>()).enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let request = self.running.get_mut(row).expect("running");
             request.left -= 1;
-            let last = stop == 1 || request.left == 0;
-            let patch = step.patch.clone().narrow(0, i, 1);
+            request.given += 1;
+            let logits = &logits[2 * i..2 * i + 2];
+            let finite = logits.iter().chain(&values[i * len..(i + 1) * len]);
+            let patch = if finite.copied().all(f32::is_finite) {
+                Ok(step.patch.clone().narrow(0, i, 1))
+            } else {
+                Err(Error::NotFinite(request.given - 1))
+            };
+            let last = patch.is_err() || logits[1] > logits[0] || request.left == 0;
             patches.push(Patch {
                 key: request.key.clone(),
                 patch,

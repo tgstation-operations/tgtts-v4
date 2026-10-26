@@ -231,7 +231,7 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// As [`start`](Self::start).
+    /// As [`start`](Self::start), and if a patch comes out NaN or infinite.
     pub fn generate(
         &self,
         prompt: &Prompt,
@@ -240,7 +240,7 @@ impl Model {
         noise: &mut impl Noise,
     ) -> Result<Tensor<3>, Error> {
         let patches = self.patches(prompt, sampling, max_patches, noise)?;
-        Ok(Tensor::cat(patches.collect(), 0))
+        Ok(Tensor::cat(patches.collect::<Result<_, _>>()?, 0))
     }
 
     /// The patches [`generate`](Self::generate) gives, each sampled only as the iterator is
@@ -261,6 +261,7 @@ impl Model {
             sampling,
             noise,
             left: max_patches,
+            given: 0,
             last: None,
         })
     }
@@ -291,7 +292,8 @@ pub struct Generation<'a> {
 }
 
 /// The patches of a generation, each `[1, patch_size, feat_dim]` in f32, sampled one at a time
-/// as the iterator is advanced: [`Model::patches`].
+/// as the iterator is advanced: [`Model::patches`]. One that comes out NaN or infinite ends it,
+/// as an error.
 #[derive(Debug)]
 pub struct Patches<'a, N> {
     generation: Generation<'a>,
@@ -299,15 +301,16 @@ pub struct Patches<'a, N> {
     noise: &'a mut N,
     /// How many more patches may follow, none once the stop head has said to stop.
     left: usize,
+    given: usize,
     /// The patch given last, which the LMs take in only before the next is sampled, so that
     /// the caller has it sooner.
     last: Option<Tensor<3>>,
 }
 
 impl<N: Noise> Iterator for Patches<'_, N> {
-    type Item = Tensor<3>;
+    type Item = Result<Tensor<3>, Error>;
 
-    fn next(&mut self) -> Option<Tensor<3>> {
+    fn next(&mut self) -> Option<Result<Tensor<3>, Error>> {
         if self.left == 0 {
             return None;
         }
@@ -316,9 +319,14 @@ impl<N: Noise> Iterator for Patches<'_, N> {
         }
         let noise = self.generation.model.noise(self.noise);
         let step = self.generation.sample(noise, self.sampling);
+        self.given += 1;
+        if !step.is_finite() {
+            self.left = 0;
+            return Some(Err(Error::NotFinite(self.given - 1)));
+        }
         self.left = if step.stops() { 0 } else { self.left - 1 };
         self.last = Some(step.patch.clone());
-        Some(step.patch)
+        Some(Ok(step.patch))
     }
 }
 
@@ -332,6 +340,12 @@ pub struct Step {
 }
 
 impl Step {
+    /// Whether the patch and the stop head's logits are all finite.
+    pub fn is_finite(&self) -> bool {
+        let finite = |data: TensorData| data.iter::<f32>().all(f32::is_finite);
+        finite(self.patch.clone().into_data()) && finite(self.stop_logits.clone().into_data())
+    }
+
     /// Whether generation stops after this patch.
     pub fn stops(&self) -> bool {
         let stop = self.stop_logits.clone().argmax(1).into_data();

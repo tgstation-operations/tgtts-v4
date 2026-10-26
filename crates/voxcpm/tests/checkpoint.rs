@@ -400,7 +400,7 @@ fn samples_requests_together_as_alone_on_the_real_weights() {
             }
         }
         for patch in scheduler.step() {
-            free[patch.key].push(patch.patch);
+            free[patch.key].push(patch.patch.unwrap());
         }
         if t >= 6 && scheduler.requests() == 0 {
             break;
@@ -472,7 +472,7 @@ fn streams_speech_a_patch_at_a_time_as_it_synthesizes() {
         .unwrap();
     let mut noise = SeededNoise::new(1);
     let stream = tts.stream(text, &voice, &params, &mut noise).unwrap();
-    let patches: Vec<Vec<f32>> = stream.collect();
+    let patches: Vec<Vec<f32>> = stream.collect::<Result<_, _>>().unwrap();
     assert!(patches.iter().all(|patch| patch.len() == 4 * 1920));
     let streamed = Tensor::<1>::from_floats(patches.concat().as_slice(), &device);
     let whole = Tensor::from_floats(whole.as_slice(), &device);

@@ -55,6 +55,9 @@ pub enum Error {
     Tokenizer(String),
     /// A request the model cannot serve.
     Request(String),
+    /// The patch, by its index, came out NaN or infinite, as an overflow or a kernel that wrote
+    /// nothing leaves it, after which the stop head might never say to stop.
+    NotFinite(usize),
 }
 
 impl fmt::Display for Error {
@@ -68,6 +71,7 @@ impl fmt::Display for Error {
             Self::AudioVae(e) => write!(f, "{e}"),
             Self::Tokenizer(what) => write!(f, "tokenizer.json: {what}"),
             Self::Request(what) => write!(f, "cannot generate from {what}"),
+            Self::NotFinite(patch) => write!(f, "patch {patch} came out NaN or infinite"),
         }
     }
 }

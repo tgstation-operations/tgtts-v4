@@ -89,7 +89,7 @@ impl TextToSpeech {
     /// # Errors
     ///
     /// If the voice is not a whole number of patches, or it, the text and `params.max_patches`
-    /// would run past the positions the LM has.
+    /// would run past the positions the LM has, or a patch comes out NaN or infinite.
     pub fn synthesize(
         &self,
         text: &str,
@@ -110,19 +110,19 @@ impl TextToSpeech {
     ///
     /// # Errors
     ///
-    /// As [`synthesize`](Self::synthesize).
+    /// As [`synthesize`](Self::synthesize), the last as the last item.
     pub fn stream<'a, N: Noise>(
         &'a self,
         text: &str,
         voice: &Latent,
         params: &'a Params,
         noise: &'a mut N,
-    ) -> Result<impl Iterator<Item = Vec<f32>> + use<'a, N>, Error> {
+    ) -> Result<impl Iterator<Item = Result<Vec<f32>, Error>> + use<'a, N>, Error> {
         let prompt = self.prompt(text, voice)?;
         let (sampling, max_patches) = (&params.sampling, params.max_patches);
         let patches = self.model.patches(&prompt, sampling, max_patches, noise)?;
         let mut decoder = self.speech_decoder(voice, params);
-        Ok(patches.map(move |patch| decoder.push(patch)))
+        Ok(patches.map(move |patch| patch.map(|patch| decoder.push(patch))))
     }
 
     /// A decoder of the patches generated from the [`prompt`](Self::prompt) of `voice`, in

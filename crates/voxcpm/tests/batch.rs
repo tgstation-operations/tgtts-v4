@@ -4,7 +4,7 @@ use burn::tensor::{FloatDType, Tensor};
 use common::tiny;
 use testkit::{Fixture, assert_close, device, fixture};
 use voxcpm::{
-    Batch, Dtypes, Model, Noise, Prompt, PromptCache, Sampling, Scheduler, SeededNoise, Step,
+    Batch, Dtypes, Error, Model, Noise, Prompt, PromptCache, Sampling, Scheduler, SeededNoise, Step,
 };
 
 const F32: Dtypes = Dtypes {
@@ -160,7 +160,7 @@ fn a_scheduler_generates_each_request_as_alone() {
                 patch.key
             );
             first[patch.key].get_or_insert(t);
-            got[patch.key].push(patch.patch);
+            got[patch.key].push(patch.patch.unwrap());
             done[patch.key] = patch.last;
         }
         if scheduler.requests() == 0 && t >= 2 {
@@ -184,4 +184,77 @@ fn a_scheduler_generates_each_request_as_alone() {
         assert_eq!(patches.dims(), expected.dims(), "request {i}");
         assert_close(patches, expected, ATOL, RTOL);
     }
+}
+
+/// Noise that is NaN from the `from`th patch on.
+struct Diverging {
+    noise: SeededNoise,
+    left: usize,
+}
+
+impl Noise for Diverging {
+    fn next(&mut self, len: usize) -> Vec<f32> {
+        let noise = self.noise.next(len);
+        if self.left == 0 {
+            return vec![f32::NAN; len];
+        }
+        self.left -= 1;
+        noise
+    }
+}
+
+/// A request whose third patch comes out NaN ends with an error in its place, and the request
+/// beside it goes on as alone.
+#[test]
+fn a_patch_that_is_not_finite_ends_its_request_with_an_error() {
+    let fixture = fixture!("voxcpm_generate");
+    let model = model(&fixture);
+    let voice: Vec<f32> = fixture
+        .tensor::<2>("input.voice", &device())
+        .into_data()
+        .iter()
+        .collect();
+    let tokens = [5, 17, 42, 9, 77, 3, 64];
+    let prompt = Prompt::cloning(&tokens, &voice, &tiny()).unwrap();
+    let sampling = Sampling::default();
+    let diverging = || Diverging {
+        noise: SeededNoise::new(3),
+        left: 2,
+    };
+    let alone = model.generate(&prompt, &sampling, 8, &mut diverging());
+    assert!(matches!(alone, Err(Error::NotFinite(2))), "{alone:?}");
+
+    let mut scheduler = Scheduler::new(&model, PromptCache::new(usize::MAX), 8);
+    scheduler
+        .add(0, &prompt, &sampling, 8, diverging())
+        .unwrap();
+    let mut other = vec![];
+    let mut seeded = Some(SeededNoise::new(3));
+    let mut failed = vec![];
+    while scheduler.requests() > 0 {
+        let patches = scheduler.step();
+        // The other request joins after the first's first patch, from a noise of its own.
+        if let Some(noise) = seeded.take() {
+            let noise = Diverging {
+                noise,
+                left: usize::MAX,
+            };
+            scheduler.add(1, &prompt, &sampling, 8, noise).unwrap();
+        }
+        for patch in patches {
+            match (patch.key, patch.patch) {
+                (0, Ok(_)) => assert!(failed.is_empty()),
+                (0, Err(error)) => {
+                    assert!(patch.last);
+                    failed.push(error);
+                }
+                (_, patch) => other.push(patch.unwrap()),
+            }
+        }
+    }
+    assert!(matches!(failed[..], [Error::NotFinite(2)]), "{failed:?}");
+    let expected = model
+        .generate(&prompt, &sampling, 8, &mut SeededNoise::new(3))
+        .unwrap();
+    assert_close(Tensor::cat(other, 0), expected, ATOL, RTOL);
 }
