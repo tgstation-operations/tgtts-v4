@@ -1,0 +1,110 @@
+; axpb: y[i] = a * x[i] + b, and s[i] = the size of the subgroup invocation i ran in.
+;
+; The device tests' kernel, written as SPIR-V assembly so that nothing but spirv-tools
+; stands between this file and the blob the driver gets.
+;
+; a (SpecId 1), b (SpecId 2) and the workgroup width (SpecId 0, through LocalSizeId, which
+; needs the maintenance4 feature) are specialization constants, so the suite can check
+; that the runtime applies them. The multiply and the add are decorated NoContraction:
+; without it the driver may fuse them into one fused multiply-add with a single rounding,
+; and the result would no longer match the CPU's a * x + b bit for bit. The element count
+; is the length of the bound x buffer (OpArrayLength), so the spare invocations of the
+; last workgroup do nothing. Writing the SubgroupSize built-in out per element is how the
+; suite sees which wave size the driver actually compiled for.
+;
+; Bindings, all in descriptor set 0: 0 x (f32, read), 1 y (f32, written), 2 s (u32,
+; written). y and s must be at least as long as x.
+;
+; Assembled and validated, from crates/vulkan, with
+;   spirv-as --target-env vulkan1.3 tests/kernels/axpb.spvasm -o tests/kernels/axpb.spv
+;   spirv-val --target-env vulkan1.3 tests/kernels/axpb.spv
+; and `nix run .#device-tests` checks that the committed blob is what this file assembles to.
+
+               OpCapability Shader
+               OpCapability GroupNonUniform
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %global_id %subgroup_size %x %y %s
+               OpExecutionModeId %main LocalSizeId %width %uint_1 %uint_1
+
+               OpName %main "main"
+               OpName %x "x"
+               OpName %y "y"
+               OpName %s "s"
+               OpName %width "width"
+               OpName %a "a"
+               OpName %b "b"
+
+               OpDecorate %global_id BuiltIn GlobalInvocationId
+               OpDecorate %subgroup_size BuiltIn SubgroupSize
+               OpDecorate %width SpecId 0
+               OpDecorate %a SpecId 1
+               OpDecorate %b SpecId 2
+               OpDecorate %floats ArrayStride 4
+               OpDecorate %uints ArrayStride 4
+               OpDecorate %FloatBuffer Block
+               OpMemberDecorate %FloatBuffer 0 Offset 0
+               OpDecorate %UintBuffer Block
+               OpMemberDecorate %UintBuffer 0 Offset 0
+               OpDecorate %x DescriptorSet 0
+               OpDecorate %x Binding 0
+               OpDecorate %x NonWritable
+               OpDecorate %y DescriptorSet 0
+               OpDecorate %y Binding 1
+               OpDecorate %s DescriptorSet 0
+               OpDecorate %s Binding 2
+               OpDecorate %ax NoContraction
+               OpDecorate %axb NoContraction
+
+       %void = OpTypeVoid
+    %void_fn = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+      %float = OpTypeFloat 32
+      %uint3 = OpTypeVector %uint 3
+     %floats = OpTypeRuntimeArray %float
+      %uints = OpTypeRuntimeArray %uint
+%FloatBuffer = OpTypeStruct %floats
+ %UintBuffer = OpTypeStruct %uints
+%float_buffer_ptr = OpTypePointer StorageBuffer %FloatBuffer
+%uint_buffer_ptr = OpTypePointer StorageBuffer %UintBuffer
+  %float_ptr = OpTypePointer StorageBuffer %float
+   %uint_ptr = OpTypePointer StorageBuffer %uint
+ %uint3_in_ptr = OpTypePointer Input %uint3
+ %uint_in_ptr = OpTypePointer Input %uint
+
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+      %width = OpSpecConstant %uint 64
+          %a = OpSpecConstant %float 1
+          %b = OpSpecConstant %float 0
+
+  %global_id = OpVariable %uint3_in_ptr Input
+%subgroup_size = OpVariable %uint_in_ptr Input
+          %x = OpVariable %float_buffer_ptr StorageBuffer
+          %y = OpVariable %float_buffer_ptr StorageBuffer
+          %s = OpVariable %uint_buffer_ptr StorageBuffer
+
+       %main = OpFunction %void None %void_fn
+      %entry = OpLabel
+        %gid = OpLoad %uint3 %global_id
+          %i = OpCompositeExtract %uint %gid 0
+          %n = OpArrayLength %uint %x 0
+  %in_bounds = OpULessThan %bool %i %n
+               OpSelectionMerge %done None
+               OpBranchConditional %in_bounds %body %done
+
+       %body = OpLabel
+     %x_elem = OpAccessChain %float_ptr %x %uint_0 %i
+         %xi = OpLoad %float %x_elem
+         %ax = OpFMul %float %a %xi
+        %axb = OpFAdd %float %ax %b
+     %y_elem = OpAccessChain %float_ptr %y %uint_0 %i
+               OpStore %y_elem %axb
+         %sg = OpLoad %uint %subgroup_size
+     %s_elem = OpAccessChain %uint_ptr %s %uint_0 %i
+               OpStore %s_elem %sg
+               OpBranch %done
+
+       %done = OpLabel
+               OpReturn
+               OpFunctionEnd

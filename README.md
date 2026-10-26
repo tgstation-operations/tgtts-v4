@@ -19,6 +19,9 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   --features vulkan` runs the models' fixtures there, and with
   `-- --include-ignored` their goldens on the real weights and the service end
   to end, which also need `VOICES_DIR` and `ASSETS_DIR`.
+- `nix run .#device-tests` runs the Vulkan runtime's tests on the GPU, under
+  the Khronos validation layer, the start of a GPU path of its own; the burn
+  code stays the oracle it is checked against.
 - `nix run .#bench` times release builds of the hot paths on the real data
   (`VOXCPM2_DIR`, `VOICES_DIR` for a converted voices directory and `ASSETS_DIR`
   for the radio's sounds) and writes each run as JSON;

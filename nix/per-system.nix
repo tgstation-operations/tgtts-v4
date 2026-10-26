@@ -24,6 +24,7 @@ in
   # fixtures stays out of the devshell, whose closure would then hold torch.
   packages = scripts // {
     inherit mlir;
+    device-tests = import ./scripts/device-tests.nix { inherit pkgs rustToolchain; };
     fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
     cuda-trial = import ./cuda-trial.nix {
       inherit

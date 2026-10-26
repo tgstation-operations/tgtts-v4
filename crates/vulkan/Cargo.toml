@@ -1,0 +1,13 @@
+[package]
+name = "vulkan"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+# The tests that run on the GPU, built only with it.
+device = []
+
+[dependencies]
+ash.workspace = true
