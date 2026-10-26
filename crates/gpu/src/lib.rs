@@ -137,6 +137,15 @@ mod common {
         }
     }
 
+    impl Drop for Gpu {
+        /// cubecl keeps memory per stream, a stream per thread, and holds the pages a stream
+        /// emptied until asked to give them back. Each test runs on a thread of its own, so
+        /// without that every test of a process would keep what it used from the next.
+        fn drop(&mut self) {
+            self.device.memory_cleanup();
+        }
+    }
+
     impl Deref for Gpu {
         type Target = Device;
 
