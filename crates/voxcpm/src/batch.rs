@@ -433,24 +433,25 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         if joining > 0 {
             let (requests, prefills): (Vec<_>, Vec<_>) = self.waiting.drain(..joining).unzip();
             let generations = self.model.prefill_together(prefills, &mut self.cache);
+            if let Rows::Stable(stepper) = &mut self.batch {
+                // An empty one may sample in other steps than the requests.
+                if stepper
+                    .as_ref()
+                    .is_none_or(|stepper| stepper.rows().is_empty())
+                {
+                    let (model, timesteps) = (self.model, requests[0].sampling.timesteps);
+                    *stepper = Some(Box::new(Stepper::new(model, model.stepping(), timesteps)));
+                }
+                stepper.as_mut().expect("made").reserve(&generations);
+            }
             for (mut request, generation) in requests.into_iter().zip(generations) {
                 let row = match &mut self.batch {
                     Rows::Eager(batch) => batch.join(generation, &request.sampling),
-                    Rows::Stable(stepper) => {
-                        // An empty one may sample in other steps than the request.
-                        if stepper
-                            .as_ref()
-                            .is_some_and(|stepper| stepper.rows().is_empty())
-                        {
-                            *stepper = None;
-                        }
-                        let (model, timesteps) = (self.model, request.sampling.timesteps);
-                        let stepping = model.stepping();
-                        let stepper = stepper.get_or_insert_with(|| {
-                            Box::new(Stepper::new(model, stepping, timesteps))
-                        });
-                        stepper.join(generation, &request.sampling, &mut request.noise)
-                    }
+                    Rows::Stable(stepper) => stepper.as_mut().expect("made").join(
+                        generation,
+                        &request.sampling,
+                        &mut request.noise,
+                    ),
                 };
                 self.running
                     .insert(row.expect("checked when added"), request);

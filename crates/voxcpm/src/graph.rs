@@ -463,6 +463,28 @@ impl<'a> Stepper<'a> {
         Ok(id)
     }
 
+    /// Makes room for `generations` to join, so that the rows move once for all of them rather
+    /// than doubling as each joins: as many rows as hold them and those it holds, as it would
+    /// come to, in caches of the capacity the longest needs.
+    pub fn reserve(&mut self, generations: &[Generation<'a>]) {
+        let held = self.rows.iter().flatten().count();
+        let mut rows = self.rows.len().max(1);
+        while rows < held + generations.len() {
+            rows *= 2;
+        }
+        let model = self.model;
+        let needed = generations.iter().map(|generation| {
+            let end = generation.base_cache.capacity();
+            end.next_power_of_two().min(model.max_positions)
+        });
+        let held_capacity = self.graph.as_ref().map_or(0, |(key, _)| key.1);
+        let capacity = needed.fold(held_capacity, usize::max);
+        if (rows, capacity) != (self.rows.len(), held_capacity) {
+            let kept: Vec<usize> = (0..self.rows.len()).collect();
+            self.move_to(&kept, rows, capacity);
+        }
+    }
+
     /// Drops the generation `row`.
     ///
     /// # Panics
