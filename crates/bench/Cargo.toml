@@ -8,6 +8,8 @@ publish = false
 [features]
 # --device vulkan, keeping what autotune chose from one run to the next.
 vulkan = ["burn/persistence", "dep:gpu", "gpu/vulkan"]
+# --device cuda, likewise.
+cuda = ["burn/persistence", "dep:gpu", "gpu/cuda"]
 
 [dependencies]
 audiovae = { path = "../audiovae" }

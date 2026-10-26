@@ -34,7 +34,7 @@ use crate::{
 };
 
 const USAGE: &str = "\
-usage: bench [run] [--filter TEXT]... [--quick] [--warmup N] [--reps N] [--device flex|vulkan]
+usage: bench [run] [--filter TEXT]... [--quick] [--warmup N] [--reps N] [--device flex|vulkan|cuda]
              [--dtype D] [--lm-dtype D] [--local-encoder-dtype D] [--local-dit-dtype D]
              [--audio-decoder-dtype D] [--autotune-cache DIR] [--voice NAME] [--label TEXT]
              [--out DIR] [--max-load CPUS] [--noisy-ok]
@@ -56,7 +56,8 @@ Each part of the model runs in --dtype (f32, f16 or bf16), or in the dtype its o
 by default in the dtypes the service serves in there, f16 but for the audio decoder's f32. Its
 autotune keeps the kernels it chose in --autotune-cache (target/bench/autotune by default), and
 the benchmarks that grow through KV lengths first run through them untimed; the audio VAE's
-encoder is never timed there. A GPU's times run to the device's having finished, and its
+encoder is never timed there. --device cuda, in a build with the cuda feature, times the first
+CUDA device alike. A GPU's times run to the device's having finished, and its
 counters count only the host's share: launching the kernels and waiting for them.
 
 compare says which benchmarks changed between two runs beyond their noise; --spread names runs
@@ -457,6 +458,15 @@ pub fn summary(run: &Run) -> String {
             gpu.autotune_cache,
             gpu.autotune_cache_bytes_before
         );
+        if let Some(cuda) = &gpu.cuda {
+            out += &format!(
+                "CUDA {} by the driver, bound for {}, NVRTC {}, kernels compiled by {}\n",
+                cuda.driver,
+                cuda.bindings,
+                cuda.nvrtc.as_deref().unwrap_or("absent"),
+                cuda.compiler
+            );
+        }
     }
     if run.noisy.is_empty() {
         out += "quiet throughout\n";
