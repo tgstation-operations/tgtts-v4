@@ -23,6 +23,14 @@ in
   # fixtures stays out of the devshell, whose closure would then hold torch.
   packages = scripts // {
     fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
+    cuda-trial = import ./cuda-trial.nix {
+      inherit
+        pkgs
+        rustToolchain
+        ffmpeg
+        tracelLlvm
+        ;
+    };
   };
   devShell = import ./devshell.nix {
     inherit

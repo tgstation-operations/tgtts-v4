@@ -24,6 +24,16 @@
               pkgs = import nixpkgs {
                 inherit system;
                 overlays = [ rust-overlay.overlays.default ];
+                # The CUDA a GPU build runs with: NVRTC, the headers it compiles
+                # kernels with, and libdevice, which comes with nvcc.
+                config.allowUnfreePredicate =
+                  pkg:
+                  builtins.elem (nixpkgs.lib.getName pkg) [
+                    "cuda_cccl"
+                    "cuda_cudart"
+                    "cuda_nvcc"
+                    "cuda_nvrtc"
+                  ];
               };
             }
           )
