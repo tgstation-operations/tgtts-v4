@@ -1,6 +1,6 @@
 //! The service end to end on the real model on the GPU, in the dtypes it serves in there and
 //! warmed up as it starts: a message for everyone, as the game asks for it.
-#![cfg(feature = "vulkan")]
+#![cfg(any(feature = "vulkan", feature = "cuda"))]
 
 #[path = "../../tgtts/tests/common/mod.rs"]
 mod service;

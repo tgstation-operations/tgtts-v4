@@ -1,6 +1,6 @@
 //! voxcpm on the real weights on the GPU, against what upstream computes with them, as
 //! fixtures/voxcpm_checkpoint.py records it: in f32, and in the dtypes the GPU serves in.
-#![cfg(feature = "vulkan")]
+#![cfg(any(feature = "vulkan", feature = "cuda"))]
 
 mod common;
 #[path = "../../voxcpm/tests/recorded/mod.rs"]

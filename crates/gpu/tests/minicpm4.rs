@@ -1,5 +1,5 @@
 //! minicpm4's fixtures and real-weight golden on the GPU, in f32 and in f16.
-#![cfg(feature = "vulkan")]
+#![cfg(any(feature = "vulkan", feature = "cuda"))]
 
 mod common;
 

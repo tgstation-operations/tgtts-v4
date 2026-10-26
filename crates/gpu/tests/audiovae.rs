@@ -3,7 +3,7 @@
 //! The decoder runs in f32 on the GPU too: in f16 the first of its transposed convolutions, 2048
 //! channels to 1024, sums in f16, which took the real golden's decode from 116 dB of upstream's
 //! to 46 dB, where the CPU in f16 reaches 56 dB.
-#![cfg(feature = "vulkan")]
+#![cfg(any(feature = "vulkan", feature = "cuda"))]
 
 mod common;
 

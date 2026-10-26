@@ -7,9 +7,23 @@ publish = false
 
 [features]
 vulkan = ["burn/autotune", "burn/cubecl", "burn/vulkan"]
+cuda = ["burn/autotune", "burn/cubecl", "burn/cuda", "dep:cudarc"]
+# CUDA with its kernels compiled as C++ by NVRTC, which needs the CUDA headers at run time,
+# rather than by LLVM to PTX.
+nvrtc = ["cuda", "dep:cubecl", "cubecl/cuda-cpp"]
 
 [dependencies]
 burn = { workspace = true, features = ["std"] }
+# As burn's CUDA runtime has them, to ask the driver what it opens before it does.
+cubecl = { version = "0.11.3", default-features = false, optional = true }
+cudarc = { version = "0.19.10", default-features = false, optional = true, features = [
+    "cuda-version-from-build-system",
+    "driver",
+    "fallback-dynamic-loading",
+    "fallback-latest",
+    "nvrtc",
+    "std",
+] }
 
 [dev-dependencies]
 audiovae = { path = "../audiovae" }

@@ -3109,6 +3109,8 @@ dependencies = [
  "axum",
  "burn",
  "crc32fast",
+ "cubecl",
+ "cudarc",
  "dsp",
  "minicpm4",
  "serde_json",
