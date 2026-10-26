@@ -11,7 +11,7 @@ mod config;
 mod layer;
 mod rope;
 
-use std::{collections::BTreeMap, fmt, iter, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 use burn::{
     module::Module,
@@ -245,7 +245,8 @@ impl Model {
 
     /// Hides from each of the next `len` positions of each row, after its `starts`, the keys
     /// after it, once for each query head of a group, as attention stacks them along the
-    /// sequence. None when `len` is 1 and the rows are as long: each sees every key.
+    /// sequence. None when `len` is 1 and the rows are as long: each sees every key. Made on the
+    /// device, where a batch of long prompts would have to upload one as long as all of them.
     fn causal_mask(
         &self,
         starts: &[usize],
@@ -263,29 +264,30 @@ impl Model {
         };
         let total = rows.iter().max().map_or(0, |start| start + len);
         let groups = self.config.num_attention_heads / self.config.num_key_value_heads;
-        let hidden = rows.iter().flat_map(|&start| {
-            (0..groups).flat_map(move |_| {
-                (0..len).flat_map(move |q| (0..total).map(move |k| k > start + q))
-            })
-        });
         let shape = [rows.len(), 1, groups * len, total];
-        Some(Tensor::from_data(
-            TensorData::new(hidden.collect(), shape),
-            device,
-        ))
+        let queries = positions(rows, len, device).repeat_dim(1, groups);
+        let queries = queries
+            .reshape([rows.len(), 1, groups * len, 1])
+            .expand(shape);
+        let keys = Tensor::<1, Int>::arange(0..total as i64, device).reshape([1, 1, 1, total]);
+        Some(keys.expand(shape).greater(queries))
     }
 
     /// The positions of each row's next `len` keys and values, as the cache's layers take them.
     fn slots(&self, starts: &[usize], len: usize, device: &Device) -> Tensor<4, Int> {
         let (heads, dim) = (self.config.num_key_value_heads, self.config.head_dim());
-        let at = starts.iter().flat_map(|&start| {
-            (0..heads).flat_map(move |_| {
-                (start..start + len).flat_map(move |t| iter::repeat_n(t as i64, dim))
-            })
-        });
-        let shape = [starts.len(), heads, len, dim];
-        Tensor::from_data(TensorData::new(at.collect(), shape), device)
+        let at = positions(starts, len, device).reshape([starts.len(), 1, len, 1]);
+        at.expand([starts.len(), heads, len, dim])
     }
+}
+
+/// The positions `start..start + len` of each row's `start`, `[starts.len(), len]`.
+fn positions(starts: &[usize], len: usize, device: &Device) -> Tensor<2, Int> {
+    let rows = starts.len();
+    let starts: Vec<i64> = starts.iter().map(|&start| start as i64).collect();
+    let starts = Tensor::<1, Int>::from_data(starts.as_slice(), device).reshape([rows, 1]);
+    let run = Tensor::<1, Int>::arange(0..len as i64, device).reshape([1, len]);
+    starts.expand([rows, len]) + run.expand([rows, len])
 }
 
 /// The projections a layer runs as one, and upstream's, whose weights are joined along their
