@@ -27,7 +27,7 @@ pub use crate::{
     batch::{Batch, Patch, RowId, Scheduler, Started, StepReport},
     cfm::{Cfm, Sampling, schedule},
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
-    graph::{Stepper, Stepping},
+    graph::{GraphCounts, Stepper, Stepping},
     local_dit::LocalDit,
     local_encoder::LocalEncoder,
     model::{Dtypes, Generation, Model, Patches, Step},

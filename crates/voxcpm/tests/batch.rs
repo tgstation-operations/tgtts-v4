@@ -265,6 +265,36 @@ fn requests_go_on_as_alone_after_a_scheduler_left_off_by_replays() {
     requests_go_on_as_alone_after_a_scheduler_left_off(Stepping::Captured);
 }
 
+/// The graphs of each number of rows and capacity of cache are captured once, for the first
+/// requests that reach them, kept while the model lives, and replayed for the requests after.
+#[test]
+fn graphs_are_captured_once_and_kept() {
+    let fixture = fixture!("voxcpm_generate");
+    let mut model = model(&fixture);
+    model.set_stepping(Stepping::Captured);
+    let prompts: Vec<Prompt> = (0..5)
+        .map(|i| prompt(i, 2 + i as usize % 3, &[5, 17, 42, 9], &[77, 3, 64]))
+        .collect();
+    let run = |model: &Model| {
+        let mut scheduler = Scheduler::new(model, PromptCache::new(usize::MAX), usize::MAX);
+        for (i, prompt) in prompts.iter().enumerate() {
+            let noise = SeededNoise::new(i as u64);
+            scheduler
+                .add(i, prompt, &Sampling::default(), 6, noise)
+                .unwrap();
+        }
+        while scheduler.requests() > 0 {
+            scheduler.step();
+        }
+    };
+    run(&model);
+    let first = model.graph_counts();
+    assert!(first.captured > 1, "{first:?}");
+    assert_eq!(first.destroyed, 0);
+    run(&model);
+    assert_eq!(model.graph_counts(), first);
+}
+
 /// Noise that is NaN from the `from`th patch on.
 struct Diverging {
     noise: SeededNoise,

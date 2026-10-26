@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     fmt,
     ops::Range,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::{self, ThreadId},
 };
 
@@ -41,9 +44,26 @@ impl Stepping {
 }
 
 /// The graphs a model has captured of its step, with the buffers each reads and writes, each
-/// kept for the next generation of its key while none is using it.
+/// kept for the next generation of its key while none is using it, and kept for as long as the
+/// model lives: on Vulkan, replays have read memory a graph destroyed beside them had held.
 #[derive(Default)]
-pub(crate) struct Graphs(Mutex<HashMap<Key, StepGraph>>);
+pub(crate) struct Graphs {
+    kept: Mutex<HashMap<Key, Vec<StepGraph>>>,
+    counts: Arc<Counts>,
+}
+
+#[derive(Debug, Default)]
+struct Counts {
+    captured: AtomicUsize,
+    destroyed: AtomicUsize,
+}
+
+/// How many graphs of its step a model has captured, and how many of those it has destroyed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraphCounts {
+    pub captured: usize,
+    pub destroyed: usize,
+}
 
 /// The rows and the capacity of the caches a graph steps, the sampling steps of each patch, and
 /// the thread that captured it: a replay must be ordered after the writes of its inputs, which
@@ -52,8 +72,8 @@ type Key = (usize, usize, usize, ThreadId);
 
 impl Graphs {
     fn take(&self, key: &Key) -> Option<StepGraph> {
-        let mut graphs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let graph = graphs.remove(key)?;
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let graph = kept.get_mut(key)?.pop()?;
         {
             let mut state = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
             for row in 0..key.0 {
@@ -64,10 +84,17 @@ impl Graphs {
         Some(graph)
     }
 
-    /// Keeps `graph` for `key` unless another generation kept one there first.
+    /// Keeps `graph` for the next generation of `key`, beside any other kept there.
     fn give(&self, key: Key, graph: StepGraph) {
-        let mut graphs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        graphs.entry(key).or_insert(graph);
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.entry(key).or_default().push(graph);
+    }
+
+    pub(crate) fn counts(&self) -> GraphCounts {
+        GraphCounts {
+            captured: self.counts.captured.load(Ordering::Relaxed),
+            destroyed: self.counts.destroyed.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -80,8 +107,8 @@ impl Clone for Graphs {
 
 impl fmt::Debug for Graphs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let graphs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        write!(f, "Graphs({})", graphs.len())
+        let kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        write!(f, "Graphs({})", kept.values().map(Vec::len).sum::<usize>())
     }
 }
 
@@ -130,6 +157,15 @@ struct StepGraph {
     /// Whether the device says if a tensor shares its buffer, which a write to the state must
     /// not, or it would move where a replay does not look.
     shares_known: bool,
+    counts: Arc<Counts>,
+}
+
+impl Drop for StepGraph {
+    fn drop(&mut self) {
+        if self.graph.is_some() {
+            self.counts.destroyed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Model {
@@ -204,6 +240,7 @@ impl Model {
             state: Arc::new(Mutex::new(state)),
             graph: None,
             shares_known: Tensor::<1>::zeros([1], device).can_mut(),
+            counts: self.graphs.counts.clone(),
         }
     }
 }
@@ -237,8 +274,9 @@ impl StepGraph {
 
     /// The graph of the stable step on this state, captured the first time.
     fn captured(&mut self, model: &Model, timesteps: usize) -> &mut Graph<StepOutputs, StepFn> {
-        let state = &self.state;
+        let (state, counts) = (&self.state, &self.counts);
         self.graph.get_or_insert_with(|| {
+            counts.captured.fetch_add(1, Ordering::Relaxed);
             let (device, model, state) = (model.device.clone(), model.clone(), state.clone());
             let step: StepFn = Box::new(move || {
                 let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);

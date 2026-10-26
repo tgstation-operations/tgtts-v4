@@ -11,8 +11,8 @@ use burn::{
 use minicpm4::KvCache;
 
 use crate::{
-    Cfm, Config, Error, LocalEncoder, Noise, Prompt, Sampling, Stepper, Stepping, graph::Graphs,
-    weights,
+    Cfm, Config, Error, GraphCounts, LocalEncoder, Noise, Prompt, Sampling, Stepper, Stepping,
+    graph::Graphs, weights,
 };
 
 /// The dtype each part of the model is held and computed in.
@@ -134,6 +134,11 @@ impl Model {
     /// How [`patches`](Self::patches) computes each patch: eagerly by default.
     pub fn stepping(&self) -> Stepping {
         self.stepping
+    }
+
+    /// How many graphs of its step it has captured and destroyed.
+    pub fn graph_counts(&self) -> GraphCounts {
+        self.graphs.counts()
     }
 
     /// Has [`patches`](Self::patches) compute each patch as `stepping` says. Steps are captured

@@ -72,6 +72,7 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         (peak.sum::<u64>(), now.sum::<u64>(), largest)
     };
     let (warmed, _, page) = pools();
+    let graphs = model.graph_counts();
     // The cache's budget in whole pages of the largest pool, where it keeps its keys and values.
     let cache = (PROMPT_CACHE_BYTES as u64).div_ceil(page) * page;
     let mib = |bytes: u64| bytes >> 20;
@@ -104,6 +105,9 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         "pages of {warmed} MiB at most during the warm-up, the cache's {cache} MiB of pages, then \
          after each round {rounds:?}"
     );
+    // The warm-up captured each graph the requests replay, and none is destroyed while it lives.
+    assert_eq!(model.graph_counts(), graphs, "graphs after the warm-up");
+    assert_eq!(graphs.destroyed, 0, "graphs destroyed in the warm-up");
     assert!(
         rounds.iter().all(|&held| held <= warmed + cache),
         "pages of {warmed} MiB at most during the warm-up and {cache} MiB for the cache, then \

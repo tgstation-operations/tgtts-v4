@@ -15,11 +15,11 @@ use std::{
 
 use burn::tensor::{Device, Tensor};
 use dsp::RATE;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
-    Config, Dtypes, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise, Stepping,
-    TextToSpeech,
+    Config, Dtypes, GraphCounts, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise,
+    Stepping, TextToSpeech,
 };
 
 use crate::synth::{self, Speech, Start, Synthesizer};
@@ -155,6 +155,11 @@ impl VoxCpm {
         })
     }
 
+    /// How many graphs of its step the model has captured, and destroyed.
+    pub fn graph_counts(&self) -> GraphCounts {
+        self.tts.model().graph_counts()
+    }
+
     /// Runs the shapes synthesis takes with `voices`, so that a GPU's autotune, which chooses
     /// the kernels of each shape the first time it runs, has chosen them before a request waits
     /// on it: as many requests as run at once in voices from the shortest prompt a median line
@@ -213,6 +218,7 @@ impl VoxCpm {
             patches = WARM_UP_PATCHES,
             decoder_chunks = %format!("1..={}", self.params.decode_chunk_frames),
             generation_seconds = generated.as_secs_f64(),
+            graphs_captured = self.graph_counts().captured,
             decoder_seconds = seconds - generated.as_secs_f64(),
             seconds,
             "warmed up"
@@ -260,6 +266,7 @@ fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
         next: 0,
         on: generating,
         stepped: Instant::now(),
+        warmed: None,
     };
     loop {
         if batch.scheduler.requests() == 0 {
@@ -342,6 +349,8 @@ struct Batch<'a> {
     on: &'a Generating,
     /// When the last step returned.
     stepped: Instant,
+    /// The graphs of the step captured and destroyed when the warm-up ended, and since, if it has.
+    warmed: Option<GraphCounts>,
 }
 
 struct Generation {
@@ -355,7 +364,9 @@ impl Batch<'_> {
         match job {
             Job::Generate(request) => self.add(request),
             Job::WarmUp(runs, done) => {
-                let _ = done.send(self.on.warm_up(&runs));
+                let warmed = self.on.warm_up(&runs);
+                self.warmed = Some(self.on.tts.model().graph_counts());
+                let _ = done.send(warmed);
             }
         }
     }
@@ -425,6 +436,18 @@ impl Batch<'_> {
         }
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let report = self.scheduler.last_step();
+        let graphs = self.on.tts.model().graph_counts();
+        if let Some(warmed) = self.warmed.replace(graphs)
+            && warmed != graphs
+        {
+            // Each capture after the warm-up is a pause of a few steps, and a destroyed graph
+            // is what faulted the GPU on Vulkan.
+            warn!(
+                captured = graphs.captured - warmed.captured,
+                destroyed = graphs.destroyed - warmed.destroyed,
+                "graphs of the step captured or destroyed after the warm-up"
+            );
+        }
         self.stepped = Instant::now();
         debug!(
             rows = report.rows,
@@ -437,6 +460,7 @@ impl Batch<'_> {
             retire_ms = ms(report.retire),
             decode_ms = ms(self.stepped - stepped),
             between_ms = ms(between),
+            graphs_captured = graphs.captured,
             "stepped"
         );
     }
