@@ -13,7 +13,12 @@ use tgtts::{device::Kind, model::VoxCpm};
             ASSETS_DIR the assets"]
 fn serves_a_message_on_the_real_model() {
     let (checkpoint, device) = (real::dir("VOXCPM2_DIR"), gpu::device());
-    let dtypes = Kind::Vulkan.dtypes();
+    let kind = if cfg!(feature = "cuda") {
+        Kind::Cuda
+    } else {
+        Kind::Vulkan
+    };
+    let dtypes = kind.dtypes();
     let model = VoxCpm::load(
         &checkpoint,
         &dtypes,

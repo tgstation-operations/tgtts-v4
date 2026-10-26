@@ -13,13 +13,15 @@ pub enum Kind {
     /// The GPU wgpu prefers among the Vulkan devices, or the one `CUBECL_WGPU_DEFAULT_DEVICE`
     /// names.
     Vulkan,
+    /// The first CUDA device, or the first `CUDA_VISIBLE_DEVICES` names.
+    Cuda,
 }
 
 impl Kind {
     /// Whether autotune chooses its kernels for each shape as it first runs, by timing them,
     /// which the first request of each shape would wait for.
     pub fn autotunes(self) -> bool {
-        matches!(self, Self::Vulkan)
+        matches!(self, Self::Vulkan | Self::Cuda)
     }
 
     /// What each part of the model runs in by default: f32 on the CPU, and on a GPU f16 but for
@@ -34,7 +36,7 @@ impl Kind {
                 local_dit: f32,
                 audio_decoder: f32,
             },
-            Self::Vulkan => Dtypes {
+            Self::Vulkan | Self::Cuda => Dtypes {
                 lm: f16,
                 local_encoder: f16,
                 local_dit: f16,
@@ -51,7 +53,8 @@ impl FromStr for Kind {
         match name {
             "cpu" => Ok(Self::Cpu),
             "vulkan" => Ok(Self::Vulkan),
-            _ => Err("not cpu or vulkan".to_owned()),
+            "cuda" => Ok(Self::Cuda),
+            _ => Err("not cpu, vulkan or cuda".to_owned()),
         }
     }
 }
@@ -61,6 +64,7 @@ impl fmt::Display for Kind {
         f.write_str(match self {
             Self::Cpu => "cpu",
             Self::Vulkan => "vulkan",
+            Self::Cuda => "cuda",
         })
     }
 }
@@ -86,6 +90,7 @@ pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<
     let device = match kind {
         Kind::Cpu => Device::flex(),
         Kind::Vulkan => vulkan(autotune_dir)?,
+        Kind::Cuda => cuda(autotune_dir)?,
     };
     let parts = [
         ("lm_dtype", dtypes.lm),
@@ -116,6 +121,19 @@ fn vulkan(_: Option<&Path>) -> Result<Device, String> {
     Err("device vulkan: this build has no Vulkan; build tgtts with --features vulkan".to_owned())
 }
 
+#[cfg(feature = "cuda")]
+fn cuda(autotune_dir: Option<&Path>) -> Result<Device, String> {
+    if let Some(dir) = autotune_dir {
+        gpu::keep_autotune_in(dir).map_err(|e| e.to_string())?;
+    }
+    gpu::cuda().map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda(_: Option<&Path>) -> Result<Device, String> {
+    Err("device cuda: this build has no CUDA; build tgtts with --features cuda".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,7 +142,8 @@ mod tests {
     fn names_devices_and_dtypes() {
         assert_eq!("cpu".parse(), Ok(Kind::Cpu));
         assert_eq!("vulkan".parse(), Ok(Kind::Vulkan));
-        assert!("cuda".parse::<Kind>().is_err());
+        assert_eq!("cuda".parse(), Ok(Kind::Cuda));
+        assert!("rocm".parse::<Kind>().is_err());
         assert_eq!(parse_dtype("bf16"), Ok(FloatDType::BF16));
         assert!(parse_dtype("f64").is_err());
     }
@@ -145,5 +164,12 @@ mod tests {
     fn refuses_vulkan_in_a_build_without_it() {
         let error = open(Kind::Vulkan, &Kind::Vulkan.dtypes(), None);
         assert!(error.unwrap_err().contains("--features vulkan"));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn refuses_cuda_in_a_build_without_it() {
+        let error = open(Kind::Cuda, &Kind::Cuda.dtypes(), None);
+        assert!(error.unwrap_err().contains("--features cuda"));
     }
 }

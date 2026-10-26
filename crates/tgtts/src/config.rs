@@ -6,14 +6,14 @@
 //! - `voices_dir`: the voices directory.
 //! - `assets_dir`: the radio's clicks and static and the silicon effect's impulse responses.
 //! - `checkpoint_dir`: the VoxCPM2 checkpoint.
-//! - `device`: what the model runs on, `cpu` by default or `vulkan`, which needs a build with the
-//!   `vulkan` feature.
+//! - `device`: what the model runs on, `cpu` by default, `vulkan` or `cuda`, which need a build
+//!   with the feature of the same name.
 //! - `lm_dtype`, `local_encoder_dtype`, `local_dit_dtype`, `audio_decoder_dtype`: what each part
 //!   of the model computes in, `f32`, `f16` or `bf16`; f32 throughout by default on the CPU, f16
 //!   but for the audio decoder's f32 on a GPU.
 //! - `cache_dir`: where the speech cache is kept.
 //! - `autotune_cache_dir`: where autotune keeps the kernels it chose on a GPU, for the next
-//!   start to skip choosing them again; `vulkan` needs it.
+//!   start to skip choosing them again; `vulkan` and `cuda` need it.
 //! - `metrics_db`: the SQLite database the metrics go to, none by default.
 //! - `ffmpeg`: the ffmpeg to run, `ffmpeg` on the `PATH` by default.
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
@@ -130,9 +130,9 @@ impl Config {
         let device = settings.parse("device")?.unwrap_or(Kind::Cpu);
         let defaults = device.dtypes();
         let autotune_cache_dir = settings.parse("autotune_cache_dir")?;
-        if device == Kind::Vulkan && autotune_cache_dir.is_none() {
-            let reason = "autotune_cache_dir is not set, which the vulkan device needs";
-            return Err(Error(reason.to_owned()));
+        if device.autotunes() && autotune_cache_dir.is_none() {
+            let reason = format!("autotune_cache_dir is not set, which the {device} device needs");
+            return Err(Error(reason));
         }
         Ok(Self {
             listen: settings
@@ -418,10 +418,12 @@ mod tests {
         assert!(error(REQUIRED, &[("TGTTS_CPU_LIMIT", "0")]).starts_with("cpu_limit:"));
         assert!(error(REQUIRED, &[("TGTTS_RADIO_WAIT_SECONDS", "-1")]).starts_with("radio_wait"));
         assert!(error(REQUIRED, &[("TGTTS_LOG_LEVEL", "loud")]).starts_with("log_level:"));
-        assert!(error(REQUIRED, &[("TGTTS_DEVICE", "cuda")]).starts_with("device:"));
+        assert!(error(REQUIRED, &[("TGTTS_DEVICE", "rocm")]).starts_with("device:"));
         assert!(error(REQUIRED, &[("TGTTS_LM_DTYPE", "f64")]).starts_with("lm_dtype:"));
-        let vulkan = error(REQUIRED, &[("TGTTS_DEVICE", "vulkan")]);
-        assert!(vulkan.starts_with("autotune_cache_dir"), "{vulkan}");
+        for device in ["vulkan", "cuda"] {
+            let error = error(REQUIRED, &[("TGTTS_DEVICE", device)]);
+            assert!(error.starts_with("autotune_cache_dir"), "{error}");
+        }
         for (key, value) in [
             ("TGTTS_LOUDNESS_TARGET_LUFS", "NaN"),
             ("TGTTS_LOUDNESS_TARGET_LUFS", "-inf"),
