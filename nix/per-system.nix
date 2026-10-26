@@ -5,6 +5,7 @@ let
   ffmpeg = pkgs.ffmpeg-headless.override { withRubberband = true; };
   tracelLlvm = import ./tracel-llvm.nix { inherit pkgs; };
   mlir = import ./mlir.nix { inherit pkgs llvm-project; };
+  gpuKernels = import ./gpu-kernels.nix { inherit pkgs mlir; };
 
   scripts = rec {
     fmt = import ./scripts/fmt.nix { inherit pkgs rustToolchain; };
@@ -21,10 +22,12 @@ let
   };
 in
 {
-  # fixtures stays out of the devshell, whose closure would then hold torch.
+  # fixtures stays out of the devshell, whose closure would then hold torch, and device-tests,
+  # which would make entering it build LLVM where the store does not have it.
   packages = scripts // {
     inherit mlir;
-    device-tests = import ./scripts/device-tests.nix { inherit pkgs rustToolchain; };
+    gpu-kernels = gpuKernels;
+    device-tests = import ./scripts/device-tests.nix { inherit pkgs rustToolchain gpuKernels; };
     fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
     cuda-trial = import ./cuda-trial.nix {
       inherit

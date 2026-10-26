@@ -11,3 +11,7 @@ device = []
 
 [dependencies]
 ash.workspace = true
+
+[dev-dependencies]
+half.workspace = true
+serde_json.workspace = true

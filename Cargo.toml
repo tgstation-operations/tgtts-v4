@@ -15,6 +15,7 @@ blake3 = "1.8.7"
 burn = { version = "0.22.1", default-features = false }
 crc32fast = "1.5.3"
 fancy-regex = "0.20.0"
+half = { version = "2.7.1", default-features = false }
 libc = "0.2.191"
 pkg-config = "0.3.34"
 rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }

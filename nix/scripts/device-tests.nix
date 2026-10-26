@@ -1,6 +1,7 @@
 {
   pkgs,
   rustToolchain,
+  gpuKernels,
 }:
 pkgs.writeShellApplication {
   name = "device-tests";
@@ -14,8 +15,8 @@ pkgs.writeShellApplication {
     pkgs.spirv-tools
   ];
   text = ''
-    # device-tests [CARGO_TEST_ARGS...]: the vulkan crate's tests on the GPU, each failing on any
-    # message of the validation layer.
+    # device-tests [CARGO_TEST_ARGS...]: the vulkan crate's tests on the GPU, the GPU kernels
+    # among them, each failing on any message of the validation layer.
     cd "$(git rev-parse --show-toplevel)"
     export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true CARGO_BUILD_FINGERPRINT=content \
       CARGO_UNSTABLE_RUSTDOC_DEPINFO=true
@@ -23,6 +24,7 @@ pkgs.writeShellApplication {
     export VULKAN_VALIDATION=1
     export VK_LAYER_PATH=${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d
     export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true
+    export VULKAN_KERNELS=${gpuKernels}
 
     # A hand-written kernel's blob is what its assembly assembles to, and valid.
     scratch=$(mktemp -d)
