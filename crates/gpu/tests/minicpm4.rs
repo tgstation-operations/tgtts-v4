@@ -109,6 +109,57 @@ fn decodes_as_upstream(config: &Config, prefix: &str, input: &str, precision: Pr
     check(steps, expected, precision);
 }
 
+/// Rows prefilled alone to 3 and 5 positions run on together, a position at a time, then the
+/// shorter alone with the other row holding nothing, its last two positions at once: each
+/// against upstream's output at the same positions.
+fn rows_go_on_as_upstream(config: &Config, prefix: &str, input: &str, precision: Precision) {
+    let (fixture, device) = (fixture("minicpm4", "minicpm4"), gpu::device());
+    let model = Model::load(config, fixture.path(), prefix, precision.dtype, &device).unwrap();
+    let x = fixture.tensor::<3>(input, &device).cast(precision.dtype);
+    let causal = fixture.tensor::<3>(&format!("output.{prefix}causal"), &device);
+    let at = |x: &Tensor<3>, rows: &[(usize, usize)], len| {
+        let rows = rows
+            .iter()
+            .map(|&(row, start)| x.clone().narrow(0, row, 1).narrow(1, start, len));
+        Tensor::cat(rows.collect(), 0)
+    };
+    let mut batch = model.cache(2, 7);
+    for (row, len) in [(0, 3), (1, 5)] {
+        let mut alone = model.cache(1, 7);
+        model.forward_cached(at(&x, &[(row, 0)], len), &mut alone);
+        batch.insert(row, &alone, 0);
+    }
+    let out = model.forward_cached(at(&x, &[(0, 3), (1, 5)], 1), &mut batch);
+    check(out, at(&causal, &[(0, 3), (1, 5)], 1), precision);
+    batch.clear(1);
+    let out = model.forward_cached(at(&x, &[(0, 4), (1, 0)], 1), &mut batch);
+    check(out.narrow(0, 0, 1), at(&causal, &[(0, 4)], 1), precision);
+    let out = model.forward_cached(at(&x, &[(0, 5), (1, 0)], 2), &mut batch);
+    check(out.narrow(0, 0, 1), at(&causal, &[(0, 5)], 2), precision);
+}
+
+#[test]
+fn base_lm_rows_of_different_lengths_go_on_as_upstream_in_f32() {
+    rows_go_on_as_upstream(&tiny().lm, "base_lm.", "output.base_lm.embeds", F32);
+}
+
+#[test]
+fn base_lm_rows_of_different_lengths_go_on_as_upstream_in_f16() {
+    rows_go_on_as_upstream(&tiny().lm, "base_lm.", "output.base_lm.embeds", F16);
+}
+
+#[test]
+fn residual_lm_rows_of_different_lengths_go_on_as_upstream_in_f32() {
+    let lm = tiny().residual_lm;
+    rows_go_on_as_upstream(&lm, "residual_lm.", "input.residual_lm.x", F32);
+}
+
+#[test]
+fn residual_lm_rows_of_different_lengths_go_on_as_upstream_in_f16() {
+    let lm = tiny().residual_lm;
+    rows_go_on_as_upstream(&lm, "residual_lm.", "input.residual_lm.x", F16);
+}
+
 fn base_lm_attends(precision: Precision) {
     let input = "output.base_lm.embeds";
     attends_as_upstream(&tiny().lm, "base_lm.", input, Mask::Causal, precision);

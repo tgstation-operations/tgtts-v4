@@ -8,12 +8,14 @@ mod recorded;
 
 use std::path::PathBuf;
 
-use burn::tensor::{FloatDType, Tensor};
+use burn::tensor::{FloatDType, Tensor, TensorData};
 use common::fixture;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, checkpoint_dir};
 use voices::Latent;
-use voxcpm::{Dtypes, Noise, Params, SeededNoise, TextToSpeech};
+use voxcpm::{
+    Batch, Dtypes, Noise, Params, PromptCache, Scheduler, SeededNoise, Step, TextToSpeech,
+};
 
 /// How far what generation gives in some dtypes may be from upstream's in f32.
 struct Precision {
@@ -219,4 +221,173 @@ fn generates_as_upstream_on_the_real_weights_in_f32() {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
 fn generates_as_upstream_on_the_real_weights_as_served() {
     generates_as_upstream(&SERVED);
+}
+
+/// A voice whose latent is of the median length, four times the golden's.
+const OTHER_VOICE: &str = "creaturesupermutant";
+
+/// The most patches a request runs to in the batch's test.
+const MOST: usize = 30;
+
+fn max_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
+    let (a, b) = (a.cast(FloatDType::F32), b.cast(FloatDType::F32));
+    (a - b).abs().max().into_scalar()
+}
+
+/// Requests in a batch against each alone, as voxcpm's test on the CPU runs them: the golden's
+/// line; another line in its voice, run from what a prompt cache kept of the first, which joins
+/// after the first's third patch; and a line in a voice of four times as many patches, which
+/// joins after its sixth. Each is sampled after the patches it was given alone and leaves after
+/// the last of them, then all run free.
+fn samples_requests_together_as_alone(precision: &Precision) {
+    let (golden, device) = (golden(), gpu::device());
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let dir = std::path::absolute(PathBuf::from(std::env::var_os("VOICES_DIR").unwrap())).unwrap();
+    let other = Latent::read(&voices::latent_path(&dir, OTHER_VOICE)).unwrap();
+    let tts = TextToSpeech::load(&checkpoint_dir(), &precision.dtypes, &device).unwrap();
+    let (model, params) = (tts.model(), Params::default());
+    let requests = [
+        (text.as_str(), &voice, 0),
+        ("Someone set the kitchen on fire again.", &voice, 3),
+        ("Clown in the armory, send security.", &other, 6),
+    ];
+    let prompts: Vec<_> = requests
+        .iter()
+        .map(|(line, voice, _)| tts.prompt(line, voice).unwrap())
+        .collect();
+    let alone: Vec<Vec<Step>> = (0..requests.len())
+        .map(|i| {
+            let mut generation = model.start(&prompts[i], MOST).unwrap();
+            let mut noise = SeededNoise::new(i as u64);
+            let mut steps = vec![];
+            loop {
+                let step = generation.sample(model.noise(&mut noise), &params.sampling);
+                let last = step.stops() || steps.len() + 1 == MOST;
+                if !last {
+                    generation.advance(step.patch.clone());
+                }
+                steps.push(step);
+                if last {
+                    break steps;
+                }
+            }
+        })
+        .collect();
+    let lengths: Vec<usize> = alone.iter().map(Vec::len).collect();
+
+    let mut cache = PromptCache::new(usize::MAX);
+    let mut batch = Batch::new(model);
+    let mut noise: Vec<_> = (0..requests.len() as u64).map(SeededNoise::new).collect();
+    let (mut rows, mut sampled) = (vec![], vec![0; requests.len()]);
+    let mut patches = vec![vec![]; requests.len()];
+    for t in 0.. {
+        for (i, &(_, _, join)) in requests.iter().enumerate() {
+            if t == join {
+                let mut prefill = model.prefill(&prompts[i], MOST, &mut cache).unwrap();
+                while !prefill.run(64, &mut cache) {}
+                rows.push((batch.join(prefill.finish(), &params.sampling).unwrap(), i));
+            }
+        }
+        if rows.is_empty() {
+            break;
+        }
+        let draws: Vec<f32> = rows.iter().flat_map(|&(_, i)| noise[i].next(256)).collect();
+        let draws = TensorData::new(draws, [rows.len(), 64, 4]);
+        let step = batch.sample(Tensor::from_data(draws, &*device));
+        let stops: Vec<i64> = step
+            .stop_logits
+            .clone()
+            .argmax(1)
+            .into_data()
+            .iter()
+            .collect();
+        let mut fed = vec![];
+        for (k, &(id, i)) in rows.iter().enumerate() {
+            let expected = &alone[i][sampled[i]];
+            let at = format!("request {i}, patch {}", sampled[i]);
+            let patch = step.patch.clone().narrow(0, k, 1);
+            let values: Vec<f32> = patch.clone().into_data().iter().collect();
+            assert!(values.iter().all(|x| x.is_finite()), "{at}");
+            patches[i].push(max_diff(patch, expected.patch.clone()));
+            let logits = step
+                .stop_logits
+                .clone()
+                .narrow(0, k, 1)
+                .cast(FloatDType::F32);
+            let alone_logits = expected.stop_logits.clone().cast(FloatDType::F32);
+            let margin: Vec<f32> = alone_logits.clone().into_data().iter().collect();
+            if (margin[1] - margin[0]).abs() > 2.0 * precision.stop_logits {
+                assert_eq!(stops[k] == 1, expected.stops(), "{at}");
+            }
+            assert_close(logits, alone_logits, precision.stop_logits, 0.0);
+            sampled[i] += 1;
+            if sampled[i] == alone[i].len() {
+                batch.leave(id);
+            } else {
+                fed.push(expected.patch.clone());
+            }
+        }
+        rows.retain(|&(_, i)| sampled[i] < alone[i].len());
+        if !fed.is_empty() {
+            batch.advance(Tensor::cat(fed, 0));
+        }
+    }
+    // Given the same patches, rows came within 2.2e-3 of alone in f32, and each patch is held as
+    // against upstream. Where some are held only to being finite there, a level of the quantizer
+    // rounding apart is amplified at steps no other line shares, so each request's patches are
+    // held at their median: as served, rows came within 4.0e-2 of alone at most steps and within
+    // 3.0e-1 at the worst.
+    for (i, diffs) in patches.iter_mut().enumerate() {
+        diffs.sort_by(f32::total_cmp);
+        let held = if precision.amplified.is_empty() {
+            diffs.last()
+        } else {
+            diffs.get(diffs.len() / 2)
+        };
+        let worst = diffs.last().unwrap();
+        eprintln!("request {i}: patches within {worst:.1e} of alone");
+        assert!(
+            held.is_some_and(|&d| d <= precision.patch),
+            "request {i}: {diffs:?}"
+        );
+    }
+
+    let mut scheduler = Scheduler::new(model, PromptCache::new(usize::MAX), 64);
+    let mut free = vec![0usize; requests.len()];
+    for t in 0.. {
+        for (i, &(_, _, join)) in requests.iter().enumerate() {
+            if t == join {
+                let noise = SeededNoise::new(i as u64);
+                scheduler
+                    .add(i, &prompts[i], &params.sampling, MOST, noise)
+                    .unwrap();
+            }
+        }
+        for patch in scheduler.step() {
+            free[patch.key] += 1;
+        }
+        if t >= 6 && scheduler.requests() == 0 {
+            break;
+        }
+    }
+    // Run free, the stop logits drift with the patches, and the last margins for stopping are
+    // as narrow as 0.11 here: as served, generation may stop a patch before or after alone.
+    for (i, (&free, &alone)) in free.iter().zip(&lengths).enumerate() {
+        assert!(
+            free.abs_diff(alone) <= precision.stops_late,
+            "request {i} stopped after {free} patches, alone after {alone}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn samples_requests_together_as_alone_on_the_real_weights_in_f32() {
+    samples_requests_together_as_alone(&F32);
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn samples_requests_together_as_alone_on_the_real_weights_as_served() {
+    samples_requests_together_as_alone(&SERVED);
 }
