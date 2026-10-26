@@ -294,6 +294,76 @@ fn replays_as_kernel_by_kernel_on_the_real_weights_as_served() {
     replays_as_kernel_by_kernel(&SERVED);
 }
 
+/// Requests joining a scheduler at different patches and leaving as they stop, three lines in two
+/// voices, stepped kernel by kernel and then by replays: the rows grow and shrink through the
+/// graphs of one, two and four rows, and every patch comes out the same bits.
+fn schedules_by_replay_as_kernel_by_kernel(precision: &Precision) {
+    let (golden, device) = (golden(), gpu::device());
+    let (voice, text) = (voice(&golden), &golden.metadata()["text"]);
+    let dir = std::path::absolute(PathBuf::from(std::env::var_os("VOICES_DIR").unwrap())).unwrap();
+    let other = Latent::read(&voices::latent_path(&dir, OTHER_VOICE)).unwrap();
+    let mut tts = TextToSpeech::load(&checkpoint_dir(), &precision.dtypes, &device).unwrap();
+    let params = Params::default();
+    let requests = [
+        (text.as_str(), &voice, 0),
+        ("Someone set the kitchen on fire again.", &voice, 2),
+        ("Clown in the armory, send security.", &other, 3),
+    ];
+    let prompts: Vec<_> = requests
+        .iter()
+        .map(|(line, voice, _)| tts.prompt(line, voice).unwrap())
+        .collect();
+    let mut run = |stepping| {
+        tts.set_stepping(stepping);
+        let model = tts.model();
+        let mut scheduler = Scheduler::new(model, PromptCache::new(usize::MAX), 64);
+        let mut patches = vec![vec![]; requests.len()];
+        let mut t = 0;
+        loop {
+            for (i, &(_, _, join)) in requests.iter().enumerate() {
+                if t == join {
+                    let noise = SeededNoise::new(i as u64);
+                    let max_patches = 6 + 3 * i;
+                    scheduler
+                        .add(i, &prompts[i], &params.sampling, max_patches, noise)
+                        .unwrap();
+                }
+            }
+            for patch in scheduler.step() {
+                let values = patch.patch.unwrap().into_data();
+                patches[patch.key].push(values.iter::<f32>().map(f32::to_bits).collect::<Vec<_>>());
+            }
+            if t >= 3 && scheduler.requests() == 0 {
+                break patches;
+            }
+            t += 1;
+        }
+    };
+    let stable = run(Stepping::Stable);
+    let replayed = run(Stepping::Captured);
+    assert_eq!(
+        stable.iter().map(Vec::len).collect::<Vec<_>>(),
+        replayed.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    for (i, (stable, replayed)) in stable.iter().zip(&replayed).enumerate() {
+        for (k, (stable, replayed)) in stable.iter().zip(replayed).enumerate() {
+            assert!(stable == replayed, "request {i}, patch {k}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn schedules_by_replay_as_kernel_by_kernel_on_the_real_weights_in_f32() {
+    schedules_by_replay_as_kernel_by_kernel(&F32);
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn schedules_by_replay_as_kernel_by_kernel_on_the_real_weights_as_served() {
+    schedules_by_replay_as_kernel_by_kernel(&SERVED);
+}
+
 /// A voice whose latent is of the median length, four times the golden's.
 const OTHER_VOICE: &str = "creaturesupermutant";
 

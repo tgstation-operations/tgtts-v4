@@ -6,7 +6,10 @@ use std::{
 use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorData};
 use minicpm4::KvCache;
 
-use crate::{Error, Generation, Model, Noise, Prefill, Prompt, PromptCache, Sampling, Step};
+use crate::{
+    Error, Generation, Model, Noise, Prefill, Prompt, PromptCache, Sampling, Step, Stepper,
+    Stepping,
+};
 
 /// Generations sampled together, a patch of each at a time: a generation joins once its prompt
 /// has run through the LMs and leaves when it is done, while the others go on.
@@ -29,7 +32,7 @@ pub struct Batch<'a> {
 
 /// A generation in a [`Batch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RowId(u64);
+pub struct RowId(pub(crate) u64);
 
 impl<'a> Batch<'a> {
     /// A batch of no generations of `model`.
@@ -234,7 +237,8 @@ fn held_rows<const D: usize>(all: &Tensor<D>, held: Option<&Tensor<1, Int>>) -> 
     }
 }
 
-/// Requests generated together in a [`Batch`], each until its stop head says to stop or it has
+/// Requests generated together in a [`Batch`], or a [`Stepper`] where the model's
+/// [`stepping`](Model::stepping) is not eager, each until its stop head says to stop or it has
 /// its most patches.
 ///
 /// A request's prompt runs through the LMs from where what a [`PromptCache`] keeps of its voice
@@ -244,11 +248,18 @@ fn held_rows<const D: usize>(all: &Tensor<D>, held: Option<&Tensor<1, Int>>) -> 
 #[derive(Debug)]
 pub struct Scheduler<'a, K, N> {
     model: &'a Model,
-    batch: Batch<'a>,
+    batch: Rows<'a>,
     cache: PromptCache,
     waiting: VecDeque<(Request<K, N>, Prefill<'a>)>,
     running: HashMap<RowId, Request<K, N>>,
     prefill_positions: usize,
+}
+
+#[derive(Debug)]
+enum Rows<'a> {
+    Eager(Box<Batch<'a>>),
+    /// A stepper, once a request has said in how many steps patches are sampled.
+    Stable(Option<Box<Stepper<'a>>>),
 }
 
 #[derive(Debug)]
@@ -274,9 +285,13 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
     /// Generates from `model`, keeping what prompts compute in `cache`, and running at most
     /// `prefill_positions` positions of prompts between two patches of the requests that run.
     pub fn new(model: &'a Model, cache: PromptCache, prefill_positions: usize) -> Self {
+        let batch = match model.stepping() {
+            Stepping::Eager => Rows::Eager(Box::new(Batch::new(model))),
+            _ => Rows::Stable(None),
+        };
         Self {
             model,
-            batch: Batch::new(model),
+            batch,
             cache,
             waiting: VecDeque::new(),
             running: HashMap::new(),
@@ -319,6 +334,11 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         Ok(())
     }
 
+    /// The model it generates from.
+    pub fn model(&self) -> &'a Model {
+        self.model
+    }
+
     /// The requests waiting for their prompts to run and those generating.
     pub fn requests(&self) -> usize {
         self.waiting.len() + self.running.len()
@@ -349,26 +369,51 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             if !prefill.run(positions, &mut self.cache) {
                 break;
             }
-            let (request, prefill) = self.waiting.pop_front().expect("the front");
-            let row = self
-                .batch
-                .join(prefill.finish(), &request.sampling)
-                .expect("checked when added");
-            self.running.insert(row, request);
+            let (mut request, prefill) = self.waiting.pop_front().expect("the front");
+            let generation = prefill.finish();
+            let row = match &mut self.batch {
+                Rows::Eager(batch) => batch.join(generation, &request.sampling),
+                Rows::Stable(stepper) => {
+                    // An empty one may sample in other steps than the request.
+                    if stepper
+                        .as_ref()
+                        .is_some_and(|stepper| stepper.rows().is_empty())
+                    {
+                        *stepper = None;
+                    }
+                    let (model, timesteps) = (self.model, request.sampling.timesteps);
+                    let stepping = model.stepping();
+                    let stepper = stepper
+                        .get_or_insert_with(|| Box::new(Stepper::new(model, stepping, timesteps)));
+                    stepper.join(generation, &request.sampling, &mut request.noise)
+                }
+            };
+            self.running
+                .insert(row.expect("checked when added"), request);
         }
 
-        let rows = self.batch.rows();
-        if rows.is_empty() {
-            return vec![];
-        }
         let (model, len) = (self.model, self.model.feat_dim * self.model.patch_size);
-        let noise = rows.iter().flat_map(|row| {
-            let request = self.running.get_mut(row).expect("running");
-            request.noise.next(len)
-        });
-        let shape = [rows.len(), model.feat_dim, model.patch_size];
-        let noise = Tensor::from_data(TensorData::new(noise.collect(), shape), &model.device);
-        let step = self.batch.sample(noise);
+        let (rows, step) = match &mut self.batch {
+            Rows::Eager(batch) => {
+                let rows = batch.rows();
+                if rows.is_empty() {
+                    return vec![];
+                }
+                let noise = rows.iter().flat_map(|row| {
+                    let request = self.running.get_mut(row).expect("running");
+                    request.noise.next(len)
+                });
+                let shape = [rows.len(), model.feat_dim, model.patch_size];
+                let noise = TensorData::new(noise.collect(), shape);
+                let step = batch.sample(Tensor::from_data(noise, &model.device));
+                (rows, step)
+            }
+            // Its generations drew their noise as they joined.
+            Rows::Stable(Some(stepper)) if !stepper.rows().is_empty() => {
+                (stepper.rows(), stepper.step())
+            }
+            Rows::Stable(_) => return vec![],
+        };
         let logits: Vec<f32> = step.stop_logits.clone().into_data().iter().collect();
         let values: Vec<f32> = step.patch.clone().into_data().iter().collect();
         let mut patches = vec![];
@@ -392,19 +437,25 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             });
             if last {
                 self.running.remove(row);
-                self.batch.leave(*row);
+                match &mut self.batch {
+                    Rows::Eager(batch) => batch.leave(*row),
+                    Rows::Stable(stepper) => stepper.as_mut().expect("stepping").leave(*row),
+                }
             } else {
                 going.push(i as i64);
             }
         }
-        if !going.is_empty() {
+        // The stable step fed its generations their patches as it sampled them.
+        if let Rows::Eager(batch) = &mut self.batch
+            && !going.is_empty()
+        {
             let next = if going.len() == rows.len() {
                 step.patch
             } else {
                 let going = Tensor::<1, Int>::from_data(going.as_slice(), &model.device);
                 step.patch.select(0, going)
             };
-            self.batch.advance(next);
+            batch.advance(next);
         }
         patches
     }

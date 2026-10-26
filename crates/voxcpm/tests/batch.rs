@@ -4,7 +4,8 @@ use burn::tensor::{FloatDType, Tensor};
 use common::tiny;
 use testkit::{Fixture, assert_close, device, fixture};
 use voxcpm::{
-    Batch, Dtypes, Error, Model, Noise, Prompt, PromptCache, Sampling, Scheduler, SeededNoise, Step,
+    Batch, Dtypes, Error, Model, Noise, Prompt, PromptCache, Sampling, Scheduler, SeededNoise,
+    Step, Stepping,
 };
 
 const F32: Dtypes = Dtypes {
@@ -117,11 +118,12 @@ fn rows_of_a_batch_are_sampled_as_alone() {
 }
 
 /// Requests coming in while others run, one in the voice of another, each stopping as its stop
-/// head says or at its most patches.
-#[test]
-fn a_scheduler_generates_each_request_as_alone() {
+/// head says or at its most patches, as `stepping` steps them, against each generated alone by
+/// the eager step.
+fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
     let fixture = fixture!("voxcpm_generate");
-    let model = model(&fixture);
+    let mut model = model(&fixture);
+    model.set_stepping(stepping);
     let voice: Vec<f32> = fixture
         .tensor::<2>("input.voice", &device())
         .into_data()
@@ -174,6 +176,8 @@ fn a_scheduler_generates_each_request_as_alone() {
     // having stopped.
     assert_eq!(first, [Some(0), Some(2), Some(3), Some(5)]);
     assert_eq!(most, 3);
+    drop(scheduler);
+    model.set_stepping(Stepping::Eager);
     for (i, prompt) in prompts.iter().enumerate() {
         let mut noise = SeededNoise::new(seeds[i]);
         let sampling = Sampling::default();
@@ -203,12 +207,27 @@ impl Noise for Diverging {
     }
 }
 
-/// A request whose third patch comes out NaN ends with an error in its place, and the request
-/// beside it goes on as alone.
 #[test]
-fn a_patch_that_is_not_finite_ends_its_request_with_an_error() {
+fn a_scheduler_generates_each_request_as_alone_by_the_eager_step() {
+    a_scheduler_generates_each_request_as_alone(Stepping::Eager);
+}
+
+#[test]
+fn a_scheduler_generates_each_request_as_alone_by_the_stable_step() {
+    a_scheduler_generates_each_request_as_alone(Stepping::Stable);
+}
+
+#[test]
+fn a_scheduler_generates_each_request_as_alone_by_replays() {
+    a_scheduler_generates_each_request_as_alone(Stepping::Captured);
+}
+
+/// A request whose third patch comes out NaN ends with an error in its place, and the request
+/// beside it goes on as alone, as `stepping` steps them.
+fn a_patch_that_is_not_finite_ends_its_request_with_an_error(stepping: Stepping) {
     let fixture = fixture!("voxcpm_generate");
-    let model = model(&fixture);
+    let mut model = model(&fixture);
+    model.set_stepping(stepping);
     let voice: Vec<f32> = fixture
         .tensor::<2>("input.voice", &device())
         .into_data()
@@ -253,8 +272,20 @@ fn a_patch_that_is_not_finite_ends_its_request_with_an_error() {
         }
     }
     assert!(matches!(failed[..], [Error::NotFinite(2)]), "{failed:?}");
+    drop(scheduler);
+    model.set_stepping(Stepping::Eager);
     let expected = model
         .generate(&prompt, &sampling, 8, &mut SeededNoise::new(3))
         .unwrap();
     assert_close(Tensor::cat(other, 0), expected, ATOL, RTOL);
+}
+
+#[test]
+fn a_patch_that_is_not_finite_ends_its_request_with_an_error_by_the_eager_step() {
+    a_patch_that_is_not_finite_ends_its_request_with_an_error(Stepping::Eager);
+}
+
+#[test]
+fn a_patch_that_is_not_finite_ends_its_request_with_an_error_by_replays() {
+    a_patch_that_is_not_finite_ends_its_request_with_an_error(Stepping::Captured);
 }
