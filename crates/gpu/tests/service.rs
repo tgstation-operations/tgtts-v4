@@ -10,7 +10,7 @@ use std::{thread, time::Duration};
 use service::real;
 use tgtts::{
     device::Kind,
-    model::{Batching, PROMPT_CACHE_BYTES, VoxCpm},
+    model::{Batching, PREFILL_POSITIONS, PROMPT_CACHE_BYTES, VoxCpm},
     synth::Synthesizer,
 };
 use voices::Voices;
@@ -57,6 +57,7 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         window: Duration::from_millis(100),
         requests: 16,
         graphs,
+        prefill_positions: PREFILL_POSITIONS,
     };
     let params = Params::default();
     let model = VoxCpm::load(&checkpoint, &kind.dtypes(), &device, params, batching).unwrap();

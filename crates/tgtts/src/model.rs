@@ -37,9 +37,10 @@ const WARM_UP_PATCHES: usize = 9;
 /// takes about 11 MB, so about 90 of them.
 pub const PROMPT_CACHE_BYTES: usize = 1 << 30;
 
-/// The positions of prompts run between two patches while other requests generate: on a GPU in
-/// f16 a run of 128 takes about as long as a patch of one request.
-const PREFILL_POSITIONS: usize = 128;
+/// The positions of prompts run between two patches while other requests generate, unless the
+/// configuration says otherwise: on a GPU in f16 a run of 128 takes about as long as a patch of
+/// one request.
+pub const PREFILL_POSITIONS: usize = 128;
 
 /// How requests are batched.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,6 +51,8 @@ pub struct Batching {
     pub requests: usize,
     /// Whether a batch steps by replaying graphs of its step where the device records them.
     pub graphs: bool,
+    /// The positions of prompts run between two patches while other requests generate.
+    pub prefill_positions: usize,
 }
 
 /// VoxCPM2, synthesizing with the same parameters for every request: the requests generate
@@ -132,6 +135,7 @@ impl VoxCpm {
                     config: model_config,
                     params: model_params,
                     device: on,
+                    prefill_positions: batching.prefill_positions,
                 };
                 generate(&generating, batching, &received);
             })
@@ -242,6 +246,7 @@ struct Generating {
     config: Config,
     params: Params,
     device: Device,
+    prefill_positions: usize,
 }
 
 /// Does each job `jobs` brings, generating the patches of requests in a batch and decoding the
@@ -250,7 +255,7 @@ struct Generating {
 fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
     let cache = PromptCache::new(PROMPT_CACHE_BYTES);
     let mut batch = Batch {
-        scheduler: Scheduler::new(generating.tts.model(), cache, PREFILL_POSITIONS),
+        scheduler: Scheduler::new(generating.tts.model(), cache, generating.prefill_positions),
         generating: HashMap::new(),
         next: 0,
         on: generating,
@@ -292,7 +297,7 @@ impl Generating {
         let (tts, params) = (&*self.tts, &self.params);
         let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
         for run in runs {
-            let mut scheduler = Scheduler::new(tts.model(), cache, PREFILL_POSITIONS);
+            let mut scheduler = Scheduler::new(tts.model(), cache, self.prefill_positions);
             for (i, prompt) in run.iter().enumerate() {
                 let noise = SeededNoise::new(i as u64);
                 scheduler.add(i, prompt, &params.sampling, params.max_patches, noise)?;
@@ -491,6 +496,7 @@ mod tests {
             window: Duration::ZERO,
             requests: 1,
             graphs: true,
+            prefill_positions: PREFILL_POSITIONS,
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
     }

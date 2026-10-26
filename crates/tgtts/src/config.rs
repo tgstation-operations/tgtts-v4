@@ -19,6 +19,8 @@
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
 //! - `batch_window_seconds`: how long a request to an idle model waits for others to generate
 //!   with it, 0.1 by default.
+//! - `prefill_positions`: the positions of prompts run between two patches while other requests
+//!   generate, 128 by default.
 //! - `step_graphs`: whether the model steps by replaying graphs of its step on CUDA, `true` by
 //!   default; it steps eagerly on any other device.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
@@ -49,10 +51,11 @@ use voxcpm::Dtypes;
 
 use crate::{
     device::{self, Kind},
+    model,
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 24] = [
+const KEYS: [&str; 25] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -70,6 +73,7 @@ const KEYS: [&str; 24] = [
     "synthesis_limit",
     "batch_window_seconds",
     "step_graphs",
+    "prefill_positions",
     "cpu_limit",
     "queue_timeout_seconds",
     "radio_wait_seconds",
@@ -96,6 +100,7 @@ pub struct Config {
     pub synthesis_limit: usize,
     pub batch_window: Duration,
     pub step_graphs: bool,
+    pub prefill_positions: usize,
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
     pub radio_wait: Duration,
@@ -173,6 +178,9 @@ impl Config {
                 .seconds("batch_window_seconds")?
                 .unwrap_or(Duration::from_millis(100)),
             step_graphs: settings.parse("step_graphs")?.unwrap_or(true),
+            prefill_positions: settings
+                .limit("prefill_positions")?
+                .unwrap_or(model::PREFILL_POSITIONS),
             cpu_limit: settings.limit("cpu_limit")?.unwrap_or(cpus),
             queue_timeout: settings
                 .seconds("queue_timeout_seconds")?
@@ -326,6 +334,7 @@ mod tests {
                 synthesis_limit: 16,
                 batch_window: Duration::from_millis(100),
                 step_graphs: true,
+                prefill_positions: 128,
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),
@@ -349,6 +358,7 @@ mod tests {
             synthesis_limit = 4
             batch_window_seconds = 0.05
             step_graphs = false
+            prefill_positions = 512
             cpu_limit = 8
             queue_timeout_seconds = 2.5
             radio_wait_seconds = 10
@@ -381,6 +391,7 @@ mod tests {
         assert_eq!((config.synthesis_limit, config.cpu_limit), (4, 8));
         assert_eq!(config.batch_window, Duration::from_millis(50));
         assert!(!config.step_graphs);
+        assert_eq!(config.prefill_positions, 512);
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
         assert_eq!(config.radio_wait_ceiling, Duration::from_secs(45));
         let loudness = Loudness {
@@ -442,6 +453,8 @@ mod tests {
         assert!(error(REQUIRED, &[("TGTTS_DEVICE", "rocm")]).starts_with("device:"));
         assert!(error(REQUIRED, &[("TGTTS_LM_DTYPE", "f64")]).starts_with("lm_dtype:"));
         assert!(error(REQUIRED, &[("TGTTS_STEP_GRAPHS", "1")]).starts_with("step_graphs:"));
+        let none = error(REQUIRED, &[("TGTTS_PREFILL_POSITIONS", "0")]);
+        assert!(none.starts_with("prefill_positions:"), "{none}");
         for device in ["vulkan", "cuda"] {
             let error = error(REQUIRED, &[("TGTTS_DEVICE", device)]);
             assert!(error.starts_with("autotune_cache_dir"), "{error}");
