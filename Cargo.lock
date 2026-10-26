@@ -3105,11 +3105,18 @@ name = "gpu"
 version = "0.1.0"
 dependencies = [
  "audiovae",
+ "axum",
  "burn",
  "crc32fast",
+ "dsp",
  "minicpm4",
  "serde_json",
+ "tempfile",
  "testkit",
+ "tgtts",
+ "tokio",
+ "tracing",
+ "ureq 2.12.1",
  "voices",
  "voxcpm",
 ]

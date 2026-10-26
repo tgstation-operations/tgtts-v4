@@ -13,9 +13,16 @@ burn = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 audiovae = { path = "../audiovae" }
+axum = { workspace = true, features = ["http1", "tokio"] }
 crc32fast.workspace = true
+dsp = { path = "../dsp" }
 minicpm4 = { path = "../minicpm4" }
 serde_json.workspace = true
+tempfile.workspace = true
 testkit = { path = "../testkit" }
+tgtts = { path = "../tgtts" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+tracing.workspace = true
+ureq.workspace = true
 voices = { path = "../voices" }
 voxcpm = { path = "../voxcpm" }
