@@ -514,6 +514,46 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
     })
 }
 
+/// Writes the weights of a stack into `step`, a recording of `graph`, whose tensors `layers` and
+/// `norm` hold them, as [`Decoder::load`] does.
+pub fn load_stack(
+    step: &mut Step,
+    graph: &Graph,
+    layers: &[LayerTensors],
+    norm: TensorId,
+    checkpoint: &Checkpoint,
+    prefix: &str,
+) -> Result<(), Error> {
+    let mut write = |t: TensorId, names: &[&str]| -> Result<(), Error> {
+        let names: Vec<String> = names.iter().map(|n| format!("{prefix}{n}")).collect();
+        let values = if names.len() == 1 && checkpoint.shape(&names[0]).map(<[_]>::len) == Some(1) {
+            checkpoint.f16(&names[0])?.1
+        } else {
+            checkpoint.rows_f16(&names)?.1
+        };
+        let want = graph.tensors[t.0].bytes as usize / 2;
+        if values.len() != want {
+            return Err(Error::Checkpoint(format!(
+                "{names:?}: {} values, not {want}",
+                values.len()
+            )));
+        }
+        step.write(t, &values)
+    };
+    for (l, t) in layers.iter().enumerate() {
+        let n = |what: &str| format!("layers.{l}.{what}.weight");
+        let [q, k, v] = ["q_proj", "k_proj", "v_proj"].map(|p| n(&format!("self_attn.{p}")));
+        write(t.qkv, &[&q, &k, &v])?;
+        write(t.o, &[&n("self_attn.o_proj")])?;
+        let [gate, up] = ["gate_proj", "up_proj"].map(|p| n(&format!("mlp.{p}")));
+        write(t.gate_up, &[&gate, &up])?;
+        write(t.down, &[&n("mlp.down_proj")])?;
+        write(t.input_norm, &[&n("input_layernorm")])?;
+        write(t.post_norm, &[&n("post_attention_layernorm")])?;
+    }
+    write(norm, &["norm.weight"])
+}
+
 /// A MiniCPM-4 stack's decode step on the GPU, with its weights and KV cache.
 #[derive(Debug)]
 pub struct Decoder {
@@ -543,35 +583,15 @@ impl Decoder {
     /// `checkpoint`, as upstream's state_dict names them (VoxCPM2's base LM is `base_lm.`),
     /// converted to f16.
     pub fn load(&mut self, checkpoint: &Checkpoint, prefix: &str) -> Result<(), Error> {
-        let mut write = |t: TensorId, names: &[&str]| -> Result<(), Error> {
-            let names: Vec<String> = names.iter().map(|n| format!("{prefix}{n}")).collect();
-            let values =
-                if names.len() == 1 && checkpoint.shape(&names[0]).map(<[_]>::len) == Some(1) {
-                    checkpoint.f16(&names[0])?.1
-                } else {
-                    checkpoint.rows_f16(&names)?.1
-                };
-            let want = self.tensors.graph.tensors[t.0].bytes as usize / 2;
-            if values.len() != want {
-                return Err(Error::Checkpoint(format!(
-                    "{names:?}: {} values, not {want}",
-                    values.len()
-                )));
-            }
-            self.step.write(t, &values)
-        };
-        for (l, t) in self.tensors.layers.clone().iter().enumerate() {
-            let n = |what: &str| format!("layers.{l}.{what}.weight");
-            let [q, k, v] = ["q_proj", "k_proj", "v_proj"].map(|p| n(&format!("self_attn.{p}")));
-            write(t.qkv, &[&q, &k, &v])?;
-            write(t.o, &[&n("self_attn.o_proj")])?;
-            let [gate, up] = ["gate_proj", "up_proj"].map(|p| n(&format!("mlp.{p}")));
-            write(t.gate_up, &[&gate, &up])?;
-            write(t.down, &[&n("mlp.down_proj")])?;
-            write(t.input_norm, &[&n("input_layernorm")])?;
-            write(t.post_norm, &[&n("post_attention_layernorm")])?;
-        }
-        write(self.tensors.norm, &["norm.weight"])
+        let t = &self.tensors;
+        load_stack(
+            &mut self.step,
+            &t.graph,
+            &t.layers,
+            t.norm,
+            checkpoint,
+            prefix,
+        )
     }
 
     /// Runs the stack over `x`, the hidden state of `position` as f16 bits, writing its keys and
