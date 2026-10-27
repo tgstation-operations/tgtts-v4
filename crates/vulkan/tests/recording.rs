@@ -71,22 +71,24 @@ fn on_the_cpu(x: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Buffers: 0 x, 1 the two intermediate results back to back, 2 the output, 3 the subgroup
-/// sizes every link writes. The second link reads and writes ranges of buffer 1.
+/// Buffers: 0 x, 1 the two intermediate results, the second at the first offset past the first
+/// that the device can bind, 2 the output, 3 the subgroup sizes every link writes. The second
+/// link reads and writes ranges of buffer 1.
 fn chain(ctx: &Context, kernels: &[Arc<Kernel>], n: usize, timed: bool) -> vulkan::Recording {
     let bytes = 4 * n as u64;
+    let after_first = bytes.next_multiple_of(ctx.report().min_storage_buffer_offset_alignment);
     let buffer = |size, residence| {
         ctx.buffer_in(size, residence)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let buffers = vec![
         buffer(bytes, Residence::Upload),
-        buffer(2 * bytes, Residence::Device),
+        buffer(after_first + bytes, Residence::Device),
         buffer(bytes, Residence::Readback),
         buffer(bytes, Residence::Readback),
     ];
     let first = Binding::range(1, 0, bytes);
-    let second = Binding::range(1, bytes, bytes);
+    let second = Binding::range(1, after_first, bytes);
     let groups = [groups_for(n as u64, WIDTH) as u32, 1, 1];
     let links = [
         (Binding::whole(0), first),
