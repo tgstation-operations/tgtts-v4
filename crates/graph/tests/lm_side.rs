@@ -6,6 +6,9 @@
 //! run's patches, so that all three follow one generation. Built with the `device` feature, and run
 //! with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS`
 //! the compiled kernels, as `nix run .#device-tests` sets the last.
+//!
+//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
+//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
@@ -18,7 +21,8 @@ use graph::{
     lm_side::{self, LmSide, LmSideShape},
 };
 use half::f16;
-use testkit::{Fixture, checkpoint_dir, device};
+use serde::{Deserialize, Serialize};
+use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
 use voices::Latent;
 use voxcpm::{Config, Dtypes, Generation, LocalEncoder, Model, Prompt, Sampling, SeededNoise};
 use vulkan::Context;
@@ -72,6 +76,7 @@ fn configs(layers: usize, residual_layers: usize) -> (Config, lm_side::Config) {
 }
 
 /// What voxcpm's model gives on the CPU.
+#[derive(Serialize, Deserialize)]
 struct Oracle {
     /// The local encoder's output for every patch, the prompt's and then the generated ones,
     /// rounded to f16: `[patches][encoder]` as f16 bits.
@@ -89,6 +94,16 @@ fn floats<const D: usize>(t: Tensor<D>) -> Vec<f32> {
 }
 
 fn oracle(config: &Config) -> Oracle {
+    let (layers, residual) = (
+        config.lm_config.num_hidden_layers,
+        config.residual_lm_num_layers,
+    );
+    kept(&format!("lm-side-{layers}-{residual}"), || {
+        compute_oracle(config)
+    })
+}
+
+fn compute_oracle(config: &Config) -> Oracle {
     let weights = checkpoint_dir().join("model.safetensors");
     let cpu = device();
     let voice = voice();
@@ -299,6 +314,19 @@ fn decides_alike(oracle: &Oracle, stop: &[f32]) -> bool {
         let margin = w[1] - w[0];
         margin.abs() <= 2.0 * error || (margin > 0.0) == (g[1] > g[0])
     })
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
+            ORACLE_DIR a directory to keep the oracles in"]
+fn keeps_the_oracles() {
+    if oracle_dir().is_none() {
+        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
+        return;
+    }
+    oracle(&configs(2, 1).0);
+    let json = fs::read_to_string(checkpoint_dir().join("config.json")).unwrap();
+    oracle(&Config::from_json(&json).unwrap());
 }
 
 #[test]

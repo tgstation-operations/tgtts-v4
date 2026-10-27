@@ -4,6 +4,9 @@
 //! compared, then the steps' outputs. Built with the `device` feature, and run with `VOXCPM2_DIR`
 //! naming the checkpoint and `GLSL_KERNELS` and `VULKAN_KERNELS` the compiled kernels, as `nix run
 //! .#device-tests` sets them.
+//!
+//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
+//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
 use std::{collections::BTreeMap, fs, time::Instant};
@@ -18,8 +21,9 @@ use graph::{
 };
 use half::f16;
 use minicpm4::{Config, Mask, Model};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use testkit::{Fixture, checkpoint_dir, device};
+use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
 use vulkan::Context;
 
 fn context() -> Context {
@@ -120,6 +124,7 @@ const STEPS: usize = 8;
 /// What a run of a stack gives over a prompt and the decode steps after it: the outputs after the
 /// final norm, `[len + STEPS][hidden]`, and every layer's keys then values over the prompt,
 /// `[layers][2][kv_heads][len][head_dim]`.
+#[derive(Serialize, Deserialize)]
 struct Run {
     outputs: Vec<f32>,
     cache: Vec<f32>,
@@ -173,10 +178,35 @@ fn rounded(x: &[f32]) -> Vec<u16> {
     x.iter().map(|&v| f16::from_f32(v).to_bits()).collect()
 }
 
+/// The base LM's embeddings of `len` tokens of the game's lines, rounded to f16, by `stack`'s
+/// model.
+fn embedded(stack: &Stack, len: usize) -> Vec<u16> {
+    let model = Model::load(
+        &stack.cpu,
+        checkpoint_dir().join("model.safetensors"),
+        stack.prefix,
+        FloatDType::F32,
+        &device(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    rounded(&embeddings(&model, len))
+}
+
+/// The hidden states `x` makes, and [`compute_oracle`]'s runs over them, kept by the stack and
+/// `len` alone: each stack's test makes its hidden states one way.
+fn oracle(stack: &Stack, len: usize, x: impl FnOnce() -> Vec<u16>) -> (Vec<u16>, Run, Run) {
+    let layers = stack.cpu.num_hidden_layers;
+    kept(&format!("prefill-{}{layers}-{len}", stack.prefix), || {
+        let x = x();
+        let (want, burn_f16) = compute_oracle(stack, &x, len);
+        (x, want, burn_f16)
+    })
+}
+
 /// minicpm4 on the CPU over `stack`, in f32 and in f16, over `x16`, hidden states
 /// `[len + STEPS][hidden]` as f16 bits: the first `len` as a prompt at once, then a step at a
 /// time.
-fn oracle(stack: &Stack, x16: &[u16], len: usize) -> (Run, Run) {
+fn compute_oracle(stack: &Stack, x16: &[u16], len: usize) -> (Run, Run) {
     let weights = checkpoint_dir().join("model.safetensors");
     let cpu = device();
     let config = &stack.cpu;
@@ -386,6 +416,24 @@ fn a_prefill_runs_on_the_decoder_it_was_recorded_for_alone() {
 }
 
 #[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and ORACLE_DIR a directory to keep \
+            the oracles in"]
+fn keeps_the_oracles() {
+    if oracle_dir().is_none() {
+        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
+        return;
+    }
+    for (layers, len) in [(1, 600), (28, 200)] {
+        let stack = base_lm(layers);
+        oracle(&stack, len, || embedded(&stack, len + STEPS));
+    }
+    let len = 300;
+    oracle(&residual_lm(), len, || {
+        rounded(&residual_inputs(len + STEPS))
+    });
+}
+
+#[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn one_layer_prefills_as_minicpm4_does_on_the_cpu() {
     // Five tiles of rows, run as two prefills that each end inside a tile, the second from where
@@ -393,17 +441,7 @@ fn one_layer_prefills_as_minicpm4_does_on_the_cpu() {
     let len = 600;
     let runs = [333, 267];
     let stack = base_lm(1);
-    let model = Model::load(
-        &stack.cpu,
-        checkpoint_dir().join("model.safetensors"),
-        stack.prefix,
-        FloatDType::F32,
-        &device(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    let x = rounded(&embeddings(&model, len + STEPS));
-    drop(model);
-    let (want, burn_f16) = oracle(&stack, &x, len);
+    let (x, want, burn_f16) = oracle(&stack, len, || embedded(&stack, len + STEPS));
     let report = context().report().clone();
     for subgroup in SUBGROUPS
         .into_iter()
@@ -426,17 +464,7 @@ fn one_layer_prefills_as_minicpm4_does_on_the_cpu() {
 fn the_base_lm_prefills_as_minicpm4_does_on_the_cpu() {
     let len = 200;
     let stack = base_lm(28);
-    let model = Model::load(
-        &stack.cpu,
-        checkpoint_dir().join("model.safetensors"),
-        stack.prefix,
-        FloatDType::F32,
-        &device(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    let x = rounded(&embeddings(&model, len + STEPS));
-    drop(model);
-    let (want, burn_f16) = oracle(&stack, &x, len);
+    let (x, want, burn_f16) = oracle(&stack, len, || embedded(&stack, len + STEPS));
     let got = gpu(&stack, &x, &[len], 0, None, 2 * TILE);
     let (_, margin) = check(&want, &burn_f16, &got, len);
     assert!(within(margin), "{margin:?}");
@@ -480,8 +508,7 @@ fn the_residual_lm_prefills_as_minicpm4_does_on_the_cpu() {
     let runs = [200, 100];
     let stack = residual_lm();
     assert!(stack.gpu.no_rope, "VoxCPM2's residual LM goes without RoPE");
-    let x = rounded(&residual_inputs(len + STEPS));
-    let (want, burn_f16) = oracle(&stack, &x, len);
+    let (x, want, burn_f16) = oracle(&stack, len, || rounded(&residual_inputs(len + STEPS)));
     let got = gpu(&stack, &x, &runs, 0, None, 2 * TILE);
     let (_, margin) = check(&want, &burn_f16, &got, len);
     assert!(within(margin), "{margin:?}");

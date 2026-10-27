@@ -3,6 +3,9 @@
 //! noise it drew for the next. Built with the `device` feature, and run with `VOXCPM2_DIR`
 //! naming the checkpoint and `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests`
 //! sets it.
+//!
+//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
+//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
@@ -21,7 +24,7 @@ use graph::{
     step::Step,
 };
 use half::f16;
-use testkit::{Fixture, checkpoint_dir, device};
+use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
 use voxcpm::{Cfm, Config, LocalEncoder, Sampling};
 use vulkan::Context;
 
@@ -167,9 +170,17 @@ fn within(margins: [f64; 2]) -> bool {
     margins.iter().all(|&m| m <= 1.25)
 }
 
+/// [`compute_oracle`]'s, kept by the steps and the dtype alone: every test samples the cases
+/// [`cases`] gives.
+fn oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
+    kept(&format!("local-sampler-{timesteps}-{dtype:?}"), || {
+        compute_oracle(cases, timesteps, dtype)
+    })
+}
+
 /// What voxcpm's sampler gives for each case in `timesteps` steps, its DiT in `dtype`, the
 /// patches `[feat_dim][patch_size]` flattened one after another.
-fn oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
+fn compute_oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
     let config = Config::from_json(&config_json()).unwrap();
     let (feat_dim, patch_size) = (config.feat_dim, config.patch_size);
     let cpu = device();
@@ -310,6 +321,25 @@ fn tunings(ctx: &Context) -> Vec<Tuning> {
 }
 
 #[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
+            ORACLE_DIR a directory to keep the oracles in"]
+fn keeps_the_oracles() {
+    if oracle_dir().is_none() {
+        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
+        return;
+    }
+    let config = patch_config();
+    let cases = rounded(cases(&config));
+    let mut patches = golden().0;
+    patches.extend(voice_patches(&config, 40));
+    for dtype in [FloatDType::F32, FloatDType::F16] {
+        oracle(&cases, 2, dtype);
+        oracle(&cases, Sampling::default().timesteps, dtype);
+        encoder_oracle(&patches, dtype);
+    }
+}
+
+#[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn one_euler_step_samples_as_voxcpm_does_on_the_cpu() {
     let config = patch_config();
@@ -358,8 +388,16 @@ fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
     assert_no_validation_messages(&ctx);
 }
 
-/// What voxcpm's local encoder gives for each patch `[patch_size][feat_dim]`, in `dtype`.
+/// [`compute_encoder_oracle`]'s, kept by the dtype alone: the encoder's test embeds the golden's
+/// patches and [`voice_patches`]' 40.
 fn encoder_oracle(patches: &[Vec<f32>], dtype: FloatDType) -> Vec<f32> {
+    kept(&format!("local-encoder-{dtype:?}"), || {
+        compute_encoder_oracle(patches, dtype)
+    })
+}
+
+/// What voxcpm's local encoder gives for each patch `[patch_size][feat_dim]`, in `dtype`.
+fn compute_encoder_oracle(patches: &[Vec<f32>], dtype: FloatDType) -> Vec<f32> {
     let config = Config::from_json(&config_json()).unwrap();
     let cpu = device();
     let encoder =

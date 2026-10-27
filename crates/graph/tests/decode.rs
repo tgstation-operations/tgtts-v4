@@ -2,6 +2,9 @@
 //! base LM over a real prompt: a prefill on the CPU and one position at a time on the GPU, then
 //! decode steps on both. Built with the `device` feature, and run with `VOXCPM2_DIR` naming the
 //! checkpoint and `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests` sets it.
+//!
+//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
+//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
@@ -14,8 +17,9 @@ use graph::{
 };
 use half::f16;
 use minicpm4::{Config, Model};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use testkit::{Fixture, checkpoint_dir, device};
+use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
 use vulkan::Context;
 
 fn context() -> Context {
@@ -94,7 +98,7 @@ fn distance(got: &[f32], want: &[f32], atol: f64, rtol: f64) -> Distance {
 
 /// A stack of VoxCPM2's: its base LM; its residual LM, which goes without RoPE; or, as a defect,
 /// the residual LM rotated as the base LM is.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Stack {
     Base,
     Residual,
@@ -114,6 +118,7 @@ impl Stack {
 /// over the prompt's embeddings rounded to f16, the first `prefill` positions at once and the
 /// rest one at a time: the outputs in f32 and in f16, `[positions][hidden]` flattened, and the
 /// embeddings as f16 bits.
+#[derive(Serialize, Deserialize)]
 struct Oracle {
     f32: Vec<f32>,
     f16: Vec<f32>,
@@ -126,6 +131,12 @@ fn config() -> Value {
 }
 
 fn oracle(stack: Stack, layers: usize, prefill: usize) -> Oracle {
+    kept(&format!("decode-{stack:?}-{layers}-{prefill}"), || {
+        compute_oracle(stack, layers, prefill)
+    })
+}
+
+fn compute_oracle(stack: Stack, layers: usize, prefill: usize) -> Oracle {
     let weights = checkpoint_dir().join("model.safetensors");
     let ids = prompt_ids();
     let len = ids.len();
@@ -283,6 +294,19 @@ fn check(want: &[f32], burn_f16: &[f32], got: &[f32], prefill: usize) -> (Distan
 
 fn within(margin: [f64; 4]) -> bool {
     margin.iter().all(|&m| m <= 1.25)
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and ORACLE_DIR a directory to keep \
+            the oracles in"]
+fn keeps_the_oracles() {
+    if oracle_dir().is_none() {
+        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
+        return;
+    }
+    oracle(Stack::Base, 1, 70);
+    oracle(Stack::Base, 28, 70);
+    oracle(Stack::Residual, 8, 70);
 }
 
 #[test]

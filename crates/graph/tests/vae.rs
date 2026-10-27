@@ -2,6 +2,9 @@
 //! VoxCPM2's real weights over a real voice's latents. Built with the `device` feature, and run
 //! with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS`
 //! the compiled kernels, as `nix run .#device-tests` sets it.
+//!
+//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
+//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
 use std::{fs, path::PathBuf, time::Instant};
@@ -12,7 +15,7 @@ use graph::{
     kernels::Kernels,
     vae::{VaeConfig, VaeDecoder, VaeShape},
 };
-use testkit::{checkpoint_dir, device};
+use testkit::{checkpoint_dir, device, kept, oracle_dir};
 use voices::Latent;
 use vulkan::Context;
 
@@ -60,8 +63,16 @@ fn latents(frames: usize) -> Vec<f32> {
     voice.frames[4..4 + frames].as_flattened().to_vec()
 }
 
-/// What the audiovae crate decodes `latents` into on the CPU, whole, with the decoder in `dtype`.
+/// [`compute_oracle`]'s, kept by the frames and the dtype alone: the tests decode [`latents`]'.
 fn cpu(latents: &[f32], dtype: FloatDType) -> Vec<f32> {
+    let frames = latents.len() / LATENT;
+    kept(&format!("vae-{frames}-{dtype:?}"), || {
+        compute_oracle(latents, dtype)
+    })
+}
+
+/// What the audiovae crate decodes `latents` into on the CPU, whole, with the decoder in `dtype`.
+fn compute_oracle(latents: &[f32], dtype: FloatDType) -> Vec<f32> {
     let start = Instant::now();
     let config: AudioVaeConfig = serde_json::from_value(config()).unwrap();
     let device = device();
@@ -181,6 +192,21 @@ fn check(got: &[f32], want: &[f32], burn_f16: &[f32], max_abs: f64) {
         ours.relative_rms <= burn.relative_rms,
         "{ours:?} against {burn:?}"
     );
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
+            ORACLE_DIR a directory to keep the oracles in"]
+fn keeps_the_oracles() {
+    if oracle_dir().is_none() {
+        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
+        return;
+    }
+    for frames in [3, 50] {
+        let latents = latents(frames);
+        cpu(&latents, FloatDType::F32);
+        cpu(&latents, FloatDType::F16);
+    }
 }
 
 #[test]
