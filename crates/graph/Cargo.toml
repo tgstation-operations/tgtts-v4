@@ -16,7 +16,9 @@ serde_json.workspace = true
 vulkan = { path = "../vulkan" }
 
 [dev-dependencies]
+audiovae = { path = "../audiovae" }
 burn = { workspace = true, features = ["std"] }
 libc.workspace = true
 minicpm4 = { path = "../minicpm4" }
 testkit = { path = "../testkit" }
+voices = { path = "../voices" }

@@ -18,6 +18,7 @@ pub mod decode;
 pub mod graph;
 pub mod kernels;
 pub mod step;
+pub mod vae;
 
 use std::fmt;
 

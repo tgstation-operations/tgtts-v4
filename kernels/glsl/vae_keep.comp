@@ -1,0 +1,24 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Keeps a causal convolution's last REACH inputs in its ring for the next chunk, through the
+// prologue as the convolution takes them, once it has read the ring: the chunk's rows from
+// rows() - REACH on, those of them there are. One invocation per value kept.
+
+layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer Ring { float ring[]; };
+layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };
+
+#include "vae.glsl"
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint back = REACH - i / C;
+    uint c = i % C;
+    uint total = rows();
+    if (i >= REACH * C || back > total) {
+        return;
+    }
+    uint t = total - back;
+    ring[(ring_start() + t) % REACH * C + c] = input_at(int(t), c);
+}

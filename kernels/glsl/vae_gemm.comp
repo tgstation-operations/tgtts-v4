@@ -1,0 +1,100 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+// A causal convolution of the audio VAE's decoder over a chunk, as a GEMM: out = A W + bias,
+// plus `residual` where RESIDUAL, with A's row t the convolution's inputs t - TAPS + 1 to t side
+// by side and W [TAPS * C][N]. A pointwise convolution is one tap. A transposed convolution
+// upsampling by s, of kernel 2 s, is two taps and N = s * channels: an input step's s outputs side
+// by side, which is the time-major [rows * s][channels] they are.
+//
+// A workgroup takes a BM x BN tile of out, each invocation TM x TN of it, rows WORKGROUP / WN
+// apart and columns WN apart; A and W pass through shared memory BK columns at a time.
+
+layout(constant_id = 5) const uint TAPS = 1;
+layout(constant_id = 6) const uint N = 2048;
+layout(constant_id = 7) const bool RESIDUAL = false;
+layout(constant_id = 8) const uint TM = 4;
+layout(constant_id = 9) const uint TN = 4;
+layout(constant_id = 10) const uint WN = 16;
+
+layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) readonly buffer Ring { float ring[]; };
+layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };
+layout(std430, binding = 4) readonly buffer W { float w[]; };
+layout(std430, binding = 5) readonly buffer Bias { float bias[]; };
+layout(std430, binding = 6) readonly buffer Residual { float residual[]; };
+layout(std430, binding = 7) writeonly buffer Out { float out_[]; };
+
+#include "vae.glsl"
+
+const uint K = TAPS * C;
+const uint WM = WORKGROUP / WN;
+const uint BM = TM * WM;
+const uint BN = TN * WN;
+const uint BK = 16;
+// A's tile is kept transposed, a row of shared memory per column of A, padded so that the
+// columns invocations write side by side fall in different banks.
+const uint PADDED = BM + 1;
+
+shared float as_[BK * PADDED];
+shared float ws[BK * BN];
+
+void main() {
+    uint m0 = gl_WorkGroupID.y * BM;
+    uint n0 = gl_WorkGroupID.x * BN;
+    uint total = rows();
+    if (m0 >= total) {
+        return;
+    }
+    uint t = gl_LocalInvocationID.x;
+    uint tn = t % WN;
+    uint tm = t / WN;
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0; i < TM; i++) {
+        [[unroll]] for (uint j = 0; j < TN; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        // C is a multiple of BK, so a tile of columns lies within one tap.
+        uint back = TAPS - 1 - k0 / C;
+        uint c0 = k0 % C;
+        for (uint i = t; i < BM * BK; i += WORKGROUP) {
+            uint m = m0 + i / BK;
+            as_[i % BK * PADDED + i / BK] = input_at(int(m) - int(back), c0 + i % BK);
+        }
+        for (uint i = t; i < BK * BN; i += WORKGROUP) {
+            ws[i] = w[(k0 + i / BN) * N + n0 + i % BN];
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0; kk < BK; kk++) {
+            float a[TM];
+            float b[TN];
+            [[unroll]] for (uint i = 0; i < TM; i++) {
+                a[i] = as_[kk * PADDED + tm + i * WM];
+            }
+            [[unroll]] for (uint j = 0; j < TN; j++) {
+                b[j] = ws[kk * BN + tn + j * WN];
+            }
+            [[unroll]] for (uint i = 0; i < TM; i++) {
+                [[unroll]] for (uint j = 0; j < TN; j++) {
+                    acc[i][j] = fma(a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for (uint i = 0; i < TM; i++) {
+        uint m = m0 + tm + i * WM;
+        if (m >= total) {
+            continue;
+        }
+        [[unroll]] for (uint j = 0; j < TN; j++) {
+            uint n = n0 + tn + j * WN;
+            uint at = m * N + n;
+            float v = acc[i][j] + bias[n];
+            out_[at] = RESIDUAL ? residual[at] + v : v;
+        }
+    }
+}

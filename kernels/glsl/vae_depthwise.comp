@@ -1,0 +1,60 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+// A depthwise causal convolution of kernel 7 over a chunk, dilated by REACH / 6: out[t][c] =
+// bias[c] + the sum over k of w[c][k] times the input REACH - k REACH / 6 rows before t, with
+// Snake after it where EPILOGUE.
+//
+// A workgroup takes TILE rows of COLUMNS channels, and stages their inputs, the REACH rows
+// before them included, through the prologue into shared memory once, rather than once for
+// each of the seven outputs that read each.
+
+layout(constant_id = 5) const bool EPILOGUE = false;
+
+layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) readonly buffer Ring { float ring[]; };
+layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };
+// [C][7]
+layout(std430, binding = 4) readonly buffer W { float w[]; };
+layout(std430, binding = 5) readonly buffer Bias { float bias[]; };
+layout(std430, binding = 6) readonly buffer Epilogue { vec4 epilogue[]; };
+layout(std430, binding = 7) writeonly buffer Out { float out_[]; };
+
+#include "vae.glsl"
+
+const uint KERNEL = 7;
+const uint DILATION = REACH / (KERNEL - 1);
+const uint COLUMNS = 32;
+const uint TILE = 64;
+const uint ROWS_APART = WORKGROUP / COLUMNS;
+
+shared float xs[(TILE + REACH) * COLUMNS];
+
+void main() {
+    uint t0 = gl_WorkGroupID.y * TILE;
+    uint c0 = gl_WorkGroupID.x * COLUMNS;
+    uint total = rows();
+    if (t0 >= total) {
+        return;
+    }
+    uint local = gl_LocalInvocationID.x;
+    for (uint i = local; i < (TILE + REACH) * COLUMNS; i += WORKGROUP) {
+        xs[i] = input_at(int(t0 + i / COLUMNS) - int(REACH), c0 + i % COLUMNS);
+    }
+    barrier();
+    uint column = local % COLUMNS;
+    uint c = c0 + column;
+    float weights[KERNEL];
+    [[unroll]] for (uint k = 0; k < KERNEL; k++) {
+        weights[k] = w[c * KERNEL + k];
+    }
+    for (uint r = local / COLUMNS; r < TILE && t0 + r < total; r += ROWS_APART) {
+        float acc = 0.0;
+        [[unroll]] for (uint k = 0; k < KERNEL; k++) {
+            acc = fma(weights[k], xs[(r + k * DILATION) * COLUMNS + column], acc);
+        }
+        float v = acc + bias[c];
+        out_[(t0 + r) * C + c] = EPILOGUE ? affine_snake(v, epilogue[c]) : v;
+    }
+}

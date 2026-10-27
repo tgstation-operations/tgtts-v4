@@ -1,0 +1,47 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The audio VAE decoder's last layers over a chunk: Snake as the prologue, a causal convolution
+// of kernel 7 from C channels to one, and tanh, a sample of audio per row.
+//
+// A workgroup takes WORKGROUP samples, and stages their inputs, the six rows before them
+// included, through Snake into shared memory once, rather than once for each of the seven
+// samples that read each.
+
+layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) readonly buffer Ring { float ring[]; };
+layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };
+// [7][C]
+layout(std430, binding = 4) readonly buffer W { float w[]; };
+layout(std430, binding = 5) readonly buffer Bias { float bias; };
+layout(std430, binding = 6) writeonly buffer Out { float out_[]; };
+
+#include "vae.glsl"
+
+const uint KERNEL = 7;
+
+shared float xs[(WORKGROUP + KERNEL - 1) * C];
+
+void main() {
+    uint t0 = gl_WorkGroupID.x * WORKGROUP;
+    uint total = rows();
+    if (t0 >= total) {
+        return;
+    }
+    uint local = gl_LocalInvocationID.x;
+    for (uint i = local; i < (WORKGROUP + KERNEL - 1) * C; i += WORKGROUP) {
+        xs[i] = input_at(int(t0 + i / C) - int(KERNEL - 1), i % C);
+    }
+    barrier();
+    uint t = t0 + local;
+    if (t >= total) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint k = 0; k < KERNEL; k++) {
+        for (uint c = 0; c < C; c++) {
+            acc = fma(w[k * C + c], xs[(local + k) * C + c], acc);
+        }
+    }
+    out_[t] = tanh(acc + bias);
+}
