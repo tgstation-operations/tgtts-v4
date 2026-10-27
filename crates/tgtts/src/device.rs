@@ -12,8 +12,20 @@ use tracing::{
     Event, Subscriber,
     field::{Field, Visit},
 };
-use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    layer::{Context, Layer},
+};
 use voxcpm::Dtypes;
+
+/// What is logged at `level`: the service's own events at it, and the crates' it uses at it but
+/// never past `INFO`, as cubecl logs every kernel it compiles at `DEBUG`, gigabytes in minutes,
+/// and at `INFO` the kernels autotune tunes, which [`Tunings`] counts.
+pub fn log_filter(level: LevelFilter) -> Targets {
+    Targets::new()
+        .with_default(level.min(LevelFilter::INFO))
+        .with_target("tgtts", level)
+}
 
 /// The kernels autotune has tuned in this process, as [`Tunings`] counts them.
 static TUNED: AtomicUsize = AtomicUsize::new(0);
@@ -181,6 +193,26 @@ fn cuda(_: Option<&Path>) -> Result<Device, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_the_crates_it_uses_no_finer_than_info() {
+        use tracing::Level;
+
+        let enabled =
+            |filter: &Targets, target: &str, level: Level| filter.would_enable(target, &level);
+        let debug = log_filter(LevelFilter::DEBUG);
+        assert!(enabled(&debug, "tgtts::model", Level::DEBUG));
+        assert!(!enabled(
+            &debug,
+            "cubecl_cuda::compute::server",
+            Level::DEBUG
+        ));
+        assert!(enabled(&debug, "cubecl_runtime::tune::tuner", Level::INFO));
+        let warn = log_filter(LevelFilter::WARN);
+        assert!(!enabled(&warn, "tgtts::model", Level::INFO));
+        assert!(!enabled(&warn, "cubecl_runtime::tune::tuner", Level::INFO));
+        assert!(enabled(&warn, "cubecl_runtime::tune::tuner", Level::WARN));
+    }
 
     #[test]
     fn counts_the_kernels_autotune_tunes() {

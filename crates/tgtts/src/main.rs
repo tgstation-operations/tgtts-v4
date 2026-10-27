@@ -45,14 +45,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (level, reload) = reload::Layer::new(config.log_level);
+    let (level, reload) = reload::Layer::new(device::log_filter(config.log_level));
     tracing_subscriber::registry()
         .with(level)
         .with(tracing_subscriber::fmt::layer())
         .with(device::Tunings)
         .init();
     let set_level = move |level: LevelFilter| {
-        if let Err(e) = reload.modify(|filter| *filter = level) {
+        if let Err(e) = reload.modify(|filter| *filter = device::log_filter(level)) {
             error!("setting the log level: {e}");
         }
     };
