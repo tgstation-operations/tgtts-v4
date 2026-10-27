@@ -12,6 +12,7 @@ use std::{
 
 use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 use safetensors::{Dtype, SafeTensors};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// The device every test runs on.
 pub fn device() -> Device {
@@ -212,4 +213,35 @@ pub fn checkpoint_dir() -> PathBuf {
         panic!("VOXCPM2_DIR: {} has no config.json", dir.display());
     }
     dir
+}
+
+/// The directory `ORACLE_DIR` names, where [`kept`] keeps what it computes, when it is set.
+pub fn oracle_dir() -> Option<PathBuf> {
+    std::env::var_os("ORACLE_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `compute`'s result, kept as JSON under [`oracle_dir`] when it is set, by `name`: read from
+/// there when a run before left it. A test keeps its CPU oracle so, to compute it once, or on
+/// another host than the one whose GPU it runs on. A change to what computes it wants the file
+/// removed.
+///
+/// # Panics
+///
+/// If the kept file is not a `T`, or the result cannot be kept.
+#[track_caller]
+pub fn kept<T: Serialize + DeserializeOwned>(name: &str, compute: impl FnOnce() -> T) -> T {
+    let Some(dir) = oracle_dir() else {
+        return compute();
+    };
+    let path = dir.join(format!("{name}.json"));
+    if let Ok(json) = std::fs::read(&path) {
+        eprintln!("the oracle from {}", path.display());
+        return serde_json::from_slice(&json).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    }
+    let value = compute();
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap())
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    value
 }

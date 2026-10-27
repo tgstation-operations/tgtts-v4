@@ -11,3 +11,5 @@ publish = false
 # features. gemm picks those kernels at run time, so the tests still run without AVX-512.
 burn = { workspace = true, features = ["flex", "rayon", "x86-v4"] }
 safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true

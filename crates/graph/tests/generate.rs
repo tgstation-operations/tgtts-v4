@@ -30,7 +30,7 @@
 //! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
-use std::{fs, path::PathBuf, time::Instant};
+use std::{fs, time::Instant};
 
 use audiovae::Weights;
 use burn::{
@@ -54,8 +54,8 @@ use graph::{
     prompt::Prompter,
 };
 use half::f16;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use testkit::{Fixture, checkpoint_dir, device};
+use serde::{Deserialize, Serialize};
+use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
 use voices::Latent;
 use voxcpm::{
     Config, Dtypes, LocalEncoder, Model, Noise, Params, Prompt, Sampling, SeededNoise,
@@ -109,23 +109,6 @@ fn voice() -> (String, Latent) {
     let name = golden().metadata()["voice"].clone();
     let latent = Latent::read(&voices::latent_path(&dir, &name)).unwrap_or_else(|e| panic!("{e}"));
     (name, latent)
-}
-
-/// `compute`'s result, kept as JSON under `ORACLE_DIR` when it is set, by `name`: read from
-/// there when a run before left it. A change to what computes it wants the file removed.
-fn kept<T: Serialize + DeserializeOwned>(name: &str, compute: impl FnOnce() -> T) -> T {
-    let Some(dir) = std::env::var_os("ORACLE_DIR").filter(|dir| !dir.is_empty()) else {
-        return compute();
-    };
-    let path = PathBuf::from(dir).join(format!("{name}.json"));
-    if let Ok(json) = fs::read(&path) {
-        eprintln!("the oracle from {}", path.display());
-        return serde_json::from_slice(&json).unwrap_or_else(|e| panic!("{e}"));
-    }
-    let value = compute();
-    fs::write(&path, serde_json::to_vec(&value).unwrap())
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    value
 }
 
 /// What voxcpm's model gives on the CPU for a prompt, in f32 and in burn's f16, the second each
@@ -602,7 +585,7 @@ fn judge(oracle: &Oracle, run: &Run) -> Verdict {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
             ORACLE_DIR a directory to keep the oracles in"]
 fn keeps_the_oracles() {
-    if std::env::var_os("ORACLE_DIR").is_none_or(|dir| dir.is_empty()) {
+    if oracle_dir().is_none() {
         eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
         return;
     }
