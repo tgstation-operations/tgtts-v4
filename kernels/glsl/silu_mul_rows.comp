@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out = SiLU(gate) * up over each row of a run, gate and up the two halves of the f32 gate_up
+// projection c, as gemv_gate_up computes them for one position. Workgroup r takes row r.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint INNER = 6144;
+
+#include "run.glsl"
+
+// [rows][2 INNER], the gate's columns first.
+layout(std430, binding = 1) readonly buffer C { vec4 c[]; };
+// [rows][INNER]
+layout(std430, binding = 2) writeonly buffer Out { uvec2 out_[]; };
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= len) {
+        return;
+    }
+    for (uint v = gl_LocalInvocationID.x; v < INNER / 4; v += WORKGROUP) {
+        vec4 gate = c[row * (INNER / 2) + v];
+        vec4 up = c[row * (INNER / 2) + INNER / 4 + v];
+        vec4 r = gate / (1.0 + exp(-gate)) * up;
+        out_[row * (INNER / 4) + v] = uvec2(packFloat2x16(f16vec2(r.xy)), packFloat2x16(f16vec2(r.zw)));
+    }
+}

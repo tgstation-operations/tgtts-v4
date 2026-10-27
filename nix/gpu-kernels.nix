@@ -18,6 +18,17 @@ let
     "256 384 512"
     "512 6144 2048"
   ];
+  # The prefill's projections, q/k/v, output, gate/up and down, at every number of rows a
+  # program of crates/graph/src/prefill.rs takes, accumulating in f32.
+  prefillGemms = lib.concatMap (
+    m:
+    map (nk: "${toString m} ${nk}") [
+      "2560 2048"
+      "2048 2048"
+      "12288 2048"
+      "2048 6144"
+    ]
+  ) (lib.genList (i: 128 * (i + 1)) 8);
 in
 pkgs.stdenvNoCC.mkDerivation {
   pname = "gpu-kernels";
@@ -43,6 +54,10 @@ pkgs.stdenvNoCC.mkDerivation {
       for acc in f16 f32; do
         python3 kernels/gpu/build.py --out $out gemm --m "$m" --n "$n" --k "$k" --acc "$acc"
       done
+    done
+    for shape in ${lib.escapeShellArgs prefillGemms}; do
+      read -r m n k <<<"$shape"
+      python3 kernels/gpu/build.py --out $out gemm --m "$m" --n "$n" --k "$k" --acc f32
     done
     for acc in f16 f32; do
       python3 kernels/gpu/cpu_oracle.py --mlir-lib ${mlir}/lib gemm kernels/gpu/gemm.mlir \

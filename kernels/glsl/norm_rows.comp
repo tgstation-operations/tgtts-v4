@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out = RMSNorm(x) with gain g, over each row of a run: workgroup r takes row r, as
+// rmsnorm.comp takes its one vector.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 2048;
+layout(constant_id = 3) const float EPS = 1e-5;
+
+#include "run.glsl"
+#include "row_norm.glsl"
+
+layout(std430, binding = 1) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 2) readonly buffer G { uvec4 g[]; };
+layout(std430, binding = 3) writeonly buffer Out { uvec4 out_[]; };
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= len) {
+        return;
+    }
+    uint base = row * (K / 8);
+    vec4 lo[STEPS];
+    vec4 hi[STEPS];
+    float squares = 0.0;
+    [[unroll]] for (uint s = 0; s < STEPS; s++) {
+        unpack8(x[base + s * WORKGROUP + gl_LocalInvocationID.x], lo[s], hi[s]);
+        squares += dot(lo[s], lo[s]) + dot(hi[s], hi[s]);
+    }
+    float scale = row_scale(squares, EPS);
+    [[unroll]] for (uint s = 0; s < STEPS; s++) {
+        uint v = s * WORKGROUP + gl_LocalInvocationID.x;
+        vec4 glo, ghi;
+        unpack8(g[v], glo, ghi);
+        out_[base + v] = pack8(lo[s] * scale * glo, hi[s] * scale * ghi);
+    }
+}

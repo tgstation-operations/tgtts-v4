@@ -1,0 +1,67 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The attention's input side over each row of a run, from the f32 q/k/v projection c, as
+// gemv_qkv_rope makes it for one position: q and k rotated by RoPE at the row's position, unless
+// ROPE is false, and k and v written into the cache there. Workgroup r takes row r, an
+// invocation the pairs of columns i and i + HEAD_DIM / 2 of a head that RoPE rotates together.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint HEADS = 16;
+layout(constant_id = 3) const uint KV_HEADS = 2;
+layout(constant_id = 4) const uint HEAD_DIM = 128;
+layout(constant_id = 5) const uint CAPACITY = 1024;
+layout(constant_id = 6) const bool ROPE = true;
+
+#include "run.glsl"
+
+const uint HALF = HEAD_DIM / 2;
+const uint WIDTH = (HEADS + 2 * KV_HEADS) * HEAD_DIM;
+
+// [rows][WIDTH]: q, k and v of each row, as upstream's q_proj, k_proj and v_proj give them.
+layout(std430, binding = 1) readonly buffer C { float c[]; };
+// [CAPACITY][HEAD_DIM / 2] each.
+layout(std430, binding = 2) readonly buffer Cos { float cos_[]; };
+layout(std430, binding = 3) readonly buffer Sin { float sin_[]; };
+// [rows][HEADS][HEAD_DIM]
+layout(std430, binding = 4) writeonly buffer Q { float16_t q[]; };
+// [KV_HEADS][CAPACITY][HEAD_DIM]
+layout(std430, binding = 5) writeonly buffer KCache { float16_t k_cache[]; };
+layout(std430, binding = 6) writeonly buffer VCache { float16_t v_cache[]; };
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint pos = start + row;
+    if (row >= len || pos >= CAPACITY) {
+        return;
+    }
+    for (uint pair = gl_LocalInvocationID.x; pair < WIDTH / 2; pair += WORKGROUP) {
+        uint head = pair / HALF;
+        uint i = pair % HALF;
+        uint at = row * WIDTH + head * HEAD_DIM + i;
+        float a = c[at];
+        float b = c[at + HALF];
+        if (head >= HEADS + KV_HEADS) {
+            uint to = ((head - HEADS - KV_HEADS) * CAPACITY + pos) * HEAD_DIM + i;
+            v_cache[to] = float16_t(a);
+            v_cache[to + HALF] = float16_t(b);
+            continue;
+        }
+        if (ROPE) {
+            // As upstream: x cos + rotate_half(x) sin.
+            float co = cos_[pos * HALF + i];
+            float si = sin_[pos * HALF + i];
+            float ra = a * co - b * si;
+            b = b * co + a * si;
+            a = ra;
+        }
+        if (head < HEADS) {
+            uint to = (row * HEADS + head) * HEAD_DIM + i;
+            q[to] = float16_t(a);
+            q[to + HALF] = float16_t(b);
+        } else {
+            uint to = ((head - HEADS) * CAPACITY + pos) * HEAD_DIM + i;
+            k_cache[to] = float16_t(a);
+            k_cache[to + HALF] = float16_t(b);
+        }
+    }
+}

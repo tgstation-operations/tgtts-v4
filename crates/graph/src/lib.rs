@@ -20,6 +20,7 @@ pub mod decode;
 pub mod graph;
 pub mod kernels;
 pub mod lm_side;
+pub mod prefill;
 pub mod step;
 pub mod vae;
 

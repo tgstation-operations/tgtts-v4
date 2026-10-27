@@ -1,0 +1,45 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// sum = residual + c and normed = RMSNorm(sum) with gain g, over each row of a run: the residual
+// add after a projection the GEMM left in f32, and the norm before the next one. Workgroup r
+// takes row r. The norm is of the sum before it is rounded to f16 for `sum`, so that it does not
+// depend on whether the driver folds that rounding away (common.glsl).
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 2048;
+layout(constant_id = 3) const float EPS = 1e-5;
+
+#include "run.glsl"
+#include "row_norm.glsl"
+
+layout(std430, binding = 1) readonly buffer C { vec4 c[]; };
+layout(std430, binding = 2) readonly buffer Residual { uvec4 residual[]; };
+layout(std430, binding = 3) readonly buffer G { uvec4 g[]; };
+layout(std430, binding = 4) writeonly buffer Sum { uvec4 sum[]; };
+layout(std430, binding = 5) writeonly buffer Normed { uvec4 normed[]; };
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= len) {
+        return;
+    }
+    uint base = row * (K / 8);
+    vec4 lo[STEPS];
+    vec4 hi[STEPS];
+    float squares = 0.0;
+    [[unroll]] for (uint s = 0; s < STEPS; s++) {
+        uint v = base + s * WORKGROUP + gl_LocalInvocationID.x;
+        unpack8(residual[v], lo[s], hi[s]);
+        lo[s] += c[2 * v];
+        hi[s] += c[2 * v + 1];
+        sum[v] = pack8(lo[s], hi[s]);
+        squares += dot(lo[s], lo[s]) + dot(hi[s], hi[s]);
+    }
+    float scale = row_scale(squares, EPS);
+    [[unroll]] for (uint s = 0; s < STEPS; s++) {
+        uint v = s * WORKGROUP + gl_LocalInvocationID.x;
+        vec4 glo, ghi;
+        unpack8(g[v], glo, ghi);
+        normed[base + v] = pack8(lo[s] * scale * glo, hi[s] * scale * ghi);
+    }
+}

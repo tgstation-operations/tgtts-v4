@@ -1,0 +1,125 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Causal attention over a run, flash-style: workgroup (r, h) takes ROWS rows of the run from
+// r ROWS, for the GROUP query heads key-value head h serves, and walks the cache from position 0
+// to the last of their positions in tiles of KEYS keys and values, each query keeping its running
+// maximum score, sum of exponentials and output, so that no score is stored. Keys after a query's
+// position are masked out, and keys after the workgroup's last are read as zero, so that
+// whatever the cache holds there cannot reach a sum as NaN.
+//
+// Four invocations take a query, each a quarter of its dimensions, the scores summed over them by
+// a clustered reduction, whose cluster size glslang takes only as a literal. Invocation `lane` of
+// the four holds the vec4s of a head lane, lane + 4, ..., so that the four read neighboring words
+// of a key in shared memory.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(constant_id = 2) const uint HEADS = 16;
+layout(constant_id = 3) const uint KV_HEADS = 2;
+layout(constant_id = 4) const uint HEAD_DIM = 128;
+layout(constant_id = 5) const uint CAPACITY = 1024;
+// 1 / sqrt(HEAD_DIM), from the host.
+layout(constant_id = 6) const float SCALE = 0.08838834764831845;
+
+#include "run.glsl"
+
+const uint LANES = 4;
+const uint KEYS = 32;
+const uint GROUP = HEADS / KV_HEADS;
+const uint ROWS = WORKGROUP / LANES / GROUP;
+// A head's vec4s, and those of one invocation.
+const uint ROW = HEAD_DIM / 4;
+const uint SLICE = ROW / LANES;
+
+// [rows][HEADS][HEAD_DIM], four to a uvec2.
+layout(std430, binding = 1) readonly buffer Q { uvec2 q[]; };
+// [KV_HEADS][CAPACITY][HEAD_DIM], eight to a uvec4.
+layout(std430, binding = 2) readonly buffer KCache { uvec4 k_cache[]; };
+layout(std430, binding = 3) readonly buffer VCache { uvec4 v_cache[]; };
+// [rows][HEADS][HEAD_DIM], as o_proj takes it.
+layout(std430, binding = 4) writeonly buffer Out { uvec2 out_[]; };
+
+shared vec4 ks[KEYS * ROW];
+shared vec4 vs[KEYS * ROW];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint first = gl_WorkGroupID.x * ROWS;
+    uint kv = gl_WorkGroupID.y;
+    if (first >= len) {
+        return;
+    }
+    uint query = t / LANES;
+    uint lane = t % LANES;
+    uint row = first + query / GROUP;
+    uint head = kv * GROUP + query % GROUP;
+    bool live = row < len;
+    uint pos = start + row;
+    uint last = start + min(first + ROWS, len) - 1;
+
+    vec4 qs[SLICE];
+    vec4 o[SLICE];
+    [[unroll]] for (uint i = 0; i < SLICE; i++) {
+        uvec2 h = live ? q[(row * HEADS + head) * ROW + i * LANES + lane] : uvec2(0);
+        qs[i] = vec4(unpackHalf2x16(h.x), unpackHalf2x16(h.y));
+        o[i] = vec4(0.0);
+    }
+    float m = uintBitsToFloat(0xff800000u);
+    float l = 0.0;
+
+    for (uint from = 0; from <= last; from += KEYS) {
+        barrier();
+        for (uint i = t; i < KEYS * HEAD_DIM / 8; i += WORKGROUP) {
+            uint p = i / (HEAD_DIM / 8);
+            uint j = i % (HEAD_DIM / 8);
+            uvec4 k = uvec4(0);
+            uvec4 v = uvec4(0);
+            if (from + p <= last) {
+                uint at = (kv * CAPACITY + from) * (HEAD_DIM / 8) + i;
+                k = k_cache[at];
+                v = v_cache[at];
+            }
+            ks[p * ROW + 2 * j] = vec4(unpackHalf2x16(k.x), unpackHalf2x16(k.y));
+            ks[p * ROW + 2 * j + 1] = vec4(unpackHalf2x16(k.z), unpackHalf2x16(k.w));
+            vs[p * ROW + 2 * j] = vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+            vs[p * ROW + 2 * j + 1] = vec4(unpackHalf2x16(v.z), unpackHalf2x16(v.w));
+        }
+        barrier();
+
+        float scores[KEYS];
+        float top = uintBitsToFloat(0xff800000u);
+        [[unroll]] for (uint p = 0; p < KEYS; p++) {
+            float part = 0.0;
+            [[unroll]] for (uint i = 0; i < SLICE; i++) {
+                part += dot(qs[i], ks[p * ROW + i * LANES + lane]);
+            }
+            float score = subgroupClusteredAdd(part, 4) * SCALE;
+            scores[p] = from + p <= pos ? score : uintBitsToFloat(0xff800000u);
+            top = max(top, scores[p]);
+        }
+        // The first tile holds position 0, which every query sees, so m is finite after it.
+        float next = max(m, top);
+        float rescale = exp(m - next);
+        l *= rescale;
+        [[unroll]] for (uint i = 0; i < SLICE; i++) {
+            o[i] *= rescale;
+        }
+        [[unroll]] for (uint p = 0; p < KEYS; p++) {
+            float e = exp(scores[p] - next);
+            l += e;
+            [[unroll]] for (uint i = 0; i < SLICE; i++) {
+                o[i] += e * vs[p * ROW + i * LANES + lane];
+            }
+        }
+        m = next;
+    }
+
+    if (!live) {
+        return;
+    }
+    [[unroll]] for (uint i = 0; i < SLICE; i++) {
+        vec4 r = o[i] / l;
+        out_[(row * HEADS + head) * ROW + i * LANES + lane] =
+            uvec2(packFloat2x16(f16vec2(r.xy)), packFloat2x16(f16vec2(r.zw)));
+    }
+}
