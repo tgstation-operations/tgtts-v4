@@ -19,6 +19,7 @@ use crate::{
         Access::{Read, Write},
         KernelInfo, Kernels,
     },
+    local::identity,
     step::Step,
 };
 
@@ -200,22 +201,8 @@ fn append_stack(
     ];
     let ids = splice(g, &stack.graph, prefix, &shared);
     let at = |t: TensorId| ids[t.0];
-    let layers = stack
-        .layers
-        .iter()
-        .map(|l| LayerTensors {
-            input_norm: at(l.input_norm),
-            qkv: at(l.qkv),
-            o: at(l.o),
-            post_norm: at(l.post_norm),
-            gate_up: at(l.gate_up),
-            down: at(l.down),
-            k_cache: at(l.k_cache),
-            v_cache: at(l.v_cache),
-        })
-        .collect();
     Stack {
-        layers,
+        layers: stack.layers.iter().map(|l| l.map(at)).collect(),
         norm: at(stack.norm),
     }
 }
@@ -411,6 +398,41 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
     })
 }
 
+/// Writes the weights of VoxCPM2's LM side from `checkpoint`, converted to f16, into `step`, a
+/// recording of `graph`, where `ids` puts each of `side`'s tensors: as [`splice`] gives them when
+/// the LM side's graph is part of `graph`.
+pub fn load_lm_side(
+    step: &mut Step,
+    graph: &Graph,
+    side: &LmSideGraph,
+    ids: &[TensorId],
+    checkpoint: &Checkpoint,
+) -> Result<(), Error> {
+    let at = |t: TensorId| ids[t.0];
+    for (stack, prefix) in [(&side.base, "base_lm."), (&side.residual, "residual_lm.")] {
+        let layers: Vec<LayerTensors> = stack.layers.iter().map(|l| l.map(at)).collect();
+        load_stack(step, graph, &layers, at(stack.norm), checkpoint, prefix)?;
+    }
+    for (name, layer, has_bias) in side.heads.named() {
+        let parts = [("weight", layer.weight)]
+            .into_iter()
+            .chain(has_bias.then_some(("bias", layer.bias)));
+        for (part, tensor) in parts {
+            let name = format!("{name}.{part}");
+            let (_, values) = checkpoint.f16(&name)?;
+            let want = graph.tensors[at(tensor).0].bytes as usize / 2;
+            if values.len() != want {
+                return Err(Error::Checkpoint(format!(
+                    "{name}: {} values, not {want}",
+                    values.len()
+                )));
+            }
+            step.write(at(tensor), &values)?;
+        }
+    }
+    Ok(())
+}
+
 /// What the LM side gives for a patch: what the next is sampled with.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Conditioning {
@@ -445,38 +467,10 @@ impl LmSide {
         Ok(LmSide { step, tensors })
     }
 
-    /// Writes the weights from VoxCPM2's checkpoint, converted to f16.
+    /// Writes the weights from VoxCPM2's checkpoint, converted to f16, as [`load_lm_side`] does.
     pub fn load(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let t = &self.tensors;
-        let step = &mut self.step;
-        for (stack, prefix) in [(&t.base, "base_lm."), (&t.residual, "residual_lm.")] {
-            load_stack(
-                step,
-                &t.graph,
-                &stack.layers,
-                stack.norm,
-                checkpoint,
-                prefix,
-            )?;
-        }
-        for (name, layer, has_bias) in t.heads.named() {
-            let parts = [("weight", layer.weight)]
-                .into_iter()
-                .chain(has_bias.then_some(("bias", layer.bias)));
-            for (part, tensor) in parts {
-                let name = format!("{name}.{part}");
-                let (_, values) = checkpoint.f16(&name)?;
-                let want = t.graph.tensors[tensor.0].bytes as usize / 2;
-                if values.len() != want {
-                    return Err(Error::Checkpoint(format!(
-                        "{name}: {} values, not {want}",
-                        values.len()
-                    )));
-                }
-                step.write(tensor, &values)?;
-            }
-        }
-        Ok(())
+        load_lm_side(&mut self.step, &t.graph, t, &identity(&t.graph), checkpoint)
     }
 
     /// Runs the LM side over `enc`, the local encoder's output for the patch at `position` as f16

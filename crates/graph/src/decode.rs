@@ -236,6 +236,22 @@ pub struct LayerTensors {
     pub v_cache: TensorId,
 }
 
+impl LayerTensors {
+    /// The layer's tensors where `at` puts each, such as in a graph its graph was spliced into.
+    pub fn map(&self, at: impl Fn(TensorId) -> TensorId) -> Self {
+        LayerTensors {
+            input_norm: at(self.input_norm),
+            qkv: at(self.qkv),
+            o: at(self.o),
+            post_norm: at(self.post_norm),
+            gate_up: at(self.gate_up),
+            down: at(self.down),
+            k_cache: at(self.k_cache),
+            v_cache: at(self.v_cache),
+        }
+    }
+}
+
 /// The step's graph and the tensors the host writes and reads.
 #[derive(Clone, Debug)]
 pub struct DecodeGraph {
