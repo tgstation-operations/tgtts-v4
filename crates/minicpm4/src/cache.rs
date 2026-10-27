@@ -7,7 +7,9 @@ use burn::tensor::{DType, Device, IndexingUpdateOp, Int, Tensor};
 ///
 /// Each row holds a sequence of its own length, or none: a batch whose sequences start, stop
 /// and are taken in at different times, each in a row of its own.
-#[derive(Debug)]
+///
+/// A clone shares its buffers.
+#[derive(Clone, Debug)]
 pub struct KvCache {
     pub(crate) layers: Vec<LayerCache>,
     pub(crate) capacity: usize,
@@ -61,6 +63,30 @@ impl KvCache {
             size(&layer.keys) + size(&layer.values)
         };
         self.layers.iter().map(layer).sum()
+    }
+
+    /// Row `row` alone, sharing its buffers, at the same capacity: what a sequence computed in a
+    /// batch of others is read from, as [`insert`](Self::insert) reads it, rather than copied
+    /// out. A write to it would copy every buffer first.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such row.
+    pub fn row(&self, row: usize) -> KvCache {
+        let rows = |cache: &Tensor<4>| cache.clone().narrow(0, row, 1);
+        KvCache {
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| LayerCache {
+                    keys: rows(&layer.keys),
+                    values: rows(&layer.values),
+                })
+                .collect(),
+            capacity: self.capacity,
+            lens: vec![self.lens[row]],
+            slots: self.slots.clone(),
+        }
     }
 
     /// A cache of one row holding a copy of the first `len` positions of `row`, at capacity
@@ -242,7 +268,7 @@ pub(crate) enum Slots {
 }
 
 /// One layer's keys and values, `[batch, kv_heads, capacity, head_dim]`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LayerCache {
     keys: Tensor<4>,
     values: Tensor<4>,

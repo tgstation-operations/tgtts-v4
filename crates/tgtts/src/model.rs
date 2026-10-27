@@ -18,8 +18,8 @@ use dsp::RATE;
 use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
-    Config, Dtypes, GraphCounts, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise,
-    Stepping, TextToSpeech,
+    Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt, PromptCache, Scheduler,
+    SeededNoise, Stepping, TextToSpeech,
 };
 
 use crate::{
@@ -74,9 +74,19 @@ pub struct VoxCpm {
 /// What the thread that generates is asked to do.
 enum Job {
     Generate(Request),
-    /// Generate from each run of prompts in turn, a batch of each, then decode each chunk
-    /// length, as the warm-up does, and say how long generating took.
-    WarmUp(Vec<Vec<Prompt>>, Sender<Result<Duration, voxcpm::Error>>),
+    /// Run what the warm-up runs and say how long generating took.
+    WarmUp(WarmUp, Sender<Result<Duration, voxcpm::Error>>),
+}
+
+/// What the warm-up runs on the thread that generates.
+struct WarmUp {
+    /// Runs of prompts generated from in turn, a batch of each.
+    runs: Vec<Vec<Prompt>>,
+    /// The positions of the longest prompt, the patches of the longest voice, and the most
+    /// requests that run at once.
+    longest: usize,
+    voice_patches: usize,
+    requests: usize,
 }
 
 /// A prompt to generate from in a voice, and where its speech goes.
@@ -208,10 +218,19 @@ impl VoxCpm {
             boundaries.push(boundary);
             boundary *= 2;
         }
+        let voice_patches = (voices.names())
+            .map(|name| Ok(voices.latent(name)?.frames.len() / self.config.patch_size))
+            .collect::<Result<Vec<_>, voices::Error>>()?;
+        let warm_up = WarmUp {
+            runs,
+            longest: longest.len(),
+            voice_patches: voice_patches.into_iter().max().unwrap_or(1),
+            requests,
+        };
         let (done, warmed) = mpsc::channel();
         let stopped = "the thread VoxCPM2 generates on has stopped";
         self.jobs
-            .send(Job::WarmUp(runs, done))
+            .send(Job::WarmUp(warm_up, done))
             .map_err(|_| stopped)?;
         let generated = warmed.recv().map_err(|_| stopped)??;
         let seconds = started.elapsed().as_secs_f64();
@@ -230,6 +249,31 @@ impl VoxCpm {
         );
         Ok(())
     }
+}
+
+/// The runs of prompts that join a scheduler together the warm-up runs, as rows, positions held
+/// and positions run: for each number of rows up to `requests` and of positions up to those of
+/// the `longest` prompt, each a power of two of at least 32, as autotune rounds the shapes it
+/// chooses kernels for, that come to at most [`PREFILL_BATCH`] positions, each after enough
+/// held positions to come to each power of two of keys from those positions to the longest's.
+/// Each is the largest of the shapes autotune rounds to it, which also holds the most memory.
+fn prefill_shapes(longest: usize, requests: usize) -> Vec<(usize, usize, usize)> {
+    let powers = |from: usize, to: usize| {
+        (0..)
+            .map(move |power| 1 << power)
+            .skip_while(move |&n| n < from)
+            .take_while(move |&n| n <= to)
+    };
+    let (rows, positions) = (requests.next_power_of_two(), longest.next_power_of_two());
+    let mut shapes = vec![];
+    for rows in powers(1, rows) {
+        for len in powers(32, positions).filter(|&len| rows * len <= PREFILL_BATCH) {
+            for keys in powers(len, positions) {
+                shapes.push((rows, keys - len, len));
+            }
+        }
+    }
+    shapes
 }
 
 /// The prompts, by their index among `lengths` in ascending order, of each run of requests at once
@@ -336,11 +380,14 @@ impl Generating {
     /// prompt cache of their own, until each request has [`WARM_UP_PATCHES`] patches, in caches
     /// of the capacity a request has, then decodes silence in every chunk length; gives how long
     /// generating took.
-    fn warm_up(&self, runs: &[Vec<Prompt>]) -> Result<Duration, voxcpm::Error> {
+    /// Then it runs each shape of the runs of prompts that join together [`prefill_shapes`]
+    /// gives and embeds a voice of each power of two of patches, after every graph is captured,
+    /// so that the pools hold what the largest takes beside them.
+    fn warm_up(&self, warm_up: &WarmUp) -> Result<Duration, voxcpm::Error> {
         let started = Instant::now();
         let (tts, params) = (&*self.tts, &self.params);
         let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
-        for run in runs {
+        for run in &warm_up.runs {
             let mut scheduler = Scheduler::new(tts.model(), cache, self.prefill_positions);
             for (i, prompt) in run.iter().enumerate() {
                 let noise = SeededNoise::new(i as u64);
@@ -357,6 +404,15 @@ impl Generating {
                 }
             }
             cache = scheduler.into_cache();
+        }
+        let model = tts.model();
+        for (rows, held, len) in prefill_shapes(warm_up.longest, warm_up.requests) {
+            model.warm_prefill(rows, held, len);
+        }
+        let mut patches = 1;
+        while patches < warm_up.voice_patches {
+            patches *= 2;
+            model.warm_voice(patches);
         }
         let generated = started.elapsed();
         let silent = Latent {
@@ -401,8 +457,8 @@ impl Batch<'_> {
     fn take(&mut self, job: Job) {
         match job {
             Job::Generate(request) => self.add(request),
-            Job::WarmUp(runs, done) => {
-                let warmed = self.on.warm_up(&runs);
+            Job::WarmUp(warm_up, done) => {
+                let warmed = self.on.warm_up(&warm_up);
                 self.warmed = Some((self.on.tts.model().graph_counts(), device::tuned()));
                 let _ = done.send(warmed);
             }
@@ -569,6 +625,36 @@ mod tests {
             prefill_positions: PREFILL_POSITIONS,
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
+    }
+
+    /// Every shape autotune rounds a run of up to 12 prompts of up to 579 positions to, as many
+    /// rows, keys and positions run as a power of two each, that the scheduler lets through.
+    #[test]
+    fn warms_up_each_shape_of_prompts_run_together() {
+        let shapes = prefill_shapes(579, 12);
+        let rounded = |n: usize| n.next_power_of_two();
+        let mut keys: Vec<_> = shapes
+            .iter()
+            .map(|&(rows, held, len)| (rounded(rows), rounded(held + len), rounded(len)))
+            .collect();
+        let count = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "a shape warmed up twice");
+        for rows in [1, 2, 4, 8, 16] {
+            for len in [32, 64, 128, 256, 512, 1024] {
+                for held in 0..1024 - len {
+                    let key = (rows, rounded(held + len), len);
+                    let allowed = rows * len <= PREFILL_BATCH;
+                    assert_eq!(keys.contains(&key), allowed, "{key:?}");
+                }
+            }
+        }
+        assert!(
+            shapes
+                .iter()
+                .all(|&(rows, _, len)| rows * len <= PREFILL_BATCH)
+        );
     }
 
     /// Prompts of three capacities and requests of up to 12 at once: each capacity is reached

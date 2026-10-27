@@ -408,7 +408,7 @@ impl<'a> Stepper<'a> {
                 sampling.timesteps, self.timesteps
             )));
         }
-        let end = generation.base_cache.capacity();
+        let end = generation.capacity;
         let len = generation
             .base_cache
             .len(0)
@@ -474,7 +474,7 @@ impl<'a> Stepper<'a> {
         }
         let model = self.model;
         let needed = generations.iter().map(|generation| {
-            let end = generation.base_cache.capacity();
+            let end = generation.capacity;
             model.graph_capacity(end, 0)
         });
         let held_capacity = self.graph.as_ref().map_or(0, |(key, _)| key.1);

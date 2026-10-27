@@ -134,8 +134,13 @@ pub struct Prefill<'a> {
     audio: Tensor<3, Bool>,
     /// The embeddings of the voice's patches where the prompt has them, `[1, len, hidden]`.
     embeds: Tensor<3>,
-    caches: (KvCache, KvCache),
-    /// The positions run so far.
+    /// The positions its generation may hold.
+    capacity: usize,
+    /// The LMs' keys and values, once a run has made them, and before, those the cache kept of
+    /// the prompt's first positions, which it shares.
+    caches: Option<(KvCache, KvCache)>,
+    kept: Option<(KvCache, KvCache)>,
+    /// The positions run so far, or kept.
     done: usize,
     /// The voice's key in the cache, while the LMs' keys and values over the text are still to
     /// be kept there.
@@ -192,24 +197,14 @@ impl Model {
         let tokens = Tensor::from_data(TensorData::new(tokens, [1, len]), device);
         let audio = TensorData::new(prompt.audio.clone(), [1, len, 1]);
 
-        let mut caches = (
-            self.base_lm.cache(1, capacity),
-            self.residual_lm.cache(1, capacity),
-        );
         let text = prompt.text();
-        let (mut done, mut keep) = (0, None);
+        let (mut done, mut keep, mut kept) = (0, None, None);
         match cache.get(&key).map(|voice| &voice.prefix) {
             Some(Some(prefix)) => {
                 let tokens = &prompt.tokens[text.clone()];
                 let shared = prefix.text.iter().zip(tokens);
                 done = text.start + shared.take_while(|(a, b)| a == b).count();
-                for (cache, kept) in [
-                    (&mut caches.0, &prefix.base),
-                    (&mut caches.1, &prefix.residual),
-                ] {
-                    cache.insert(0, kept, 0);
-                    cache.truncate(0, done);
-                }
+                kept = Some((prefix.base.clone(), prefix.residual.clone()));
             }
             Some(None) => keep = Some(key),
             None => {}
@@ -220,7 +215,9 @@ impl Model {
             tokens,
             audio: Tensor::from_data(audio, device),
             embeds,
-            caches,
+            capacity,
+            caches: None,
+            kept,
             done,
             keep,
             text,
@@ -233,10 +230,13 @@ impl Model {
     /// are followed by as many as the longest has more, which no position before them attends
     /// to. What the LMs computed over a text is kept in `cache` as [`Prefill::run`] keeps it.
     ///
+    /// The batch's keys and values are held for as many positions as the first power of two
+    /// that holds them, and each generation shares its row of them, to join a batch from.
+    ///
     /// # Panics
     ///
     /// If `prefills` is empty, or one is of another model.
-    pub fn prefill_together<'a>(
+    pub(crate) fn prefill_together<'a>(
         &'a self,
         prefills: Vec<Prefill<'a>>,
         cache: &mut PromptCache,
@@ -250,16 +250,21 @@ impl Model {
             .max()
             .expect("prompts");
         let (device, hidden) = (&self.device, self.hidden);
+        let positions = (held + longest).next_power_of_two();
         let mut caches = (
-            self.base_lm.cache(rows, held + longest),
-            self.residual_lm.cache(rows, held + longest),
+            self.base_lm.cache(rows, positions),
+            self.residual_lm.cache(rows, positions),
         );
         let (mut tokens, mut audio, mut embeds) = (vec![], vec![], vec![]);
         for (row, prefill) in prefills.iter().enumerate() {
             assert!(ptr::eq(self, prefill.model), "a prompt of another model");
-            if prefill.done > 0 {
-                caches.0.insert(row, &prefill.caches.0, 0);
-                caches.1.insert(row, &prefill.caches.1, 0);
+            if let Some((base, residual)) = prefill.caches.as_ref().or(prefill.kept.as_ref())
+                && prefill.done > 0
+            {
+                caches.0.insert(row, base, 0);
+                caches.1.insert(row, residual, 0);
+                caches.0.truncate(row, prefill.done);
+                caches.1.truncate(row, prefill.done);
             }
             let (start, left) = (prefill.done, prefill.left());
             let pad = longest - left;
@@ -302,19 +307,44 @@ impl Model {
                     };
                     cache.keep_prefix(&key, prefix);
                 }
-                let capacity = prefill.caches.0.capacity();
-                let mut own = (
-                    self.base_lm.cache(1, capacity),
-                    self.residual_lm.cache(1, capacity),
-                );
-                own.0.insert(0, &caches.0, row);
-                own.1.insert(0, &caches.1, row);
+                let own = (caches.0.row(row), caches.1.row(row));
                 let left = prefill.left();
                 let row_of = |t: &Tensor<3>| t.clone().narrow(0, row, 1).narrow(1, 0, left);
                 let outputs = (row_of(&outputs.0), row_of(&outputs.1));
-                self.generation(own, outputs, &prefill.prompt)
+                let mut generation = self.generation(own, outputs, &prefill.prompt);
+                generation.capacity = prefill.capacity;
+                generation
             })
             .collect()
+    }
+
+    /// Runs the LMs as [`Scheduler`](crate::Scheduler) runs the prompts of requests that join
+    /// together, over `rows` rows of `len` positions after `held` each: on prompts of nothing in
+    /// particular, for autotune to choose the kernels of that shape and the pools to hold what it
+    /// takes before a request waits for either.
+    pub fn warm_prefill(&self, rows: usize, held: usize, len: usize) {
+        let (device, hidden) = (&self.device, self.hidden);
+        let mut caches = (
+            self.base_lm.cache(rows, (held + len).next_power_of_two()),
+            self.residual_lm
+                .cache(rows, (held + len).next_power_of_two()),
+        );
+        for run in [held, len].into_iter().filter(|&run| run > 0) {
+            self.run_prompt(
+                Tensor::zeros([rows, run], device),
+                Tensor::full([rows, run, 1], true, device),
+                Tensor::zeros([rows, run, hidden], (device, self.lm_dtype)),
+                (&mut caches.0, &mut caches.1),
+            );
+        }
+    }
+
+    /// Embeds a voice of `patches` patches of nothing in particular, as a prompt in a voice the
+    /// prompt cache does not hold is embedded, to warm it up as
+    /// [`warm_prefill`](Self::warm_prefill) does.
+    pub fn warm_voice(&self, patches: usize) {
+        let voice = vec![0.0; patches * self.patch_size * self.feat_dim];
+        self.embed_voice(&voice, patches);
     }
 
     /// The LMs' embeddings `[patches, hidden]` of the voice's `patches` patches.
@@ -336,6 +366,20 @@ impl<'a> Prefill<'a> {
     pub fn run(&mut self, positions: usize, cache: &mut PromptCache) -> bool {
         let len = self.prompt.len();
         let end = self.done.saturating_add(positions.max(1)).min(len);
+        let caches = self.caches.get_or_insert_with(|| {
+            let model = self.model;
+            let mut caches = (
+                model.base_lm.cache(1, self.capacity),
+                model.residual_lm.cache(1, self.capacity),
+            );
+            if let Some((base, residual)) = self.kept.take() {
+                for (cache, kept) in [(&mut caches.0, &base), (&mut caches.1, &residual)] {
+                    cache.insert(0, kept, 0);
+                    cache.truncate(0, self.done);
+                }
+            }
+            caches
+        });
         while self.done < end {
             let stop = match &self.keep {
                 Some(_) if self.done < self.text.end => end.min(self.text.end),
@@ -346,7 +390,7 @@ impl<'a> Prefill<'a> {
                 self.tokens.clone().narrow(1, start, run),
                 self.audio.clone().narrow(1, start, run),
                 self.embeds.clone().narrow(1, start, run),
-                (&mut self.caches.0, &mut self.caches.1),
+                (&mut caches.0, &mut caches.1),
             );
             self.outputs = Some(outputs);
             self.done = stop;
@@ -355,8 +399,8 @@ impl<'a> Prefill<'a> {
             {
                 let prefix = Prefix {
                     text: self.prompt.tokens[self.text.clone()].to_vec(),
-                    base: self.caches.0.prefix(0, self.done),
-                    residual: self.caches.1.prefix(0, self.done),
+                    base: caches.0.prefix(0, self.done),
+                    residual: caches.1.prefix(0, self.done),
                 };
                 cache.keep_prefix(&key, prefix);
             }
@@ -372,7 +416,8 @@ impl<'a> Prefill<'a> {
     pub fn finish(self) -> Generation<'a> {
         assert_eq!(self.left(), 0, "positions of the prompt still to run");
         let outputs = self.outputs.expect("a prompt of at least one position");
-        self.model.generation(self.caches, outputs, &self.prompt)
+        let caches = self.caches.expect("run as it was finished");
+        self.model.generation(caches, outputs, &self.prompt)
     }
 }
 

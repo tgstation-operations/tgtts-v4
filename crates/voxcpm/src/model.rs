@@ -257,6 +257,7 @@ impl Model {
         let cond = TensorData::new(cond, [1, self.patch_size, self.feat_dim]);
         Generation {
             model: self,
+            capacity: base_cache.capacity(),
             base_cache,
             residual_cache,
             lm_hidden: last(outputs),
@@ -335,6 +336,8 @@ pub struct Generation<'a> {
     pub(crate) model: &'a Model,
     pub(crate) base_cache: KvCache,
     pub(crate) residual_cache: KvCache,
+    /// The positions it may hold, which a cache it shares with others may have more of.
+    pub(crate) capacity: usize,
     pub(crate) lm_hidden: Tensor<2>,
     pub(crate) residual_hidden: Tensor<2>,
     pub(crate) cond: Tensor<3>,

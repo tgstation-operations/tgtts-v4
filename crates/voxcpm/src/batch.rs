@@ -93,7 +93,7 @@ impl<'a> Batch<'a> {
                 slot
             }
         };
-        let capacity = generation.base_cache.capacity();
+        let capacity = generation.capacity;
         if capacity > self.caches.0.capacity() {
             let rows: Vec<usize> = (0..self.rows.len()).collect();
             self.caches.0.reshape(&rows, rows.len(), capacity);
@@ -237,6 +237,12 @@ fn held_rows<const D: usize>(all: &Tensor<D>, held: Option<&Tensor<1, Int>>) -> 
         None => all.clone(),
     }
 }
+
+/// The most positions a run of prompts that join a [`Scheduler`] takes, its rows and the
+/// positions of its longest prompt each rounded up to a power of two, as autotune rounds the
+/// shapes it chooses kernels for: what bounds the memory a run holds and the shapes there are
+/// to warm up, [`Model::warm_prefill`]'s.
+pub const PREFILL_BATCH: usize = 4096;
 
 /// Requests generated together in a [`Batch`], or a [`Stepper`] where the model's
 /// [`stepping`](Model::stepping) is not eager, each until its stop head says to stop or it has
@@ -414,21 +420,24 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
     }
 
     /// Runs the prompts of waiting requests together, whole, from the first, as many as the
-    /// budget of positions takes, or all if no request is generating to wait for them, then
+    /// budget of positions takes, or all if no request is generating to wait for them, up to
+    /// [`PREFILL_BATCH`], then
     /// samples the next patch of every generating request. A request whose patch comes out NaN or
     /// infinite ends with an error in its place.
     pub fn step(&mut self) -> Vec<Patch<K>> {
         let started = Instant::now();
         let mut report = StepReport::default();
-        let (mut joining, mut positions) = (0, 0);
+        let (mut joining, mut positions, mut longest) = (0usize, 0, 0);
         for (_, prefill) in &self.waiting {
             let left = prefill.left();
             let fits = positions + left <= self.prefill_positions || self.running.is_empty();
-            if joining > 0 && !fits {
+            let padded = (joining + 1).next_power_of_two() * longest.max(left).next_power_of_two();
+            if joining > 0 && (!fits || padded > PREFILL_BATCH) {
                 break;
             }
             joining += 1;
             positions += left;
+            longest = longest.max(left);
         }
         if joining > 0 {
             let (requests, prefills): (Vec<_>, Vec<_>) = self.waiting.drain(..joining).unzip();
