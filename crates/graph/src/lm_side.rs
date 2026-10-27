@@ -141,6 +141,10 @@ pub struct LmSideGraph {
     pub mu: TensorId,
     /// The stop head's logits `[2]` f16, of going on and of stopping after the next patch.
     pub stop_logits: TensorId,
+    /// The base LM's output `[hidden]` f16, which the scalar quantizer takes.
+    pub base_out: TensorId,
+    /// The scalar quantizer's levels `[latent]` f16, each a multiple of `1 / levels`.
+    pub levels: TensorId,
     pub cos: TensorId,
     pub sin: TensorId,
     pub base: Stack,
@@ -390,6 +394,8 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
         position,
         mu,
         stop_logits,
+        base_out,
+        levels,
         cos,
         sin,
         base: base_stack,

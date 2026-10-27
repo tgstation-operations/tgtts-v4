@@ -17,7 +17,7 @@ vulkan = { path = "../vulkan" }
 
 [dev-dependencies]
 audiovae = { path = "../audiovae" }
-burn = { workspace = true, features = ["std"] }
+burn = { workspace = true, features = ["safetensors", "std", "store"] }
 libc.workspace = true
 minicpm4 = { path = "../minicpm4" }
 testkit = { path = "../testkit" }
