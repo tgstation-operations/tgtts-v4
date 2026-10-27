@@ -167,7 +167,7 @@ fn check_manifest(module: &Module, shape: Shape, acc: Acc) -> [u32; 3] {
             module.name
         );
     }
-    let grid = [n / TILE, m / TILE, 1].map(|g| g as u64);
+    let grid = [m / TILE, n / TILE, 1].map(|g| g as u64);
     assert_eq!(
         uints(&manifest["dispatch"]),
         grid,
@@ -488,7 +488,7 @@ fn small_gemms_agree_with_the_reference_at_either_accumulator() {
         Shape {
             m: 128,
             n: 128,
-            k: 32,
+            k: 64,
         },
         Shape {
             m: 256,
@@ -511,7 +511,7 @@ fn a_gemm_compiled_at_another_wave_size_is_caught() {
     let shape = Shape {
         m: 128,
         n: 128,
-        k: 32,
+        k: 64,
     };
     for acc in [Acc::F16, Acc::F32] {
         let module = module(shape, acc);

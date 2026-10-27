@@ -203,7 +203,7 @@ pub fn prefill_graph(
             n.is_multiple_of(TILE),
             format!("a GEMM of {n} columns of C"),
         )?;
-        Ok((pipeline, [(n / TILE) as u32, (rows / TILE) as u32, 1]))
+        Ok((pipeline, [(rows / TILE) as u32, (n / TILE) as u32, 1]))
     };
     let qkv_gemm = gemm_op(qkv_width, s.hidden)?;
     let o_gemm = gemm_op(s.hidden, s.heads * s.head_dim)?;
@@ -484,7 +484,7 @@ mod tests {
                 let p = prefill_graph(&decode, rows, MAX_ROWS, &tuning).unwrap();
                 let gemms = p.graph.ops.iter().filter(|op| op.label.ends_with("_proj"));
                 for op in gemms {
-                    let [n, m, _] = op.groups.map(|g| g as usize * TILE);
+                    let [m, n, _] = op.groups.map(|g| g as usize * TILE);
                     assert_eq!(m, rows, "{}", op.label);
                     assert!(op.pipeline.kernel.name.contains(&format!("_{rows}x{n}x")));
                     assert_eq!(op.pipeline.subgroup_size, Some(GEMM_SUBGROUP));

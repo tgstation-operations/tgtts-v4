@@ -14,7 +14,7 @@ let
   # M x N x K: the device tests' small shapes, and the base LM's up projection over a 446
   # position prefill, padded to the schedule's 128.
   gemms = [
-    "128 128 32"
+    "128 128 64"
     "256 384 512"
     "512 6144 2048"
   ];

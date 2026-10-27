@@ -3,10 +3,16 @@
 // Each workgroup computes a 128 x 128 tile of C with four subgroups of 64
 // invocations (256 in all), each subgroup a 64 x 64 quarter of it held as
 // sixteen 16 x 16 accumulators for the whole K loop. Each iteration of that
-// loop covers 32 of K: eight 16 x 16 tiles of A and eight of B, loaded
-// straight from the storage buffers, and 32 multiply-adds at RADV's one
+// loop covers 64 of K: sixteen 16 x 16 tiles of A and sixteen of B, loaded
+// straight from the storage buffers, and 64 multiply-adds at RADV's one
 // cooperative-matrix shape, 16 x 16 x 16. No workgroup memory: the two
 // subgroups that share rows of A each load them, and likewise for B.
+//
+// The workgroups of a column of C's tiles run one after another, so that
+// those reading the same rows of B, a projection's weights, do so together:
+// a layer's weights outgrow the GPU's caches. With that order and steps of
+// 64 of K rather than 32, the base LM's prefill over 512 positions took
+// 163 ms on the Radeon 8060S rather than 292; steps of 128 were slower.
 //
 // A transform library with two entry points, run by the build in this order:
 // @gemm_schedule on the tensor-level function, then outlining and
@@ -23,7 +29,7 @@ module attributes {transform.with_named_sequence} {
     // The zero fill follows the matmul into both, so each subgroup starts its
     // own accumulators at zero rather than reading C.
     %mm_wg, %wg = transform.structured.tile_using_forall %matmul tile_sizes [128, 128]
-        (mapping = [#gpu.block<y>, #gpu.block<x>])
+        (mapping = [#gpu.block<x>, #gpu.block<y>])
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %fill_wg, %wg2 = transform.structured.fuse_into_containing_op %fill into %wg
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
@@ -33,11 +39,11 @@ module attributes {transform.with_named_sequence} {
     %fill_sg, %sg2 = transform.structured.fuse_into_containing_op %fill_wg into %sg
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
-    // K in steps of 32.
-    %mm_k, %kloop = transform.structured.tile_using_for %mm_sg tile_sizes [0, 0, 32]
+    // K in steps of 64.
+    %mm_k, %kloop = transform.structured.tile_using_for %mm_sg tile_sizes [0, 0, 64]
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
-    // Vectorize: the 64 x 64 x 32 matmul becomes one vector.contract, and the
+    // Vectorize: the 64 x 64 x 64 matmul becomes one vector.contract, and the
     // fill a transfer_write of zeros. Fold f16 -> f32 extensions into the
     // contraction (the f32-accumulating instance would otherwise multiply f32
     // matrices, which RADV does not offer), then unroll everything to the
@@ -67,8 +73,8 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %vfunc : !transform.any_op
 
     // Bufferize straight into the arguments, then put the loops on the GPU:
-    // the grid follows the workgroup loop's trip counts (N / 128 across,
-    // M / 128 down), and subgroups are 64 invocations, the size @gemm_abi
+    // the grid follows the workgroup loop's trip counts (M / 128 across,
+    // N / 128 down), and subgroups are 64 invocations, the size @gemm_abi
     // records for the runtime.
     transform.bufferization.eliminate_empty_tensors %vfunc : !transform.any_op
     %bfunc = transform.bufferization.one_shot_bufferize %vfunc

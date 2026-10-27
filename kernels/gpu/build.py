@@ -41,8 +41,8 @@ KERNELS = {
     },
 }
 
-# The GEMM schedule's tiles: 128 x 128 of C per workgroup, 32 of K per step.
-GEMM_TILE_MN, GEMM_TILE_K = 128, 32
+# The GEMM schedule's tiles: 128 x 128 of C per workgroup, 64 of K per step.
+GEMM_TILE_MN, GEMM_TILE_K = 128, 64
 
 
 def pipeline(kernel):
