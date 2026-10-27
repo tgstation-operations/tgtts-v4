@@ -38,6 +38,7 @@ in
         ;
     };
     fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
+    vk-trial = import ./vk-trial.nix { inherit pkgs rustToolchain glslKernels; };
     cuda-trial = import ./cuda-trial.nix {
       inherit
         pkgs
