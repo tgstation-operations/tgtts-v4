@@ -1,9 +1,8 @@
 //! VoxCPM2 as the service's [`Synthesizer`].
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
-    num::NonZeroUsize,
     path::Path,
     sync::{
         Arc,
@@ -18,8 +17,8 @@ use dsp::RATE;
 use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
-    Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt, PromptCache, Scheduler,
-    SeededNoise, Stepping, TextToSpeech,
+    CHUNK_FRAMES, ChunkDecoder, Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt,
+    PromptCache, Scheduler, SeededNoise, Stepping, TextToSpeech,
 };
 
 use crate::{
@@ -58,8 +57,9 @@ pub struct Batching {
 }
 
 /// VoxCPM2, synthesizing with the same parameters for every request: the requests generate
-/// together, in a batch a thread of its own runs, which loads the model and decodes each one's
-/// speech too. That thread is the only one to use the device, as cubecl gives each thread a
+/// together, in a batch a thread of its own runs, which loads the model and decodes their
+/// speech too, a chunk at a time as their patches come, those of every request with a chunk to
+/// decode at once. That thread is the only one to use the device, as cubecl gives each thread a
 /// stream of its own, and work on several streams at once has faulted the GPU.
 #[derive(Debug)]
 pub struct VoxCpm {
@@ -178,9 +178,9 @@ impl VoxCpm {
     /// longest, each number a graph of the step holds them in at each capacity of cache their
     /// prompts need, later runs going on from what the prompt cache kept of earlier ones; one
     /// request and as many as run at once going past each power of two the KV length goes past
-    /// before the longest's last patch, where a GPU takes other kernels; and the audio decoder's
-    /// every chunk length, all on the thread that generates. Logs what it ran and how long it
-    /// took.
+    /// before the longest's last patch, where a GPU takes other kernels; each shape of prompts
+    /// run together; and chunks of every number of requests at once through the audio decoder,
+    /// all on the thread that generates. Logs what it ran and how long it took.
     ///
     /// The thread that generates keeps the graphs a GPU records of each number of requests and
     /// capacity of cache the warm-up reaches, which the requests after it replay.
@@ -239,7 +239,7 @@ impl VoxCpm {
             requests,
             past = ?boundaries,
             patches = WARM_UP_PATCHES,
-            decoder_chunks = %format!("1..={}", self.params.decode_chunk_frames),
+            decoder_rows = %format!("1..={requests}"),
             generation_seconds = generated.as_secs_f64(),
             graphs_captured = self.graph_counts().captured,
             kernels_tuned = device::tuned(),
@@ -378,11 +378,11 @@ fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
 impl Generating {
     /// Generates from each run of `prompts` in turn, a batch of each, as `params` says, from a
     /// prompt cache of their own, until each request has [`WARM_UP_PATCHES`] patches, in caches
-    /// of the capacity a request has, then decodes silence in every chunk length; gives how long
+    /// of the capacity a request has. Then it runs each shape of the runs of prompts that join
+    /// together [`prefill_shapes`] gives and embeds a voice of each power of two of patches,
+    /// after every graph is captured, so that the pools hold what the largest takes beside them;
+    /// and decodes two chunks of silence for each number of requests at once. Gives how long
     /// generating took.
-    /// Then it runs each shape of the runs of prompts that join together [`prefill_shapes`]
-    /// gives and embeds a voice of each power of two of patches, after every graph is captured,
-    /// so that the pools hold what the largest takes beside them.
     fn warm_up(&self, warm_up: &WarmUp) -> Result<Duration, voxcpm::Error> {
         let started = Instant::now();
         let (tts, params) = (&*self.tts, &self.params);
@@ -420,14 +420,17 @@ impl Generating {
             text: String::new(),
         };
         let patch_size = self.config.patch_size;
-        for chunk in 1..=params.decode_chunk_frames.get() {
-            let params = Params {
-                decode_chunk_frames: NonZeroUsize::new(chunk).expect("not zero"),
-                ..params.clone()
-            };
-            let shape = [chunk.div_ceil(patch_size), patch_size, self.config.feat_dim];
-            let patches = Tensor::zeros(shape, &self.device);
-            tts.speech_decoder(&silent, &params).push(patches);
+        let shape = [CHUNK_FRAMES / patch_size, patch_size, self.config.feat_dim];
+        for rows in 1..=warm_up.requests {
+            let mut decoders: Vec<_> = (0..rows).map(|_| tts.chunk_decoder(&silent)).collect();
+            // A first chunk, then one after it.
+            for _ in 0..2 {
+                for decoder in &mut decoders {
+                    decoder.push(Tensor::zeros(shape, &self.device));
+                }
+                let mut decoding: Vec<_> = decoders.iter_mut().collect();
+                ChunkDecoder::decode_together(&mut decoding, &vec![false; rows]);
+            }
         }
         Ok(generated)
     }
@@ -437,7 +440,7 @@ impl Generating {
 /// patches it has so far.
 struct Batch<'a> {
     scheduler: Scheduler<'a, u64, SeededNoise>,
-    generating: HashMap<u64, Generation>,
+    generating: HashMap<u64, Generation<'a>>,
     next: u64,
     on: &'a Generating,
     /// When the last step returned.
@@ -447,10 +450,11 @@ struct Batch<'a> {
     warmed: Option<(GraphCounts, usize)>,
 }
 
-struct Generation {
+struct Generation<'a> {
     request: Request,
     start: Option<Start>,
-    patches: Vec<Tensor<3>>,
+    decoder: ChunkDecoder<'a>,
+    samples: Vec<f32>,
 }
 
 impl Batch<'_> {
@@ -476,9 +480,10 @@ impl Batch<'_> {
         {
             Ok(()) => {
                 let generation = Generation {
+                    decoder: self.on.tts.chunk_decoder(&request.voice),
                     request,
                     start: None,
-                    patches: vec![],
+                    samples: vec![],
                 };
                 self.generating.insert(key, generation);
             }
@@ -492,6 +497,7 @@ impl Batch<'_> {
         let between = self.stepped.elapsed();
         let patches = self.scheduler.step();
         let stepped = Instant::now();
+        let mut decoding = vec![];
         for Patch {
             key,
             patch,
@@ -507,25 +513,39 @@ impl Batch<'_> {
                     prefilled: started.prefilled,
                 });
             }
-            let failed = match patch {
+            match patch {
                 Ok(patch) => {
-                    generation.patches.push(patch);
-                    None
+                    generation.decoder.push(patch);
+                    if last || generation.decoder.ready() {
+                        decoding.push((key, last));
+                    }
                 }
-                Err(e) => Some(e),
-            };
-            if last {
-                let generation = self.generating.remove(&key).expect("generating");
-                let (request, start) = (generation.request, generation.start);
-                let speech = failed.map_or_else(
-                    || {
-                        let mut decoder =
-                            self.on.tts.speech_decoder(&request.voice, &self.on.params);
-                        Ok((decoder.push(Tensor::cat(generation.patches, 0)), start))
-                    },
-                    Err,
-                );
-                let _ = request.speech.send(speech);
+                Err(e) => {
+                    let generation = self.generating.remove(&key).expect("generating");
+                    let _ = generation.request.speech.send(Err(e));
+                }
+            }
+        }
+        if !decoding.is_empty() {
+            let keys: HashSet<u64> = decoding.iter().map(|&(key, _)| key).collect();
+            let (mut decoders, mut last, mut whose) = (vec![], vec![], vec![]);
+            for (key, generation) in &mut self.generating {
+                if keys.contains(key) {
+                    let ends = decoding.iter().any(|&(at, ends)| at == *key && ends);
+                    decoders.push(&mut generation.decoder);
+                    last.push(ends);
+                    whose.push((*key, ends));
+                }
+            }
+            let decoded = ChunkDecoder::decode_together(&mut decoders, &last);
+            for ((key, ends), samples) in whose.into_iter().zip(decoded) {
+                let generation = self.generating.get_mut(&key).expect("generating");
+                generation.samples.extend(samples);
+                if ends {
+                    let generation = self.generating.remove(&key).expect("generating");
+                    let speech = (generation.samples, generation.start);
+                    let _ = generation.request.speech.send(Ok(speech));
+                }
             }
         }
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
