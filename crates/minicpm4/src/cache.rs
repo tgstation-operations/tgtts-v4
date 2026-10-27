@@ -56,6 +56,17 @@ impl KvCache {
         self.lens[row]
     }
 
+    /// The keys and values of layer `layer`, `[rows, kv_heads, capacity, head_dim]` each, sharing
+    /// their buffers.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such layer.
+    pub fn layer(&self, layer: usize) -> (Tensor<4>, Tensor<4>) {
+        let layer = &self.layers[layer];
+        (layer.keys.clone(), layer.values.clone())
+    }
+
     /// The bytes its keys and values take on the device.
     pub fn bytes(&self) -> usize {
         let layer = |layer: &LayerCache| {
