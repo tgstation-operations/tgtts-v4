@@ -1,8 +1,8 @@
 mod chunks;
 mod common;
 
-use audiovae::{AudioVaeConfig, DecodeStream, Decoder, Error};
-use burn::tensor::{FloatDType, Tensor};
+use audiovae::{AudioVaeConfig, DecodeSlots, DecodeStream, Decoder, Error};
+use burn::tensor::{FloatDType, Int, Tensor};
 use chunks::{Draws, streamed};
 use common::{tiny, weights};
 use testkit::{assert_close, device, fixture};
@@ -77,6 +77,45 @@ fn streams_decoded_together_come_out_as_alone() {
     for i in 1..chunks {
         let both = Tensor::cat(vec![at(0, i), at(1, i - 1)], 0);
         let decoded = DecodeStream::push_together(&mut [&mut one, &mut two], both);
+        audio.push(decoded.clone().narrow(0, 0, 1));
+        together.push(decoded.narrow(0, 1, 1));
+    }
+    assert_close(Tensor::cat(audio, 2), first, 0.0, 0.0);
+    assert_close(Tensor::cat(together, 2), second, 0.0, 0.0);
+}
+
+/// Streams in slots, decoded together a chunk at a time: the first alone, then beside the
+/// second, which starts a chunk later in a slot another stream left, with rows of a spare slot
+/// padding the batch. Each comes out bit for bit as decoded alone.
+#[test]
+fn streams_in_slots_come_out_as_alone() {
+    let device = device();
+    let decoder = Decoder::load(&tiny(), &weights(), FloatDType::F64, &device).unwrap();
+    let mut draws = Draws::new(6);
+    let (chunk, chunks) = (6, 4);
+    let latents = draws.latents([2, 4, chunk * chunks], &device);
+    let at = |row: usize, i: usize| {
+        latents
+            .clone()
+            .narrow(0, row, 1)
+            .narrow(2, i * chunk, chunk)
+    };
+    let alone = |row: usize, chunks: usize| {
+        let mut stream = decoder.stream();
+        let audio = (0..chunks).map(|i| stream.push(at(row, i)));
+        Tensor::cat(audio.collect(), 2)
+    };
+    let (first, second) = (alone(0, chunks), alone(1, chunks - 1));
+    let mut slots = DecodeSlots::new(&decoder, 3, &device);
+    let slot = |slots: &[i64]| Tensor::<1, Int>::from_data(slots, &device);
+    slots.push(slot(&[1]), at(1, 2));
+    slots.clear(1);
+    let mut audio = vec![slots.push(slot(&[0]), at(0, 0))];
+    let mut together = vec![];
+    for i in 1..chunks {
+        let spare = latents.clone().narrow(0, 0, 1).narrow(2, 0, chunk);
+        let rows = Tensor::cat(vec![at(0, i), at(1, i - 1), spare.clone(), spare], 0);
+        let decoded = slots.push(slot(&[0, 1, 2, 2]), rows);
         audio.push(decoded.clone().narrow(0, 0, 1));
         together.push(decoded.narrow(0, 1, 1));
     }

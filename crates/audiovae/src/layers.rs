@@ -7,7 +7,7 @@ use burn::{
         conv::{Conv1d, Conv1dConfig},
     },
     tensor::{
-        Device, Int, Tensor,
+        Device, IndexingUpdateOp, Int, Tensor,
         module::{conv_transpose1d, conv1d},
         ops::{ConvOptions, ConvTransposeOptions, PadMode},
     },
@@ -64,20 +64,29 @@ pub(crate) fn sequential_push(layers: &[Layer], x: Tensor<3>, carry: &mut Carry)
 }
 
 /// What the layers that reach back across a chunk boundary carry from one chunk to the next:
-/// each one's last inputs, in the order the layers run.
+/// each one's last inputs, in the order the layers run. Each stream of a batch of chunks
+/// carries its own: a stream's own batch, or a row each where there are several, or in slots of
+/// tensors that stay where they are, a slot a stream.
 #[derive(Debug)]
-/// What each stream of a batch of chunks carries over from its chunk before: a stream's own
-/// batch, or a row each where there are several.
-pub(crate) struct Carry {
-    last: Vec<vec::IntoIter<Tensor<3>>>,
-    next: Vec<Vec<Tensor<3>>>,
+pub(crate) enum Carry<'s> {
+    Streams {
+        last: Vec<vec::IntoIter<Tensor<3>>>,
+        next: Vec<Vec<Tensor<3>>>,
+    },
+    Slots {
+        /// Each layer's last inputs of every slot, `[slots, channels, length]`.
+        kept: &'s mut [Tensor<3>],
+        /// The slot of each row, `[rows]`.
+        at: Box<Tensor<1, Int>>,
+        layer: usize,
+    },
 }
 
-impl Carry {
+impl Carry<'_> {
     /// The carry out of the chunks before, each row's `kept` as [`into_kept`](Self::into_kept)
     /// gave it, or nothing before its first.
     pub(crate) fn new(kept: Vec<Vec<Tensor<3>>>) -> Self {
-        Self {
+        Self::Streams {
             next: vec![vec![]; kept.len()],
             last: kept.into_iter().map(Vec::into_iter).collect(),
         }
@@ -85,16 +94,33 @@ impl Carry {
 
     /// What each row's next chunk takes over.
     pub(crate) fn into_kept(self) -> Vec<Vec<Tensor<3>>> {
-        self.next
+        match self {
+            Self::Streams { next, .. } => next,
+            Self::Slots { .. } => vec![],
+        }
     }
 
     /// `x` after the `length` inputs before it: those each row's next layer to run kept from
     /// the chunk before, or zeros in its first chunk, as the layer pads a whole sequence. The
     /// last `length` of the result are kept for that layer's next chunk.
     fn extend(&mut self, x: Tensor<3>, length: usize) -> Tensor<3> {
+        let (last, next) = match self {
+            Self::Streams { last, next } => (last, next),
+            Self::Slots { kept, at, layer } => {
+                let kept = &mut kept[*layer];
+                *layer += 1;
+                let at = (**at).clone();
+                let x = Tensor::cat(vec![kept.clone().select(0, at.clone()), x], 2);
+                let total = x.dims()[2];
+                let tail = x.clone().narrow(2, total - length, length);
+                let assign = IndexingUpdateOp::Assign;
+                kept.inplace(|kept| kept.select_assign(0, at, tail, assign));
+                return x;
+            }
+        };
         let [rows, channels, _] = x.dims();
         let options = (&x.device(), x.dtype());
-        let kept: Vec<Option<Tensor<3>>> = self.last.iter_mut().map(Iterator::next).collect();
+        let kept: Vec<Option<Tensor<3>>> = last.iter_mut().map(Iterator::next).collect();
         let x = match &kept[..] {
             [None] => x.pad([(length, 0)], PadMode::Constant(0.0)),
             [Some(kept)] => Tensor::cat(vec![kept.clone(), x], 2),
@@ -106,7 +132,7 @@ impl Carry {
         };
         let total = x.dims()[2];
         let kept = x.clone().narrow(2, total - length, length);
-        match &mut self.next[..] {
+        match &mut next[..] {
             // One stream keeps its whole batch.
             [next] => next.push(kept),
             next => {

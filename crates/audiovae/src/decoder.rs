@@ -24,6 +24,7 @@ pub struct Decoder {
     /// The condition applied before each layer of `model`, upstream's `sr_cond_model`.
     sr_cond_model: Vec<Option<SampleRateCondition>>,
     bucket: usize,
+    latent_dim: usize,
     #[module(skip)]
     dtype: DType,
 }
@@ -89,6 +90,7 @@ impl Decoder {
             model,
             sr_cond_model,
             bucket: bucket(boundaries, config.out_sample_rate),
+            latent_dim: latent,
             dtype: dtype.into(),
         }
     }
@@ -184,6 +186,64 @@ impl DecodeStream<'_> {
             stream.kept = kept;
         }
         audio
+    }
+}
+
+/// Streams of latents decoded a chunk at a time, as [`DecodeStream`]s are, each carrying what it
+/// keeps from chunk to chunk in a slot of tensors that stay where they are: what a graph of
+/// [`push`](Self::push) captured once replays over, whichever slots it is given.
+#[derive(Clone, Debug)]
+pub struct DecodeSlots {
+    decoder: Decoder,
+    /// What each layer that reaches back keeps of every slot, `[slots, channels, length]`.
+    kept: Vec<Tensor<3>>,
+}
+
+impl DecodeSlots {
+    /// `slots` slots of streams through `decoder`, each as a stream holds them before its first
+    /// chunk.
+    pub fn new(decoder: &Decoder, slots: usize, device: &Device) -> Self {
+        let mut stream = decoder.stream();
+        stream.push(Tensor::zeros(
+            [1, decoder.latent_dim, 1],
+            (device, decoder.dtype),
+        ));
+        let fresh = |kept: &Tensor<3>| {
+            let [_, channels, length] = kept.dims();
+            Tensor::zeros([slots, channels, length], (device, kept.dtype()))
+        };
+        Self {
+            decoder: decoder.clone(),
+            kept: stream.kept.iter().map(fresh).collect(),
+        }
+    }
+
+    /// Makes `slot` a stream before its first chunk.
+    pub fn clear(&mut self, slot: usize) {
+        for kept in &mut self.kept {
+            let [_, channels, length] = kept.dims();
+            let options = (&kept.device(), kept.dtype());
+            let at = [slot..slot + 1, 0..channels, 0..length];
+            let zeros = Tensor::zeros([1, channels, length], options);
+            kept.inplace(|kept| kept.slice_assign(at, zeros));
+        }
+    }
+
+    /// Decodes the next latents of the streams in the slots `at` `[rows]`, `[rows, latent_dim,
+    /// frames]` a row each, into their audio `[rows, 1, samples]`, as each stream's
+    /// [`DecodeStream::push`] would. Every operation on the device, nothing read back, so that a
+    /// graph of it replays as it ran. Rows of the same slot write it in turn.
+    pub fn push(&mut self, at: Tensor<1, Int>, latents: Tensor<3>) -> Tensor<3> {
+        let decoder = &self.decoder;
+        let buckets = decoder.buckets(&latents);
+        let mut carry = Carry::Slots {
+            kept: &mut self.kept,
+            at: Box::new(at),
+            layer: 0,
+        };
+        decoder.forward(latents.cast(decoder.dtype), buckets, |layer, x| {
+            layer.push(x, &mut carry)
+        })
     }
 }
 

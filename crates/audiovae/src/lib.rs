@@ -16,7 +16,7 @@ use std::fmt;
 
 pub use crate::{
     config::AudioVaeConfig,
-    decoder::{DecodeStream, Decoder},
+    decoder::{DecodeSlots, DecodeStream, Decoder},
     encoder::Encoder,
     weights::Weights,
 };
