@@ -1,0 +1,71 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Attention within each sequence of T tokens of a local stack, every token attending to every
+// token of its sequence: a cluster of CLUSTER lanes takes one query head of one token, each
+// lane eight of the head's dimensions at a time, and scores it against the sequence's keys
+// of the key-value head serving it, in f32. q and out are `[M][HEADS][HEAD_DIM]`, k and v
+// `[M][KV_HEADS][HEAD_DIM]`, eight to a uvec4.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(constant_id = 2) const uint M = 22;
+layout(constant_id = 3) const uint T = 11;
+layout(constant_id = 4) const uint HEADS = 16;
+layout(constant_id = 5) const uint KV_HEADS = 2;
+layout(constant_id = 6) const uint HEAD_DIM = 128;
+// 1 / sqrt(HEAD_DIM), from the host.
+layout(constant_id = 7) const float SCALE = 0.08838834764831845;
+
+const uint CLUSTER = 16;
+const uint CLUSTERS = WORKGROUP / CLUSTER;
+const uint ROW = HEAD_DIM / 8;
+const uint STEPS = ROW / CLUSTER;
+
+layout(std430, binding = 0) readonly buffer Q { uvec4 q[]; };
+layout(std430, binding = 1) readonly buffer Key { uvec4 k[]; };
+layout(std430, binding = 2) readonly buffer Value { uvec4 v[]; };
+layout(std430, binding = 3) writeonly buffer Out { uvec4 out_[]; };
+
+void main() {
+    uint item = gl_WorkGroupID.x * CLUSTERS + gl_SubgroupID * (SUBGROUP / CLUSTER)
+        + gl_SubgroupInvocationID / CLUSTER;
+    if (item >= M * HEADS) {
+        return;
+    }
+    uint lane = gl_SubgroupInvocationID % CLUSTER;
+    uint m = item / HEADS;
+    uint head = item % HEADS;
+    uint kv = head / (HEADS / KV_HEADS);
+    uint first = m / T * T;
+    vec4 qlo[STEPS], qhi[STEPS];
+    [[unroll]] for (uint s = 0; s < STEPS; s++) {
+        unpack8(q[(m * HEADS + head) * ROW + s * CLUSTER + lane], qlo[s], qhi[s]);
+    }
+    float scores[T];
+    float top = uintBitsToFloat(0xff800000u);
+    [[unroll]] for (uint j = 0; j < T; j++) {
+        float partial = 0.0;
+        [[unroll]] for (uint s = 0; s < STEPS; s++) {
+            vec4 lo, hi;
+            unpack8(k[((first + j) * KV_HEADS + kv) * ROW + s * CLUSTER + lane], lo, hi);
+            partial += dot(qlo[s], lo) + dot(qhi[s], hi);
+        }
+        scores[j] = subgroupClusteredAdd(partial, CLUSTER) * SCALE;
+        top = max(top, scores[j]);
+    }
+    float total = 0.0;
+    [[unroll]] for (uint j = 0; j < T; j++) {
+        scores[j] = exp(scores[j] - top);
+        total += scores[j];
+    }
+    [[unroll]] for (uint s = 0; s < STEPS; s++) {
+        vec4 lo = vec4(0.0), hi = vec4(0.0);
+        [[unroll]] for (uint j = 0; j < T; j++) {
+            vec4 vlo, vhi;
+            unpack8(v[((first + j) * KV_HEADS + kv) * ROW + s * CLUSTER + lane], vlo, vhi);
+            lo += scores[j] * vlo;
+            hi += scores[j] * vhi;
+        }
+        out_[(m * HEADS + head) * ROW + s * CLUSTER + lane] = pack8(lo / total, hi / total);
+    }
+}

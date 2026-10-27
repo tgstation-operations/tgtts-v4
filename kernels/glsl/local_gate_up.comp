@@ -1,0 +1,57 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out = SiLU(gate) * up for each of the M tokens of a local stack, with gate and up the two
+// halves of W RMSNorm(x): the MLP's gate_up_proj and what comes before and after it. W is
+// 2 INNER x K, the gate's rows first; a cluster takes PAIRS rows of the gate and the same rows
+// of up, and a workgroup BLOCKS blocks of them. x is `[M][K]`, out `[M][INNER]`.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 1024;
+layout(constant_id = 3) const uint M = 22;
+layout(constant_id = 4) const uint INNER = 4096;
+layout(constant_id = 5) const float EPS = 1e-5;
+layout(constant_id = 6) const uint PAIRS = 1;
+layout(constant_id = 7) const uint KC = 1024;
+layout(constant_id = 8) const uint BLOCKS = 1;
+const uint ROWS = 2 * PAIRS;
+
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
+layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
+
+#include "gemm.glsl"
+#include "gemm_norm.glsl"
+
+void stage(uint chunk) {
+    if (chunk == 0) {
+        norm_scales();
+    }
+    stage_normed(chunk);
+}
+
+void rows_of(uint block, out uint rows[ROWS]) {
+    uint first = (block * CLUSTERS + cluster_id()) * PAIRS;
+    [[unroll]] for (uint p = 0; p < PAIRS; p++) {
+        rows[2 * p] = first + p;
+        rows[2 * p + 1] = INNER + first + p;
+    }
+}
+
+void epilogue(uint rows[ROWS], float acc[SUMS]) {
+    [[unroll]] for (uint p = 0; p < PAIRS; p++) {
+        float gate[PER_LANE], up[PER_LANE];
+        mine(acc, 2 * p, gate);
+        mine(acc, 2 * p + 1, up);
+        [[unroll]] for (uint t = 0; t < PER_LANE; t++) {
+            uint m = t * CLUSTER + cluster_lane();
+            if (m < M) {
+                out_[m * INNER + rows[2 * p]] = float16_t(gate[t] / (1.0 + exp(-gate[t])) * up[t]);
+            }
+        }
+    }
+}
+
+void main() {
+    run();
+}

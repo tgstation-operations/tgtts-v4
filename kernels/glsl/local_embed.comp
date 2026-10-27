@@ -1,0 +1,64 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The tokens a local stack starts from, in SEQS sequences of T tokens of N: at FIRST of each,
+// FRAMES tokens W f16(src) + b projected from the frames of a patch, `src` `[IN][FRAMES]` in
+// f32 as the sampler keeps it; and at AT, COPIED tokens of `tokens`, `[COPIED][N]`, the same in
+// every sequence unless GUIDED, which zeroes them in all but the first, as the sampler's
+// unconditional sequence has them. The other tokens are left as they are. An invocation takes
+// one of the N outputs.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint IN = 64;
+layout(constant_id = 3) const uint FRAMES = 4;
+layout(constant_id = 4) const uint N = 1024;
+layout(constant_id = 5) const uint SEQS = 2;
+layout(constant_id = 6) const uint T = 11;
+layout(constant_id = 7) const uint FIRST = 7;
+layout(constant_id = 8) const uint AT = 2;
+layout(constant_id = 9) const uint COPIED = 1;
+layout(constant_id = 10) const bool GUIDED = false;
+
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+// [N][IN]
+layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 2) readonly buffer Bias { float16_t bias[]; };
+layout(std430, binding = 3) readonly buffer Tokens { float16_t tokens[]; };
+// [SEQS][T][N]
+layout(std430, binding = 4) writeonly buffer H { float16_t h[]; };
+
+// The frames rounded to f16, as the stack takes them, `[FRAMES][IN]`: stored as f16, so that
+// the rounding is not folded away.
+shared float16_t frames[FRAMES * IN];
+
+void main() {
+    for (uint i = gl_LocalInvocationID.x; i < FRAMES * IN; i += WORKGROUP) {
+        uint f = i / IN;
+        uint c = i % IN;
+        frames[i] = float16_t(src[c * FRAMES + f]);
+    }
+    barrier();
+    uint n = gl_GlobalInvocationID.x;
+    float acc[FRAMES];
+    [[unroll]] for (uint f = 0; f < FRAMES; f++) {
+        acc[f] = float(bias[n]);
+    }
+    for (uint v = 0; v < IN / 8; v++) {
+        vec4 lo, hi;
+        unpack8(w[n * (IN / 8) + v], lo, hi);
+        [[unroll]] for (uint f = 0; f < FRAMES; f++) {
+            uint at = f * IN + 8 * v;
+            vec4 flo = vec4(frames[at], frames[at + 1], frames[at + 2], frames[at + 3]);
+            vec4 fhi = vec4(frames[at + 4], frames[at + 5], frames[at + 6], frames[at + 7]);
+            acc[f] += dot(lo, flo) + dot(hi, fhi);
+        }
+    }
+    for (uint s = 0; s < SEQS; s++) {
+        [[unroll]] for (uint f = 0; f < FRAMES; f++) {
+            h[((s * T) + FIRST + f) * N + n] = float16_t(acc[f]);
+        }
+        for (uint t = 0; t < COPIED; t++) {
+            float16_t value = GUIDED && s > 0 ? float16_t(0.0) : tokens[t * N + n];
+            h[((s * T) + AT + t) * N + n] = value;
+        }
+    }
+}

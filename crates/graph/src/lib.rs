@@ -11,6 +11,7 @@
 //!   weights read from the checkpoint ([`checkpoint`]).
 //! - [`lm_side`]: VoxCPM2's LM side of a patch, both LMs and the layers around them, from the
 //!   local encoder's output to the DiT's condition and the stop logits.
+//! - [`local`]: VoxCPM2's patch sampler with its local DiT, and its local encoder, at batch 1.
 //!
 //! The tests that need a GPU are built with the `device` feature: `nix run .#device-tests` runs
 //! them under the validation layer.
@@ -20,6 +21,7 @@ pub mod decode;
 pub mod graph;
 pub mod kernels;
 pub mod lm_side;
+pub mod local;
 pub mod prefill;
 pub mod step;
 pub mod vae;
