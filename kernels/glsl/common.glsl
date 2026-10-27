@@ -21,3 +21,17 @@ layout(constant_id = 1) const uint WORKGROUP = 256;
 layout(local_size_x_id = 1) in;
 
 const uint SUBGROUPS = WORKGROUP / SUBGROUP;
+
+// Eight f16 values packed in a uvec4, as f32, and back, rounding to nearest even.
+void unpack8(uvec4 q, out vec4 lo, out vec4 hi) {
+    lo = vec4(unpackHalf2x16(q.x), unpackHalf2x16(q.y));
+    hi = vec4(unpackHalf2x16(q.z), unpackHalf2x16(q.w));
+}
+
+uvec4 pack8(vec4 lo, vec4 hi) {
+    return uvec4(
+        packFloat2x16(f16vec2(lo.xy)),
+        packFloat2x16(f16vec2(lo.zw)),
+        packFloat2x16(f16vec2(hi.xy)),
+        packFloat2x16(f16vec2(hi.zw)));
+}

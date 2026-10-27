@@ -7,7 +7,7 @@
 layout(constant_id = 2) const uint K = 2048;
 layout(constant_id = 3) const uint ROWS = 2;
 
-layout(std430, binding = 0) readonly buffer X { float16_t x[]; };
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 2) readonly buffer Residual { float16_t residual[]; };
 layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };

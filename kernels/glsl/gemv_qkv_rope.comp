@@ -22,8 +22,8 @@ layout(constant_id = 8) const uint PAIRS = 1;
 const uint ROWS = 2 * PAIRS;
 const uint HALF = HEAD_DIM / 2;
 
-layout(std430, binding = 0) readonly buffer X { float16_t x[]; };
-layout(std430, binding = 1) readonly buffer G { float16_t g[]; };
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
 layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 3) readonly buffer Cos { float cos_[]; };
 layout(std430, binding = 4) readonly buffer Sin { float sin_[]; };
@@ -38,8 +38,8 @@ layout(std430, binding = 8) writeonly buffer VCache { float16_t v_cache[]; };
 
 void main() {
     float scale = rms_scale(EPS);
-    for (uint i = gl_LocalInvocationID.x; i < K; i += WORKGROUP) {
-        store_x(i, normed(i, scale));
+    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
+        xs[v] = normed8(v, scale);
     }
     barrier();
     uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * PAIRS;

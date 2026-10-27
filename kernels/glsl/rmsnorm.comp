@@ -6,15 +6,15 @@
 layout(constant_id = 2) const uint K = 2048;
 layout(constant_id = 3) const float EPS = 1e-5;
 
-layout(std430, binding = 0) readonly buffer X { float16_t x[]; };
-layout(std430, binding = 1) readonly buffer G { float16_t g[]; };
-layout(std430, binding = 2) writeonly buffer Out { float16_t out_[]; };
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
+layout(std430, binding = 2) writeonly buffer Out { uvec4 out_[]; };
 
 #include "norm.glsl"
 
 void main() {
     float scale = rms_scale(EPS);
-    for (uint i = gl_LocalInvocationID.x; i < K; i += WORKGROUP) {
-        out_[i] = normed(i, scale);
+    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
+        out_[v] = normed8(v, scale);
     }
 }
