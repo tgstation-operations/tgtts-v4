@@ -92,7 +92,25 @@ fn distance(got: &[f32], want: &[f32], atol: f64, rtol: f64) -> Distance {
     }
 }
 
-/// What minicpm4 on the CPU gives for the base LM's first `layers` layers and its final norm,
+/// A stack of VoxCPM2's: its base LM; its residual LM, which goes without RoPE; or, as a defect,
+/// the residual LM rotated as the base LM is.
+#[derive(Clone, Copy, PartialEq)]
+enum Stack {
+    Base,
+    Residual,
+    RotatedResidual,
+}
+
+impl Stack {
+    fn prefix(self) -> &'static str {
+        match self {
+            Stack::Base => "base_lm.",
+            _ => "residual_lm.",
+        }
+    }
+}
+
+/// What minicpm4 on the CPU gives for the first `layers` layers of a stack and its final norm,
 /// over the prompt's embeddings rounded to f16, the first `prefill` positions at once and the
 /// rest one at a time: the outputs in f32 and in f16, `[positions][hidden]` flattened, and the
 /// embeddings as f16 bits.
@@ -107,22 +125,33 @@ fn config() -> Value {
     serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
 }
 
-fn oracle(layers: usize, prefill: usize) -> Oracle {
+fn oracle(stack: Stack, layers: usize, prefill: usize) -> Oracle {
     let weights = checkpoint_dir().join("model.safetensors");
     let ids = prompt_ids();
     let len = ids.len();
     let cpu = device();
-    let mut config: Config = serde_json::from_value(config()["lm_config"].clone()).unwrap();
-    config.num_hidden_layers = layers;
+    let base: Config = serde_json::from_value(config()["lm_config"].clone()).unwrap();
+    let config = match stack {
+        Stack::Base => Config {
+            num_hidden_layers: layers,
+            ..base.clone()
+        },
+        _ => base.residual_lm(layers, stack == Stack::Residual),
+    };
     let hidden = config.hidden_size;
-    let load = |dtype| {
-        Model::load(&config, &weights, "base_lm.", dtype, &cpu).unwrap_or_else(|e| panic!("{e}"))
+    let load = |config: &Config, prefix, dtype| {
+        Model::load(config, &weights, prefix, dtype, &cpu).unwrap_or_else(|e| panic!("{e}"))
     };
 
     let start = Instant::now();
-    let f32_model = load(FloatDType::F32);
+    let embedding = Config {
+        num_hidden_layers: 0,
+        ..base
+    };
+    let embedding = load(&embedding, "base_lm.", FloatDType::F32);
     let ids = Tensor::<2, Int>::from_data(TensorData::new(ids, [1, len]), &cpu);
-    let embeds: Vec<f32> = f32_model.embed(ids).into_data().iter::<f32>().collect();
+    let embeds: Vec<f32> = embedding.embed(ids).into_data().iter::<f32>().collect();
+    drop(embedding);
     let x16: Vec<u16> = embeds.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
     let x: Vec<f32> = x16.iter().map(|&h| f16::from_bits(h).to_f32()).collect();
     let decode = |model: &Model, dtype: FloatDType| -> Vec<f32> {
@@ -136,9 +165,12 @@ fn oracle(layers: usize, prefill: usize) -> Oracle {
         let out = Tensor::cat(outputs, 1).cast(FloatDType::F32);
         out.into_data().iter::<f32>().collect()
     };
-    let want = decode(&f32_model, FloatDType::F32);
-    drop(f32_model);
-    let burn_f16 = decode(&load(FloatDType::F16), FloatDType::F16);
+    let want = decode(
+        &load(&config, stack.prefix(), FloatDType::F32),
+        FloatDType::F32,
+    );
+    let f16_model = load(&config, stack.prefix(), FloatDType::F16);
+    let burn_f16 = decode(&f16_model, FloatDType::F16);
     eprintln!(
         "{layers} layers on the CPU, f32 and f16: {:.1} s",
         start.elapsed().as_secs_f64()
@@ -150,16 +182,19 @@ fn oracle(layers: usize, prefill: usize) -> Oracle {
     }
 }
 
-/// The GPU's outputs for the same layers over the embeddings `x`, every position one at a time,
-/// each at its position plus `shift` in the cache, with the kernels at `subgroup` (the device's
-/// default when `None`).
-fn gpu(layers: usize, x: &[u16], shift: usize, subgroup: Option<u32>) -> Vec<f32> {
+/// The GPU's outputs for the same layers of `stack` over the embeddings `x`, every position one at
+/// a time, each at its position plus `shift` in the cache, with the kernels at `subgroup` (the
+/// device's default when `None`).
+fn gpu(stack: Stack, layers: usize, x: &[u16], shift: usize, subgroup: Option<u32>) -> Vec<f32> {
     let json = config();
     let hidden = json["lm_config"]["hidden_size"].as_u64().unwrap() as usize;
     let len = x.len() / hidden;
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let config: LmConfig = serde_json::from_value(json["lm_config"].clone()).unwrap();
+    let config = LmConfig {
+        no_rope: stack == Stack::Residual,
+        ..serde_json::from_value(json["lm_config"].clone()).unwrap()
+    };
     let shape = Shape::new(&config, layers, (len + shift).next_multiple_of(32)).unwrap();
     let start = Instant::now();
     let tuning = match subgroup {
@@ -171,7 +206,7 @@ fn gpu(layers: usize, x: &[u16], shift: usize, subgroup: Option<u32>) -> Vec<f32
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     decoder
-        .load(&checkpoint, "base_lm.")
+        .load(&checkpoint, stack.prefix())
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
         "{layers} layers recorded and loaded on the GPU at {tuning:?}: {:.1} s, {} dispatches, \
@@ -253,21 +288,21 @@ fn within(margin: [f64; 4]) -> bool {
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn one_layer_decodes_as_minicpm4_does_on_the_cpu() {
-    let oracle = oracle(1, 70);
+    let oracle = oracle(Stack::Base, 1, 70);
     // At every subgroup size the device can require: 32, as on NVIDIA, also on the Radeon.
     let report = context().report().clone();
     for subgroup in SUBGROUPS
         .into_iter()
         .filter(|&s| report.can_require_subgroup_size(s))
     {
-        let got = gpu(1, &oracle.x, 0, Some(subgroup));
+        let got = gpu(Stack::Base, 1, &oracle.x, 0, Some(subgroup));
         let (ours, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
         assert!(within(margin), "wave{subgroup}: {margin:?}");
         // One layer is well inside the served tolerance, which was set for eight.
         assert!(ours.worst <= 1.0, "wave{subgroup}: {ours:?}");
     }
     // Defect: every position one slot on in the cache, so rotated by the next position's angle.
-    let shifted = gpu(1, &oracle.x, 1, None);
+    let shifted = gpu(Stack::Base, 1, &oracle.x, 1, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &shifted, 70);
     assert!(!within(margin), "positions one slot on pass: {margin:?}");
 }
@@ -341,8 +376,24 @@ fn one_layer_recorded_again_with_its_rows_cut_otherwise_decodes_the_same() {
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn the_base_lm_decodes_as_minicpm4_does_on_the_cpu() {
-    let oracle = oracle(28, 70);
-    let got = gpu(28, &oracle.x, 0, None);
+    let oracle = oracle(Stack::Base, 28, 70);
+    let got = gpu(Stack::Base, 28, &oracle.x, 0, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
     assert!(within(margin), "{margin:?}");
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn the_residual_lm_decodes_without_rope_as_minicpm4_does_on_the_cpu() {
+    let oracle = oracle(Stack::Residual, 8, 70);
+    let got = gpu(Stack::Residual, 8, &oracle.x, 0, None);
+    let (_, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
+    assert!(within(margin), "{margin:?}");
+    // Defect: the residual LM rotated by RoPE.
+    let rotated = gpu(Stack::RotatedResidual, 8, &oracle.x, 0, None);
+    let (_, margin) = check(&oracle.f32, &oracle.f16, &rotated, 70);
+    assert!(
+        !within(margin),
+        "the residual LM rotated passes: {margin:?}"
+    );
 }

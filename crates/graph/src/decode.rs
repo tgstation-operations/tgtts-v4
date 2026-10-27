@@ -39,6 +39,10 @@ pub struct LmConfig {
     /// As upstream assumes when it is missing.
     #[serde(default = "upstream_use_mup")]
     pub use_mup: bool,
+    /// Whether attention goes without RoPE, as VoxCPM2's residual LM does: its stack is the base
+    /// LM's with this taken from `residual_lm_no_rope`.
+    #[serde(default)]
+    pub no_rope: bool,
 }
 
 fn upstream_use_mup() -> bool {
@@ -68,6 +72,8 @@ pub struct Shape {
     pub rope_theta: f32,
     /// LongRoPE's divisors of each frequency, at the native length (the only one VoxCPM2 uses).
     pub rope_factors: Vec<f64>,
+    /// Whether q and k are rotated.
+    pub rope: bool,
 }
 
 impl Shape {
@@ -79,8 +85,9 @@ impl Shape {
             return unsupported("use_mup".into());
         }
         let rope = &config.rope_scaling;
-        if rope.kind != "longrope"
-            || config.max_position_embeddings != rope.original_max_position_embeddings
+        if !config.no_rope
+            && (rope.kind != "longrope"
+                || config.max_position_embeddings != rope.original_max_position_embeddings)
         {
             return unsupported(format!(
                 "rope_scaling {:?} from {} positions to {}",
@@ -109,6 +116,7 @@ impl Shape {
             eps: config.rms_norm_eps as f32,
             rope_theta: config.rope_theta as f32,
             rope_factors: rope.short_factor.clone(),
+            rope: !config.no_rope,
         })
     }
 
@@ -308,6 +316,7 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (7, eps),
             (8, SpecValue::U32(tuning.qkv_pairs)),
             (9, SpecValue::U32(tuning.ahead)),
+            (10, SpecValue::Bool(s.rope)),
         ],
         sub,
     );
@@ -644,6 +653,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10_000.0,
             rope_factors: vec![1.0; 64],
+            rope: true,
         }
     }
 
@@ -740,6 +750,49 @@ mod tests {
             ..tuning
         };
         assert!(matches!(decode_graph(&s, &narrow), Err(Error::Shape(_))));
+    }
+
+    #[test]
+    fn a_stack_without_rope_is_taken_from_its_config_and_rotates_nothing() {
+        let config = |no_rope: bool| -> LmConfig {
+            serde_json::from_value(serde_json::json!({
+                "hidden_size": 2048,
+                "intermediate_size": 6144,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 28,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000,
+                "kv_channels": 128,
+                "max_position_embeddings": 32768,
+                "rope_scaling": {
+                    "type": "dynamic",
+                    "short_factor": vec![1.0; 64],
+                    "original_max_position_embeddings": 32768,
+                },
+                "use_mup": false,
+                "no_rope": no_rope,
+            }))
+            .unwrap()
+        };
+        // RoPE other than LongRoPE is refused only where it would be used.
+        assert!(matches!(
+            Shape::new(&config(false), 8, 64),
+            Err(Error::Shape(_))
+        ));
+        let s = Shape::new(&config(true), 8, 64).unwrap();
+        assert!(!s.rope);
+        let rope = |s: &Shape| -> Vec<SpecValue> {
+            let g = decode_graph(s, &Tuning::for_subgroup(64)).unwrap();
+            let qkv = g.graph.ops.iter().filter(|op| op.label == "qkv_rope");
+            let constant = |op: &crate::graph::Op| {
+                let found = op.pipeline.constants.iter().find(|(id, _)| *id == 10);
+                found.expect("a ROPE constant").1
+            };
+            qkv.map(constant).collect()
+        };
+        assert_eq!(rope(&s), vec![SpecValue::Bool(false); 8]);
+        assert_eq!(rope(&shape(2)), vec![SpecValue::Bool(true); 2]);
     }
 
     #[test]

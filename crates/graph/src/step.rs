@@ -241,6 +241,7 @@ mod tests {
             eps: 1e-5,
             rope_theta: 10_000.0,
             rope_factors: vec![1.0; 64],
+            rope: true,
         };
         let layout = |s: &Shape, t: &Tuning| Layout::of(&decode_graph(s, t).unwrap().graph);
         let base = Tuning::for_subgroup(32);

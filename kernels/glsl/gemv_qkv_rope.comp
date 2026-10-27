@@ -19,6 +19,8 @@ layout(constant_id = 6) const uint CAPACITY = 1024;
 layout(constant_id = 7) const float EPS = 1e-5;
 layout(constant_id = 8) const uint PAIRS = 1;
 layout(constant_id = 9) const uint AHEAD = 0;
+// Whether q and k are rotated: VoxCPM2's residual LM attends without RoPE.
+layout(constant_id = 10) const bool ROPE = true;
 
 const uint ROWS = 2 * PAIRS;
 const uint HALF = HEAD_DIM / 2;
@@ -70,11 +72,15 @@ void main() {
             v_cache[at + HALF] = float16_t(b);
             continue;
         }
-        // As upstream: x cos + rotate_half(x) sin.
-        float c = cos_[pos * HALF + i];
-        float s = sin_[pos * HALF + i];
-        float ra = a * c - b * s;
-        float rb = b * c + a * s;
+        float ra = a;
+        float rb = b;
+        if (ROPE) {
+            // As upstream: x cos + rotate_half(x) sin.
+            float c = cos_[pos * HALF + i];
+            float s = sin_[pos * HALF + i];
+            ra = a * c - b * s;
+            rb = b * c + a * s;
+        }
         if (head < HEADS) {
             uint at = head * HEAD_DIM + i;
             q[at] = float16_t(ra);
