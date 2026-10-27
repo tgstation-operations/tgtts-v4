@@ -4,17 +4,18 @@
 //!
 //! The recording owns the buffers it binds, so none of them can be freed, or touched by the host,
 //! while the GPU may be using it: [`Recording::submit`] takes it mutably and waits for the GPU
-//! before returning, and the host reaches the buffers only through the recording between
-//! submissions. A value that changes from one submission to the next, such as a position, lives
-//! in one of those buffers and is written there before each submission, not baked into the
-//! commands. Buffers are bound through descriptor sets written once, at their ranges as given;
-//! nothing in the commands is a raw device address.
+//! before returning, [`Recording::start`] returns a [`Submission`] that holds it until waited for,
+//! and the host reaches the buffers only through the recording between submissions. A value that
+//! changes from one submission to the next, such as a position, lives in one of those buffers and
+//! is written there before each submission, not baked into the commands. Buffers are bound through
+//! descriptor sets written once, at their ranges as given; nothing in the commands is a raw device
+//! address.
 //!
 //! Every submission is timed from a timestamp before its first dispatch to one after its last
 //! ([`Recording::elapsed`]), which costs two timestamps a submission; a recording made timed also
 //! times each dispatch ([`Recording::timings`]).
 
-use std::sync::Arc;
+use std::{mem::ManuallyDrop, sync::Arc};
 
 use ash::vk;
 
@@ -388,7 +389,11 @@ impl Recording {
     /// Runs the recorded dispatches once and waits for them: when this returns, everything they
     /// wrote is visible to the host.
     pub fn submit(&mut self) -> Result<()> {
-        let device = &self.ctx.device;
+        self.start()?.wait()
+    }
+
+    /// Submits the recorded dispatches and returns without waiting for them.
+    pub fn start(&mut self) -> Result<Submission<'_>> {
         {
             let submit = self
                 .ctx
@@ -397,14 +402,27 @@ impl Recording {
                 .map_err(|_| Error::Unsupported("a poisoned queue lock".into()))?;
             let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(self.commands)];
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
-            // SAFETY: the command buffer is executable and not pending (the last submission
-            // was waited for), and the queue is held for the call.
-            unsafe { device.queue_submit2(submit.queue, &submits, self.fence) }
-                .call("vkQueueSubmit2")?;
+            // SAFETY: the command buffer is executable and not pending (a submission holds the
+            // recording until it has been waited for), and the queue is held for the call.
+            unsafe {
+                self.ctx
+                    .device
+                    .queue_submit2(submit.queue, &submits, self.fence)
+            }
+            .call("vkQueueSubmit2")?;
         }
         self.pending = true;
-        // SAFETY: the fence belongs to this recording and was submitted above. On a timeout
-        // the work is still pending, and `pending` stays set.
+        Ok(Submission { recording: self })
+    }
+
+    /// Waits for the last submission unless it was seen finished. On a timeout the work is still
+    /// pending, and `pending` stays set.
+    fn finish(&mut self) -> Result<()> {
+        if !self.pending {
+            return Ok(());
+        }
+        let device = &self.ctx.device;
+        // SAFETY: the fence belongs to this recording and was submitted.
         unsafe {
             device
                 .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
@@ -464,6 +482,37 @@ impl Recording {
             ticks,
             nanoseconds: ticks_to_ns(ticks, report.timestamp_period),
         }
+    }
+}
+
+/// A recording's dispatches, submitted and perhaps still running. It holds the recording, so the
+/// host cannot reach a buffer the GPU may be using until the submission is waited for; dropping it
+/// waits too.
+#[must_use = "dropping a submission waits for it"]
+pub struct Submission<'a> {
+    recording: &'a mut Recording,
+}
+
+impl std::fmt::Debug for Submission<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Submission")
+            .field("pending", &self.recording.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Submission<'_> {
+    /// Waits for the dispatches: when this returns, everything they wrote is visible to the host.
+    pub fn wait(self) -> Result<()> {
+        // A failed wait is not repeated when the submission is dropped.
+        ManuallyDrop::new(self).recording.finish()
+    }
+}
+
+impl Drop for Submission<'_> {
+    fn drop(&mut self) {
+        // A failure leaves the recording pending, which its own drop then accounts for.
+        let _ = self.recording.finish();
     }
 }
 

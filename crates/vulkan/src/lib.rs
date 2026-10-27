@@ -44,5 +44,5 @@ pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};
 pub use kernel::{Kernel, KernelDesc, SpecValue};
 pub use memory::{Buffer, Residence};
-pub use recording::{Binding, Dispatch, Recording};
+pub use recording::{Binding, Dispatch, Recording, Submission};
 pub use report::DeviceReport;

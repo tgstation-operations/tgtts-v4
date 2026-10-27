@@ -154,7 +154,16 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
         // A value the host changes between submissions, as a position would be.
         let x = inputs(n, step + 1);
         recording.buffer_mut(0).write(&x).unwrap();
-        recording.submit().unwrap_or_else(|e| panic!("{e}"));
+        // Submitted and waited for at once, started and then waited for, or started and
+        // dropped, which waits.
+        if step % 3 == 0 {
+            recording.submit().unwrap_or_else(|e| panic!("{e}"));
+        } else {
+            let started = recording.start().unwrap_or_else(|e| panic!("{e}"));
+            if step % 3 == 1 {
+                started.wait().unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
         let got = recording.buffer(2).read::<f32>().unwrap();
         if step == 0 {
             assert_eq!(differences(&got, &one_at_a_time), 0, "the first submission");
