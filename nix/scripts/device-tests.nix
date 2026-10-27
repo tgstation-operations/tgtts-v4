@@ -2,6 +2,7 @@
   pkgs,
   rustToolchain,
   gpuKernels,
+  glslKernels,
 }:
 pkgs.writeShellApplication {
   name = "device-tests";
@@ -25,6 +26,7 @@ pkgs.writeShellApplication {
     export VK_LAYER_PATH=${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d
     export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true
     export VULKAN_KERNELS=${gpuKernels}
+    export GLSL_KERNELS=${glslKernels}
 
     # A hand-written kernel's blob is what its assembly assembles to, and valid.
     scratch=$(mktemp -d)

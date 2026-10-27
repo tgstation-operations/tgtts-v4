@@ -6,6 +6,7 @@ let
   tracelLlvm = import ./tracel-llvm.nix { inherit pkgs; };
   mlir = import ./mlir.nix { inherit pkgs llvm-project; };
   gpuKernels = import ./gpu-kernels.nix { inherit pkgs mlir; };
+  glslKernels = import ./glsl-kernels.nix { inherit pkgs; };
 
   scripts = rec {
     fmt = import ./scripts/fmt.nix { inherit pkgs rustToolchain; };
@@ -27,7 +28,15 @@ in
   packages = scripts // {
     inherit mlir;
     gpu-kernels = gpuKernels;
-    device-tests = import ./scripts/device-tests.nix { inherit pkgs rustToolchain gpuKernels; };
+    glsl-kernels = glslKernels;
+    device-tests = import ./scripts/device-tests.nix {
+      inherit
+        pkgs
+        rustToolchain
+        gpuKernels
+        glslKernels
+        ;
+    };
     fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
     cuda-trial = import ./cuda-trial.nix {
       inherit

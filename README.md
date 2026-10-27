@@ -23,7 +23,8 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   the Khronos validation layer, the start of a GPU path of its own; the burn
   code stays the oracle it is checked against. Its kernels are MLIR compiled
   ahead of time to SPIR-V, from `kernels/gpu`: `nix build .#gpu-kernels`, which
-  builds LLVM first where the store does not have it.
+  builds LLVM first where the store does not have it. The decode step's kernels
+  are GLSL, from `kernels/glsl`: `nix build .#glsl-kernels`.
 - `nix run .#bench` times release builds of the hot paths on the real data
   (`VOXCPM2_DIR`, `VOICES_DIR` for a converted voices directory and `ASSETS_DIR`
   for the radio's sounds) and writes each run as JSON;

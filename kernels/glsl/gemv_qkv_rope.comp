@@ -1,0 +1,86 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The attention's input side for one position: q, k and v = W RMSNorm(x), q and k rotated by
+// RoPE at the position, k and v written into the cache there. W is upstream's q_proj, k_proj
+// and v_proj joined along their outputs: HEADS + 2 KV_HEADS heads of HEAD_DIM rows. A subgroup
+// takes PAIRS pairs of rows i and i + HEAD_DIM / 2 of one head, the pairs RoPE rotates
+// together, so the rotation needs nothing from another subgroup.
+//
+// The position is read from `position` on every run, so a recording of this dispatch serves
+// every position. The rotation's cosines and sines are tables of HEAD_DIM / 2 per position,
+// computed by the host as upstream's LongRoPE computes them.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 2048;
+layout(constant_id = 3) const uint HEADS = 16;
+layout(constant_id = 4) const uint KV_HEADS = 2;
+layout(constant_id = 5) const uint HEAD_DIM = 128;
+layout(constant_id = 6) const uint CAPACITY = 1024;
+layout(constant_id = 7) const float EPS = 1e-5;
+layout(constant_id = 8) const uint PAIRS = 1;
+
+const uint ROWS = 2 * PAIRS;
+const uint HALF = HEAD_DIM / 2;
+
+layout(std430, binding = 0) readonly buffer X { float16_t x[]; };
+layout(std430, binding = 1) readonly buffer G { float16_t g[]; };
+layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 3) readonly buffer Cos { float cos_[]; };
+layout(std430, binding = 4) readonly buffer Sin { float sin_[]; };
+layout(std430, binding = 5) readonly buffer Position { uint position; };
+layout(std430, binding = 6) writeonly buffer Q { float16_t q[]; };
+// [KV_HEADS][CAPACITY][HEAD_DIM]
+layout(std430, binding = 7) writeonly buffer KCache { float16_t k_cache[]; };
+layout(std430, binding = 8) writeonly buffer VCache { float16_t v_cache[]; };
+
+#include "gemv.glsl"
+#include "norm.glsl"
+
+void main() {
+    float scale = rms_scale(EPS);
+    for (uint i = gl_LocalInvocationID.x; i < K; i += WORKGROUP) {
+        store_x(i, normed(i, scale));
+    }
+    barrier();
+    uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * PAIRS;
+    uint rows[ROWS];
+    [[unroll]] for (uint p = 0; p < PAIRS; p++) {
+        uint pair = first + p;
+        uint row = pair / HALF * HEAD_DIM + pair % HALF;
+        rows[2 * p] = row;
+        rows[2 * p + 1] = row + HALF;
+    }
+    float sums[ROWS];
+    dot_rows(rows, sums);
+    uint pos = position;
+    if (gl_SubgroupInvocationID != 0 || pos >= CAPACITY) {
+        return;
+    }
+    [[unroll]] for (uint p = 0; p < PAIRS; p++) {
+        uint pair = first + p;
+        uint head = pair / HALF;
+        uint i = pair % HALF;
+        float a = sums[2 * p];
+        float b = sums[2 * p + 1];
+        if (head >= HEADS + KV_HEADS) {
+            uint at = ((head - HEADS - KV_HEADS) * CAPACITY + pos) * HEAD_DIM + i;
+            v_cache[at] = float16_t(a);
+            v_cache[at + HALF] = float16_t(b);
+            continue;
+        }
+        // As upstream: x cos + rotate_half(x) sin.
+        float c = cos_[pos * HALF + i];
+        float s = sin_[pos * HALF + i];
+        float ra = a * c - b * s;
+        float rb = b * c + a * s;
+        if (head < HEADS) {
+            uint at = head * HEAD_DIM + i;
+            q[at] = float16_t(ra);
+            q[at + HALF] = float16_t(rb);
+        } else {
+            uint at = ((head - HEADS) * CAPACITY + pos) * HEAD_DIM + i;
+            k_cache[at] = float16_t(ra);
+            k_cache[at + HALF] = float16_t(rb);
+        }
+    }
+}

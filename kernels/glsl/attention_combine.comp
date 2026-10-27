@@ -1,0 +1,50 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Joins attention_split's chunks up to the position into each query head's output: workgroup h
+// rescales each chunk's sum to the largest maximum among them and divides by the total.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint HEADS = 16;
+layout(constant_id = 3) const uint HEAD_DIM = 128;
+layout(constant_id = 4) const uint CAPACITY = 1024;
+
+// As attention_split's.
+const uint CHUNK = 32;
+const uint CHUNKS = CAPACITY / CHUNK;
+const uint ROW = HEAD_DIM / 4;
+
+layout(std430, binding = 0) readonly buffer Position { uint position; };
+layout(std430, binding = 1) readonly buffer PartialO { vec4 partial_o[]; };
+layout(std430, binding = 2) readonly buffer PartialMl { vec2 partial_ml[]; };
+// [HEADS * HEAD_DIM]
+layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint pos = position;
+    if (pos >= CAPACITY) {
+        return;
+    }
+    uint chunks = pos / CHUNK + 1;
+    float m = uintBitsToFloat(0xff800000u);
+    for (uint c = 0; c < chunks; c++) {
+        m = max(m, partial_ml[head * CHUNKS + c].x);
+    }
+    float total = 0.0;
+    for (uint c = 0; c < chunks; c++) {
+        vec2 ml = partial_ml[head * CHUNKS + c];
+        total += ml.y * exp(ml.x - m);
+    }
+    for (uint d = gl_LocalInvocationID.x; d < ROW; d += WORKGROUP) {
+        vec4 acc = vec4(0.0);
+        for (uint c = 0; c < chunks; c++) {
+            acc += partial_o[(head * CHUNKS + c) * ROW + d] * exp(partial_ml[head * CHUNKS + c].x - m);
+        }
+        acc /= total;
+        uint at = head * HEAD_DIM + 4 * d;
+        out_[at] = float16_t(acc.x);
+        out_[at + 1] = float16_t(acc.y);
+        out_[at + 2] = float16_t(acc.z);
+        out_[at + 3] = float16_t(acc.w);
+    }
+}

@@ -1,0 +1,101 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Decode attention over the cache, split along it: workgroup (c, h) takes CHUNK positions from
+// c CHUNK for the GROUP query heads key-value head h serves, and writes each head's softmax
+// over them unnormalized, with its maximum and sum, for attention_combine to join. Keys after
+// the position are masked out; a chunk that starts after it writes nothing.
+//
+// One invocation per (head, position) scores; the chunk's softmax is a clustered reduction over
+// the CHUNK invocations of one head, whose cluster size glslang takes only as a literal, so
+// CHUNK is fixed at 32, which divides every subgroup size there is.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(constant_id = 2) const uint HEADS = 16;
+layout(constant_id = 3) const uint KV_HEADS = 2;
+layout(constant_id = 4) const uint HEAD_DIM = 128;
+layout(constant_id = 5) const uint CAPACITY = 1024;
+// 1 / sqrt(HEAD_DIM), from the host.
+layout(constant_id = 6) const float SCALE = 0.08838834764831845;
+
+const uint CHUNK = 32;
+const uint GROUP = HEADS / KV_HEADS;
+const uint CHUNKS = CAPACITY / CHUNK;
+const uint ROW = HEAD_DIM / 4;
+// A row of keys or values in shared memory, one vec4 longer than it needs so that the rows
+// invocations read side by side fall in different banks.
+const uint PADDED = ROW + 1;
+
+layout(std430, binding = 0) readonly buffer Q { float16_t q[]; };
+// [KV_HEADS][CAPACITY][HEAD_DIM], eight to a uvec4.
+layout(std430, binding = 1) readonly buffer KCache { uvec4 k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCache { uvec4 v_cache[]; };
+layout(std430, binding = 3) readonly buffer Position { uint position; };
+// [HEADS][CHUNKS][HEAD_DIM]
+layout(std430, binding = 4) writeonly buffer PartialO { vec4 partial_o[]; };
+// [HEADS][CHUNKS]: the maximum score and the sum of exponentials.
+layout(std430, binding = 5) writeonly buffer PartialMl { vec2 partial_ml[]; };
+
+shared vec4 qs[GROUP * ROW];
+shared vec4 ks[CHUNK * PADDED];
+shared vec4 vs[CHUNK * PADDED];
+shared float ps[GROUP * CHUNK];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint c = gl_WorkGroupID.x;
+    uint kv = gl_WorkGroupID.y;
+    uint start = c * CHUNK;
+    uint pos = position;
+    if (start > pos || pos >= CAPACITY) {
+        return;
+    }
+    for (uint i = t; i < GROUP * ROW; i += WORKGROUP) {
+        uint at = kv * GROUP * HEAD_DIM + 4 * i;
+        qs[i] = vec4(float(q[at]), float(q[at + 1]), float(q[at + 2]), float(q[at + 3]));
+    }
+    for (uint i = t; i < CHUNK * HEAD_DIM / 8; i += WORKGROUP) {
+        uint p = i / (HEAD_DIM / 8);
+        uint j = i % (HEAD_DIM / 8);
+        uvec4 k = uvec4(0);
+        uvec4 v = uvec4(0);
+        if (start + p <= pos) {
+            uint at = (kv * CAPACITY + start) * (HEAD_DIM / 8) + i;
+            k = k_cache[at];
+            v = v_cache[at];
+        }
+        ks[p * PADDED + 2 * j] = vec4(unpackHalf2x16(k.x), unpackHalf2x16(k.y));
+        ks[p * PADDED + 2 * j + 1] = vec4(unpackHalf2x16(k.z), unpackHalf2x16(k.w));
+        vs[p * PADDED + 2 * j] = vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+        vs[p * PADDED + 2 * j + 1] = vec4(unpackHalf2x16(v.z), unpackHalf2x16(v.w));
+    }
+    barrier();
+
+    for (uint i = t; i < GROUP * CHUNK; i += WORKGROUP) {
+        uint head = i / CHUNK;
+        uint p = i % CHUNK;
+        float score = 0.0;
+        for (uint d = 0; d < ROW; d++) {
+            score += dot(qs[head * ROW + d], ks[p * PADDED + d]);
+        }
+        score = start + p <= pos ? score * SCALE : uintBitsToFloat(0xff800000u);
+        float m = subgroupClusteredMax(score, CHUNK);
+        float e = exp(score - m);
+        float l = subgroupClusteredAdd(e, CHUNK);
+        ps[i] = e;
+        if (p == 0) {
+            partial_ml[(kv * GROUP + head) * CHUNKS + c] = vec2(m, l);
+        }
+    }
+    barrier();
+
+    for (uint i = t; i < GROUP * ROW; i += WORKGROUP) {
+        uint head = i / ROW;
+        uint d = i % ROW;
+        vec4 acc = vec4(0.0);
+        for (uint p = 0; p < CHUNK; p++) {
+            acc += ps[head * CHUNK + p] * vs[p * PADDED + d];
+        }
+        partial_o[((kv * GROUP + head) * CHUNKS + c) * ROW + d] = acc;
+    }
+}

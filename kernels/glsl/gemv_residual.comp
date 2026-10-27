@@ -1,0 +1,31 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out = residual + W x: o_proj and down_proj with the residual add after them. W is N x K,
+// ROWS rows to a subgroup.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 2048;
+layout(constant_id = 3) const uint ROWS = 2;
+
+layout(std430, binding = 0) readonly buffer X { float16_t x[]; };
+layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 2) readonly buffer Residual { float16_t residual[]; };
+layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
+
+#include "gemv.glsl"
+
+void main() {
+    load_plain();
+    uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * ROWS;
+    uint rows[ROWS];
+    [[unroll]] for (uint r = 0; r < ROWS; r++) {
+        rows[r] = first + r;
+    }
+    float sums[ROWS];
+    dot_rows(rows, sums);
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint r = 0; r < ROWS; r++) {
+            out_[rows[r]] = float16_t(float(residual[rows[r]]) + sums[r]);
+        }
+    }
+}
