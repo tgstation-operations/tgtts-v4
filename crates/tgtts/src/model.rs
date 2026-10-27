@@ -12,13 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use burn::tensor::{Device, Tensor};
+use burn::tensor::{Device, Distribution::Normal, Tensor};
 use dsp::RATE;
 use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
-    CHUNK_FRAMES, ChunkDecoder, Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt,
-    PromptCache, Scheduler, SeededNoise, Stepping, TextToSpeech,
+    ChunkDecoder, Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt, PromptCache,
+    Scheduler, SeededNoise, Stepping, TextToSpeech,
 };
 
 use crate::{
@@ -87,6 +87,8 @@ struct WarmUp {
     longest: usize,
     voice_patches: usize,
     requests: usize,
+    /// A voice to decode speech after.
+    voice: Latent,
 }
 
 /// A prompt to generate from in a voice, and where its speech goes.
@@ -226,6 +228,7 @@ impl VoxCpm {
             longest: longest.len(),
             voice_patches: voice_patches.into_iter().max().unwrap_or(1),
             requests,
+            voice: voice.clone(),
         };
         let (done, warmed) = mpsc::channel();
         let stopped = "the thread VoxCPM2 generates on has stopped";
@@ -418,24 +421,30 @@ impl Generating {
             model.warm_voice(patches);
         }
         let generated = started.elapsed();
-        let silent = Latent {
-            frames: Vec::new(),
-            text: String::new(),
-        };
-        let patch_size = self.config.patch_size;
-        let shape = [CHUNK_FRAMES / patch_size, patch_size, self.config.feat_dim];
+        // Patches of noise rather than of silence, which a GPU may hold as a broadcast value
+        // whose strides key other kernels than speech's.
+        let (shape, normal) = (
+            [1, self.config.patch_size, self.config.feat_dim],
+            Normal(0.0, 1.0),
+        );
+        let patch = || Tensor::random(shape, normal, &self.device);
         // Autotune rounds the rows up to a power of two, as it rounds those of prompts.
         let rows = (0..).map(|power| 1 << power);
         let rows = rows.take_while(|&rows| rows <= warm_up.requests.next_power_of_two());
         for rows in rows {
-            let mut decoders: Vec<_> = (0..rows).map(|_| tts.chunk_decoder(&silent)).collect();
-            // A first chunk, then one after it.
-            for _ in 0..2 {
+            let decoders = (0..rows).map(|_| tts.chunk_decoder(&warm_up.voice));
+            let mut decoders: Vec<_> = decoders.collect();
+            // A first chunk, after the voice's last frames, one after it and a last one filled
+            // out with silence, each taking its patches one at a time, as requests' do.
+            for last in [false, false, true] {
                 for decoder in &mut decoders {
-                    decoder.push(Tensor::zeros(shape, &self.device));
+                    decoder.push(patch());
+                    while !last && !decoder.ready() {
+                        decoder.push(patch());
+                    }
                 }
                 let mut decoding: Vec<_> = decoders.iter_mut().collect();
-                ChunkDecoder::decode_together(&mut decoding, &vec![false; rows]);
+                ChunkDecoder::decode_together(&mut decoding, &vec![last; rows]);
             }
         }
         Ok(generated)
