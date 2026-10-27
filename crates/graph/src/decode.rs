@@ -655,6 +655,12 @@ impl Decoder {
     pub fn graph_step(&self) -> &Step {
         &self.step
     }
+
+    /// The step's tensors, and the step, for programs over its weights and cache to be added to
+    /// it ([`Step::add`]) and run.
+    pub fn parts_mut(&mut self) -> (&DecodeGraph, &mut Step) {
+        (&self.tensors, &mut self.step)
+    }
 }
 
 #[cfg(test)]
