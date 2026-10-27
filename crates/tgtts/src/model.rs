@@ -22,7 +22,10 @@ use voxcpm::{
     Stepping, TextToSpeech,
 };
 
-use crate::synth::{self, Speech, Start, Synthesizer};
+use crate::{
+    device,
+    synth::{self, Speech, Start, Synthesizer},
+};
 
 /// The line the warm-up gives each voice to find the shortest and longest prompts, as long as a
 /// median line.
@@ -220,6 +223,7 @@ impl VoxCpm {
             decoder_chunks = %format!("1..={}", self.params.decode_chunk_frames),
             generation_seconds = generated.as_secs_f64(),
             graphs_captured = self.graph_counts().captured,
+            kernels_tuned = device::tuned(),
             decoder_seconds = seconds - generated.as_secs_f64(),
             seconds,
             "warmed up"
@@ -382,8 +386,9 @@ struct Batch<'a> {
     on: &'a Generating,
     /// When the last step returned.
     stepped: Instant,
-    /// The graphs of the step captured and destroyed when the warm-up ended, and since, if it has.
-    warmed: Option<GraphCounts>,
+    /// The graphs of the step captured and destroyed, and the kernels autotune tuned, when the
+    /// warm-up ended, and since, if it has.
+    warmed: Option<(GraphCounts, usize)>,
 }
 
 struct Generation {
@@ -398,7 +403,7 @@ impl Batch<'_> {
             Job::Generate(request) => self.add(request),
             Job::WarmUp(runs, done) => {
                 let warmed = self.on.warm_up(&runs);
-                self.warmed = Some(self.on.tts.model().graph_counts());
+                self.warmed = Some((self.on.tts.model().graph_counts(), device::tuned()));
                 let _ = done.send(warmed);
             }
         }
@@ -469,17 +474,25 @@ impl Batch<'_> {
         }
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let report = self.scheduler.last_step();
-        let graphs = self.on.tts.model().graph_counts();
-        if let Some(warmed) = self.warmed.replace(graphs)
-            && warmed != graphs
-        {
-            // Each capture after the warm-up is a pause of a few steps, and a destroyed graph
-            // is what faulted the GPU on Vulkan.
-            warn!(
-                captured = graphs.captured - warmed.captured,
-                destroyed = graphs.destroyed - warmed.destroyed,
-                "graphs of the step captured or destroyed after the warm-up"
-            );
+        let (graphs, tuned) = (self.on.tts.model().graph_counts(), device::tuned());
+        if let Some((warmed, before)) = self.warmed.replace((graphs, tuned)) {
+            if warmed != graphs {
+                // Each capture after the warm-up is a pause of a few steps, and a destroyed graph
+                // is what faulted the GPU on Vulkan.
+                warn!(
+                    captured = graphs.captured - warmed.captured,
+                    destroyed = graphs.destroyed - warmed.destroyed,
+                    "graphs of the step captured or destroyed after the warm-up"
+                );
+            }
+            if tuned != before {
+                // Cubecl logs the key of each just before; every request waits while it times
+                // its candidates.
+                warn!(
+                    kernels = tuned - before,
+                    "kernels autotuned after the warm-up, of shapes it did not run"
+                );
+            }
         }
         self.stepped = Instant::now();
         debug!(

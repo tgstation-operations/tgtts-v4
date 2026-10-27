@@ -37,7 +37,7 @@ tokio = { workspace = true, features = [
 ] }
 toml = { workspace = true, features = ["parse", "std"] }
 tracing.workspace = true
-tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "std", "tracing-log"] }
 vorbis_rs.workspace = true
 voices = { path = "../voices" }
 voxcpm = { path = "../voxcpm" }

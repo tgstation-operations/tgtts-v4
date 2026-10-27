@@ -49,6 +49,7 @@ fn main() -> ExitCode {
     tracing_subscriber::registry()
         .with(level)
         .with(tracing_subscriber::fmt::layer())
+        .with(device::Tunings)
         .init();
     let set_level = move |level: LevelFilter| {
         if let Err(e) = reload.modify(|filter| *filter = level) {

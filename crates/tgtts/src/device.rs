@@ -1,9 +1,53 @@
 //! The device the model runs on, as the configuration names it.
 
-use std::{fmt, path::Path, str::FromStr};
+use std::{
+    fmt,
+    path::Path,
+    str::FromStr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use burn::tensor::{Device, FloatDType};
+use tracing::{
+    Event, Subscriber,
+    field::{Field, Visit},
+};
+use tracing_subscriber::layer::{Context, Layer};
 use voxcpm::Dtypes;
+
+/// The kernels autotune has tuned in this process, as [`Tunings`] counts them.
+static TUNED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many kernels autotune has tuned in this process, as the layer [`Tunings`] has seen
+/// cubecl log them: none where it is not installed or the log level is past `INFO`.
+pub fn tuned() -> usize {
+    TUNED.load(Ordering::Relaxed)
+}
+
+/// Counts the kernels autotune tunes, by the line cubecl logs at `INFO` as it starts on each,
+/// for [`tuned`]: one tuned while requests wait holds them up for as long as it times its
+/// candidates.
+#[derive(Debug, Default)]
+pub struct Tunings;
+
+impl<S: Subscriber> Layer<S> for Tunings {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        struct Message(bool);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                if field.name() == "message" {
+                    let text = format!("{value:?}");
+                    self.0 = text.starts_with("Tuning ") && text.contains("AutotuneKey");
+                }
+            }
+        }
+        let mut message = Message(false);
+        event.record(&mut message);
+        if message.0 {
+            TUNED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// A device the configuration can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +181,21 @@ fn cuda(_: Option<&Path>) -> Result<Device, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_the_kernels_autotune_tunes() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let before = tuned();
+        let subscriber = tracing_subscriber::registry().with(Tunings);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("Tuning MatmulAutotuneKey - Definition: m: 128, n: 2048, k: 1024");
+            tracing::info!("Tuning ConvAutotuneKey {{ kernel_size: [7] }}");
+            tracing::info!("Tuning done");
+            tracing::info!("Load autotune cache ...");
+        });
+        assert_eq!(tuned() - before, 2);
+    }
 
     #[test]
     fn names_devices_and_dtypes() {
