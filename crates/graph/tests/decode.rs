@@ -9,7 +9,7 @@ use std::{fs, time::Instant};
 use burn::tensor::{FloatDType, Int, Tensor, TensorData};
 use graph::{
     checkpoint::Checkpoint,
-    decode::{Decoder, LmConfig, Shape, Tuning},
+    decode::{Decoder, LmConfig, SUBGROUPS, Shape, Tuning},
     kernels::Kernels,
 };
 use half::f16;
@@ -151,8 +151,9 @@ fn oracle(layers: usize, prefill: usize) -> Oracle {
 }
 
 /// The GPU's outputs for the same layers over the embeddings `x`, every position one at a time,
-/// each at its position plus `shift` in the cache.
-fn gpu(layers: usize, x: &[u16], shift: usize) -> Vec<f32> {
+/// each at its position plus `shift` in the cache, with the kernels at `subgroup` (the device's
+/// default when `None`).
+fn gpu(layers: usize, x: &[u16], shift: usize, subgroup: Option<u32>) -> Vec<f32> {
     let json = config();
     let hidden = json["lm_config"]["hidden_size"].as_u64().unwrap() as usize;
     let len = x.len() / hidden;
@@ -161,16 +162,20 @@ fn gpu(layers: usize, x: &[u16], shift: usize) -> Vec<f32> {
     let config: LmConfig = serde_json::from_value(json["lm_config"].clone()).unwrap();
     let shape = Shape::new(&config, layers, (len + shift).next_multiple_of(32)).unwrap();
     let start = Instant::now();
-    let mut decoder = Decoder::new(&ctx, &mut kernels, &shape, &Tuning::default(), false)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let tuning = match subgroup {
+        Some(s) => Tuning::for_subgroup(s),
+        None => Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}")),
+    };
+    let mut decoder =
+        Decoder::new(&ctx, &mut kernels, &shape, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     decoder
         .load(&checkpoint, "base_lm.")
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "{layers} layers recorded and loaded on the GPU: {:.1} s, {} dispatches, {} barriers, \
-         {} pipelines, an arena of {} KiB",
+        "{layers} layers recorded and loaded on the GPU at {tuning:?}: {:.1} s, {} dispatches, \
+         {} barriers, {} pipelines, an arena of {} KiB",
         start.elapsed().as_secs_f64(),
         decoder.graph_step().dispatches(),
         decoder.graph_step().barriers(),
@@ -249,13 +254,20 @@ fn within(margin: [f64; 4]) -> bool {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn one_layer_decodes_as_minicpm4_does_on_the_cpu() {
     let oracle = oracle(1, 70);
-    let got = gpu(1, &oracle.x, 0);
-    let (ours, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
-    assert!(within(margin), "{margin:?}");
-    // One layer is well inside the served tolerance, which was set for eight.
-    assert!(ours.worst <= 1.0, "{ours:?}");
+    // At every subgroup size the device can require: 32, as on NVIDIA, also on the Radeon.
+    let report = context().report().clone();
+    for subgroup in SUBGROUPS
+        .into_iter()
+        .filter(|&s| report.can_require_subgroup_size(s))
+    {
+        let got = gpu(1, &oracle.x, 0, Some(subgroup));
+        let (ours, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
+        assert!(within(margin), "wave{subgroup}: {margin:?}");
+        // One layer is well inside the served tolerance, which was set for eight.
+        assert!(ours.worst <= 1.0, "wave{subgroup}: {ours:?}");
+    }
     // Defect: every position one slot on in the cache, so rotated by the next position's angle.
-    let shifted = gpu(1, &oracle.x, 1);
+    let shifted = gpu(1, &oracle.x, 1, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &shifted, 70);
     assert!(!within(margin), "positions one slot on pass: {margin:?}");
 }
@@ -264,7 +276,7 @@ fn one_layer_decodes_as_minicpm4_does_on_the_cpu() {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn the_base_lm_decodes_as_minicpm4_does_on_the_cpu() {
     let oracle = oracle(28, 70);
-    let got = gpu(28, &oracle.x, 0);
+    let got = gpu(28, &oracle.x, 0, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
     assert!(within(margin), "{margin:?}");
 }

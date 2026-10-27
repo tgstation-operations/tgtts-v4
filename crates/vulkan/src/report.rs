@@ -17,6 +17,7 @@ use ash::vk;
 use crate::{
     error::{Result, VkCall},
     instance::Instance,
+    kernel::required_subgroup_size_allowed,
     select::{Candidate, Features, QueueFamily, REQUIRED_EXTENSIONS, version_string},
 };
 
@@ -393,6 +394,16 @@ impl DeviceReport {
             extensions,
         };
         Ok(report)
+    }
+
+    /// Whether a compute pipeline may require subgroups of `size` invocations.
+    pub fn can_require_subgroup_size(&self, size: u32) -> bool {
+        required_subgroup_size_allowed(
+            size,
+            self.features.subgroup_size_control,
+            (self.min_subgroup_size, self.max_subgroup_size),
+            self.required_subgroup_size_stages,
+        )
     }
 
     /// The device as device selection sees it.

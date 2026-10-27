@@ -11,6 +11,8 @@ use vulkan::{
 
 const AXPB: &[u8] = include_bytes!("kernels/axpb.spv");
 const WIDTH: u32 = 64;
+/// The size every device the kernels run on can require.
+const SUBGROUP: u32 = 32;
 
 /// The chain's (a, b): each link computes `a * x + b` of the one before.
 const LINKS: [(f32, f32); 3] = [(1.7, -0.3), (-0.6, 0.25), (1.1, 2.0)];
@@ -40,7 +42,7 @@ fn axpb(ctx: &Context, a: f32, b: f32) -> Arc<Kernel> {
     ];
     let desc = KernelDesc {
         storage_buffers: 3,
-        subgroup_size: Some(64),
+        subgroup_size: Some(SUBGROUP),
         full_subgroups: true,
         constants: &constants,
         ..KernelDesc::default()
@@ -163,7 +165,7 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
                 .read::<u32>()
                 .unwrap()
                 .iter()
-                .all(|&s| s == 64)
+                .all(|&s| s == SUBGROUP)
         );
     }
     eprintln!(

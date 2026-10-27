@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use half::f16;
 use vulkan::{Buffer, Context, Kernel, KernelDesc, Residence, SpecValue};
 
+/// stream_read's workgroup width.
 const WORKGROUP: u32 = 256;
 
 fn context() -> Context {
@@ -53,6 +54,30 @@ fn kernel(
     };
     ctx.kernel(&spirv, &desc)
         .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The subgroup sizes the kernels are written for, 32 and 64, that the device can require.
+fn subgroup_sizes(ctx: &Context) -> Vec<u32> {
+    [32, 64]
+        .into_iter()
+        .filter(|&s| ctx.report().can_require_subgroup_size(s))
+        .collect()
+}
+
+/// Each case at each (subgroup size, workgroup width) the device can run: one subgroup to a
+/// workgroup, as the decode step runs on the Radeon, and several.
+fn cut<T: Copy>(ctx: &Context, cases: &[T]) -> Vec<(T, (usize, u32))> {
+    let shapes = [(32, 32), (32, 128), (32, 256), (64, 64), (64, 256)];
+    let sizes = subgroup_sizes(ctx);
+    cases
+        .iter()
+        .flat_map(|&case| {
+            shapes
+                .into_iter()
+                .filter(|&(s, _)| sizes.contains(&(s as u32)))
+                .map(move |shape| (case, shape))
+        })
+        .collect()
 }
 
 fn u(v: usize) -> SpecValue {
@@ -174,7 +199,7 @@ fn timed(ctx: &Context, kernel: &Kernel, buffers: &mut [&mut Buffer], groups: [u
 #[test]
 fn rmsnorm_rounds_as_upstream_in_f16() {
     let ctx = context();
-    for (k, subgroup) in [(256, 64), (2048, 64), (2048, 32)] {
+    for (k, (subgroup, workgroup)) in cut(&ctx, &[256, 2048]) {
         let x = halves(&uniform(k, 3, 2.0));
         let g = halves(
             &uniform(k, 5, 1.0)
@@ -185,7 +210,7 @@ fn rmsnorm_rounds_as_upstream_in_f16() {
         let eps = 1e-5;
         let constants = [
             (0, u(subgroup)),
-            (1, SpecValue::U32(WORKGROUP)),
+            (1, SpecValue::U32(workgroup)),
             (2, u(k)),
             (3, SpecValue::F32(eps as f32)),
         ];
@@ -199,14 +224,14 @@ fn rmsnorm_rounds_as_upstream_in_f16() {
         // the next f16.
         let bound = |i: usize| ulp16(want[i]);
         let bad = past(&got, &want, bound);
-        assert!(bad.is_empty(), "K {k}, wave{subgroup}: {bad:?}");
+        assert!(bad.is_empty(), "K {k}, wave{subgroup}/{workgroup}: {bad:?}");
         let exact = got.iter().zip(&want).filter(|(g, w)| g == w).count();
         // Defect: the gain left out.
         let ungained = rmsnorm(&x, &vec![f16::ONE; k], eps);
         assert!(past(&got, &ungained, bound).len() > k / 2);
         eprintln!(
-            "rmsnorm K {k} wave{subgroup}: {exact} of {k} bit-exact, worst at {:.2} of its bound; \
-             {:.1} us",
+            "rmsnorm K {k} wave{subgroup}/{workgroup}: {exact} of {k} bit-exact, worst at {:.2} of \
+             its bound; {:.1} us",
             worst(&got, &want, bound),
             ns / 1e3
         );
@@ -245,18 +270,18 @@ fn gemv_case(n: usize, k: usize, seed: u32) -> GemvCase {
 #[test]
 fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
     let ctx = context();
-    for (n, k, subgroup, rows) in [
-        (64, 512, 64, 2),
-        (2048, 2048, 64, 2),
-        (2048, 2048, 32, 2),
-        (2048, 6144, 64, 2),
-        (2048, 6144, 64, 4),
-        (2048, 6144, 32, 4),
-    ] {
+    let cases = [
+        (64, 512, 2),
+        (2048, 2048, 1),
+        (2048, 2048, 2),
+        (2048, 6144, 2),
+        (2048, 6144, 4),
+    ];
+    for ((n, k, rows), (subgroup, workgroup)) in cut(&ctx, &cases) {
         let case = gemv_case(n, k, 11);
         let constants = [
             (0, u(subgroup)),
-            (1, SpecValue::U32(WORKGROUP)),
+            (1, SpecValue::U32(workgroup)),
             (2, u(k)),
             (3, u(rows)),
         ];
@@ -265,7 +290,7 @@ fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
         let mut wb = buffer_of(&ctx, &case.w);
         let mut rb = buffer_of(&ctx, &case.residual);
         let mut out = ctx.buffer_in(2 * n as u64, Residence::Readback).unwrap();
-        let groups = (n / (WORKGROUP as usize / subgroup * rows)) as u32;
+        let groups = (n / (workgroup as usize / subgroup * rows)) as u32;
         let mut ns = Vec::new();
         for _ in 0..4 {
             let buffers = &mut [&mut xb, &mut wb, &mut rb, &mut out];
@@ -284,7 +309,7 @@ fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
         let bad = past(&got, &want, bound);
         assert!(
             bad.is_empty(),
-            "{n}x{k} wave{subgroup} rows {rows}: {bad:?}"
+            "{n}x{k} wave{subgroup}/{workgroup} rows {rows}: {bad:?}"
         );
         assert!(got[case.subnormal] != 0.0);
         // Defect: subnormal weights flushed to zero.
@@ -296,8 +321,8 @@ fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
         let bytes = (n * k * 2) as f64;
         let best = ns[1..].iter().copied().fold(f64::INFINITY, f64::min);
         eprintln!(
-            "gemv_residual {n}x{k} wave{subgroup} rows {rows}: worst at {:.2} of its bound; best \
-             of 3 {:.1} us, {:.0} GB/s of weights",
+            "gemv_residual {n}x{k} wave{subgroup}/{workgroup} rows {rows}: worst at {:.2} of its \
+             bound; best of 3 {:.1} us, {:.0} GB/s of weights",
             worst(&got, &want, bound),
             best / 1e3,
             bytes / best
@@ -321,12 +346,8 @@ fn normed_dot_bound(k: usize, magnitude: f64, row: &[f16], normed: &[f64]) -> f6
 #[test]
 fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
     let ctx = context();
-    for (k, inner, subgroup, pairs) in [
-        (512, 256, 64, 1),
-        (2048, 6144, 64, 1),
-        (2048, 6144, 32, 1),
-        (2048, 6144, 64, 2),
-    ] {
+    let cases = [(512, 256, 1), (2048, 6144, 1), (2048, 6144, 2)];
+    for ((k, inner, pairs), (subgroup, workgroup)) in cut(&ctx, &cases) {
         let case = gemv_case(2 * inner, k, 23);
         let g = halves(
             &uniform(k, 29, 0.5)
@@ -337,7 +358,7 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
         let eps = 1e-5;
         let constants = [
             (0, u(subgroup)),
-            (1, SpecValue::U32(WORKGROUP)),
+            (1, SpecValue::U32(workgroup)),
             (2, u(k)),
             (3, u(inner)),
             (4, SpecValue::F32(eps as f32)),
@@ -350,7 +371,7 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
         let mut out = ctx
             .buffer_in(2 * inner as u64, Residence::Readback)
             .unwrap();
-        let groups = (inner / (WORKGROUP as usize / subgroup * pairs)) as u32;
+        let groups = (inner / (workgroup as usize / subgroup * pairs)) as u32;
         let mut ns = Vec::new();
         for _ in 0..4 {
             let buffers = &mut [&mut xb, &mut gb, &mut wb, &mut out];
@@ -374,7 +395,7 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
         let bad = past(&got, &want, bound);
         assert!(
             bad.is_empty(),
-            "{inner}x{k} wave{subgroup} pairs {pairs}: {bad:?}"
+            "{inner}x{k} wave{subgroup}/{workgroup} pairs {pairs}: {bad:?}"
         );
         // Defect: gate and up swapped.
         let swapped: Vec<f64> = (0..inner)
@@ -384,8 +405,8 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
         let bytes = (2 * inner * k * 2) as f64;
         let best = ns[1..].iter().copied().fold(f64::INFINITY, f64::min);
         eprintln!(
-            "gemv_gate_up {inner}x{k} wave{subgroup} pairs {pairs}: worst at {:.2} of its bound; \
-             best of 3 {:.1} us, {:.0} GB/s of weights",
+            "gemv_gate_up {inner}x{k} wave{subgroup}/{workgroup} pairs {pairs}: worst at {:.2} of \
+             its bound; best of 3 {:.1} us, {:.0} GB/s of weights",
             worst(&got, &want, bound),
             best / 1e3,
             bytes / best
@@ -431,10 +452,11 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
     let normed = rmsnorm(&case.x, &g, eps);
     let sums = dots(&case.w, &normed, k, 0..rows);
     let sentinel = f16::from_f64(-7.0);
-    for (subgroup, pairs, position) in [(64, 1, 0), (64, 1, 37), (32, 1, 63), (64, 2, 5)] {
+    let cases = [(1, 0), (1, 37), (1, 63), (2, 5)];
+    for ((pairs, position), (subgroup, workgroup)) in cut(&ctx, &cases) {
         let constants = [
             (0, u(subgroup)),
-            (1, SpecValue::U32(WORKGROUP)),
+            (1, SpecValue::U32(workgroup)),
             (2, u(k)),
             (3, u(heads)),
             (4, u(kv_heads)),
@@ -458,7 +480,7 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
             .unwrap();
         let cache = vec![sentinel; kv_heads * capacity * dim];
         let (mut kb, mut vb) = (buffer_of(&ctx, &cache), buffer_of(&ctx, &cache));
-        let groups = (rows / 2 / (WORKGROUP as usize / subgroup * pairs)) as u32;
+        let groups = (rows / 2 / (workgroup as usize / subgroup * pairs)) as u32;
         let buffers = &mut [
             &mut xb, &mut gb, &mut wb, &mut cb, &mut sb, &mut pb, &mut qb, &mut kb, &mut vb,
         ];
@@ -508,7 +530,7 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
         let bad = past(&got, &want, bound);
         assert!(
             bad.is_empty(),
-            "wave{subgroup} pairs {pairs} at {position}: {bad:?}"
+            "wave{subgroup}/{workgroup} pairs {pairs} at {position}: {bad:?}"
         );
         let untouched = |cache: &[f64]| {
             cache
@@ -527,8 +549,8 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
         let want_other: Vec<f64> = other.iter().map(|r| r.1).collect();
         assert!(past(&got, &want_other, bound).len() > got.len() / 50);
         eprintln!(
-            "gemv_qkv_rope wave{subgroup} pairs {pairs} at {position}: worst at {:.2} of its \
-             bound; {:.1} us",
+            "gemv_qkv_rope wave{subgroup}/{workgroup} pairs {pairs} at {position}: worst at {:.2} \
+             of its bound; {:.1} us",
             worst(&got, &want, bound),
             ns / 1e3
         );
@@ -581,7 +603,7 @@ fn split_attention_joined_matches_softmax_attention_up_to_the_position() {
     let q = halves(&uniform(heads * dim, 41, 2.0));
     let kc = halves(&uniform(kv_heads * capacity * dim, 43, 2.0));
     let vc = halves(&uniform(kv_heads * capacity * dim, 47, 1.0));
-    for subgroup in [64, 32] {
+    for subgroup in subgroup_sizes(&ctx) {
         let split = kernel(
             &ctx,
             "attention_split",
@@ -691,7 +713,10 @@ fn streaming_reads_reach_the_bandwidth_the_kernels_are_held_to() {
     let mut data = ctx.buffer_in(bytes as u64, Residence::Device).unwrap();
     data.write(&pattern).unwrap();
     drop(pattern);
-    for (subgroup, loads) in [(64, 1), (64, 4), (64, 16), (32, 4)] {
+    let shapes = subgroup_sizes(&ctx)
+        .into_iter()
+        .flat_map(|s| [1, 4, 16].map(|loads| (s, loads)));
+    for (subgroup, loads) in shapes {
         let k = kernel(
             &ctx,
             "stream_read",

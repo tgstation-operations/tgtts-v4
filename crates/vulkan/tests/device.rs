@@ -8,7 +8,6 @@ use std::time::Instant;
 use ash::vk;
 use vulkan::{
     Context, Error, KernelDesc, Residence, SpecValue, groups_for,
-    kernel::required_subgroup_size_allowed,
     memory::{STAGING_BYTES, choose_memory_type},
 };
 
@@ -36,6 +35,14 @@ fn assert_no_validation_messages(ctx: &Context) {
         "the validation layer reported:\n{}",
         messages.join("\n")
     );
+}
+
+/// The subgroup sizes the kernels are written for, 32 and 64, that the device can require.
+fn subgroup_sizes(ctx: &Context) -> Vec<u32> {
+    [32, 64]
+        .into_iter()
+        .filter(|&s| ctx.report().can_require_subgroup_size(s))
+        .collect()
 }
 
 /// `n` floats with full mantissas, both signs, over a few binades, from a fixed xorshift
@@ -143,18 +150,24 @@ fn the_device_offers_what_the_runtime_relies_on() {
         "no 16x16x16 f16 x f16 + f16 cooperative matrix at subgroup scope"
     );
 
-    for size in [32, 64] {
-        assert!(
-            required_subgroup_size_allowed(
-                size,
-                r.features.subgroup_size_control,
-                (r.min_subgroup_size, r.max_subgroup_size),
-                r.required_subgroup_size_stages,
-            ),
-            "a compute pipeline cannot require a subgroup size of {size}"
-        );
-    }
+    // Every kernel runs at 32, NVIDIA's only size; RADV can also require 64.
+    eprintln!(
+        "subgroups of {} to {}, required sizes {:?}",
+        r.min_subgroup_size,
+        r.max_subgroup_size,
+        subgroup_sizes(&ctx)
+    );
+    assert!(
+        r.can_require_subgroup_size(32),
+        "a compute pipeline cannot require a subgroup size of 32"
+    );
     assert!(r.timestamp_period > 0.0);
+    // What kernels/glsl/common.glsl declares of every kernel.
+    assert!(
+        r.float_controls.rounding_rte_f16 && r.float_controls.denorm_preserve_f16,
+        "f16 rounding to nearest even and f16 subnormals kept: {:?}",
+        r.float_controls
+    );
 
     // Each residence's buffers in the memory its preference names, wherever the device
     // offers it; where it does not, the fallbacks still give the GPU device-local memory and
@@ -165,7 +178,8 @@ fn the_device_offers_what_the_runtime_relies_on() {
         let preferred =
             choose_memory_type(&r.types, &r.heaps, u32::MAX, 1 << 20, residence).unwrap();
         eprintln!(
-            "{residence:?} buffers: memory type {} ({flags:?}); the device's preferred is {preferred}",
+            "{residence:?} buffers: memory type {} ({flags:?}); the device's preferred is \
+             {preferred}",
             buffer.memory_type()
         );
         let needs = if residence.mapped() {
@@ -185,7 +199,7 @@ fn axpb_matches_the_cpu_bit_for_bit_at_each_required_subgroup_size() {
     // Not a multiple of the workgroup, so the last workgroup has spare invocations.
     let x = inputs(100_003);
     let want: Vec<f32> = x.iter().map(|&v| a * v + b).collect();
-    for size in [32, 64] {
+    for size in subgroup_sizes(&ctx) {
         let run = run_axpb(&ctx, &x, 64, Some(size), a, b);
         let wrong: Vec<usize> = (0..x.len())
             .filter(|&i| run.y[i].to_bits() != want[i].to_bits())
@@ -298,13 +312,19 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
 }
 
 #[test]
-fn left_to_the_driver_the_wave_is_64_except_for_workgroups_of_32_or_fewer() {
+fn left_to_the_driver_the_subgroup_size_follows_its_rule() {
     // RADV's rule for a SPIR-V 1.6 module with no required size: wave32 for a workgroup
-    // of at most 32 invocations, its default (wave64) otherwise. If this fails, the
-    // driver's rule changed.
+    // of at most 32 invocations, its default (wave64) otherwise. A device of one size, as
+    // NVIDIA's are of 32, runs every pipeline at it. If this fails, the driver's rule changed.
     let ctx = context();
+    let r = ctx.report();
     let x = inputs(4_096);
-    for (width, expected) in [(16, 32), (32, 32), (64, 64), (128, 64), (256, 64)] {
+    for width in [16, 32, 64, 128, 256] {
+        let expected = if r.min_subgroup_size == r.max_subgroup_size || width > 32 {
+            r.subgroup_size
+        } else {
+            32
+        };
         let run = run_axpb(&ctx, &x, width, None, 1.0, 0.0);
         let seen: std::collections::BTreeSet<_> = run.s.iter().copied().collect();
         eprintln!("workgroup {width}: subgroup sizes {seen:?}");
@@ -339,7 +359,7 @@ fn timestamps_grow_with_the_work_and_never_exceed_the_wall_clock() {
     for n in [1 << 20, 1 << 24] {
         let x = inputs(n);
         let start = Instant::now();
-        let run = run_axpb(&ctx, &x, 64, Some(64), 1.0, 0.0);
+        let run = run_axpb(&ctx, &x, 64, Some(32), 1.0, 0.0);
         let wall = start.elapsed().as_nanos() as f64;
         assert!(run.nanoseconds > 0.0, "a zero interval for {n} elements");
         assert!(
@@ -363,14 +383,23 @@ fn timestamps_grow_with_the_work_and_never_exceed_the_wall_clock() {
 #[test]
 fn the_driver_reports_what_it_compiled_each_pipeline_into() {
     // A probe of a different kind from the kernel's own report of its subgroup size: the
-    // driver's account of the compiled executable must agree with it at each width.
+    // driver's account of the compiled executable must agree with it at each width. RADV's
+    // statistics and final assembly are checked by name; another driver's are printed.
     let ctx = context();
-    assert!(
-        ctx.captures_executables(),
-        "the device does not offer VK_KHR_pipeline_executable_properties"
-    );
+    let radv = ctx.report().driver_name == "radv";
+    if !ctx.captures_executables() {
+        assert!(
+            !radv,
+            "the device does not offer VK_KHR_pipeline_executable_properties"
+        );
+        eprintln!(
+            "{}: no VK_KHR_pipeline_executable_properties",
+            ctx.report().driver_name
+        );
+        return;
+    }
     let x = inputs(4_096);
-    for size in [32, 64] {
+    for size in subgroup_sizes(&ctx) {
         let constants = [
             (WIDTH, SpecValue::U32(64)),
             (A, SpecValue::F32(1.0)),
@@ -396,23 +425,35 @@ fn the_driver_reports_what_it_compiled_each_pipeline_into() {
             "wave{size}: the driver reports {}",
             e.subgroup_size
         );
-        let vgprs = e.statistic("VGPRs").map(|v| v.as_f64());
-        assert!(
-            vgprs.is_some_and(|v| v > 0.0),
-            "no VGPR count: {:?}",
-            e.statistics
-        );
-        assert!(
-            e.text().contains("s_endpgm"),
-            "no final assembly among {:?}",
-            e.representations
-                .iter()
-                .map(|r| &r.name)
-                .collect::<Vec<_>>()
-        );
+        if radv {
+            let vgprs = e.statistic("VGPRs").map(|v| v.as_f64());
+            assert!(
+                vgprs.is_some_and(|v| v > 0.0),
+                "no VGPR count: {:?}",
+                e.statistics
+            );
+            assert!(
+                e.text().contains("s_endpgm"),
+                "no final assembly among {:?}",
+                e.representations
+                    .iter()
+                    .map(|r| &r.name)
+                    .collect::<Vec<_>>()
+            );
+        }
         let run = run_axpb(&ctx, &x, 64, Some(size), 1.0, 0.0);
         assert!(run.s.iter().all(|&s| s == size), "wave{size}");
-        eprintln!("wave{size}: the driver and the kernel agree; {vgprs:?} VGPRs");
+        let statistics: Vec<String> = e
+            .statistics
+            .iter()
+            .map(|s| format!("{} {}", s.name, s.value.as_f64()))
+            .collect();
+        let representations: Vec<&str> =
+            e.representations.iter().map(|r| r.name.as_str()).collect();
+        eprintln!(
+            "wave{size}: the driver and the kernel agree; statistics {statistics:?}; \
+             representations {representations:?}"
+        );
     }
     assert_no_validation_messages(&ctx);
 }

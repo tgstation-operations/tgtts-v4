@@ -249,6 +249,30 @@ mod tests {
     }
 
     #[test]
+    fn a_discrete_gpu_beside_an_apu_is_chosen_with_its_compute_only_queue() {
+        // Queue families in the order NVIDIA's driver lists them: graphics, transfer only,
+        // compute, video decode.
+        let mut nvidia = gpu(
+            "NVIDIA GeForce RTX 4070 Ti SUPER",
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+        );
+        let both = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER;
+        nvidia.queue_families = vec![
+            family(both, 64),
+            family(vk::QueueFlags::TRANSFER, 64),
+            family(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER, 64),
+            family(vk::QueueFlags::VIDEO_DECODE_KHR, 64),
+        ];
+        let devices = [
+            gpu("radv", vk::PhysicalDeviceType::INTEGRATED_GPU),
+            nvidia.clone(),
+            gpu("llvmpipe", vk::PhysicalDeviceType::CPU),
+        ];
+        assert_eq!(choose(&devices), Ok(1));
+        assert_eq!(compute_queue_family(&nvidia.queue_families), Some(2));
+    }
+
+    #[test]
     fn every_reason_a_device_is_passed_over_is_reported() {
         let mut old = gpu("old", vk::PhysicalDeviceType::INTEGRATED_GPU);
         old.api_version = vk::make_api_version(0, 1, 2, 198);

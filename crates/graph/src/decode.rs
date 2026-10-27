@@ -6,7 +6,7 @@
 //! submitted at every position, which is read from a buffer the host writes before each.
 
 use serde::Deserialize;
-use vulkan::{Context, SpecValue, Timing};
+use vulkan::{Context, DeviceReport, SpecValue, Timing};
 
 use crate::{
     Error,
@@ -167,20 +167,46 @@ pub struct Tuning {
     pub residual_rows: u32,
 }
 
-/// The fastest measured on the Radeon 8060S: one row, or one pair of rows, to a subgroup of 64
-/// and one subgroup to a workgroup, which reached 220 GB/s over four layers' weights where a
-/// streaming read reaches 240. Larger workgroups and more rows to a subgroup were slower.
-impl Default for Tuning {
-    fn default() -> Self {
+impl Tuning {
+    /// One row, or one pair of rows, to a subgroup, at `subgroup`.
+    ///
+    /// At 64, one subgroup to a workgroup: the fastest measured on the Radeon 8060S, which
+    /// reached 220 GB/s over four layers' weights where a streaming read reaches 240; larger
+    /// workgroups and more rows to a subgroup were slower. At 32, four subgroups to a workgroup,
+    /// unmeasured: an NVIDIA multiprocessor of compute capability 8.9 holds at most 24
+    /// workgroups and 48 subgroups, so one subgroup to a workgroup would leave half of it idle.
+    pub fn for_subgroup(subgroup: u32) -> Self {
         Tuning {
-            subgroup: 64,
-            workgroup: 64,
+            subgroup,
+            workgroup: if subgroup >= 64 {
+                subgroup
+            } else {
+                4 * subgroup
+            },
             qkv_pairs: 1,
             gate_up_pairs: 1,
             residual_rows: 1,
         }
     }
+
+    /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for,
+    /// 64 or 32, that the device can require.
+    pub fn for_device(report: &DeviceReport) -> Result<Self, Error> {
+        SUBGROUPS
+            .into_iter()
+            .find(|&s| report.can_require_subgroup_size(s))
+            .map(Self::for_subgroup)
+            .ok_or_else(|| {
+                Error::Shape(format!(
+                    "{} requires subgroups of {} to {}, none of {SUBGROUPS:?}",
+                    report.name, report.min_subgroup_size, report.max_subgroup_size
+                ))
+            })
+    }
 }
+
+/// The subgroup sizes the kernels are written for, widest first: a multiple of [`CHUNK`].
+pub const SUBGROUPS: [u32; 2] = [64, 32];
 
 /// One layer's tensors.
 #[derive(Clone, Debug)]
@@ -579,7 +605,7 @@ mod tests {
     #[test]
     fn a_layer_is_six_dispatches_each_after_a_barrier() {
         let s = shape(28);
-        let g = decode_graph(&s, &Tuning::default()).unwrap();
+        let g = decode_graph(&s, &Tuning::for_subgroup(64)).unwrap();
         assert_eq!(g.graph.ops.len(), 6 * 28 + 1);
         let plan = crate::graph::plan(&g.graph);
         let barriers = crate::graph::barriers(&g.graph, &plan);
@@ -595,8 +621,40 @@ mod tests {
     }
 
     #[test]
+    fn every_gemv_covers_its_rows_once_at_either_subgroup_size() {
+        let s = shape(28);
+        for subgroup in SUBGROUPS {
+            let tuning = Tuning {
+                qkv_pairs: 2,
+                residual_rows: 4,
+                ..Tuning::for_subgroup(subgroup)
+            };
+            let g = decode_graph(&s, &tuning).unwrap();
+            let per_group = (tuning.workgroup / subgroup) as usize;
+            for op in &g.graph.ops {
+                if op.pipeline.subgroup_size.is_some() {
+                    assert_eq!(op.pipeline.subgroup_size, Some(subgroup), "{}", op.label);
+                }
+                let groups = op.groups[0] as usize * per_group;
+                let rows = match op.label.as_str() {
+                    "qkv_rope" => groups * 2 * tuning.qkv_pairs as usize,
+                    "gate_up" => groups * tuning.gate_up_pairs as usize,
+                    "o_proj" | "down_proj" => groups * tuning.residual_rows as usize,
+                    _ => continue,
+                };
+                let want = match op.label.as_str() {
+                    "qkv_rope" => (s.heads + 2 * s.kv_heads) * s.head_dim,
+                    "gate_up" => s.inner,
+                    _ => s.hidden,
+                };
+                assert_eq!(rows, want, "{} at {subgroup}", op.label);
+            }
+        }
+    }
+
+    #[test]
     fn shapes_the_kernels_cannot_cover_exactly_are_refused() {
-        let tuning = Tuning::default();
+        let tuning = Tuning::for_subgroup(64);
         let mut s = shape(1);
         s.capacity = 1000;
         assert!(matches!(decode_graph(&s, &tuning), Err(Error::Shape(_))));

@@ -67,6 +67,12 @@ pub static GEMV_GATE_UP: KernelInfo = KernelInfo {
     access: &[Read, Read, Read, Write],
 };
 
+/// `stream_read.comp`: data -> one word per subgroup.
+pub static STREAM_READ: KernelInfo = KernelInfo {
+    name: "stream_read",
+    access: &[Read, Write],
+};
+
 type Key = (&'static str, Vec<(u32, u32)>, Option<u32>);
 
 /// The pipelines built so far, each once.

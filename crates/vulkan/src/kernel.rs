@@ -132,12 +132,7 @@ impl Kernel {
     pub(crate) fn new(ctx: &Arc<Inner>, spirv: &[u8], desc: &KernelDesc<'_>) -> Result<Self> {
         let report = &ctx.report;
         if let Some(size) = desc.subgroup_size
-            && !required_subgroup_size_allowed(
-                size,
-                report.features.subgroup_size_control,
-                (report.min_subgroup_size, report.max_subgroup_size),
-                report.required_subgroup_size_stages,
-            )
+            && !report.can_require_subgroup_size(size)
         {
             return Err(Error::Unsupported(format!(
                 "a required subgroup size of {size} (the device allows {} to {} in {:?})",
