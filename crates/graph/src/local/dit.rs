@@ -20,7 +20,8 @@
 use vulkan::{Context, SpecValue, Timing};
 
 use super::{
-    CFM_NOISE, CLUSTER, DIT_EULER, LOCAL_EMBED, PatchConfig, Stack, Tuning, groups, write_weight,
+    CFM_NOISE, CLUSTER, DIT_EULER, LOCAL_EMBED, PatchConfig, Stack, Tuning, groups, identity,
+    write_weight,
 };
 use crate::{
     Error,
@@ -268,44 +269,10 @@ impl Sampler {
     }
 
     /// Writes the weights of VoxCPM2's local DiT from `checkpoint`, converted to f16, and each
-    /// step's time token, computed from them.
+    /// step's time token, computed from them, as [`load_sampler`] does.
     pub fn load(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let t = &self.tensors;
-        let g = &t.graph;
-        let prefix = "feat_decoder.estimator.";
-        let step = &mut self.step;
-        t.stack
-            .load(step, g, checkpoint, &format!("{prefix}decoder."))?;
-        for (name, (weight, bias)) in [
-            ("in_proj", t.in_proj),
-            ("cond_proj", t.cond_proj),
-            ("out_proj", t.out_proj),
-        ] {
-            write_weight(
-                step,
-                g,
-                checkpoint,
-                weight,
-                &[format!("{prefix}{name}.weight")],
-            )?;
-            write_weight(step, g, checkpoint, bias, &[format!("{prefix}{name}.bias")])?;
-        }
-        let hidden = t.stack.shape.hidden;
-        let mlp = |name: &str| TimeMlp::read(checkpoint, &format!("{prefix}{name}"), hidden);
-        let (time, delta) = (mlp("time_mlp")?, mlp("delta_time_mlp")?);
-        // The step length is the DiT's input only in mean mode, which the graph refuses: the
-        // delta time MLP sees zero at every step.
-        let constant = delta.forward(&time_embedding(0.0, hidden));
-        for (&token, &(at, _)) in t.times.iter().zip(&t.steps) {
-            let values: Vec<u16> = time
-                .forward(&time_embedding(at, hidden))
-                .iter()
-                .zip(&constant)
-                .map(|(a, b)| half::f16::from_f64(a + b).to_bits())
-                .collect();
-            step.write(token, &values)?;
-        }
-        Ok(())
+        load_sampler(&mut self.step, &t.graph, t, &identity(&t.graph), checkpoint)
     }
 
     /// Samples a patch from `noise`, given the conditions `mu` and the patch before, `cond`,
@@ -341,6 +308,49 @@ impl Sampler {
     pub fn graph_step(&self) -> &Step {
         &self.step
     }
+}
+
+/// Writes the weights of VoxCPM2's local DiT from `checkpoint`, converted to f16, and each
+/// step's time token, computed from them, into `step`, a recording of `graph`, where `ids` puts
+/// each of `sampler`'s tensors: as [`splice`](crate::lm_side::splice) gives them when the
+/// sampler's graph is part of `graph`.
+pub fn load_sampler(
+    step: &mut Step,
+    graph: &Graph,
+    sampler: &SamplerGraph,
+    ids: &[TensorId],
+    checkpoint: &Checkpoint,
+) -> Result<(), Error> {
+    let t = sampler;
+    let at = |t: TensorId| ids[t.0];
+    let prefix = "feat_decoder.estimator.";
+    t.stack
+        .load(step, graph, ids, checkpoint, &format!("{prefix}decoder."))?;
+    for (name, (weight, bias)) in [
+        ("in_proj", t.in_proj),
+        ("cond_proj", t.cond_proj),
+        ("out_proj", t.out_proj),
+    ] {
+        let name = |part: &str| vec![format!("{prefix}{name}.{part}")];
+        write_weight(step, graph, checkpoint, at(weight), &name("weight"))?;
+        write_weight(step, graph, checkpoint, at(bias), &name("bias"))?;
+    }
+    let hidden = t.stack.shape.hidden;
+    let mlp = |name: &str| TimeMlp::read(checkpoint, &format!("{prefix}{name}"), hidden);
+    let (time, delta) = (mlp("time_mlp")?, mlp("delta_time_mlp")?);
+    // The step length is the DiT's input only in mean mode, which the graph refuses: the delta
+    // time MLP sees zero at every step.
+    let constant = delta.forward(&time_embedding(0.0, hidden));
+    for (&token, &(time_at, _)) in t.times.iter().zip(&t.steps) {
+        let values: Vec<u16> = time
+            .forward(&time_embedding(time_at, hidden))
+            .iter()
+            .zip(&constant)
+            .map(|(a, b)| half::f16::from_f64(a + b).to_bits())
+            .collect();
+        step.write(at(token), &values)?;
+    }
+    Ok(())
 }
 
 /// Upstream's `SinusoidalPosEmb` at scale 1000, in f32 and in the order voxcpm's operations

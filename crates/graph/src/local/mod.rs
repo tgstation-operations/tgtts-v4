@@ -229,6 +229,11 @@ fn slots(
     ))
 }
 
+/// Each of `graph`'s tensors where it is: the map for a graph that is not part of another.
+pub(crate) fn identity(graph: &Graph) -> Vec<TensorId> {
+    (0..graph.tensors.len()).map(TensorId).collect()
+}
+
 fn check(ok: bool, why: impl FnOnce() -> String) -> Result<(), Error> {
     if ok { Ok(()) } else { Err(Error::Shape(why())) }
 }
@@ -548,39 +553,42 @@ impl Stack {
         }
     }
 
-    /// Writes the rotation tables into `step`, recorded from `graph`, and the weights of the
-    /// stack whose tensors are named after `prefix` in `checkpoint`, as upstream's state_dict
-    /// names them, converted to f16.
+    /// Writes the rotation tables, and the weights of the stack whose tensors are named after
+    /// `prefix` in `checkpoint`, as upstream's state_dict names them, converted to f16, into
+    /// `step`, a recording of `graph`, where `ids` puts each tensor of the graph the stack was
+    /// added to.
     pub fn load(
         &self,
         step: &mut Step,
         graph: &Graph,
+        ids: &[TensorId],
         checkpoint: &Checkpoint,
         prefix: &str,
     ) -> Result<(), Error> {
+        let at = |t: TensorId| ids[t.0];
         let (cos, sin) = self.shape.rope_tables();
-        step.write(self.cos, &cos)?;
-        step.write(self.sin, &sin)?;
+        step.write(at(self.cos), &cos)?;
+        step.write(at(self.sin), &sin)?;
         for (l, t) in self.layers.iter().enumerate() {
             let n = |what: &str| format!("{prefix}layers.{l}.{what}.weight");
             let [q, k, v] = ["q_proj", "k_proj", "v_proj"].map(|p| n(&format!("self_attn.{p}")));
-            write_weight(step, graph, checkpoint, t.qkv, &[q, k, v])?;
-            write_weight(step, graph, checkpoint, t.o, &[n("self_attn.o_proj")])?;
+            write_weight(step, graph, checkpoint, at(t.qkv), &[q, k, v])?;
+            write_weight(step, graph, checkpoint, at(t.o), &[n("self_attn.o_proj")])?;
             let [gate, up] = ["gate_proj", "up_proj"].map(|p| n(&format!("mlp.{p}")));
-            write_weight(step, graph, checkpoint, t.gate_up, &[gate, up])?;
-            write_weight(step, graph, checkpoint, t.down, &[n("mlp.down_proj")])?;
+            write_weight(step, graph, checkpoint, at(t.gate_up), &[gate, up])?;
+            write_weight(step, graph, checkpoint, at(t.down), &[n("mlp.down_proj")])?;
             write_weight(
                 step,
                 graph,
                 checkpoint,
-                t.input_norm,
+                at(t.input_norm),
                 &[n("input_layernorm")],
             )?;
             write_weight(
                 step,
                 graph,
                 checkpoint,
-                t.post_norm,
+                at(t.post_norm),
                 &[n("post_attention_layernorm")],
             )?;
         }
@@ -588,7 +596,7 @@ impl Stack {
             step,
             graph,
             checkpoint,
-            self.norm,
+            at(self.norm),
             &[format!("{prefix}norm.weight")],
         )
     }

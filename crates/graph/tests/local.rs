@@ -10,8 +10,15 @@ use std::{fs, time::Instant};
 use burn::tensor::{FloatDType, Tensor, TensorData};
 use graph::{
     checkpoint::Checkpoint,
+    graph::{Graph, Kind, TensorId},
     kernels::Kernels,
-    local::{PatchConfig, Tuning, dit::Sampler, encoder::Encoder},
+    lm_side::splice,
+    local::{
+        PatchConfig, Tuning,
+        dit::{Sampler, load_sampler, sampler_graph},
+        encoder::{Encoder, encoder_graph, load_encoder},
+    },
+    step::Step,
 };
 use half::f16;
 use testkit::{Fixture, checkpoint_dir, device};
@@ -426,5 +433,52 @@ fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
     }
     let margins = margins_of(&got, &want, &burn_f16);
     assert!(!within(margins), "frames reversed: {margins:.2?}");
+    assert_no_validation_messages(&ctx);
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
+    let config = patch_config();
+    let case = rounded(cases(&config)).swap_remove(0);
+    let patch = transposed(&golden().0[3], config.patch_size);
+    let ctx = context();
+    let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+    let checkpoint = Checkpoint::open(weights()).unwrap_or_else(|e| panic!("{e}"));
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let alone = gpu(&ctx, std::slice::from_ref(&case), 2, &tuning);
+    let mut encoder =
+        Encoder::new(&ctx, &mut kernels, &config, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
+    encoder.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
+    let embedded = encoder.encode(&patch).unwrap_or_else(|e| panic!("{e}"));
+
+    // A tensor of another graph's first, so that each of theirs is somewhere else: loading
+    // them where they were would write the wrong tensors.
+    let mut g = Graph::default();
+    g.tensor("before", 256, Kind::Constant);
+    let sampler = sampler_graph(&config, 2, &tuning).unwrap_or_else(|e| panic!("{e}"));
+    let dit = splice(&mut g, &sampler.graph, "dit.", &[]);
+    let enc = encoder_graph(&config, &tuning).unwrap_or_else(|e| panic!("{e}"));
+    let local = splice(&mut g, &enc.graph, "encoder.", &[]);
+    let mut step = Step::new(&ctx, &mut kernels, &g, false).unwrap_or_else(|e| panic!("{e}"));
+    load_sampler(&mut step, &g, &sampler, &dit, &checkpoint).unwrap_or_else(|e| panic!("{e}"));
+    load_encoder(&mut step, &g, &enc, &local, &checkpoint).unwrap_or_else(|e| panic!("{e}"));
+    let at = |ids: &[TensorId], t: TensorId| ids[t.0];
+    let sampling = Sampling::default();
+    step.write(at(&dit, sampler.mu), &f16_bits(&case.mu))
+        .unwrap();
+    step.write(at(&dit, sampler.cond), &case.cond).unwrap();
+    step.write(at(&dit, sampler.noise), &case.noise).unwrap();
+    step.write(
+        at(&dit, sampler.sampling),
+        &[sampling.temperature, sampling.cfg_value],
+    )
+    .unwrap();
+    step.write(at(&local, enc.patch), &patch).unwrap();
+    step.submit().unwrap_or_else(|e| panic!("{e}"));
+    let got: Vec<f32> = step.read(at(&dit, sampler.patch)).unwrap();
+    assert_eq!(got, alone, "the spliced sampler's patch");
+    let got: Vec<u16> = step.read(at(&local, enc.out)).unwrap();
+    assert_eq!(got, embedded, "the spliced encoder's embedding");
     assert_no_validation_messages(&ctx);
 }

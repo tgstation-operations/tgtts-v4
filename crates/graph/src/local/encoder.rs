@@ -8,7 +8,7 @@
 
 use vulkan::{Context, SpecValue, Timing};
 
-use super::{LOCAL_EMBED, PatchConfig, Stack, Tuning, groups, write_weight};
+use super::{LOCAL_EMBED, PatchConfig, Stack, Tuning, groups, identity, write_weight};
 use crate::{
     Error,
     checkpoint::Checkpoint,
@@ -109,6 +109,45 @@ pub fn encoder_graph(config: &PatchConfig, tuning: &Tuning) -> Result<EncoderGra
     })
 }
 
+/// Writes the weights of VoxCPM2's local encoder from `checkpoint`, converted to f16, into
+/// `step`, a recording of `graph`, where `ids` puts each of `encoder`'s tensors: as
+/// [`splice`](crate::lm_side::splice) gives them when the encoder's graph is part of `graph`.
+pub fn load_encoder(
+    step: &mut Step,
+    graph: &Graph,
+    encoder: &EncoderGraph,
+    ids: &[TensorId],
+    checkpoint: &Checkpoint,
+) -> Result<(), Error> {
+    let t = encoder;
+    let at = |t: TensorId| ids[t.0];
+    let prefix = "feat_encoder.";
+    t.stack
+        .load(step, graph, ids, checkpoint, &format!("{prefix}encoder."))?;
+    let name = |what: &str| vec![format!("{prefix}{what}")];
+    write_weight(
+        step,
+        graph,
+        checkpoint,
+        at(t.special),
+        &name("special_token"),
+    )?;
+    write_weight(
+        step,
+        graph,
+        checkpoint,
+        at(t.in_proj.0),
+        &name("in_proj.weight"),
+    )?;
+    write_weight(
+        step,
+        graph,
+        checkpoint,
+        at(t.in_proj.1),
+        &name("in_proj.bias"),
+    )
+}
+
 /// VoxCPM2's local encoder on the GPU, with its weights.
 #[derive(Debug)]
 pub struct Encoder {
@@ -130,18 +169,11 @@ impl Encoder {
         Ok(Encoder { step, tensors })
     }
 
-    /// Writes the weights of VoxCPM2's local encoder from `checkpoint`, converted to f16.
+    /// Writes the weights of VoxCPM2's local encoder from `checkpoint`, converted to f16, as
+    /// [`load_encoder`] does.
     pub fn load(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
         let t = &self.tensors;
-        let g = &t.graph;
-        let step = &mut self.step;
-        let prefix = "feat_encoder.";
-        t.stack
-            .load(step, g, checkpoint, &format!("{prefix}encoder."))?;
-        let name = |what: &str| vec![format!("{prefix}{what}")];
-        write_weight(step, g, checkpoint, t.special, &name("special_token"))?;
-        write_weight(step, g, checkpoint, t.in_proj.0, &name("in_proj.weight"))?;
-        write_weight(step, g, checkpoint, t.in_proj.1, &name("in_proj.bias"))
+        load_encoder(&mut self.step, &t.graph, t, &identity(&t.graph), checkpoint)
     }
 
     /// The embedding of `patch`, laid out as the module's documentation says, as f16 bits.
