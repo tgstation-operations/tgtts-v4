@@ -91,6 +91,9 @@ enum Job {
     Generate(Request),
     /// Run what the warm-up runs and say how long generating took.
     WarmUp(WarmUp, Sender<Result<Duration, voxcpm::Error>>),
+    /// Give back the pages of the device's memory that hold nothing, and say the bytes the
+    /// prompt cache keeps.
+    GiveBack(Sender<usize>),
 }
 
 /// What the warm-up runs on the thread that generates.
@@ -182,6 +185,20 @@ impl VoxCpm {
             batching,
             jobs,
         })
+    }
+
+    /// Gives back the pages of the device's memory the model's pools hold and nothing on them
+    /// needs, once the requests before have generated, and gives the bytes the prompt cache
+    /// keeps.
+    ///
+    /// # Errors
+    ///
+    /// If the thread that generates has stopped.
+    pub fn give_back_memory(&self) -> Result<usize, synth::Error> {
+        let (done, given) = mpsc::channel();
+        let stopped = "the thread VoxCPM2 generates on has stopped";
+        self.jobs.send(Job::GiveBack(done)).map_err(|_| stopped)?;
+        Ok(given.recv().map_err(|_| stopped)?)
     }
 
     /// How many graphs of its step the model has captured, and destroyed.
@@ -497,6 +514,11 @@ impl Batch<'_> {
                 let warmed = self.on.warm_up(&warm_up, &mut self.chunks);
                 self.warmed = Some((self.graph_counts(), device::tuned()));
                 let _ = done.send(warmed);
+            }
+            Job::GiveBack(done) => {
+                // On this thread, whose stream holds the model's memory.
+                self.on.device.memory_cleanup();
+                let _ = done.send(self.scheduler.cache().bytes());
             }
         }
     }

@@ -89,10 +89,16 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         (peak.sum::<u64>(), now.sum::<u64>(), largest)
     };
     let (warmed, _, page) = pools();
+    let mib = |bytes: u64| bytes >> 20;
+    eprintln!(
+        "warmed up: pages of {} MiB at most, {} MiB in use, pools {:?}",
+        mib(warmed),
+        mib(device.memory_pool_usage().unwrap().bytes_in_use),
+        device.memory_pool_report().unwrap()
+    );
     let graphs = model.graph_counts();
     // The cache's budget in whole pages of the largest pool, where it keeps its keys and values.
     let cache = (budget as u64).div_ceil(page) * page;
-    let mib = |bytes: u64| bytes >> 20;
     let names: Vec<&str> = voices.names().collect();
     let lines = [
         "Help.",
@@ -116,7 +122,24 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
             }
         });
         rounds.push(mib(pools().1));
+        let usage = device.memory_pool_usage().unwrap();
+        eprintln!(
+            "round {round}: pages of {} MiB, {} MiB in use, pools {:?}",
+            mib(pools().1),
+            mib(usage.bytes_in_use),
+            device.memory_pool_report().unwrap()
+        );
     }
+    // What serving holds that needs no page: given back, the pages left hold what lives.
+    let kept = model.give_back_memory().unwrap();
+    let usage = device.memory_pool_usage().unwrap();
+    eprintln!(
+        "given back: pages of {} MiB, {} MiB in use, the prompt cache {} MiB, pools {:?}",
+        mib(pools().1),
+        mib(usage.bytes_in_use),
+        kept >> 20,
+        device.memory_pool_report().unwrap()
+    );
     let (warmed, cache) = (mib(warmed), mib(cache));
     eprintln!(
         "pages of {warmed} MiB at most during the warm-up, the cache's {cache} MiB of pages, then \
