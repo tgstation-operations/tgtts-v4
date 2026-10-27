@@ -1,27 +1,28 @@
 //! A [`Graph`] made runnable: its arena and buffers allocated as [`plan`] lays them out, each in
 //! the memory its kind wants ([`Kind::residence`](crate::graph::Kind::residence)), and its
 //! dispatches recorded once, with the barriers [`barriers`] finds, into a [`Recording`]
-//! submitted every step.
+//! submitted every step. More graphs over the same memory may be recorded beside it as programs
+//! of their own ([`Step::add`]), such as a prefill beside a decode step.
 
-use std::time::{Duration, Instant};
-
-use vulkan::{
-    Binding, Buffer, Context, Dispatch, Recording, Residence, Submission, Timing, memory::Plain,
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
+
+use vulkan::{Binding, Context, Dispatch, Recording, Residence, Submission, Timing, memory::Plain};
 
 use crate::{
     Error,
-    graph::{ALIGN, Graph, Kind, Plan, TensorId, barriers, plan},
+    graph::{ALIGN, Graph, Kind, Plan, TensorId, barriers, plan, plan_programs},
     kernels::Kernels,
 };
 
-/// Where a tensor's bytes live.
+/// Where a tensor's bytes live: from an offset of an arena, or from the start of a buffer of
+/// its own.
 #[derive(Clone, Copy, Debug)]
-enum Place {
-    /// At this offset of the arena, buffer 0.
-    Arena(u64),
-    /// In a buffer of its own.
-    Own(usize),
+struct Place {
+    buffer: usize,
+    offset: u64,
 }
 
 /// What decides where a graph's tensors live: their sizes and kinds, and the arena's plan.
@@ -40,23 +41,46 @@ impl Layout {
     }
 }
 
-/// A graph recorded for the GPU, with the buffers it binds.
-pub struct Step {
-    recording: Recording,
-    layout: Layout,
-    places: Vec<Place>,
-    bytes: Vec<u64>,
+/// One of the graphs a step runs, recorded over its memory ([`Step::add`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Program {
+    step: u64,
+    index: usize,
+}
+
+/// What a program's dispatches are called, and how many barriers it waits at.
+#[derive(Clone, Debug)]
+struct Recorded {
     labels: Vec<String>,
     barriers: usize,
+}
+
+/// Tells steps apart, so that a program is run only by the step it was recorded for.
+static STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// A graph recorded for the GPU, with the buffers it binds, and any more graphs recorded over
+/// them.
+pub struct Step {
+    recording: Recording,
+    /// The first graph's.
+    layout: Layout,
+    /// Every program's tensors, the first graph's first.
+    tensors: Vec<(u64, Kind)>,
+    places: Vec<Place>,
+    programs: Vec<Recorded>,
+    /// The program run last.
+    last: usize,
+    id: u64,
     recorded_in: Duration,
 }
 
 impl std::fmt::Debug for Step {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Step")
-            .field("dispatches", &self.labels.len())
-            .field("barriers", &self.barriers)
+            .field("dispatches", &self.programs[0].labels.len())
+            .field("barriers", &self.programs[0].barriers)
             .field("arena_bytes", &self.layout.plan.arena_bytes)
+            .field("programs", &self.programs.len())
             .finish_non_exhaustive()
     }
 }
@@ -75,22 +99,39 @@ impl Step {
         let mut places = Vec::with_capacity(graph.tensors.len());
         for (tensor, offset) in graph.tensors.iter().zip(&layout.plan.offsets) {
             places.push(match offset {
-                Some(offset) => Place::Arena(*offset),
+                &Some(offset) => Place { buffer: 0, offset },
                 None => {
                     buffers.push(ctx.buffer_in(tensor.bytes, tensor.kind.residence())?);
-                    Place::Own(buffers.len() - 1)
+                    Place {
+                        buffer: buffers.len() - 1,
+                        offset: 0,
+                    }
                 }
             });
         }
-        Self::record(ctx, kernels, graph, layout, places, buffers, timed)
+        let tensors = layout.tensors.clone();
+        let (dispatches, recorded) = dispatches(kernels, graph, &layout.plan, &tensors, &places)?;
+        let start = Instant::now();
+        let recording = ctx.record(buffers, &dispatches, timed)?;
+        Ok(Step {
+            recording,
+            recorded_in: start.elapsed(),
+            layout,
+            tensors,
+            places,
+            programs: vec![recorded],
+            last: 0,
+            id: STEPS.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
-    /// The step recorded again from `graph`, which must lay its tensors out as this step's graph
-    /// does, such as the same graph cut another way, over the memory this step holds, weights and
-    /// state included; timed per dispatch when `timed`. On an error the memory goes with the step.
+    /// The step with its first graph recorded again from `graph`, which must lay its tensors out
+    /// as that graph does, such as the same graph cut another way, over the memory this step
+    /// holds, weights and state included; timed per dispatch when `timed`. The programs added
+    /// since stay as they were. On an error the memory goes with the step.
     pub fn recorded_again(
-        self,
-        ctx: &Context,
+        mut self,
+        _ctx: &Context,
         kernels: &mut Kernels,
         graph: &Graph,
         timed: bool,
@@ -101,57 +142,94 @@ impl Step {
                 "a graph whose tensors are laid out unlike the step's".into(),
             ));
         }
-        let Step {
-            recording, places, ..
-        } = self;
-        let buffers = recording.into_buffers()?;
-        Self::record(ctx, kernels, graph, layout, places, buffers, timed)
+        let (dispatches, recorded) =
+            dispatches(kernels, graph, &layout.plan, &self.tensors, &self.places)?;
+        let start = Instant::now();
+        self.recording.replace_program(0, &dispatches, timed)?;
+        self.recorded_in = start.elapsed();
+        self.programs[0] = recorded;
+        Ok(self)
     }
 
-    /// Records `graph`'s dispatches over `buffers`, where `places` puts its tensors.
-    fn record(
+    /// Records `graphs` as more programs over this step's memory, timed per dispatch when
+    /// `timed`, and returns them in order. Each extends the graphs recorded so far: its first
+    /// tensors are theirs, at the same sizes and kinds, and the rest its own, the same in each
+    /// of `graphs`. Their own tensors are allocated, zero-filled, those of arena kinds in an
+    /// arena of their own laid out over all of `graphs` ([`plan_programs`]); none may use the
+    /// tensors of an earlier arena.
+    pub fn add(
+        &mut self,
         ctx: &Context,
         kernels: &mut Kernels,
-        graph: &Graph,
-        layout: Layout,
-        places: Vec<Place>,
-        buffers: Vec<Buffer>,
+        graphs: &[&Graph],
         timed: bool,
-    ) -> Result<Self, Error> {
-        let needs_barrier = barriers(graph, &layout.plan);
-        let bytes: Vec<u64> = graph.tensors.iter().map(|t| t.bytes).collect();
-        let binding = |t: TensorId| match places[t.0] {
-            Place::Arena(offset) => Binding::range(0, offset, bytes[t.0]),
-            Place::Own(buffer) => Binding::whole(buffer),
+    ) -> Result<Vec<Program>, Error> {
+        let Some(&first) = graphs.first() else {
+            return Ok(Vec::new());
         };
-        let mut dispatches = Vec::with_capacity(graph.ops.len());
-        for (op, &barrier) in graph.ops.iter().zip(&needs_barrier) {
-            dispatches.push(Dispatch {
-                kernel: kernels.get(&op.pipeline)?,
-                bindings: op.bindings.iter().map(|&t| binding(t)).collect(),
-                groups: op.groups,
-                barrier,
+        let held = self.tensors.len();
+        let shape = |g: &Graph| -> Vec<(u64, Kind)> {
+            g.tensors.iter().map(|t| (t.bytes, t.kind)).collect()
+        };
+        let tensors = shape(first);
+        if tensors.get(..held) != Some(&self.tensors[..])
+            || graphs.iter().any(|&g| shape(g) != tensors)
+        {
+            return Err(Error::Shape(
+                "graphs that do not extend the step's tensors alike".into(),
+            ));
+        }
+        for op in graphs.iter().flat_map(|g| &g.ops) {
+            if let Some(t) = op
+                .bindings
+                .iter()
+                .find(|t| t.0 < held && tensors[t.0].1.in_arena())
+            {
+                return Err(Error::Shape(format!(
+                    "{}: tensor {} of an earlier arena",
+                    op.label, t.0
+                )));
+            }
+        }
+        let plan = plan_programs(graphs, held);
+        let arena = match plan.arena_bytes {
+            0 => None,
+            bytes => Some(
+                self.recording
+                    .add_buffer(ctx.buffer_in(bytes, Residence::Device)?)?,
+            ),
+        };
+        for (t, &(bytes, kind)) in tensors.iter().enumerate().skip(held) {
+            let place = match (plan.offsets[t], arena) {
+                (Some(offset), Some(buffer)) => Place { buffer, offset },
+                _ => Place {
+                    buffer: self
+                        .recording
+                        .add_buffer(ctx.buffer_in(bytes, kind.residence())?)?,
+                    offset: 0,
+                },
+            };
+            self.places.push(place);
+            self.tensors.push((bytes, kind));
+        }
+        let mut programs = Vec::with_capacity(graphs.len());
+        for graph in graphs {
+            let (dispatches, recorded) =
+                dispatches(kernels, graph, &plan, &self.tensors, &self.places)?;
+            let index = self.recording.add_program(&dispatches, timed)?;
+            self.programs.push(recorded);
+            programs.push(Program {
+                step: self.id,
+                index,
             });
         }
-        let start = Instant::now();
-        let recording = ctx.record(buffers, &dispatches, timed)?;
-        Ok(Step {
-            recording,
-            recorded_in: start.elapsed(),
-            layout,
-            places,
-            bytes,
-            labels: graph.ops.iter().map(|op| op.label.clone()).collect(),
-            barriers: needs_barrier.iter().filter(|&&b| b).count(),
-        })
+        Ok(programs)
     }
 
     /// The buffer tensor `t` lives in, and where in it.
     fn place(&self, t: TensorId) -> (usize, u64) {
-        match self.places[t.0] {
-            Place::Arena(offset) => (0, offset),
-            Place::Own(buffer) => (buffer, 0),
-        }
+        let Place { buffer, offset } = self.places[t.0];
+        (buffer, offset)
     }
 
     /// Writes `values` into tensor `t`, which they must fill exactly: in place if the host maps
@@ -161,7 +239,7 @@ impl Step {
     ///
     /// If they do not fill it.
     pub fn write<T: Plain>(&mut self, t: TensorId, values: &[T]) -> Result<(), Error> {
-        let len = self.bytes[t.0];
+        let len = self.tensors[t.0].0;
         assert_eq!(
             size_of_val(values) as u64,
             len,
@@ -175,18 +253,34 @@ impl Step {
     /// Tensor `t`'s contents.
     pub fn read<T: Plain>(&self, t: TensorId) -> Result<Vec<T>, Error> {
         let (buffer, offset) = self.place(t);
-        let count = self.bytes[t.0] as usize / size_of::<T>();
+        let count = self.tensors[t.0].0 as usize / size_of::<T>();
         Ok(self.recording.buffer(buffer).read_at(offset, count)?)
     }
 
-    /// Runs the step once and waits for it.
+    /// Runs the step's first graph once and waits for it.
     pub fn submit(&mut self) -> Result<(), Error> {
+        self.last = 0;
         Ok(self.recording.submit()?)
     }
 
-    /// Starts the step and returns without waiting for it.
+    /// Starts the step's first graph and returns without waiting for it.
     pub fn start(&mut self) -> Result<Submission<'_>, Error> {
+        self.last = 0;
         Ok(self.recording.start()?)
+    }
+
+    /// Runs `program` once and waits for it.
+    pub fn run(&mut self, program: Program) -> Result<(), Error> {
+        Ok(self.start_program(program)?.wait()?)
+    }
+
+    /// Starts `program` and returns without waiting for it.
+    pub fn start_program(&mut self, program: Program) -> Result<Submission<'_>, Error> {
+        if program.step != self.id {
+            return Err(Error::Shape("a program of another step".into()));
+        }
+        self.last = program.index;
+        Ok(self.recording.start_program(program.index)?)
     }
 
     /// The GPU time of the last run, from before its first dispatch to after its last.
@@ -199,28 +293,64 @@ impl Step {
         Ok(self.recording.ends()?)
     }
 
-    /// Each dispatch's label and GPU time in the last run, when recorded timed.
+    /// Each dispatch's label and GPU time in the last run, when its program was recorded timed.
     pub fn timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
         let timings = self.recording.timings()?;
-        Ok(timings.map(|t| self.labels.iter().map(String::as_str).zip(t).collect()))
+        let labels = &self.programs[self.last].labels;
+        Ok(timings.map(|t| labels.iter().map(String::as_str).zip(t).collect()))
     }
 
+    /// The first graph's dispatches.
     pub fn dispatches(&self) -> usize {
-        self.labels.len()
+        self.programs[0].labels.len()
     }
 
+    /// The barriers the first graph's dispatches wait at.
     pub fn barriers(&self) -> usize {
-        self.barriers
+        self.programs[0].barriers
     }
 
     pub fn arena_bytes(&self) -> u64 {
         self.layout.plan.arena_bytes
     }
 
-    /// How long writing the descriptor sets and recording the commands took.
+    /// How long writing the descriptor sets and recording the commands of the first graph took,
+    /// when it was last recorded.
     pub fn recorded_in(&self) -> Duration {
         self.recorded_in
     }
+}
+
+/// `graph`'s dispatches with the barriers they need, its tensors of `tensors` where `places`
+/// puts them and its arena's as `plan` lays them out, each checked against its kernel's
+/// manifest; and what they are called.
+fn dispatches(
+    kernels: &mut Kernels,
+    graph: &Graph,
+    plan: &Plan,
+    tensors: &[(u64, Kind)],
+    places: &[Place],
+) -> Result<(Vec<Dispatch>, Recorded), Error> {
+    let needs_barrier = barriers(graph, plan);
+    let binding = |t: TensorId| {
+        let Place { buffer, offset } = places[t.0];
+        Binding::range(buffer, offset, tensors[t.0].0)
+    };
+    let mut dispatches = Vec::with_capacity(graph.ops.len());
+    for (op, &barrier) in graph.ops.iter().zip(&needs_barrier) {
+        kernels.check(op, |t| tensors[t].0)?;
+        dispatches.push(Dispatch {
+            kernel: kernels.get(&op.pipeline)?,
+            bindings: op.bindings.iter().map(|&t| binding(t)).collect(),
+            groups: op.groups,
+            barrier,
+        });
+    }
+    let recorded = Recorded {
+        labels: graph.ops.iter().map(|op| op.label.clone()).collect(),
+        barriers: needs_barrier.iter().filter(|&&b| b).count(),
+    };
+    Ok((dispatches, recorded))
 }
 
 #[cfg(test)]

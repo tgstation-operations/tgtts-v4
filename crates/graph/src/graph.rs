@@ -179,23 +179,43 @@ pub const ALIGN: u64 = 256;
 /// the largest placed first, each at the lowest aligned offset clear of those already placed
 /// whose lifetimes meet its own.
 pub fn plan(graph: &Graph) -> Plan {
-    let lifetimes = graph.lifetimes();
-    let mut order: Vec<usize> = (0..graph.tensors.len())
-        .filter(|&t| lifetimes[t].is_some())
-        .collect();
-    order.sort_by_key(|&t| (std::cmp::Reverse(graph.tensors[t].bytes), t));
-    let mut offsets = vec![None; graph.tensors.len()];
+    plan_programs(&[graph], 0)
+}
+
+/// Lays out the arena tensors from `first` on of `graphs`, programs over the same tensors of
+/// which one runs at a time, as [`plan`] lays out one graph's: two share bytes only if no
+/// program sees both live at once. Those before `first` are left out of the arena.
+///
+/// # Panics
+///
+/// If the graphs' tensors differ in number, size or kind.
+pub fn plan_programs(graphs: &[&Graph], first: usize) -> Plan {
+    let shape =
+        |g: &Graph| -> Vec<(u64, Kind)> { g.tensors.iter().map(|t| (t.bytes, t.kind)).collect() };
+    let tensors = graphs.first().map_or(0, |g| g.tensors.len());
+    assert!(
+        graphs.iter().all(|g| shape(g) == shape(graphs[0])),
+        "programs over different tensors"
+    );
+    let lifetimes: Vec<Vec<Option<Range<usize>>>> = graphs.iter().map(|g| g.lifetimes()).collect();
+    let live = |t: usize| lifetimes.iter().any(|l| l[t].is_some());
+    let meet = |a: usize, b: usize| {
+        lifetimes.iter().any(|l| match (&l[a], &l[b]) {
+            (Some(a), Some(b)) => a.start < b.end && b.start < a.end,
+            _ => false,
+        })
+    };
+    let bytes = |t: usize| graphs[0].tensors[t].bytes;
+    let mut order: Vec<usize> = (first..tensors).filter(|&t| live(t)).collect();
+    order.sort_by_key(|&t| (std::cmp::Reverse(bytes(t)), t));
+    let mut offsets = vec![None; tensors];
     let mut placed: Vec<(usize, Range<u64>)> = Vec::new();
     let mut arena_bytes = 0;
     for t in order {
-        let life = lifetimes[t].clone().expect("filtered");
-        let size = graph.tensors[t].bytes.max(1).next_multiple_of(ALIGN);
+        let size = bytes(t).max(1).next_multiple_of(ALIGN);
         let mut clashes: Vec<Range<u64>> = placed
             .iter()
-            .filter(|(other, _)| {
-                let theirs = lifetimes[*other].as_ref().expect("placed");
-                theirs.start < life.end && life.start < theirs.end
-            })
+            .filter(|(other, _)| meet(t, *other))
             .map(|(_, bytes)| bytes.clone())
             .collect();
         clashes.sort_by_key(|r| r.start);
@@ -348,6 +368,34 @@ mod tests {
         assert_eq!(residence(x), Residence::Upload);
         assert_eq!(residence(position), Residence::Upload);
         assert_eq!(residence(out), Residence::Readback);
+    }
+
+    #[test]
+    fn programs_share_bytes_between_tensors_none_of_them_sees_live_together() {
+        // P: x -> a -> b -> out, and Q: x -> c -> b -> out, over the same tensors: a meets b in
+        // P and c meets b in Q, but a and c never meet. b, the largest, is placed first.
+        let mut p = Graph::default();
+        let x = p.tensor("x", 1000, Kind::Input);
+        let a = p.tensor("a", 1000, Kind::Intermediate);
+        let b = p.tensor("b", 2000, Kind::Intermediate);
+        let c = p.tensor("c", 1000, Kind::Intermediate);
+        let out = p.tensor("out", 2000, Kind::Output);
+        let mut q = p.clone();
+        for (from, to) in [(x, a), (a, b), (b, out)] {
+            p.op("copy", pipeline(&COPY), &[from, to], [1, 1, 1]);
+        }
+        for (from, to) in [(x, c), (c, b), (b, out)] {
+            q.op("copy", pipeline(&COPY), &[from, to], [1, 1, 1]);
+        }
+        let both = plan_programs(&[&p, &q], 0);
+        assert!(!overlaps(&both, &p, a, b), "a and b meet in P");
+        assert!(!overlaps(&both, &p, b, c), "b and c meet in Q");
+        assert!(overlaps(&both, &p, a, c));
+        assert_eq!(both.arena_bytes, 3 * 1024);
+        // Tensors before `first` stay out of the arena.
+        let later = plan_programs(&[&p, &q], c.0);
+        assert_eq!(later.offsets[a.0], None);
+        assert_eq!(later.offsets[c.0], Some(0));
     }
 
     #[test]
