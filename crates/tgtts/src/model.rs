@@ -1,7 +1,7 @@
 //! VoxCPM2 as the service's [`Synthesizer`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     path::Path,
     sync::{
@@ -12,13 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use burn::tensor::{Device, Distribution::Normal, Tensor};
+use burn::tensor::Device;
 use dsp::RATE;
 use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
     ChunkDecoder, Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt, PromptCache,
-    Scheduler, SeededNoise, Stepping, TextToSpeech,
+    Scheduler, SeededNoise, SpeechChunks, Stepping, TextToSpeech,
 };
 
 use crate::{
@@ -87,8 +87,6 @@ struct WarmUp {
     longest: usize,
     voice_patches: usize,
     requests: usize,
-    /// A voice to decode speech after.
-    voice: Latent,
 }
 
 /// A prompt to generate from in a voice, and where its speech goes.
@@ -126,7 +124,7 @@ impl VoxCpm {
         let (jobs, received) = mpsc::channel();
         let (loaded, loading) = mpsc::channel();
         let (dir, dtypes, on) = (dir.to_owned(), *dtypes, device.clone());
-        let (model_config, model_params) = (config.clone(), params.clone());
+        let model_params = params.clone();
         // The weights are loaded on the thread that uses them, whose stream holds them.
         thread::Builder::new()
             .name("voxcpm".into())
@@ -146,7 +144,6 @@ impl VoxCpm {
                 let _ = loaded.send(Ok(tts.clone()));
                 let generating = Generating {
                     tts,
-                    config: model_config,
                     params: model_params,
                     device: on,
                     prefill_positions: batching.prefill_positions,
@@ -228,7 +225,6 @@ impl VoxCpm {
             longest: longest.len(),
             voice_patches: voice_patches.into_iter().max().unwrap_or(1),
             requests,
-            voice: voice.clone(),
         };
         let (done, warmed) = mpsc::channel();
         let stopped = "the thread VoxCPM2 generates on has stopped";
@@ -333,10 +329,16 @@ fn lengthened(
 /// What the thread that generates holds.
 struct Generating {
     tts: Arc<TextToSpeech>,
-    config: Config,
     params: Params,
     device: Device,
     prefill_positions: usize,
+}
+
+impl Generating {
+    /// Whether the model replays graphs of its steps, and the decoder of its chunks.
+    fn graphs(&self) -> bool {
+        self.tts.model().stepping() == Stepping::Captured
+    }
 }
 
 /// Does each job `jobs` brings, generating the patches of requests in a batch and decoding the
@@ -351,6 +353,10 @@ fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
         on: generating,
         stepped: Instant::now(),
         warmed: None,
+        chunks: generating
+            .tts
+            .speech_chunks(batching.requests, generating.graphs()),
+        queued: VecDeque::new(),
     };
     loop {
         if batch.scheduler.requests() == 0 {
@@ -386,7 +392,11 @@ impl Generating {
     /// after every graph is captured, each shape's memory given back before the next, so that
     /// the pools hold what the largest takes beside them; and decodes two chunks of silence for
     /// each power of two of requests at once. Gives how long generating took.
-    fn warm_up(&self, warm_up: &WarmUp) -> Result<Duration, voxcpm::Error> {
+    fn warm_up(
+        &self,
+        warm_up: &WarmUp,
+        chunks: &mut SpeechChunks,
+    ) -> Result<Duration, voxcpm::Error> {
         let started = Instant::now();
         let (tts, params) = (&*self.tts, &self.params);
         let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
@@ -421,32 +431,7 @@ impl Generating {
             model.warm_voice(patches);
         }
         let generated = started.elapsed();
-        // Patches of noise rather than of silence, which a GPU may hold as a broadcast value
-        // whose strides key other kernels than speech's.
-        let (shape, normal) = (
-            [1, self.config.patch_size, self.config.feat_dim],
-            Normal(0.0, 1.0),
-        );
-        let patch = || Tensor::random(shape, normal, &self.device);
-        // Autotune rounds the rows up to a power of two, as it rounds those of prompts.
-        let rows = (0..).map(|power| 1 << power);
-        let rows = rows.take_while(|&rows| rows <= warm_up.requests.next_power_of_two());
-        for rows in rows {
-            let decoders = (0..rows).map(|_| tts.chunk_decoder(&warm_up.voice));
-            let mut decoders: Vec<_> = decoders.collect();
-            // A first chunk, after the voice's last frames, one after it and a last one filled
-            // out with silence, each taking its patches one at a time, as requests' do.
-            for last in [false, false, true] {
-                for decoder in &mut decoders {
-                    decoder.push(patch());
-                    while !last && !decoder.ready() {
-                        decoder.push(patch());
-                    }
-                }
-                let mut decoding: Vec<_> = decoders.iter_mut().collect();
-                ChunkDecoder::decode_together(&mut decoding, &vec![last; rows]);
-            }
-        }
+        chunks.warm_up();
         Ok(generated)
     }
 }
@@ -455,7 +440,7 @@ impl Generating {
 /// patches it has so far.
 struct Batch<'a> {
     scheduler: Scheduler<'a, u64, SeededNoise>,
-    generating: HashMap<u64, Generation<'a>>,
+    generating: HashMap<u64, Generation>,
     next: u64,
     on: &'a Generating,
     /// When the last step returned.
@@ -463,12 +448,15 @@ struct Batch<'a> {
     /// The graphs of the step captured and destroyed, and the kernels autotune tuned, when the
     /// warm-up ended, and since, if it has.
     warmed: Option<(GraphCounts, usize)>,
+    /// What decodes the requests' speech, and the requests waiting for it to have room.
+    chunks: SpeechChunks,
+    queued: VecDeque<Request>,
 }
 
-struct Generation<'a> {
+struct Generation {
     request: Request,
     start: Option<Start>,
-    decoder: ChunkDecoder<'a>,
+    decoder: ChunkDecoder,
     samples: Vec<f32>,
 }
 
@@ -477,14 +465,26 @@ impl Batch<'_> {
         match job {
             Job::Generate(request) => self.add(request),
             Job::WarmUp(warm_up, done) => {
-                let warmed = self.on.warm_up(&warm_up);
-                self.warmed = Some((self.on.tts.model().graph_counts(), device::tuned()));
+                let warmed = self.on.warm_up(&warm_up, &mut self.chunks);
+                self.warmed = Some((self.graph_counts(), device::tuned()));
                 let _ = done.send(warmed);
             }
         }
     }
 
+    /// The graphs of the step and of the decoder captured and destroyed.
+    fn graph_counts(&self) -> GraphCounts {
+        let mut counts = self.on.tts.model().graph_counts();
+        counts.captured += self.chunks.graphs();
+        counts
+    }
+
     fn add(&mut self, request: Request) {
+        // As many generate as the decoder has slots for, the rest waiting for one.
+        if self.generating.len() == self.chunks.slots() {
+            self.queued.push_back(request);
+            return;
+        }
         let (key, noise) = (self.next, SeededNoise::new(request.seed));
         self.next += 1;
         let params = &self.on.params;
@@ -495,7 +495,7 @@ impl Batch<'_> {
         {
             Ok(()) => {
                 let generation = Generation {
-                    decoder: self.on.tts.chunk_decoder(&request.voice),
+                    decoder: self.chunks.start(request.voice.frames.as_flattened()),
                     request,
                     start: None,
                     samples: vec![],
@@ -537,6 +537,7 @@ impl Batch<'_> {
                 }
                 Err(e) => {
                     let generation = self.generating.remove(&key).expect("generating");
+                    self.chunks.release(generation.decoder);
                     let _ = generation.request.speech.send(Err(e));
                 }
             }
@@ -552,7 +553,7 @@ impl Batch<'_> {
                     whose.push((*key, ends));
                 }
             }
-            let decoded = ChunkDecoder::decode_together(&mut decoders, &last);
+            let decoded = self.chunks.decode(&mut decoders, &last);
             for ((key, ends), samples) in whose.into_iter().zip(decoded) {
                 let generation = self.generating.get_mut(&key).expect("generating");
                 generation.samples.extend(samples);
@@ -565,7 +566,12 @@ impl Batch<'_> {
         }
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let report = self.scheduler.last_step();
-        let (graphs, tuned) = (self.on.tts.model().graph_counts(), device::tuned());
+        while self.generating.len() < self.chunks.slots()
+            && let Some(request) = self.queued.pop_front()
+        {
+            self.add(request);
+        }
+        let (graphs, tuned) = (self.graph_counts(), device::tuned());
         if let Some((warmed, before)) = self.warmed.replace((graphs, tuned)) {
             if warmed != graphs {
                 // Each capture after the warm-up is a pause of a few steps, and a destroyed graph

@@ -1,7 +1,16 @@
-use std::{fs, mem, num::NonZeroUsize, path::Path};
+use std::{
+    collections::HashMap,
+    fmt, fs, mem,
+    num::NonZeroUsize,
+    ops::Range,
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
-use audiovae::{DecodeStream, Decoder, Weights};
-use burn::tensor::{Device, FloatDType, Tensor, TensorData};
+use audiovae::{DecodeSlots, DecodeStream, Decoder, Weights};
+use burn::tensor::{
+    Device, Distribution, FloatDType, Graph, Int, Tensor, TensorData, capture, kind::Basic,
+};
 use voices::{LATENT_DIM, Latent};
 
 use crate::{Config, Dtypes, Error, Model, Noise, Prompt, Sampling, Stepping, Tokenizer};
@@ -132,16 +141,12 @@ impl TextToSpeech {
         SpeechDecoder::new(&self.decoder, frames, LATENT_DIM, chunk_frames)
     }
 
-    /// A decoder of the patches generated from the [`prompt`](Self::prompt) of `voice` a chunk
-    /// at a time, several requests' chunks together.
-    pub fn chunk_decoder(&self, voice: &Latent) -> ChunkDecoder<'_> {
+    /// What decodes up to `speeches` speeches generated from the [`prompt`](Self::prompt) of a
+    /// voice a chunk at a time, several speeches' chunks together, replaying graphs where
+    /// `captured` says.
+    pub fn speech_chunks(&self, speeches: usize, captured: bool) -> SpeechChunks {
         let device = self.model.device.clone();
-        ChunkDecoder::new(
-            &self.decoder,
-            voice.frames.as_flattened(),
-            LATENT_DIM,
-            &device,
-        )
+        SpeechChunks::new(&self.decoder, LATENT_DIM, speeches, captured, &device)
     }
 
     /// The prompt [`synthesize`](Self::synthesize) generates from.
@@ -170,13 +175,51 @@ impl TextToSpeech {
 /// after them.
 pub const CHUNK_FRAMES: usize = 24;
 
-/// Speech decoded [`CHUNK_FRAMES`] latent frames at a time as its patches come, after the last
-/// frames of the voice it goes on from, several speeches' chunks at once: the audio
-/// [`SpeechDecoder`] decodes, to rounding. Its last chunk is filled out with silence, which the
-/// decoder, being causal, does not reach back from.
+/// Speeches decoded [`CHUNK_FRAMES`] latent frames at a time as their patches come, each after
+/// the last frames of the voice it goes on from, several speeches' chunks at once: the audio
+/// [`SpeechDecoder`] decodes, to rounding. A speech's last chunk is filled out with silence,
+/// which the decoder, being causal, does not reach back from.
+///
+/// Each speech carries its state in a slot of [`DecodeSlots`], up to as many at once as it was
+/// made for. Made to replay graphs, it decodes each power of two of speeches at once by replaying
+/// a graph of the decoder that [`warm_up`](Self::warm_up) captured, on a slot no speech has, and
+/// keeps them as long as it lives; it never captures one as it decodes speech, which a capture
+/// would decode again.
+pub struct SpeechChunks {
+    state: Arc<Mutex<ChunkState>>,
+    free: Vec<usize>,
+    spare: usize,
+    graphs: HashMap<usize, Graph<Tensor<3>, ChunkFn>>,
+    captured: bool,
+    channels: usize,
+    device: Device,
+    /// Whether the device says if a tensor shares its buffer, which a write to a graph's inputs
+    /// must not, or it would move where a replay does not look.
+    shares_known: bool,
+}
+
+type ChunkFn = Box<dyn FnMut() -> Tensor<3> + Send>;
+
+struct ChunkState {
+    slots: DecodeSlots,
+    /// What each graph decodes, by its rows: the slot of each row `[rows]` and the latents
+    /// `[rows, channels, CHUNK_FRAMES]`.
+    inputs: HashMap<usize, (Tensor<1, Int>, Tensor<3>)>,
+}
+
+impl fmt::Debug for SpeechChunks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpeechChunks")
+            .field("free", &self.free.len())
+            .field("graphs", &self.graphs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A speech [`SpeechChunks`] decodes: its slot and the frames that wait to be decoded.
 #[derive(Debug)]
-pub struct ChunkDecoder<'a> {
-    stream: DecodeStream<'a>,
+pub struct ChunkDecoder {
+    slot: usize,
     /// The frames to decode next, each run `[frames, channels]`, the voice's first.
     pending: Vec<Tensor<2>>,
     frames: usize,
@@ -184,21 +227,7 @@ pub struct ChunkDecoder<'a> {
     context: usize,
 }
 
-impl<'a> ChunkDecoder<'a> {
-    /// Decodes with `decoder` the speech that goes on from `voice`, its latent frames of
-    /// `channels` channels one after another, on `device`.
-    pub fn new(decoder: &'a Decoder, voice: &[f32], channels: usize, device: &Device) -> Self {
-        let context = (voice.len() / channels).min(DECODE_CONTEXT_FRAMES);
-        let frames = voice[voice.len() - context * channels..].to_vec();
-        let frames = Tensor::from_data(TensorData::new(frames, [context, channels]), device);
-        Self {
-            stream: decoder.stream(),
-            pending: if context > 0 { vec![frames] } else { vec![] },
-            frames: context,
-            context,
-        }
-    }
-
+impl ChunkDecoder {
     /// Takes the next patches of the speech, `[n, patch_size, channels]`.
     pub fn push(&mut self, patches: Tensor<3>) {
         let [n, patch_size, channels] = patches.dims();
@@ -211,16 +240,82 @@ impl<'a> ChunkDecoder<'a> {
     pub fn ready(&self) -> bool {
         self.frames >= CHUNK_FRAMES
     }
+}
+
+impl SpeechChunks {
+    /// Decodes with `decoder`, of latents of `channels` channels, up to `speeches` speeches at
+    /// once, on `device`; by replaying graphs where `captured` says, once warmed up.
+    pub fn new(
+        decoder: &Decoder,
+        channels: usize,
+        speeches: usize,
+        captured: bool,
+        device: &Device,
+    ) -> Self {
+        let state = ChunkState {
+            slots: DecodeSlots::new(decoder, speeches + 1, device),
+            inputs: HashMap::new(),
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            free: (0..speeches).rev().collect(),
+            spare: speeches,
+            graphs: HashMap::new(),
+            captured,
+            channels,
+            device: device.clone(),
+            shares_known: Tensor::<1>::zeros([1], device).can_mut(),
+        }
+    }
+
+    /// The most speeches it decodes at once.
+    pub fn slots(&self) -> usize {
+        self.spare
+    }
+
+    /// How many graphs of the decoder it has captured, each kept as long as it lives.
+    pub fn graphs(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// A speech that goes on from `voice`, its latent frames one after another.
+    ///
+    /// # Panics
+    ///
+    /// If as many speeches are being decoded as it was made for.
+    pub fn start(&mut self, voice: &[f32]) -> ChunkDecoder {
+        let slot = self.free.pop().expect("a slot for one more speech");
+        self.state().slots.clear(slot);
+        let channels = self.channels;
+        let context = (voice.len() / channels).min(DECODE_CONTEXT_FRAMES);
+        let frames = voice[voice.len() - context * channels..].to_vec();
+        let frames = TensorData::new(frames, [context, channels]);
+        ChunkDecoder {
+            slot,
+            pending: match context {
+                0 => vec![],
+                _ => vec![Tensor::from_data(frames, &self.device)],
+            },
+            frames: context,
+            context,
+        }
+    }
+
+    /// Gives back the slot of a speech that is not decoded to its end.
+    pub fn release(&mut self, decoder: ChunkDecoder) {
+        self.free.push(decoder.slot);
+    }
 
     /// Decodes a chunk of each of `decoders` at once and gives each one's audio, mono samples:
-    /// the next whole chunk, or for those `last` says the speech ends after, what is left.
+    /// the next whole chunk, or for those `last` says end, what is left, their slots given back.
     ///
     /// # Panics
     ///
     /// If there is no decoder, `last` says of another number, a decoder that goes on has less
     /// than a chunk waiting, or one that ends has more.
-    pub fn decode_together(decoders: &mut [&mut ChunkDecoder<'a>], last: &[bool]) -> Vec<Vec<f32>> {
-        assert_eq!(decoders.len(), last.len(), "whether each decoder ends");
+    pub fn decode(&mut self, decoders: &mut [&mut ChunkDecoder], last: &[bool]) -> Vec<Vec<f32>> {
+        assert!(!decoders.is_empty(), "no speech to decode");
+        assert_eq!(decoders.len(), last.len(), "whether each speech ends");
         let mut chunks = vec![];
         let mut kept = vec![];
         for (decoder, &last) in decoders.iter_mut().zip(last) {
@@ -244,11 +339,13 @@ impl<'a> ChunkDecoder<'a> {
             chunks.push(chunk.swap_dims(0, 1).unsqueeze_dim::<3>(0));
             kept.push((mem::take(&mut decoder.context), taken));
         }
-        let mut streams: Vec<_> = decoders
-            .iter_mut()
-            .map(|decoder| &mut decoder.stream)
-            .collect();
-        let audio = DecodeStream::push_together(&mut streams, Tensor::cat(chunks, 0));
+        let slots: Vec<usize> = decoders.iter().map(|decoder| decoder.slot).collect();
+        let audio = self.push(&slots, Tensor::cat(chunks, 0));
+        for (decoder, &last) in decoders.iter().zip(last) {
+            if last {
+                self.free.push(decoder.slot);
+            }
+        }
         let [_, _, samples] = audio.dims();
         let per_frame = samples / CHUNK_FRAMES;
         let audio: Vec<f32> = audio.cast(FloatDType::F32).into_data().iter().collect();
@@ -258,6 +355,95 @@ impl<'a> ChunkDecoder<'a> {
             .map(|(row, (context, taken))| row[context * per_frame..taken * per_frame].to_vec());
         speech.collect()
     }
+
+    /// The audio of `latents` `[slots.len(), channels, CHUNK_FRAMES]` through the streams in
+    /// `slots`: by replaying the graph of their power of two of rows where there is one, the
+    /// rows past theirs in the spare slot, or as they are.
+    fn push(&mut self, slots: &[usize], latents: Tensor<3>) -> Tensor<3> {
+        let rows = slots.len().next_power_of_two();
+        let Some(graph) = self.graphs.get_mut(&rows) else {
+            let at: Vec<i64> = slots.iter().map(|&slot| slot as i64).collect();
+            let at = Tensor::from_data(TensorData::new(at, [slots.len()]), &self.device);
+            return self
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .slots
+                .push(at, latents);
+        };
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let (at, input) = state.inputs.get_mut(&rows).expect("a graph's inputs");
+            let mut padded: Vec<i64> = slots.iter().map(|&slot| slot as i64).collect();
+            padded.resize(rows, self.spare as i64);
+            let padded = Tensor::from_data(TensorData::new(padded, [rows]), &self.device);
+            write(self.shares_known, at, 0..rows, padded);
+            write(self.shares_known, input, 0..slots.len(), latents);
+        }
+        // Safety: the closure owns the state, and with it every buffer it reads and writes; the
+        // inputs were written, and the audio is read, on this thread, the one it was captured
+        // on, which holds `self`.
+        let audio = unsafe { graph.replay() }.clone();
+        audio.narrow(0, 0, slots.len())
+    }
+
+    /// Runs the decoder over every power of two of speeches at once up to as many as it was
+    /// made for, in its spare slot, on latents of nothing in particular: for autotune to choose
+    /// its kernels, and where it replays graphs, to capture one of each.
+    pub fn warm_up(&mut self) {
+        let normal = Distribution::Normal(0.0, 1.0);
+        let powers = (0..).map(|power| 1usize << power);
+        let most = self.spare.next_power_of_two();
+        for rows in powers.take_while(|&rows| rows <= most) {
+            let shape = [rows, self.channels, CHUNK_FRAMES];
+            let latents = Tensor::random(shape, normal, &self.device);
+            let at = Tensor::<1, Int>::full([rows], self.spare as i64, &self.device);
+            if !self.captured {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.slots.push(at, latents);
+                continue;
+            }
+            if self.graphs.contains_key(&rows) {
+                continue;
+            }
+            let state = self.state.clone();
+            state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .inputs
+                .insert(rows, (at, latents));
+            let step: ChunkFn = Box::new(move || {
+                let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                let (at, latents) = state.inputs[&rows].clone();
+                state.slots.push(at, latents)
+            });
+            self.graphs.insert(rows, capture(&self.device, step));
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, ChunkState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Writes `value` over the `rows` of `target`, in its buffer.
+///
+/// # Panics
+///
+/// If the device says `target` shares its buffer, which the write would then move.
+fn write<const D: usize, K: Basic>(
+    shares_known: bool,
+    target: &mut Tensor<D, K>,
+    rows: Range<usize>,
+    value: Tensor<D, K>,
+) {
+    assert!(
+        !shares_known || target.can_mut(),
+        "a buffer a graph reads is shared, so a write would move it from under the graph"
+    );
+    let mut at = target.dims().map(|n| 0..n);
+    at[0] = rows;
+    target.inplace(|target| target.slice_assign(at, value));
 }
 
 /// Speech decoded from its patches as they come, after the last frames of the voice it goes on

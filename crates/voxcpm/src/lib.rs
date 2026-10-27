@@ -34,7 +34,7 @@ pub use crate::{
     noise::{Noise, SeededNoise},
     prefill::{Prefill, PromptCache},
     prompt::Prompt,
-    speech::{CHUNK_FRAMES, ChunkDecoder, Params, SpeechDecoder, TextToSpeech},
+    speech::{CHUNK_FRAMES, ChunkDecoder, Params, SpeechChunks, SpeechDecoder, TextToSpeech},
     tokenizer::Tokenizer,
 };
 

@@ -12,7 +12,7 @@ use common::tiny;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, device, fixture};
 use voxcpm::{
-    ChunkDecoder, Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechDecoder,
+    Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechChunks, SpeechDecoder,
     Stepping,
 };
 
@@ -164,70 +164,84 @@ fn steps_are_captured_only_on_the_thread_the_model_loaded_on() {
     assert!(generate().is_ok());
 }
 
-/// Two speeches decoded a chunk at a time together, the second starting two patches after the
-/// first and ending before it: each comes out bit for bit as decoded alone a second at a time.
-#[test]
-fn decodes_speeches_a_chunk_at_a_time_together() {
+/// Four speeches decoded a chunk at a time together, one starting two patches after the others,
+/// the first in a slot another left, decoded as `captured` says, three at once filling out a
+/// graph of four rows: each comes out bit for bit as decoded alone a second at a time.
+fn decodes_speeches_a_chunk_at_a_time_together(captured: bool) {
     let (fixture, device) = (fixture!("voxcpm_generate"), device());
     let weights = Weights::from_store(&mut SafetensorsStore::from_file(fixture.path())).unwrap();
     let decoder = Decoder::load(&tiny().audio_vae(), &weights, FloatDType::F32, &device).unwrap();
     let voice = floats(fixture.tensor::<2>("input.voice", &device));
     let patches = fixture.tensor::<3>("output.patches", &device);
     let count = patches.dims()[0];
-    let other: Vec<Tensor<3>> = (0..count - 3)
-        .map(|i| patches.clone().narrow(0, count - 1 - i, 1).neg())
-        .collect();
-    let alone = |patches: Tensor<3>| {
+    let patch = |i: usize| patches.clone().narrow(0, i, 1);
+    // Each speech's patches, and the step it starts at.
+    let speeches: [(Vec<Tensor<3>>, usize); 4] = [
+        ((0..count).map(patch).collect(), 0),
+        (
+            (0..count - 3).map(|i| patch(count - 1 - i).neg()).collect(),
+            2,
+        ),
+        (
+            (0..count - 1).map(|i| patch(i).mul_scalar(0.5)).collect(),
+            0,
+        ),
+        (
+            (0..count - 2)
+                .map(|i| patch(i + 1).mul_scalar(-2.0))
+                .collect(),
+            0,
+        ),
+    ];
+    let alone = |patches: &[Tensor<3>]| {
         let second = NonZeroUsize::new(25).unwrap();
-        let samples = SpeechDecoder::new(&decoder, &voice, 8, second).push(patches);
+        let mut speech = SpeechDecoder::new(&decoder, &voice, 8, second);
+        let samples = speech.push(Tensor::cat(patches.to_vec(), 0));
         Tensor::<1>::from_floats(samples.as_slice(), &device)
     };
-    let expected = [alone(patches.clone()), alone(Tensor::cat(other.clone(), 0))];
-    let mut decoders = [
-        ChunkDecoder::new(&decoder, &voice, 8, &device),
-        ChunkDecoder::new(&decoder, &voice, 8, &device),
-    ];
-    let mut audio = [vec![], vec![]];
+    let mut chunks = SpeechChunks::new(&decoder, 8, 4, captured, &device);
+    chunks.warm_up();
+    let mut gone = chunks.start(&voice);
+    gone.push(Tensor::cat(vec![patches.clone(); 3], 0));
+    chunks.decode(&mut [&mut gone], &[false]);
+    chunks.release(gone);
+    let mut decoders: Vec<_> = speeches.iter().map(|_| chunks.start(&voice)).collect();
+    let mut audio = vec![vec![]; speeches.len()];
     for step in 0..count {
-        let given = [
-            Some(patches.clone().narrow(0, step, 1)),
-            step.checked_sub(2).and_then(|i| other.get(i).cloned()),
-        ];
-        let mut ends = [None, None];
-        for (i, (decoder, patch)) in decoders.iter_mut().zip(given).enumerate() {
-            let Some(patch) = patch else { continue };
-            decoder.push(patch);
-            let last = [step == count - 1, step == other.len() + 1][i];
-            if decoder.ready() || last {
-                ends[i] = Some(last);
-            }
-        }
         let (mut chosen, mut last, mut whose) = (vec![], vec![], vec![]);
-        for (i, (decoder, ends)) in decoders.iter_mut().zip(ends).enumerate() {
-            if let Some(ends) = ends {
+        for (i, (decoder, (patches, start))) in decoders.iter_mut().zip(&speeches).enumerate() {
+            let Some(patch) = step.checked_sub(*start).and_then(|at| patches.get(at)) else {
+                continue;
+            };
+            decoder.push(patch.clone());
+            let ends = step - start == patches.len() - 1;
+            if decoder.ready() || ends {
                 chosen.push(decoder);
                 last.push(ends);
                 whose.push(i);
             }
         }
-        if chosen.is_empty() {
-            continue;
-        }
-        for (i, samples) in whose
-            .into_iter()
-            .zip(ChunkDecoder::decode_together(&mut chosen, &last))
-        {
-            audio[i].extend(samples);
+        if !chosen.is_empty() {
+            for (i, samples) in whose.into_iter().zip(chunks.decode(&mut chosen, &last)) {
+                audio[i].extend(samples);
+            }
         }
     }
-    for (audio, expected) in audio.into_iter().zip(expected) {
-        assert_close(
-            Tensor::<1>::from_floats(audio.as_slice(), &device),
-            expected,
-            0.0,
-            0.0,
-        );
+    assert_eq!(chunks.graphs(), if captured { 3 } else { 0 });
+    for (audio, (patches, _)) in audio.into_iter().zip(&speeches) {
+        let audio = Tensor::<1>::from_floats(audio.as_slice(), &device);
+        assert_close(audio, alone(patches), 0.0, 0.0);
     }
+}
+
+#[test]
+fn decodes_speeches_a_chunk_at_a_time_together_as_they_come() {
+    decodes_speeches_a_chunk_at_a_time_together(false);
+}
+
+#[test]
+fn decodes_speeches_a_chunk_at_a_time_together_by_replays() {
+    decodes_speeches_a_chunk_at_a_time_together(true);
 }
 
 #[test]
