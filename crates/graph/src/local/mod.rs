@@ -12,12 +12,12 @@ pub mod encoder;
 
 use Access::{Read, Write};
 use serde::Deserialize;
-use vulkan::SpecValue;
+use vulkan::{DeviceReport, SpecValue};
 
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    decode::{LmConfig, Shape},
+    decode::{self, LmConfig, Shape},
     graph::{Graph, Kind, Pipeline, TensorId},
     kernels::{Access, KernelInfo},
     step::Step,
@@ -134,16 +134,14 @@ pub struct Tuning {
     pub down_rows: u32,
     /// The columns of the tokens each projection stages at once.
     pub chunk: u32,
-    /// The blocks of rows each workgroup of each projection takes, one after another.
-    pub qkv_blocks: u32,
-    pub gate_up_blocks: u32,
-    pub o_blocks: u32,
-    pub down_blocks: u32,
+    /// The workgroups each projection dispatches, which share its rows out: one to each
+    /// workgroup's worth of rows when 0.
+    pub groups: u32,
 }
 
 impl Tuning {
-    /// One row or one pair of rows to a cluster, one block of them to a workgroup of 256, at
-    /// `subgroup`.
+    /// One row or one pair of rows to a cluster, in workgroups of 256 that each take a
+    /// workgroup's worth of them, at `subgroup`.
     pub fn for_subgroup(subgroup: u32) -> Self {
         Tuning {
             subgroup,
@@ -153,11 +151,27 @@ impl Tuning {
             o_rows: 1,
             down_rows: 1,
             chunk: 1024,
-            qkv_blocks: 1,
-            gate_up_blocks: 1,
-            o_blocks: 1,
-            down_blocks: 1,
+            groups: 0,
         }
+    }
+
+    /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for
+    /// that the device can require; on a device that says how many compute units it has, one
+    /// workgroup to each. On the Radeon 8060S, whose 40 compute units each hold one workgroup's
+    /// 22 tokens at once, the sampler's ten steps took 37.7 ms on the GPU so, and about 50 ms
+    /// at one workgroup to each workgroup's worth of rows.
+    pub fn for_device(report: &DeviceReport) -> Result<Self, Error> {
+        let base = decode::Tuning::for_device(report)?;
+        let units = report
+            .shader_core
+            .and_then(|core| core.active_compute_units);
+        Ok(match units {
+            Some(units) => Tuning {
+                groups: units,
+                ..Tuning::for_subgroup(base.subgroup)
+            },
+            None => Tuning::for_subgroup(base.subgroup),
+        })
     }
 }
 
@@ -174,6 +188,27 @@ pub(crate) fn groups(what: &str, total: usize, per_group: usize) -> Result<u32, 
         )));
     }
     u32::try_from(total / per_group).map_err(|_| Error::Shape(format!("{what}: {total}")))
+}
+
+/// The sets of `per_slot` of `total` rows the clusters take, and the workgroups to dispatch over
+/// them: `groups`, or one to each `clusters` of them when 0, and never more.
+fn slots(
+    what: &str,
+    total: usize,
+    per_slot: usize,
+    clusters: usize,
+    groups: u32,
+) -> Result<(u32, u32), Error> {
+    let slots = self::groups(what, total, per_slot)?;
+    let blocks = self::groups(what, slots as usize, clusters)?;
+    Ok((
+        slots,
+        if groups == 0 {
+            blocks
+        } else {
+            groups.min(blocks)
+        },
+    ))
 }
 
 fn check(ok: bool, why: impl FnOnce() -> String) -> Result<(), Error> {
@@ -266,6 +301,13 @@ impl Stack {
             subgroup_size: sub,
         };
         let eps = SpecValue::F32(s.eps);
+        let (qkv_slots, qkv_groups) = slots(
+            "q/k/v row pairs",
+            (s.heads + 2 * s.kv_heads) * s.head_dim / 2,
+            tuning.qkv_pairs as usize,
+            clusters,
+            tuning.groups,
+        )?;
         let qkv = pipeline(
             &LOCAL_QKV_ROPE,
             &[
@@ -278,14 +320,9 @@ impl Stack {
                 (8, eps),
                 (9, SpecValue::U32(tuning.qkv_pairs)),
                 (10, u(chunk.min(s.hidden))),
-                (11, SpecValue::U32(tuning.qkv_blocks)),
+                (11, SpecValue::U32(qkv_slots)),
             ],
         );
-        let qkv_groups = groups(
-            "q/k/v row pairs",
-            (s.heads + 2 * s.kv_heads) * s.head_dim / 2,
-            clusters * (tuning.qkv_pairs * tuning.qkv_blocks) as usize,
-        )?;
         let attention = pipeline(
             &LOCAL_ATTENTION,
             &[
@@ -298,8 +335,15 @@ impl Stack {
             ],
         );
         let attention_groups = (m * s.heads).div_ceil(clusters) as u32;
-        let residual = |k: usize, rows: u32, blocks: u32| {
-            pipeline(
+        let residual = |k: usize, rows: u32| -> Result<(Pipeline, u32), Error> {
+            let (slots, groups) = slots(
+                "residual rows",
+                s.hidden,
+                rows as usize,
+                clusters,
+                tuning.groups,
+            )?;
+            let pipeline = pipeline(
                 &LOCAL_RESIDUAL,
                 &[
                     (2, u(k)),
@@ -307,17 +351,18 @@ impl Stack {
                     (4, u(m)),
                     (5, u(s.hidden)),
                     (6, SpecValue::U32(rows)),
-                    (7, SpecValue::U32(blocks)),
+                    (7, SpecValue::U32(slots)),
                 ],
-            )
+            );
+            Ok((pipeline, groups))
         };
-        let residual_groups = |rows: u32, blocks: u32| {
-            groups(
-                "residual rows",
-                s.hidden,
-                clusters * (rows * blocks) as usize,
-            )
-        };
+        let (gate_up_slots, gate_up_groups) = slots(
+            "gate/up row pairs",
+            s.inner,
+            tuning.gate_up_pairs as usize,
+            clusters,
+            tuning.groups,
+        )?;
         let gate_up = pipeline(
             &LOCAL_GATE_UP,
             &[
@@ -327,26 +372,15 @@ impl Stack {
                 (5, eps),
                 (6, SpecValue::U32(tuning.gate_up_pairs)),
                 (7, u(chunk.min(s.hidden))),
-                (8, SpecValue::U32(tuning.gate_up_blocks)),
+                (8, SpecValue::U32(gate_up_slots)),
             ],
         );
-        let gate_up_groups = groups(
-            "gate/up row pairs",
-            s.inner,
-            clusters * (tuning.gate_up_pairs * tuning.gate_up_blocks) as usize,
-        )?;
         let pipelines = Pipelines {
             qkv: (qkv, qkv_groups),
             attention: (attention, attention_groups),
-            o: (
-                residual(s.heads * s.head_dim, tuning.o_rows, tuning.o_blocks),
-                residual_groups(tuning.o_rows, tuning.o_blocks)?,
-            ),
+            o: residual(s.heads * s.head_dim, tuning.o_rows)?,
             gate_up: (gate_up, gate_up_groups),
-            down: (
-                residual(s.inner, tuning.down_rows, tuning.down_blocks),
-                residual_groups(tuning.down_rows, tuning.down_blocks)?,
-            ),
+            down: residual(s.inner, tuning.down_rows)?,
         };
 
         let vector = |n: usize| 2 * n as u64;

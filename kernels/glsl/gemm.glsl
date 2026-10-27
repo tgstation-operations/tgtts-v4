@@ -4,8 +4,8 @@
 // reading 16 contiguous bytes of each row per step, and sums every row against every token in
 // f32: each weight is read once for all the tokens.
 //
-// The including kernel declares K, KC, M, ROWS and BLOCKS and the `w` buffer, then includes
-// this, defines `stage`, `rows_of` and `epilogue`, and calls `run`.
+// The including kernel declares K, KC, M, ROWS, the SLOTS of ROWS rows there are and the `w`
+// buffer, then includes this, defines `stage`, `rows_of` and `epilogue`, and calls `run`.
 #extension GL_KHR_shader_subgroup_clustered : require
 
 // A literal, as glslang takes a cluster size; it divides every subgroup size there is.
@@ -41,6 +41,10 @@ uint cluster_id() {
     return gl_SubgroupID * (SUBGROUP / CLUSTER) + gl_SubgroupInvocationID / CLUSTER;
 }
 
+// The tokens whose products `accumulate` interleaves, so that consecutive FMAs add to
+// different sums rather than wait on each other.
+const uint GROUP = 4;
+
 // Adds the products of this lane's part of a chunk of ROWS rows, `ws`, with every token's
 // part of it in xs to acc, `[ROWS][M]`.
 void accumulate(uvec4 ws[LOADS], inout float acc[SUMS]) {
@@ -50,25 +54,31 @@ void accumulate(uvec4 ws[LOADS], inout float acc[SUMS]) {
         [[unroll]] for (uint r = 0; r < ROWS; r++) {
             unpack8(ws[r * STEPS + s], wlo[r], whi[r]);
         }
-        [[unroll]] for (uint m = 0; m < M; m++) {
-            vec4 lo, hi;
-            unpack8(xs[m * (KC / 8) + s * CLUSTER + lane], lo, hi);
-            [[unroll]] for (uint r = 0; r < ROWS; r++) {
-                float a = acc[r * M + m];
-                [[unroll]] for (uint e = 0; e < 4; e++) {
-                    a = fma(wlo[r][e], lo[e], a);
+        [[unroll]] for (uint first = 0; first < M; first += GROUP) {
+            vec4 lo[GROUP], hi[GROUP];
+            [[unroll]] for (uint g = 0; g < GROUP; g++) {
+                if (first + g < M) {
+                    unpack8(xs[(first + g) * (KC / 8) + s * CLUSTER + lane], lo[g], hi[g]);
                 }
-                [[unroll]] for (uint e = 0; e < 4; e++) {
-                    a = fma(whi[r][e], hi[e], a);
+            }
+            [[unroll]] for (uint e = 0; e < 8; e++) {
+                [[unroll]] for (uint g = 0; g < GROUP; g++) {
+                    [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                        uint i = r * M + first + g;
+                        if (first + g < M) {
+                            float x = e < 4 ? lo[g][e % 4] : hi[g][e % 4];
+                            float v = e < 4 ? wlo[r][e % 4] : whi[r][e % 4];
+                            acc[i] = fma(v, x, acc[i]);
+                        }
+                    }
                 }
-                acc[r * M + m] = a;
             }
         }
     }
 }
 
-// The rows of w that this cluster takes in block `block`: the including kernel's.
-void rows_of(uint block, out uint rows[ROWS]);
+// The rows of w in set `slot` of the SLOTS sets of ROWS rows: the including kernel's.
+void rows_of(uint slot, out uint rows[ROWS]);
 
 // What the including kernel makes of the sums of rows `rows` with every token, `[ROWS][M]`,
 // in every lane of the cluster.
@@ -83,47 +93,65 @@ void load_chunk(uint rows[ROWS], uint chunk, out uvec4 ws[LOADS]) {
     }
 }
 
-// The workgroup's BLOCKS blocks of rows, every NumWorkGroups-th from its own, each times every
-// token, chunk by chunk: each chunk of the rows is loaded while the one before is summed, so
-// that the weights stream while the workgroup computes. The tokens are staged once if they
-// fit in one chunk, and chunk by chunk for every block if not.
-void run() {
+// The rows of `slot` of the SLOTS sets of ROWS rows times every token, chunk by chunk: each
+// chunk of the rows is loaded while the one before is summed, the first before the tokens are
+// staged, so that the weights stream while the workgroup computes.
+void sum_rows(uint slot, uint summed, inout float acc[SUMS]) {
     uint rows[ROWS];
-    rows_of(gl_WorkGroupID.x, rows);
+    rows_of(slot, rows);
+    [[unroll]] for (uint j = 0; j < SUMS; j++) {
+        acc[j] = 0.0;
+    }
     uvec4 next[LOADS];
     load_chunk(rows, 0, next);
-    for (uint i = 0; i < BLOCKS; i++) {
-        uint block = gl_WorkGroupID.x + i * gl_NumWorkGroups.x;
-        uint these[ROWS];
-        [[unroll]] for (uint r = 0; r < ROWS; r++) {
-            these[r] = rows[r];
+    for (uint c = 0; c < summed; c++) {
+        uvec4 ws[LOADS];
+        [[unroll]] for (uint j = 0; j < LOADS; j++) {
+            ws[j] = next[j];
         }
-        float acc[SUMS];
-        [[unroll]] for (uint j = 0; j < SUMS; j++) {
-            acc[j] = 0.0;
+        if (c + 1 < summed) {
+            load_chunk(rows, c + 1, next);
         }
-        for (uint chunk = 0; chunk < CHUNKS; chunk++) {
-            uvec4 ws[LOADS];
-            [[unroll]] for (uint j = 0; j < LOADS; j++) {
-                ws[j] = next[j];
-            }
-            if (chunk + 1 < CHUNKS) {
-                load_chunk(rows, chunk + 1, next);
-            } else if (i + 1 < BLOCKS) {
-                rows_of(block + gl_NumWorkGroups.x, rows);
-                load_chunk(rows, 0, next);
-            }
-            if (CHUNKS > 1 || i == 0) {
-                barrier();
-                stage(chunk);
-                barrier();
-            }
-            accumulate(ws, acc);
+        if (summed > 1) {
+            barrier();
+            stage(c);
+            barrier();
         }
-        [[unroll]] for (uint j = 0; j < SUMS; j++) {
-            acc[j] = subgroupClusteredAdd(acc[j], CLUSTER);
+        accumulate(ws, acc);
+    }
+    [[unroll]] for (uint j = 0; j < SUMS; j++) {
+        acc[j] = subgroupClusteredAdd(acc[j], CLUSTER);
+    }
+    epilogue(rows, acc);
+}
+
+// Every set of rows the workgroup takes. A workgroup that sums one chunk stages the tokens once,
+// and each of its subgroups then takes every NumWorkGroups-th of the subgroups' worth of slots
+// from its own on, apart from the others, so that the work is shared out a subgroup's worth at
+// a time. One that sums several restages them chunk by chunk, all its clusters together, for
+// every NumWorkGroups-th of the workgroups' worth of slots from its own on.
+//
+// A slot's first chunk is not loaded while the slot before is summed: the registers that would
+// take are what lets the compiler issue the tokens' loads from shared memory early.
+void run() {
+    float acc[SUMS];
+    if (CHUNKS == 1) {
+        barrier();
+        stage(0);
+        barrier();
+        const uint PER_SUBGROUP = SUBGROUP / CLUSTER;
+        uint cluster = gl_SubgroupInvocationID / CLUSTER;
+        uint stride = gl_NumWorkGroups.x * SUBGROUPS;
+        uint units = SLOTS / PER_SUBGROUP;
+        for (uint unit = gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID; unit < units;
+             unit += stride) {
+            sum_rows(unit * PER_SUBGROUP + cluster, 1, acc);
         }
-        epilogue(these, acc);
+    } else {
+        for (uint block = gl_WorkGroupID.x; block < SLOTS / CLUSTERS;
+             block += gl_NumWorkGroups.x) {
+            sum_rows(block * CLUSTERS + cluster_id(), CHUNKS, acc);
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 // out = SiLU(gate) * up for each of the M tokens of a local stack, with gate and up the two
 // halves of W RMSNorm(x): the MLP's gate_up_proj and what comes before and after it. W is
 // 2 INNER x K, the gate's rows first; a cluster takes PAIRS rows of the gate and the same rows
-// of up, and a workgroup BLOCKS blocks of them. x is `[M][K]`, out `[M][INNER]`.
+// of up. x is `[M][K]`, out `[M][INNER]`.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint K = 1024;
@@ -12,7 +12,7 @@ layout(constant_id = 4) const uint INNER = 4096;
 layout(constant_id = 5) const float EPS = 1e-5;
 layout(constant_id = 6) const uint PAIRS = 1;
 layout(constant_id = 7) const uint KC = 1024;
-layout(constant_id = 8) const uint BLOCKS = 1;
+layout(constant_id = 8) const uint SLOTS = 1024;
 const uint ROWS = 2 * PAIRS;
 
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
@@ -30,8 +30,8 @@ void stage(uint chunk) {
     stage_normed(chunk);
 }
 
-void rows_of(uint block, out uint rows[ROWS]) {
-    uint first = (block * CLUSTERS + cluster_id()) * PAIRS;
+void rows_of(uint slot, out uint rows[ROWS]) {
+    uint first = slot * PAIRS;
     [[unroll]] for (uint p = 0; p < PAIRS; p++) {
         rows[2 * p] = first + p;
         rows[2 * p + 1] = INNER + first + p;

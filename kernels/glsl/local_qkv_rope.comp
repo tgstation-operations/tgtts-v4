@@ -4,7 +4,7 @@
 // k and v = W RMSNorm(x), q and k rotated by RoPE at each token's place in its sequence. W is
 // upstream's q_proj, k_proj and v_proj joined along their outputs, HEADS + 2 KV_HEADS heads of
 // HEAD_DIM rows; a cluster takes PAIRS pairs of rows i and i + HEAD_DIM / 2 of one head, the
-// pairs RoPE rotates together, and a workgroup BLOCKS blocks of them. x is `[M][K]`; q, k and v are `[M][heads][HEAD_DIM]`; the
+// pairs RoPE rotates together. x is `[M][K]`; q, k and v are `[M][heads][HEAD_DIM]`; the
 // rotation's cosines and sines are `[T][HEAD_DIM / 2]`.
 #include "common.glsl"
 
@@ -17,7 +17,7 @@ layout(constant_id = 7) const uint HEAD_DIM = 128;
 layout(constant_id = 8) const float EPS = 1e-5;
 layout(constant_id = 9) const uint PAIRS = 1;
 layout(constant_id = 10) const uint KC = 1024;
-layout(constant_id = 11) const uint BLOCKS = 1;
+layout(constant_id = 11) const uint SLOTS = 1024;
 const uint ROWS = 2 * PAIRS;
 const uint HALF = HEAD_DIM / 2;
 
@@ -40,8 +40,8 @@ void stage(uint chunk) {
     stage_normed(chunk);
 }
 
-void rows_of(uint block, out uint rows[ROWS]) {
-    uint first = (block * CLUSTERS + cluster_id()) * PAIRS;
+void rows_of(uint slot, out uint rows[ROWS]) {
+    uint first = slot * PAIRS;
     [[unroll]] for (uint p = 0; p < PAIRS; p++) {
         uint pair = first + p;
         uint row = pair / HALF * HEAD_DIM + pair % HALF;

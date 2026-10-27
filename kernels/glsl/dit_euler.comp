@@ -19,8 +19,8 @@ layout(constant_id = 8) const float DT = 0.1;
 layout(constant_id = 9) const uint ROWS = 4;
 
 const uint KC = K;
-const uint BLOCKS = 1;
 const uint M = 2 * FRAMES;
+const uint SLOTS = CHANNELS / ROWS;
 const uint LEN = CHANNELS * FRAMES;
 
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
@@ -48,9 +48,9 @@ void stage(uint chunk) {
     stage_normed(chunk);
 }
 
-void rows_of(uint block, out uint rows[ROWS]) {
+void rows_of(uint slot, out uint rows[ROWS]) {
     [[unroll]] for (uint r = 0; r < ROWS; r++) {
-        rows[r] = cluster_id() * ROWS + r;
+        rows[r] = slot * ROWS + r;
     }
 }
 

@@ -247,8 +247,8 @@ fn rounded(cases: Vec<Case>) -> Vec<Case> {
 }
 
 /// The tunings each kernel is checked at, at either subgroup size: one row or pair to a cluster
-/// and more, in workgroups of 256 and 128 taking one block of rows and more, the tokens staged
-/// in chunks of 1024 columns and fewer.
+/// and more, in workgroups of 128 to 1024, one to each block of rows or fewer, which then take
+/// several in turn, the tokens staged in chunks of 1024 columns and fewer.
 fn tunings(ctx: &Context) -> Vec<Tuning> {
     let report = ctx.report();
     [64, 32]
@@ -256,27 +256,31 @@ fn tunings(ctx: &Context) -> Vec<Tuning> {
         .filter(|&s| report.can_require_subgroup_size(s))
         .flat_map(|s| {
             let base = Tuning::for_subgroup(s);
-            let cut = |workgroup, pairs, o_rows, down_rows, chunk, blocks| Tuning {
+            let cut = |workgroup, pairs, o_rows, down_rows, chunk, groups| Tuning {
                 workgroup,
                 qkv_pairs: pairs,
                 gate_up_pairs: pairs,
                 o_rows,
                 down_rows,
                 chunk,
-                qkv_blocks: blocks,
-                gate_up_blocks: blocks,
-                o_blocks: blocks,
-                down_blocks: blocks,
+                groups,
                 ..base
             };
             [
                 base,
-                cut(128, 2, 2, 4, 512, 1),
-                cut(256, 1, 1, 1, 256, 1),
-                cut(256, 2, 2, 2, 256, 2),
-                cut(128, 1, 1, 1, 256, 4),
-                cut(256, 1, 1, 1, 1024, 4),
-                cut(256, 1, 1, 1, 512, 2),
+                Tuning {
+                    subgroup: s,
+                    ..Tuning::for_device(report).unwrap()
+                },
+                cut(128, 2, 2, 4, 512, 0),
+                cut(256, 1, 1, 1, 256, 0),
+                cut(256, 2, 2, 2, 256, 24),
+                cut(128, 1, 1, 1, 256, 40),
+                cut(256, 1, 1, 1, 1024, 40),
+                cut(256, 1, 1, 1, 512, 80),
+                cut(512, 1, 1, 1, 1024, 40),
+                cut(1024, 1, 1, 1, 1024, 0),
+                cut(256, 1, 1, 1, 1024, 24),
             ]
         })
         .collect()
@@ -320,7 +324,7 @@ fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
     let want = oracle(&cases, timesteps, FloatDType::F32);
     let burn_f16 = oracle(&cases, timesteps, FloatDType::F16);
     let ctx = context();
-    let tuning = Tuning::for_subgroup(64);
+    let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let got = gpu(&ctx, &cases, timesteps, &tuning);
     let margins = margins_of(&got, &want, &burn_f16);
     assert!(within(margins), "{margins:.2?}");
