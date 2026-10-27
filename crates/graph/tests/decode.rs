@@ -274,6 +274,71 @@ fn one_layer_decodes_as_minicpm4_does_on_the_cpu() {
 
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn one_layer_recorded_again_with_its_rows_cut_otherwise_decodes_the_same() {
+    let json = config();
+    let config: LmConfig = serde_json::from_value(json["lm_config"].clone()).unwrap();
+    let ctx = context();
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let positions = 40;
+    let shape = Shape::new(&config, 1, 64).unwrap();
+    let base = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+    let mut decoder =
+        Decoder::new(&ctx, &mut kernels, &shape, &base, false).unwrap_or_else(|e| panic!("{e}"));
+    let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    decoder
+        .load(&checkpoint, "base_lm.")
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Hidden states of about the embeddings' scale, from a fixed xorshift sequence.
+    let mut state = 0x9e37_79b9_u32;
+    let x: Vec<u16> = (0..positions * shape.hidden)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            f16::from_f64((f64::from(state) / f64::from(u32::MAX) - 0.5) * 0.2).to_bits()
+        })
+        .collect();
+    let run = |decoder: &mut Decoder| -> Vec<u16> {
+        x.chunks(shape.hidden)
+            .enumerate()
+            .flat_map(|(t, x)| decoder.step(t, x).unwrap_or_else(|e| panic!("{e}")))
+            .collect()
+    };
+    let want = run(&mut decoder);
+    // Rows to a subgroup decide where each row is summed, not in what order; the workgroup
+    // width, which orders the norm's sum, stays.
+    let cuts = [
+        (
+            Tuning {
+                qkv_pairs: 2,
+                gate_up_pairs: 2,
+                residual_rows: 2,
+                ..base
+            },
+            false,
+        ),
+        (base, true),
+    ];
+    for (tuning, timed) in cuts {
+        decoder = decoder
+            .retuned(&ctx, &mut kernels, &tuning, timed)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let got = run(&mut decoder);
+        let differ = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        assert_eq!(
+            differ,
+            0,
+            "{tuning:?}, timed {timed}: {differ} of {} differ",
+            want.len()
+        );
+    }
+    eprintln!("{positions} positions alike at {base:?} and recorded again as {cuts:?}");
+    assert_no_validation_messages(&ctx);
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn the_base_lm_decodes_as_minicpm4_does_on_the_cpu() {
     let oracle = oracle(28, 70);
     let got = gpu(28, &oracle.x, 0, None);

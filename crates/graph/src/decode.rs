@@ -6,7 +6,7 @@
 //! submitted at every position, which is read from a buffer the host writes before each.
 
 use serde::Deserialize;
-use vulkan::{Context, DeviceReport, SpecValue, Timing};
+use vulkan::{Context, DeviceReport, SpecValue, Submission, Timing};
 
 use crate::{
     Error,
@@ -556,6 +556,14 @@ impl Decoder {
     /// values into the cache there and attending over the cache up to it; returns the output
     /// after the final norm, as f16 bits.
     pub fn step(&mut self, position: usize, x: &[u16]) -> Result<Vec<u16>, Error> {
+        self.set_input(position, x)?;
+        self.start()?.wait()?;
+        self.output()
+    }
+
+    /// Writes the input of the next run: `x`, the hidden state of `position` as f16 bits, and the
+    /// position.
+    pub fn set_input(&mut self, position: usize, x: &[u16]) -> Result<(), Error> {
         let capacity = self.tensors.shape.capacity;
         if position >= capacity {
             return Err(Error::Shape(format!(
@@ -563,9 +571,33 @@ impl Decoder {
             )));
         }
         self.step.write(self.tensors.x, x)?;
-        self.step.write(self.tensors.position, &[position as u32])?;
-        self.step.submit()?;
+        self.step.write(self.tensors.position, &[position as u32])
+    }
+
+    /// Starts a run over the input last written, and returns without waiting for it.
+    pub fn start(&mut self) -> Result<Submission<'_>, Error> {
+        self.step.start()
+    }
+
+    /// The output of the last run, after the final norm, as f16 bits.
+    pub fn output(&self) -> Result<Vec<u16>, Error> {
         self.step.read(self.tensors.out)
+    }
+
+    /// The decoder recorded again cut as `tuning` says, and timed per dispatch when `timed`, over
+    /// the weights and the cache it holds. On an error they go with it.
+    pub fn retuned(
+        self,
+        ctx: &Context,
+        kernels: &mut Kernels,
+        tuning: &Tuning,
+        timed: bool,
+    ) -> Result<Self, Error> {
+        let tensors = decode_graph(&self.tensors.shape, tuning)?;
+        let step = self
+            .step
+            .recorded_again(ctx, kernels, &tensors.graph, timed)?;
+        Ok(Decoder { step, tensors })
     }
 
     /// Each dispatch's label and GPU time in the last step, when recorded timed.

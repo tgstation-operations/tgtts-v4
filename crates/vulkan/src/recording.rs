@@ -386,6 +386,12 @@ impl Recording {
         &mut self.buffers[i]
     }
 
+    /// The buffers, to be recorded again; the commands are freed.
+    pub fn into_buffers(mut self) -> Result<Vec<Buffer>> {
+        self.finish()?;
+        Ok(std::mem::take(&mut self.buffers))
+    }
+
     /// Runs the recorded dispatches once and waits for them: when this returns, everything they
     /// wrote is visible to the host.
     pub fn submit(&mut self) -> Result<()> {
