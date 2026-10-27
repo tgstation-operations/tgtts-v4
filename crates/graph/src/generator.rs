@@ -8,7 +8,7 @@
 use std::{fs, mem, path::Path};
 
 use serde::Deserialize;
-use vulkan::Context;
+use vulkan::{Context, Timing};
 
 use crate::{
     Error,
@@ -248,6 +248,18 @@ impl Generator {
         self.request
             .as_mut()
             .map_or_else(Vec::new, |request| mem::take(&mut request.audio))
+    }
+
+    /// Each dispatch's label and GPU time in the last run over the LMs' caches, when recorded
+    /// timed: the prompt's last run after [`start`](Self::start), the patch step's after
+    /// [`next_patch`](Self::next_patch).
+    pub fn timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
+        self.step.timings()
+    }
+
+    /// Each dispatch's label and GPU time in the audio VAE's last chunk, when recorded timed.
+    pub fn audio_timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
+        self.vae.timings()
     }
 
     /// Ends the request, decoding the frames still waiting, and gives the audio not yet taken.
