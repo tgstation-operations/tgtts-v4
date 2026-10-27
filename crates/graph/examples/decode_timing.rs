@@ -201,6 +201,8 @@ struct Phases {
     gpu: f64,
     /// From the GPU's last timestamp to the wait's return.
     wake: Option<f64>,
+    /// How far the queue's delay and the wake may be off: the calibration's deviation.
+    deviation: Option<f64>,
     /// Reading the output.
     read: f64,
     wall: f64,
@@ -264,13 +266,18 @@ impl Bench {
             queue: ends.map(|[start, _]| start - t1),
             gpu,
             wake: ends.map(|[_, end]| t3 - end),
+            deviation: calibration.map(|c| c.deviation_ns as f64),
             read: t4 - t3,
             wall: t4 - t0,
         }
     }
 
+    /// The closest of a few calibrations: one can be far looser than the rest, as one of three on
+    /// the Radeon 8060S was, within 1.2 ms where the others were within 20 us.
     fn calibration(&self) -> Option<Calibration> {
-        self.ctx.calibrate().unwrap_or_else(|e| panic!("{e}"))
+        (0..8)
+            .filter_map(|_| self.ctx.calibrate().unwrap_or_else(|e| panic!("{e}")))
+            .min_by_key(|c| c.deviation_ns)
     }
 
     /// Steps back to back for `duration`, one at least; their phases.
@@ -333,12 +340,14 @@ fn summary(phases: &[Phases]) -> String {
     let (queue, wake) = (some(|p| p.queue), some(|p| p.wake));
     if !queue.is_empty() {
         line += &format!(
-            ", queue {:.1} us (p90 {:.1}), wake {:.1} us (p90 {:.1}, max {:.1})",
+            ", queue {:.1} us (p90 {:.1}), wake {:.1} us (p90 {:.1}, max {:.1}), each within {:.1} \
+             us",
             us(&queue),
             quantile(&queue, 0.9) / 1e3,
             us(&wake),
             quantile(&wake, 0.9) / 1e3,
-            quantile(&wake, 1.0) / 1e3
+            quantile(&wake, 1.0) / 1e3,
+            quantile(&some(|p| p.deviation), 1.0) / 1e3
         );
     }
     line + &format!(", read {:.1} us", us(&all(|p| p.read)))
