@@ -66,6 +66,25 @@ pub struct Timing {
     pub nanoseconds: f64,
 }
 
+/// The GPU's timestamp counter and the host's `CLOCK_MONOTONIC`, read at once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Calibration {
+    pub ticks: u64,
+    pub monotonic_ns: u64,
+    /// How far apart in time the two readings may have been taken, in nanoseconds.
+    pub deviation_ns: u64,
+    /// Nanoseconds per tick.
+    pub period_ns: f32,
+}
+
+impl Calibration {
+    /// The host's `CLOCK_MONOTONIC`, in nanoseconds, when the GPU's counter read `ticks`.
+    pub fn monotonic_at(&self, ticks: u64) -> f64 {
+        let since = ticks.wrapping_sub(self.ticks) as i64;
+        self.monotonic_ns as f64 + since as f64 * f64::from(self.period_ns)
+    }
+}
+
 /// The objects one submission uses, reused by every dispatch and guarded together, since
 /// a queue and a command pool are externally synchronized.
 pub(crate) struct Submit {
@@ -82,6 +101,8 @@ pub(crate) struct Inner {
     pub(crate) report: DeviceReport,
     /// `VK_KHR_pipeline_executable_properties`, when the device offers it.
     pub(crate) executables: Option<ash::khr::pipeline_executable_properties::Device>,
+    /// `VK_KHR_calibrated_timestamps`, when the device offers it with both clocks.
+    calibration: Option<ash::khr::calibrated_timestamps::Device>,
     robust_buffer_access2: bool,
     pub(crate) queue_family: u32,
     pub(crate) submit: Mutex<Submit>,
@@ -260,6 +281,23 @@ impl Context {
                 robust_buffer_access && f.robust_buffer_access2 == vk::TRUE
             };
 
+        // Optional: the GPU's timestamps read beside the host's clock, which places a
+        // submission's start and end on the host's timeline.
+        let offers_calibration = report
+            .extensions
+            .iter()
+            .any(|e| e.as_bytes() == ash::khr::calibrated_timestamps::NAME.to_bytes())
+            && {
+                let calibration =
+                    ash::khr::calibrated_timestamps::Instance::new(&instance.entry, &instance.raw);
+                // SAFETY: `physical` came from this instance, which offers the extension.
+                unsafe { calibration.get_physical_device_calibrateable_time_domains(physical) }
+                    .is_ok_and(|domains| {
+                        domains.contains(&vk::TimeDomainKHR::DEVICE)
+                            && domains.contains(&vk::TimeDomainKHR::CLOCK_MONOTONIC)
+                    })
+            };
+
         let (mut f11, mut f12, mut f13, mut fcoop) = enabled(&Features::ALL);
         let mut fexec = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
             .pipeline_executable_info(true);
@@ -289,6 +327,9 @@ impl Context {
         }
         if offers_robustness2 {
             extensions.push(ash::ext::robustness2::NAME.as_ptr());
+        }
+        if offers_calibration {
+            extensions.push(ash::khr::calibrated_timestamps::NAME.as_ptr());
         }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
@@ -351,11 +392,14 @@ impl Context {
         };
         let executables = offers_executables
             .then(|| ash::khr::pipeline_executable_properties::Device::new(&instance.raw, &device));
+        let calibration = offers_calibration
+            .then(|| ash::khr::calibrated_timestamps::Device::new(&instance.raw, &device));
         Ok(Context {
             inner: Arc::new(Inner {
                 device,
                 report,
                 executables,
+                calibration,
                 robust_buffer_access2: offers_robustness2,
                 queue_family,
                 submit: Mutex::new(submit),
@@ -391,6 +435,28 @@ impl Context {
     /// Whether the Khronos validation layer is attached ([`VALIDATION_VAR`](crate::VALIDATION_VAR)).
     pub fn validating(&self) -> bool {
         self.inner.instance.validating()
+    }
+
+    /// The GPU's timestamp counter and the host's `CLOCK_MONOTONIC` read at once, through
+    /// `VK_KHR_calibrated_timestamps`; `None` when the device does not offer both clocks.
+    pub fn calibrate(&self) -> Result<Option<Calibration>> {
+        let Some(ext) = &self.inner.calibration else {
+            return Ok(None);
+        };
+        let infos = [
+            vk::TimeDomainKHR::DEVICE,
+            vk::TimeDomainKHR::CLOCK_MONOTONIC,
+        ]
+        .map(|domain| vk::CalibratedTimestampInfoKHR::default().time_domain(domain));
+        // SAFETY: the device offers both domains, which was checked when it was created.
+        let (stamps, deviation_ns) = unsafe { ext.get_calibrated_timestamps(&infos) }
+            .call("vkGetCalibratedTimestampsKHR")?;
+        Ok(Some(Calibration {
+            ticks: stamps[0],
+            monotonic_ns: stamps[1],
+            deviation_ns,
+            period_ns: self.inner.report.timestamp_period,
+        }))
     }
 
     /// Has every wait for the GPU poll for up to `bound` before it blocks: the host sees work that
@@ -624,6 +690,19 @@ mod tests {
         assert!((ns - 10_019_036.0).abs() < 1.0, "{ns}");
         assert_eq!(ticks_to_ns(0, 10.019_036), 0.0);
         assert_eq!(ticks_to_ns(3, 1.0), 3.0);
+    }
+
+    #[test]
+    fn a_calibration_places_timestamps_either_side_of_it_on_the_host_clock() {
+        let c = Calibration {
+            ticks: 1_000,
+            monotonic_ns: 5_000_000,
+            deviation_ns: 0,
+            period_ns: 10.019_036,
+        };
+        assert_eq!(c.monotonic_at(1_000), 5_000_000.0);
+        assert!((c.monotonic_at(1_100) - 5_001_001.903_6).abs() < 1e-3);
+        assert!((c.monotonic_at(900) - 4_998_998.096_4).abs() < 1e-3);
     }
 
     #[test]

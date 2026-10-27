@@ -14,4 +14,5 @@ ash.workspace = true
 
 [dev-dependencies]
 half.workspace = true
+libc.workspace = true
 serde_json.workspace = true

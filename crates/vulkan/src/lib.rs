@@ -20,6 +20,8 @@
 //!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
 //!   each submission, and each dispatch when asked.
 //! - [`Context::set_fence_spin`] has every wait for the GPU poll for a while before it blocks.
+//! - [`Context::calibrate`] reads the GPU's timestamp counter beside the host's clock, which places
+//!   a submission's ends ([`Recording::ends`]) on the host's timeline.
 //! - [`Kernel::executables`] says what the driver compiled it into: the subgroup size it runs at,
 //!   its registers and occupancy, and the machine code ([`executable`]).
 //!
@@ -39,7 +41,9 @@ pub mod report;
 pub mod select;
 pub mod spirv;
 
-pub use context::{Context, Timing, check_groups, elapsed_ticks, groups_for, ticks_to_ns};
+pub use context::{
+    Calibration, Context, Timing, check_groups, elapsed_ticks, groups_for, ticks_to_ns,
+};
 pub use error::{Error, Result};
 pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};

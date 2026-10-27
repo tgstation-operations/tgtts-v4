@@ -40,6 +40,7 @@ const NOTABLE_EXTENSIONS: &[&str] = &[
     "VK_AMD_shader_core_properties",
     "VK_AMD_shader_core_properties2",
     "VK_KHR_pipeline_executable_properties",
+    "VK_KHR_calibrated_timestamps",
     "VK_EXT_external_memory_host",
     "VK_KHR_shader_subgroup_extended_types",
 ];

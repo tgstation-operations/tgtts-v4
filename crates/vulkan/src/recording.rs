@@ -444,10 +444,15 @@ impl Recording {
     /// The GPU time of the last submission, from the timestamp before its first dispatch to the
     /// one after its last.
     pub fn elapsed(&self) -> Result<Timing> {
-        let last = self.queries() - 1;
-        let start = self.stamps(0, 1)?[0];
-        let end = self.stamps(last, 1)?[0];
+        let [start, end] = self.ends()?;
         Ok(self.timing(start, end))
+    }
+
+    /// The last submission's timestamps before its first dispatch and after its last, in ticks,
+    /// which a [`Calibration`](crate::Calibration) places on the host's clock.
+    pub fn ends(&self) -> Result<[u64; 2]> {
+        let last = self.queries() - 1;
+        Ok([self.stamps(0, 1)?[0], self.stamps(last, 1)?[0]])
     }
 
     /// `count` timestamps of the last submission from query `first`.

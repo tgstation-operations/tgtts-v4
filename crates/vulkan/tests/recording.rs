@@ -239,6 +239,52 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
     assert_no_validation_messages(&ctx);
 }
 
+/// The host's `CLOCK_MONOTONIC`, the clock a calibration reads beside the GPU's.
+fn monotonic_ns() -> f64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock every Linux has, and a timespec to write.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec as f64 * 1e9 + t.tv_nsec as f64
+}
+
+#[test]
+fn a_calibration_places_a_submission_between_its_submit_and_its_wait() {
+    let ctx = context();
+    if ctx.calibrate().unwrap().is_none() {
+        eprintln!("the device offers no calibrated timestamps; nothing to check");
+        return;
+    }
+    let kernels: Vec<_> = LINKS.iter().map(|&(a, b)| axpb(&ctx, a, b)).collect();
+    let mut recording = chain(&ctx, &kernels, 1 << 22, false);
+    for _ in 0..3 {
+        let calibration = ctx.calibrate().unwrap().unwrap();
+        let before = monotonic_ns();
+        recording.submit().unwrap_or_else(|e| panic!("{e}"));
+        let after = monotonic_ns();
+        let [start, end] = recording
+            .ends()
+            .unwrap()
+            .map(|t| calibration.monotonic_at(t));
+        let slack = calibration.deviation_ns as f64;
+        assert!(
+            before - slack <= start && start < end && end <= after + slack,
+            "the GPU from {start} to {end}, the host from {before} to {after}, deviation {slack}"
+        );
+        eprintln!(
+            "{:.1} us from submitting to the GPU's start, {:.1} us on the GPU, {:.1} us from its \
+             end to the wait's return; deviation {:.1} us (smoke, not a measurement)",
+            (start - before) / 1e3,
+            (end - start) / 1e3,
+            (after - end) / 1e3,
+            slack / 1e3
+        );
+    }
+    assert_no_validation_messages(&ctx);
+}
+
 #[test]
 fn a_binding_outside_its_buffer_is_refused_before_the_driver_sees_it() {
     let ctx = context();
