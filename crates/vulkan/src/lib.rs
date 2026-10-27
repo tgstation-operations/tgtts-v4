@@ -19,7 +19,9 @@
 //! - [`Context::record`] records a chain of dispatches with the barriers between them into one
 //!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
 //!   each submission, and each dispatch when asked; [`Recording::add_program`] records more such
-//!   chains over the same buffers, the programs of one model, to run one at a time.
+//!   chains over the same buffers, the programs of one model, to run one at a time;
+//!   [`Recording::copy_out`] and [`Recording::copy_in`] copy ranges of them to and from a buffer
+//!   outside it on the GPU.
 //! - [`Context::set_fence_spin`] has every wait for the GPU poll for a while before it blocks.
 //! - [`Context::calibrate`] reads the GPU's timestamp counter beside the host's clock, which places
 //!   a submission's ends ([`Recording::ends`]) on the host's timeline.
@@ -50,5 +52,5 @@ pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};
 pub use kernel::{Kernel, KernelDesc, SpecValue};
 pub use memory::{Buffer, Residence};
-pub use recording::{Binding, Dispatch, Recording, Submission};
+pub use recording::{Binding, Dispatch, Recording, Region, Submission};
 pub use report::DeviceReport;

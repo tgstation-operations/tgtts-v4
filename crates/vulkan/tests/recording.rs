@@ -9,7 +9,7 @@ use std::{
 };
 
 use vulkan::{
-    Binding, Context, Dispatch, Error, Kernel, KernelDesc, Residence, SpecValue, groups_for,
+    Binding, Context, Dispatch, Error, Kernel, KernelDesc, Region, Residence, SpecValue, groups_for,
 };
 
 const AXPB: &[u8] = include_bytes!("kernels/axpb.spv");
@@ -368,6 +368,90 @@ fn a_calibration_places_a_submission_between_its_submit_and_its_wait() {
             (end - start) / 1e3,
             (after - end) / 1e3,
             slack / 1e3
+        );
+    }
+    assert_no_validation_messages(&ctx);
+}
+
+#[test]
+fn ranges_copied_out_of_a_recording_and_back_come_back_as_they_were() {
+    let ctx = context();
+    let kernels: Vec<_> = LINKS.iter().map(|&(a, b)| axpb(&ctx, a, b)).collect();
+    let n = 10_007;
+    let bytes = 4 * n as u64;
+    let mut recording = chain(&ctx, &kernels, n, false);
+    let x = inputs(n, 1);
+    recording.buffer_mut(0).write(&x).unwrap();
+    recording.submit().unwrap_or_else(|e| panic!("{e}"));
+    let out = recording.buffer(2).read::<f32>().unwrap();
+    let mut kept = ctx
+        .buffer_in(2 * bytes, Residence::Device)
+        .unwrap_or_else(|e| panic!("{e}"));
+    // The input whole and the output but its first two values, both mapped, into the GPU's own
+    // memory.
+    let regions = [
+        Region {
+            buffer: 0,
+            offset: 0,
+            other: 0,
+            bytes,
+        },
+        Region {
+            buffer: 2,
+            offset: 8,
+            other: bytes,
+            bytes: bytes - 8,
+        },
+    ];
+    recording
+        .copy_out(&regions, &mut kept)
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let y = inputs(n, 2);
+    recording.buffer_mut(0).write(&y).unwrap();
+    recording.submit().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        differences(&recording.buffer(2).read::<f32>().unwrap(), &on_the_cpu(&y)),
+        0
+    );
+    recording
+        .copy_in(&kept, &regions[1..])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let back = recording.buffer(2).read::<f32>().unwrap();
+    assert_eq!(differences(&back[2..], &out[2..]), 0);
+    assert_eq!(differences(&back[..2], &on_the_cpu(&y)[..2]), 0);
+    // The program after a copy reads what it copied.
+    recording
+        .copy_in(&kept, &regions[..1])
+        .unwrap_or_else(|e| panic!("{e}"));
+    recording.submit().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        differences(&recording.buffer(2).read::<f32>().unwrap(), &out),
+        0
+    );
+
+    for bad in [
+        Region {
+            bytes: 0,
+            ..regions[0]
+        },
+        Region {
+            buffer: 4,
+            ..regions[0]
+        },
+        Region {
+            offset: 4,
+            ..regions[0]
+        },
+        Region {
+            other: bytes + 4,
+            ..regions[0]
+        },
+    ] {
+        let refused = recording.copy_out(&[bad], &mut kept);
+        assert!(
+            matches!(refused, Err(Error::Unsupported(_))),
+            "{bad:?}: {refused:?}"
         );
     }
     assert_no_validation_messages(&ctx);

@@ -24,7 +24,7 @@ use crate::{
     context::{FENCE_TIMEOUT_NS, Inner, Timing, check_groups, elapsed_ticks, ticks_to_ns},
     error::{Error, Result, VkCall},
     kernel::Kernel,
-    memory::Buffer,
+    memory::{Buffer, after_earlier_work, before_later_work},
 };
 
 /// A range of one of a recording's buffers, bound to one binding of a kernel.
@@ -55,6 +55,18 @@ impl Binding {
             size: Some(size),
         }
     }
+}
+
+/// Bytes copied between one of a recording's buffers and a buffer outside it
+/// ([`Recording::copy_out`], [`Recording::copy_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    /// The buffer's index among those the recording owns, and the offset in it.
+    pub buffer: usize,
+    pub offset: u64,
+    /// The offset in the buffer outside.
+    pub other: u64,
+    pub bytes: u64,
 }
 
 /// One dispatch of a recording.
@@ -498,6 +510,83 @@ impl Recording {
     pub fn into_buffers(mut self) -> Result<Vec<Buffer>> {
         self.finish()?;
         Ok(std::mem::take(&mut self.buffers))
+    }
+
+    /// Copies each of `regions` of the buffers into `to`, in a submission of its own after the
+    /// last, and waits for it.
+    pub fn copy_out(&mut self, regions: &[Region], to: &mut Buffer) -> Result<()> {
+        self.copy(regions, to, true)
+    }
+
+    /// Copies each of `regions` of `from` into the buffers, as [`copy_out`](Self::copy_out)
+    /// copies them out.
+    pub fn copy_in(&mut self, from: &Buffer, regions: &[Region]) -> Result<()> {
+        self.copy(regions, from, false)
+    }
+
+    fn copy(&mut self, regions: &[Region], other: &Buffer, out: bool) -> Result<()> {
+        if !Arc::ptr_eq(&other.ctx, &self.ctx) {
+            return Err(Error::Unsupported("a buffer of another context".into()));
+        }
+        for r in regions {
+            let inside =
+                |offset: u64, size: u64| offset.checked_add(r.bytes).is_some_and(|end| end <= size);
+            let held = self.buffers.get(r.buffer).map(Buffer::size);
+            if r.bytes == 0
+                || !held.is_some_and(|size| inside(r.offset, size))
+                || !inside(r.other, other.size())
+            {
+                return Err(Error::Unsupported(format!(
+                    "a copy of {r:?} with a buffer of {} bytes",
+                    other.size()
+                )));
+            }
+        }
+        self.finish()?;
+        let copies: Vec<_> = regions
+            .iter()
+            .map(|r| {
+                let held = self.buffers[r.buffer].raw;
+                let (from, to, src, dst) = match out {
+                    true => (held, other.raw, r.offset, r.other),
+                    false => (other.raw, held, r.other, r.offset),
+                };
+                let region = vk::BufferCopy::default()
+                    .src_offset(src)
+                    .dst_offset(dst)
+                    .size(r.bytes);
+                (from, to, region)
+            })
+            .collect();
+        self.ctx.run_once(|device, cmd| {
+            let before = after_earlier_work(
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
+            );
+            let after = [
+                before_later_work()[0],
+                vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ),
+            ];
+            // SAFETY: the buffers are live and were created for transfers, each region lies
+            // inside both (checked above), and the recording's last submission has finished.
+            unsafe {
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&before),
+                );
+                for (from, to, region) in &copies {
+                    device.cmd_copy_buffer(cmd, *from, *to, std::slice::from_ref(region));
+                }
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&after),
+                );
+            }
+        })
     }
 
     /// Runs the first program once and waits for it: when this returns, everything it wrote is

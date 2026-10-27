@@ -178,7 +178,7 @@ impl std::fmt::Debug for Buffer {
 }
 
 /// Accesses to any buffer by earlier dispatches and copies, ordered before a copy's (`dst_*`).
-fn after_earlier_work(
+pub(crate) fn after_earlier_work(
     dst_stage: vk::PipelineStageFlags2,
     dst_access: vk::AccessFlags2,
 ) -> [vk::MemoryBarrier2<'static>; 1] {
@@ -190,7 +190,7 @@ fn after_earlier_work(
 }
 
 /// A copy's or a fill's writes, made visible to every later dispatch and copy.
-fn before_later_work() -> [vk::MemoryBarrier2<'static>; 1] {
+pub(crate) fn before_later_work() -> [vk::MemoryBarrier2<'static>; 1] {
     [vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
         .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
