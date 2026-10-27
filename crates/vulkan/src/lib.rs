@@ -19,6 +19,7 @@
 //! - [`Context::record`] records a chain of dispatches with the barriers between them into one
 //!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
 //!   each submission, and each dispatch when asked.
+//! - [`Context::set_fence_spin`] has every wait for the GPU poll for a while before it blocks.
 //! - [`Kernel::executables`] says what the driver compiled it into: the subgroup size it runs at,
 //!   its registers and occupancy, and the machine code ([`executable`]).
 //!

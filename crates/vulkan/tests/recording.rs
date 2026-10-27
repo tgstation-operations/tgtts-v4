@@ -3,7 +3,10 @@
 //! feature; each test fails on any message of the validation layer.
 #![cfg(feature = "device")]
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use vulkan::{
     Binding, Context, Dispatch, Error, Kernel, KernelDesc, Residence, SpecValue, groups_for,
@@ -154,6 +157,9 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
         // A value the host changes between submissions, as a position would be.
         let x = inputs(n, step + 1);
         recording.buffer_mut(0).write(&x).unwrap();
+        // Waited for by blocking at once, or by polling first for longer than the chain takes.
+        let spin = if step % 2 == 0 { 0 } else { 50 };
+        ctx.set_fence_spin(Duration::from_millis(spin));
         // Submitted and waited for at once, started and then waited for, or started and
         // dropped, which waits.
         if step % 3 == 0 {

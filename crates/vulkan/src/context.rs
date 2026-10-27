@@ -1,4 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use ash::vk;
 
@@ -79,11 +85,33 @@ pub(crate) struct Inner {
     robust_buffer_access2: bool,
     pub(crate) queue_family: u32,
     pub(crate) submit: Mutex<Submit>,
+    /// How long a wait polls its fence before blocking on it ([`Context::set_fence_spin`]).
+    fence_spin_ns: AtomicU64,
     /// Dropped after `device` is destroyed in `Drop::drop`.
     instance: Instance,
 }
 
 impl Inner {
+    /// Waits for `fence`, a fence of this device that was submitted: polls it for as long as the
+    /// context's spin allows, then blocks on it for up to [`FENCE_TIMEOUT_NS`].
+    pub(crate) fn wait_for(&self, fence: vk::Fence) -> Result<()> {
+        let spin = Duration::from_nanos(self.fence_spin_ns.load(Ordering::Relaxed));
+        let start = Instant::now();
+        while start.elapsed() < spin {
+            // SAFETY: the caller's fence; polling has no other precondition.
+            if unsafe { self.device.get_fence_status(fence) }.call("vkGetFenceStatus")? {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        unsafe {
+            self.device
+                .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
+                .call("vkWaitForFences")
+        }
+    }
+
     /// Records commands with `record` into the shared command buffer, submits them, and waits
     /// for them to finish.
     pub(crate) fn run_once(
@@ -118,9 +146,7 @@ impl Inner {
                 .queue_submit2(submit.queue, &submits, submit.fence)
                 .call("vkQueueSubmit2")?;
             // On a timeout the work is still pending, and this context must not be used again.
-            device
-                .wait_for_fences(&[submit.fence], true, FENCE_TIMEOUT_NS)
-                .call("vkWaitForFences")?;
+            self.wait_for(submit.fence)?;
             device.reset_fences(&[submit.fence]).call("vkResetFences")?;
         }
         Ok(())
@@ -333,6 +359,7 @@ impl Context {
                 robust_buffer_access2: offers_robustness2,
                 queue_family,
                 submit: Mutex::new(submit),
+                fence_spin_ns: AtomicU64::new(0),
                 instance,
             }),
         })
@@ -364,6 +391,14 @@ impl Context {
     /// Whether the Khronos validation layer is attached ([`VALIDATION_VAR`](crate::VALIDATION_VAR)).
     pub fn validating(&self) -> bool {
         self.inner.instance.validating()
+    }
+
+    /// Has every wait for the GPU poll for up to `bound` before it blocks: the host sees work that
+    /// finishes within the bound as soon as it does, rather than when the driver wakes it, and
+    /// keeps a core busy meanwhile. Zero, the default, blocks at once.
+    pub fn set_fence_spin(&self, bound: Duration) {
+        let ns = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
+        self.inner.fence_spin_ns.store(ns, Ordering::Relaxed);
     }
 
     /// Every warning and error the validation layer has reported so far.
@@ -541,9 +576,7 @@ impl Context {
                 .call("vkQueueSubmit2")?;
             // On a timeout the work is still pending, and this context must not be used
             // again.
-            device
-                .wait_for_fences(&[submit.fence], true, FENCE_TIMEOUT_NS)
-                .call("vkWaitForFences")?;
+            self.inner.wait_for(submit.fence)?;
             device.reset_fences(&[submit.fence]).call("vkResetFences")?;
 
             let mut stamps = [0u64; 2];

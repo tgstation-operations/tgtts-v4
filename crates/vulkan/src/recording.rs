@@ -421,14 +421,9 @@ impl Recording {
         if !self.pending {
             return Ok(());
         }
-        let device = &self.ctx.device;
-        // SAFETY: the fence belongs to this recording and was submitted.
-        unsafe {
-            device
-                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
-                .call("vkWaitForFences")?;
-            device.reset_fences(&[self.fence]).call("vkResetFences")?;
-        }
+        self.ctx.wait_for(self.fence)?;
+        // SAFETY: the fence belongs to this recording, and has signaled.
+        unsafe { self.ctx.device.reset_fences(&[self.fence]) }.call("vkResetFences")?;
         self.pending = false;
         Ok(())
     }
