@@ -57,7 +57,7 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin $out/libexec
-    cp $CARGO_TARGET_DIR/release/examples/{decode_timing,properties,vae_timing} $out/libexec/
+    cp $CARGO_TARGET_DIR/release/examples/{decode_timing,lm_side_timing,properties,vae_timing} $out/libexec/
     while read -r test; do
       name=$(basename "$test")
       name=''${name%-*}
