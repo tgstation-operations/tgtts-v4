@@ -177,9 +177,10 @@ impl Tuning {
     ///
     /// At 64, one subgroup to a workgroup: the fastest measured on the Radeon 8060S, which
     /// reached 220 GB/s over four layers' weights where a streaming read reaches 240; larger
-    /// workgroups and more rows to a subgroup were slower. At 32, four subgroups to a workgroup,
-    /// unmeasured: an NVIDIA multiprocessor of compute capability 8.9 holds at most 24
-    /// workgroups and 48 subgroups, so one subgroup to a workgroup would leave half of it idle.
+    /// workgroups and more rows to a subgroup were slower. At 32, four subgroups to a workgroup:
+    /// on the RTX 4070 Ti SUPER the base LM's step took 4.69 ms on the GPU so in all but the first
+    /// of nine runs (5.59 ms), 4.68 to 4.73 at two or eight subgroups to a workgroup, 4.84 at one,
+    /// and no less at two rows or pairs to a subgroup.
     pub fn for_subgroup(subgroup: u32) -> Self {
         Tuning {
             subgroup,
