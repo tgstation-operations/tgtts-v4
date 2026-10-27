@@ -1,0 +1,54 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out[OFFSET + i] = act(W x + bias)[i]: a linear layer between VoxCPM2's LMs, W N x (K0 + K1)
+// against x0's K0 values followed by x1's K1, as upstream concatenates fusion_concat_proj's
+// input. A subgroup takes one row.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K0 = 2048;
+layout(constant_id = 3) const uint K1 = 0;
+layout(constant_id = 4) const uint N = 2048;
+layout(constant_id = 5) const uint OFFSET = 0;
+// 0: none; 1: SiLU; 2: the scalar quantizer's, tanh rounded to a multiple of 1 / LEVELS.
+layout(constant_id = 6) const uint ACT = 0;
+layout(constant_id = 7) const float LEVELS = 9.0;
+
+const uint K = K0 + K1;
+const uint ROWS = 1;
+// The layers between the stacks are a hundredth of a patch's time: no loads ahead.
+const uint AHEAD = 0;
+
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 1) readonly buffer X1 { uvec4 x1[]; };
+layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 3) readonly buffer Bias { float16_t bias[]; };
+layout(std430, binding = 4) writeonly buffer Out { float16_t out_[]; };
+
+#include "gemv.glsl"
+
+void main() {
+    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
+        xs[v] = v < K0 / 8 ? x[v] : x1[v - K0 / 8];
+    }
+    barrier();
+    uint rows[ROWS];
+    rows[0] = gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID;
+    if (rows[0] >= N) {
+        return;
+    }
+    float sums[ROWS];
+    dot_rows(rows, sums);
+    if (gl_SubgroupInvocationID != 0) {
+        return;
+    }
+    float v = sums[0] + float(bias[rows[0]]);
+    if (ACT == 1) {
+        v = v / (1.0 + exp(-v));
+    } else if (ACT == 2) {
+        // tanh from exp, whose precision Vulkan bounds; tanh's own is only inherited from
+        // sinh / cosh, which overflow.
+        float t = 1.0 - 2.0 / (exp(2.0 * abs(v)) + 1.0);
+        v = roundEven(sign(v) * t * LEVELS) / LEVELS;
+    }
+    out_[OFFSET + rows[0]] = float16_t(v);
+}

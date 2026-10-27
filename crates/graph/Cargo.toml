@@ -22,3 +22,4 @@ libc.workspace = true
 minicpm4 = { path = "../minicpm4" }
 testkit = { path = "../testkit" }
 voices = { path = "../voices" }
+voxcpm = { path = "../voxcpm" }

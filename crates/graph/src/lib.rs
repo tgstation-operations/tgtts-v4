@@ -9,6 +9,8 @@
 //! - [`step`]: a graph allocated and recorded into one command buffer.
 //! - [`decode`]: MiniCPM-4's decode step at batch 1, as VoxCPM2's base LM runs it, with its
 //!   weights read from the checkpoint ([`checkpoint`]).
+//! - [`lm_side`]: VoxCPM2's LM side of a patch, both LMs and the layers around them, from the
+//!   local encoder's output to the DiT's condition and the stop logits.
 //!
 //! The tests that need a GPU are built with the `device` feature: `nix run .#device-tests` runs
 //! them under the validation layer.
@@ -17,6 +19,7 @@ pub mod checkpoint;
 pub mod decode;
 pub mod graph;
 pub mod kernels;
+pub mod lm_side;
 pub mod step;
 pub mod vae;
 
