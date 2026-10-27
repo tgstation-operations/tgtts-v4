@@ -274,9 +274,14 @@ impl Step {
         Ok(self.start_program(program)?.wait()?)
     }
 
+    /// Whether `program` was recorded for this step, and so may run on it.
+    pub fn holds(&self, program: Program) -> bool {
+        program.step == self.id
+    }
+
     /// Starts `program` and returns without waiting for it.
     pub fn start_program(&mut self, program: Program) -> Result<Submission<'_>, Error> {
-        if program.step != self.id {
+        if !self.holds(program) {
             return Err(Error::Shape("a program of another step".into()));
         }
         self.last = program.index;
