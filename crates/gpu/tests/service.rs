@@ -5,7 +5,10 @@
 #[path = "../../tgtts/tests/common/mod.rs"]
 mod service;
 
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use service::real;
 use tgtts::{
@@ -62,7 +65,9 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
     let params = Params::default();
     let model = VoxCpm::load(&checkpoint, &kind.dtypes(), &device, params, batching).unwrap();
     let voices = Voices::open(real::dir("VOICES_DIR")).unwrap();
+    let started = Instant::now();
     model.warm_up(&voices).unwrap();
+    eprintln!("warmed up in {:.1?}", started.elapsed());
     // Each pool's pages, at most and now, in bytes.
     let pools = || {
         let pools = device.memory_pool_report().unwrap();
