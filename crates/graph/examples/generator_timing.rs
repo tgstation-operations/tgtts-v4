@@ -173,6 +173,7 @@ fn main() {
         timesteps: Sampling::default().timesteps,
         chunk_frames: Params::default().decode_chunk_frames.get(),
         timed: true,
+        prompt_cache_bytes: 0,
     };
     let loaded = Instant::now();
     let parameter = |name: &str| {

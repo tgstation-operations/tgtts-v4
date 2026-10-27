@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use vulkan::{Binding, Context, Dispatch, Recording, Residence, Submission, Timing, memory::Plain};
+use vulkan::{
+    Binding, Buffer, Context, Dispatch, Recording, Residence, Submission, Timing, memory::Plain,
+};
 
 use crate::{
     Error,
@@ -39,6 +41,17 @@ impl Layout {
             plan: plan(graph),
         }
     }
+}
+
+/// Bytes copied between a tensor and a buffer outside the step ([`Step::copy_out`],
+/// [`Step::copy_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub tensor: TensorId,
+    /// The offset in the tensor, and in the buffer outside.
+    pub offset: u64,
+    pub other: u64,
+    pub bytes: u64,
 }
 
 /// One of the graphs a step runs, recorded over its memory ([`Step::add`]).
@@ -255,6 +268,41 @@ impl Step {
         let (buffer, offset) = self.place(t);
         let count = self.tensors[t.0].0 as usize / size_of::<T>();
         Ok(self.recording.buffer(buffer).read_at(offset, count)?)
+    }
+
+    /// Copies `regions` of tensors into `to`, on the GPU after the last run.
+    pub fn copy_out(&mut self, regions: &[Region], to: &mut Buffer) -> Result<(), Error> {
+        let regions = self.regions(regions)?;
+        Ok(self.recording.copy_out(&regions, to)?)
+    }
+
+    /// Copies `regions` of `from` into tensors, on the GPU after the last run.
+    pub fn copy_in(&mut self, from: &Buffer, regions: &[Region]) -> Result<(), Error> {
+        let regions = self.regions(regions)?;
+        Ok(self.recording.copy_in(from, &regions)?)
+    }
+
+    /// `regions` in the buffers the tensors live in.
+    fn regions(&self, regions: &[Region]) -> Result<Vec<vulkan::Region>, Error> {
+        regions
+            .iter()
+            .map(|r| {
+                let len = self.tensors[r.tensor.0].0;
+                if r.offset.checked_add(r.bytes).is_none_or(|end| end > len) {
+                    return Err(Error::Shape(format!(
+                        "{} bytes from {} of tensor {} of {len}",
+                        r.bytes, r.offset, r.tensor.0
+                    )));
+                }
+                let (buffer, at) = self.place(r.tensor);
+                Ok(vulkan::Region {
+                    buffer,
+                    offset: at + r.offset,
+                    other: r.other,
+                    bytes: r.bytes,
+                })
+            })
+            .collect()
     }
 
     /// Runs the step's first graph once and waits for it.

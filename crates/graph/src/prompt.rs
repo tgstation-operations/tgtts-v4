@@ -15,10 +15,17 @@
 //! writing their keys and values into the patch step's caches. The layers between the LMs read
 //! each weight once for a block of rows (`linear_rows.comp`). Both are programs over the patch
 //! step's memory ([`Step::add`](crate::step::Step::add)).
+//!
+//! A [`PromptCache`] keeps what a prompt in a voice computes that the next prompts in the voice
+//! share: its patches' embeddings, and the LMs' keys and values over the positions it begins
+//! with, which a prompt that begins with them copies back into the caches rather than run.
 
-use std::{collections::HashMap, iter};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    iter,
+};
 
-use vulkan::{Context, SpecValue};
+use vulkan::{Buffer, Context, Residence, SpecValue};
 
 use crate::{
     Error,
@@ -32,7 +39,7 @@ use crate::{
     lm_side::{Act, Linear, Stack, append_linear, splice},
     patch::{PatchGraph, PatchStep, transposed},
     prefill::{StackTensors, TILE, append_prefill},
-    step::Program,
+    step::{Program, Region},
 };
 
 /// `linear_rows.comp`: run, x0, x1, W, bias -> out.
@@ -333,6 +340,179 @@ impl Prompt<'_> {
     }
 }
 
+/// What a generator keeps of the voices for the next prompts in them, up to a number of bytes,
+/// as voxcpm's `PromptCache` keeps it on burn: for each voice, the embeddings of its prompts'
+/// patches, on the host, which the service's prompts hold twice; and on the GPU, the LMs' keys
+/// and values over the first prompt in it up to its last run of audio, the voice as reference
+/// audio and the text after it. The LMs are causal, so a prompt that begins with the same
+/// positions has the same keys and values over them, and runs only the positions after those.
+/// A voice is told by the bits of its latent frames, and the voices used longest ago make room
+/// for others.
+#[derive(Debug)]
+pub struct PromptCache {
+    ctx: Context,
+    budget: usize,
+    bytes: usize,
+    clock: u64,
+    voices: HashMap<Vec<u32>, Voice>,
+}
+
+#[derive(Debug, Default)]
+struct Voice {
+    /// The embedding of each patch as the base LM takes it, `[hidden]` as f16 bits, by the
+    /// patch's bits.
+    embeddings: HashMap<Vec<u32>, Vec<u16>>,
+    prefix: Option<Prefix>,
+    /// When it was last used, on the cache's clock.
+    used: u64,
+}
+
+/// The positions a prompt began with, and the LMs' keys and values over them.
+#[derive(Debug)]
+struct Prefix {
+    tokens: Vec<u32>,
+    /// Each position's patch's bits, `[len][patch]`.
+    patches: Vec<u32>,
+    audio: Vec<bool>,
+    /// Laid out as [`cache_regions`] lays out as many positions as it holds.
+    kept: Buffer,
+}
+
+impl Prefix {
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    fn bytes(&self) -> usize {
+        Self::bytes_of(
+            self.kept.size(),
+            self.patches.len() / self.len(),
+            self.len(),
+        )
+    }
+
+    /// The bytes of a prefix of `len` positions of patches of `patch` values, whose keys and
+    /// values take `kept`.
+    fn bytes_of(kept: u64, patch: usize, len: usize) -> usize {
+        kept as usize + (4 + 1 + 4 * patch) * len
+    }
+
+    /// The positions `prompt` begins with that this holds.
+    fn shared(&self, prompt: Prompt<'_>) -> usize {
+        let patch = self.patches.len() / self.len();
+        (0..self.len().min(prompt.len()))
+            .take_while(|&p| {
+                let at = p * patch..(p + 1) * patch;
+                let bits = prompt.patches[at.clone()].iter().map(|v| v.to_bits());
+                self.audio[p] == prompt.audio[p]
+                    && match prompt.audio[p] {
+                        true => bits.eq(self.patches[at].iter().copied()),
+                        false => self.tokens[p] == prompt.tokens[p],
+                    }
+            })
+            .count()
+    }
+}
+
+impl Voice {
+    fn bytes(&self) -> usize {
+        let embeddings = self.embeddings.iter();
+        let embeddings: usize = embeddings.map(|(k, v)| 4 * k.len() + 2 * v.len()).sum();
+        embeddings + self.prefix.as_ref().map_or(0, Prefix::bytes)
+    }
+}
+
+impl PromptCache {
+    /// An empty cache on `ctx`'s GPU that keeps at most `budget` bytes, on the host and the GPU
+    /// together.
+    pub fn new(ctx: &Context, budget: usize) -> Self {
+        PromptCache {
+            ctx: ctx.clone(),
+            budget,
+            bytes: 0,
+            clock: 0,
+            voices: HashMap::new(),
+        }
+    }
+
+    /// The bytes it keeps.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The number of voices it keeps.
+    pub fn voices(&self) -> usize {
+        self.voices.len()
+    }
+
+    /// The voice `key` with what is kept of it, which is no longer kept until it is
+    /// [`put`](Self::put) back.
+    fn take(&mut self, key: &[u32]) -> Voice {
+        self.clock += 1;
+        let Some(voice) = self.voices.remove(key) else {
+            return Voice::default();
+        };
+        self.bytes -= 4 * key.len() + voice.bytes();
+        voice
+    }
+
+    /// Keeps `voice` as `key`, without its prefix if only that way it fits, and not at all if
+    /// it does not fit alone; the voices used longest ago are dropped to make room.
+    fn put(&mut self, key: Vec<u32>, mut voice: Voice) {
+        let bytes = |voice: &Voice| 4 * key.len() + voice.bytes();
+        if bytes(&voice) > self.budget {
+            voice.prefix = None;
+        }
+        if bytes(&voice) > self.budget {
+            return;
+        }
+        while self.bytes + bytes(&voice) > self.budget {
+            let (oldest, _) = self
+                .voices
+                .iter()
+                .min_by_key(|(_, voice)| voice.used)
+                .expect("the bytes kept are some voice's");
+            let oldest = oldest.clone();
+            let dropped = self.voices.remove(&oldest).expect("found");
+            self.bytes -= 4 * oldest.len() + dropped.bytes();
+        }
+        voice.used = self.clock;
+        self.bytes += bytes(&voice);
+        self.voices.insert(key, voice);
+    }
+}
+
+/// Where the LMs' keys and values over positions `0..len` lie in `graph`'s caches, laid out as
+/// `rope_rows.comp` writes them, `[kv_heads][capacity][head_dim]` in f16 for each layer's keys
+/// and values: for each in turn, each head's `len` positions, from `held` positions apart in the
+/// buffer outside.
+fn cache_regions(graph: &PatchGraph, len: usize, held: usize) -> Vec<Region> {
+    let side = &graph.side;
+    let stacks = [
+        (&side.base, &side.shape.base),
+        (&side.residual, &side.shape.residual),
+    ];
+    let mut regions = Vec::new();
+    let mut other = 0;
+    for (stack, shape) in stacks {
+        let row = 2 * shape.head_dim as u64;
+        for layer in &stack.layers {
+            for cache in [layer.k_cache, layer.v_cache] {
+                for head in 0..shape.kv_heads as u64 {
+                    regions.push(Region {
+                        tensor: graph.side_ids[cache.0],
+                        offset: head * shape.capacity as u64 * row,
+                        other,
+                        bytes: len as u64 * row,
+                    });
+                    other += held as u64 * row;
+                }
+            }
+        }
+    }
+    regions
+}
+
 /// The prompt's programs on the GPU, recorded over a patch step's memory.
 #[derive(Debug)]
 pub struct Prompter {
@@ -399,6 +579,61 @@ impl Prompter {
         self.run_rows(step, 0, &x, &audio_x, &prompt.audio[..prompt.len() - 1])
     }
 
+    /// Runs `prompt` as [`run`](Self::run) does, in the voice whose latent frames are `voice`:
+    /// from the positions it begins with that `cache` keeps of the voice, and with the patches'
+    /// embeddings it keeps; and keeps there what the next prompts in the voice can use. Gives
+    /// the positions that run through the LMs, the prompt's last among them.
+    pub fn run_cached(
+        &self,
+        step: &mut PatchStep,
+        checkpoint: &Checkpoint,
+        prompt: Prompt<'_>,
+        voice: &[f32],
+        cache: &mut PromptCache,
+    ) -> Result<usize, Error> {
+        check(prompt)?;
+        let len = prompt.len();
+        let key: Vec<u32> = voice.iter().map(|v| v.to_bits()).collect();
+        let mut kept = cache.take(&key);
+        let prefix = kept.prefix.as_ref();
+        let shared = prefix
+            .map_or(0, |prefix| prefix.shared(prompt))
+            .min(len - 1);
+        let (x, audio_x) =
+            self.embeddings_from(step, checkpoint, prompt, shared, &mut kept.embeddings)?;
+        if let Some(prefix) = kept.prefix.as_ref().filter(|_| shared > 0) {
+            let (graph, recorded) = step.parts_mut();
+            let regions = cache_regions(graph, shared, prefix.len());
+            recorded.copy_in(&prefix.kept, &regions)?;
+        }
+        self.run_rows(step, shared, &x, &audio_x, &prompt.audio[shared..len - 1])?;
+        let held = prompt
+            .audio
+            .iter()
+            .rposition(|&a| !a)
+            .map_or(0, |text| text + 1);
+        if kept.prefix.is_none() && held > 0 {
+            let (graph, recorded) = step.parts_mut();
+            let regions = cache_regions(graph, held, held);
+            let bytes: u64 = regions.iter().map(|r| r.bytes).sum();
+            let patch = prompt.patches.len() / len;
+            let prefix = Prefix::bytes_of(bytes, patch, held);
+            if 4 * key.len() + kept.bytes() + prefix <= cache.budget {
+                let mut buffer = cache.ctx.buffer_in(bytes, Residence::Device)?;
+                recorded.copy_out(&regions, &mut buffer)?;
+                let patches = &prompt.patches[..held * patch];
+                kept.prefix = Some(Prefix {
+                    tokens: prompt.tokens[..held].to_vec(),
+                    patches: patches.iter().map(|v| v.to_bits()).collect(),
+                    audio: prompt.audio[..held].to_vec(),
+                    kept: buffer,
+                });
+            }
+        }
+        cache.put(key, kept);
+        Ok(len - shared)
+    }
+
     /// The embeddings of `prompt`'s positions but its last, `[len - 1][hidden]` as f16 bits, and
     /// those of its audio positions, zero at text: a token's read from `checkpoint`, a patch's
     /// from the GPU, once for each distinct patch.
@@ -408,42 +643,42 @@ impl Prompter {
         checkpoint: &Checkpoint,
         prompt: Prompt<'_>,
     ) -> Result<(Vec<u16>, Vec<u16>), Error> {
-        let len = prompt.len();
-        let patch = prompt.patches.len() / len.max(1);
-        if len == 0
-            || prompt.audio.len() != len
-            || prompt.patches.len() != len * patch
-            || !prompt.audio[len - 1]
-        {
-            return Err(Error::Shape(format!(
-                "a prompt of {len} tokens, {} values of patches and {} audio flags, which must \
-                 end in audio",
-                prompt.patches.len(),
-                prompt.audio.len()
-            )));
-        }
-        let (ran, hidden) = (len - 1, self.hidden);
-        let mut x = vec![0u16; ran * hidden];
-        let mut audio_x = vec![0u16; ran * hidden];
-        let text: Vec<usize> = (0..ran).filter(|&p| !prompt.audio[p]).collect();
+        check(prompt)?;
+        self.embeddings_from(step, checkpoint, prompt, 0, &mut HashMap::new())
+    }
+
+    /// The embeddings of `prompt`'s positions from `from` but its last, as
+    /// [`embeddings`](Self::embeddings) gives those from the first: a patch's from `known`
+    /// where it holds it, and else from the GPU, and kept there.
+    fn embeddings_from(
+        &self,
+        step: &mut PatchStep,
+        checkpoint: &Checkpoint,
+        prompt: Prompt<'_>,
+        from: usize,
+        known: &mut HashMap<Vec<u32>, Vec<u16>>,
+    ) -> Result<(Vec<u16>, Vec<u16>), Error> {
+        let (len, hidden) = (prompt.len(), self.hidden);
+        let patch = prompt.patches.len() / len;
+        let ran = from..len - 1;
+        let mut x = vec![0u16; ran.len() * hidden];
+        let mut audio_x = vec![0u16; ran.len() * hidden];
+        let row = |p: usize| (p - from) * hidden..(p - from + 1) * hidden;
+        let text: Vec<usize> = ran.clone().filter(|&p| !prompt.audio[p]).collect();
         let tokens: Vec<usize> = text.iter().map(|&p| prompt.tokens[p] as usize).collect();
         let rows = checkpoint.gather_f16(EMBED_TOKENS, &tokens)?;
-        for (&p, row) in text.iter().zip(rows.chunks(hidden)) {
-            x[p * hidden..(p + 1) * hidden].copy_from_slice(row);
+        for (&p, embedding) in text.iter().zip(rows.chunks(hidden)) {
+            x[row(p)].copy_from_slice(embedding);
         }
-        let mut embedded: HashMap<Vec<u32>, Vec<u16>> = HashMap::new();
-        for p in (0..ran).filter(|&p| prompt.audio[p]) {
+        for p in ran.filter(|&p| prompt.audio[p]) {
             let values = &prompt.patches[p * patch..(p + 1) * patch];
             let key: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
-            let row = match embedded.get(&key) {
-                Some(row) => row,
-                None => {
-                    let row = self.embed(step, values)?;
-                    embedded.entry(key).or_insert(row)
-                }
+            let embedding = match known.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(self.embed(step, values)?),
             };
-            x[p * hidden..(p + 1) * hidden].copy_from_slice(row);
-            audio_x[p * hidden..(p + 1) * hidden].copy_from_slice(row);
+            x[row(p)].copy_from_slice(embedding);
+            audio_x[row(p)].copy_from_slice(embedding);
         }
         Ok((x, audio_x))
     }
@@ -492,6 +727,26 @@ impl Prompter {
         }
         Ok(())
     }
+}
+
+/// Refuses a prompt the prompter cannot run: one that does not end in audio, or whose patches
+/// and flags are not one for each position.
+fn check(prompt: Prompt<'_>) -> Result<(), Error> {
+    let len = prompt.len();
+    let patch = prompt.patches.len() / len.max(1);
+    if len == 0
+        || prompt.audio.len() != len
+        || prompt.patches.len() != len * patch
+        || !prompt.audio[len - 1]
+    {
+        return Err(Error::Shape(format!(
+            "a prompt of {len} tokens, {} values of patches and {} audio flags, which must end \
+             in audio",
+            prompt.patches.len(),
+            prompt.audio.len()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -559,6 +814,31 @@ mod tests {
                 }
                 assert_eq!(layers, 3);
             }
+        }
+    }
+
+    #[test]
+    fn the_keys_and_values_kept_are_each_caches_first_positions_held_apart() {
+        let patch = patch::tests::graph(64);
+        let (len, held) = (5, 7);
+        let regions = cache_regions(&patch, len, held);
+        let side = &patch.side;
+        let caches: Vec<TensorId> = [&side.base, &side.residual]
+            .into_iter()
+            .flat_map(|stack| &stack.layers)
+            .flat_map(|l| [l.k_cache, l.v_cache])
+            .map(|t| patch.side_ids[t.0])
+            .collect();
+        let s = &side.shape.base;
+        let row = 2 * s.head_dim as u64;
+        assert_eq!(regions.len(), caches.len() * s.kv_heads);
+        for (i, r) in regions.iter().enumerate() {
+            assert_eq!(r.tensor, caches[i / s.kv_heads]);
+            let bytes = patch.graph.tensors[r.tensor.0].bytes;
+            let head = bytes / s.kv_heads as u64;
+            assert_eq!(r.offset, (i % s.kv_heads) as u64 * head);
+            assert_eq!(r.bytes, len as u64 * row);
+            assert_eq!(r.other, i as u64 * held as u64 * row);
         }
     }
 }

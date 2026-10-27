@@ -815,6 +815,7 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize) -> Generator
         timesteps: Sampling::default().timesteps,
         chunk_frames: Params::default().decode_chunk_frames.get(),
         timed: false,
+        prompt_cache_bytes: 0,
     };
     let start = Instant::now();
     let parameter = |name: &str| {

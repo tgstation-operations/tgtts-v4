@@ -1,9 +1,10 @@
 //! VoxCPM2's text-to-speech at batch 1 on the GPU, from a prompt to audio, one request at a time:
-//! the prompt run into the patch step's caches ([`prompt`](crate::prompt)), patches sampled a
-//! submission each ([`patch`](crate::patch)) until the stop head says to stop after one or the
-//! request's most are sampled, as the service stops, and their latent frames decoded by the audio
-//! VAE ([`vae`](crate::vae)) after the voice's last frames, as the service primes its decoder,
-//! in chunks of a fixed number of frames as they come.
+//! the prompt run into the patch step's caches ([`prompt`](crate::prompt)) from what a prompt
+//! cache keeps of its voice ([`PromptCache`]), patches sampled a submission each
+//! ([`patch`](crate::patch)) until the stop head says to stop after one or the request's most are
+//! sampled, as the service stops, and their latent frames decoded by the audio VAE
+//! ([`vae`](crate::vae)) after the voice's last frames, as the service primes its decoder, in
+//! chunks of a fixed number of frames as they come.
 
 use std::{fs, mem, path::Path};
 
@@ -18,7 +19,7 @@ use crate::{
     lm_side,
     local::{self, PatchConfig},
     patch::{PatchStep, patch_graph, transposed},
-    prompt::{Prompt, Prompter},
+    prompt::{Prompt, PromptCache, Prompter},
     vae::{Parameter, VaeConfig, VaeDecoder, VaeShape},
 };
 
@@ -40,6 +41,8 @@ pub struct Settings {
     pub chunk_frames: usize,
     /// Whether each submission is timed per dispatch.
     pub timed: bool,
+    /// The bytes the prompt cache keeps of the voices.
+    pub prompt_cache_bytes: usize,
 }
 
 /// The parts of VoxCPM2's `config.json` the generator reads.
@@ -84,6 +87,7 @@ struct Request {
 pub struct Generator {
     step: PatchStep,
     prompter: Prompter,
+    cache: PromptCache,
     vae: VaeDecoder,
     checkpoint: Checkpoint,
     settings: Settings,
@@ -133,6 +137,7 @@ impl Generator {
         Ok(Generator {
             step,
             prompter,
+            cache: PromptCache::new(ctx, settings.prompt_cache_bytes),
             vae,
             checkpoint,
             settings: settings.clone(),
@@ -144,7 +149,9 @@ impl Generator {
 
     /// Starts a request, ending any under way: runs `prompt`, which ends in audio, into the
     /// caches, to sample up to `max_patches` patches after it at `temperature` and guidance
-    /// scale `cfg`, whose audio goes on from `voice`, the voice's latent frames.
+    /// scale `cfg`, whose audio goes on from `voice`, the voice's latent frames. Gives the
+    /// positions of the prompt that run through the LMs, the rest coming from what the prompt
+    /// cache keeps of the voice.
     pub fn start(
         &mut self,
         prompt: Prompt<'_>,
@@ -152,7 +159,7 @@ impl Generator {
         max_patches: usize,
         temperature: f32,
         cfg: f32,
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
         self.request = None;
         let (len, capacity) = (prompt.len(), self.settings.capacity);
         let patch = self.patch_size * self.feat_dim;
@@ -170,8 +177,13 @@ impl Generator {
                 self.feat_dim
             )));
         }
-        self.prompter
-            .run(&mut self.step, &self.checkpoint, prompt)?;
+        let prefilled = self.prompter.run_cached(
+            &mut self.step,
+            &self.checkpoint,
+            prompt,
+            voice,
+            &mut self.cache,
+        )?;
         self.vae.reset()?;
         let context = (voice.len() / self.feat_dim).min(CONTEXT_FRAMES);
         let last = &prompt.patches[(len - 1) * patch..];
@@ -186,7 +198,7 @@ impl Generator {
             context,
             audio: Vec::new(),
         });
-        Ok(())
+        Ok(prefilled)
     }
 
     /// Has the next patch sampled after `frames`, `[patch_size][feat_dim]`, rather than the
@@ -241,6 +253,11 @@ impl Generator {
             stop_logits: sampled.stop_logits,
             last: request.left == 0,
         }))
+    }
+
+    /// What the generator keeps of the voices.
+    pub fn prompt_cache(&self) -> &PromptCache {
+        &self.cache
     }
 
     /// The audio decoded since it was last taken, mono samples at the audio VAE's rate.
