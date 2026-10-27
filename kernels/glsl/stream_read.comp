@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Reads a buffer once, 16 bytes per load, and does next to nothing with it: the bandwidth the
+// GEMVs are measured against. Each invocation reads LOADS uvec4s, a grid's width apart, and
+// each subgroup writes one word of their XOR, so that no read can be left out.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint LOADS = 4;
+
+layout(std430, binding = 0) readonly buffer Data { uvec4 data[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint out_[]; };
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * WORKGROUP;
+    uvec4 acc = uvec4(0);
+    [[unroll]] for (uint i = 0; i < LOADS; i++) {
+        acc ^= data[i * stride + gl_GlobalInvocationID.x];
+    }
+    uint word = subgroupXor(acc.x ^ acc.y ^ acc.z ^ acc.w);
+    if (subgroupElect()) {
+        out_[gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID] = word;
+    }
+}

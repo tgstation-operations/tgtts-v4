@@ -657,3 +657,59 @@ fn split_attention_joined_matches_softmax_attention_up_to_the_position() {
     }
     assert_no_validation_messages(&ctx);
 }
+
+#[test]
+fn streaming_reads_reach_the_bandwidth_the_kernels_are_held_to() {
+    // 512 MiB, far past the 32 MiB of Infinity Cache, read once per dispatch.
+    let ctx = context();
+    let bytes = 512usize << 20;
+    let words = bytes / 4;
+    let mut state = 0x2545_f491_u32;
+    let pattern: Vec<u32> = (0..words)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        })
+        .collect();
+    let want = pattern.iter().fold(0, |a, &w| a ^ w);
+    let mut data = ctx.buffer(bytes as u64).unwrap();
+    data.write(&pattern);
+    drop(pattern);
+    for (subgroup, loads) in [(64, 1), (64, 4), (64, 16), (32, 4)] {
+        let k = kernel(
+            &ctx,
+            "stream_read",
+            2,
+            Some(subgroup),
+            &[
+                (0, SpecValue::U32(subgroup)),
+                (1, SpecValue::U32(WORKGROUP)),
+                (2, SpecValue::U32(loads)),
+            ],
+        );
+        let groups = (bytes / 16 / (WORKGROUP * loads) as usize) as u32;
+        let subgroups = (WORKGROUP / subgroup) as u64;
+        let mut out = ctx.buffer(4 * u64::from(groups) * subgroups).unwrap();
+        let mut ns: Vec<f64> = (0..10)
+            .map(|_| timed(&ctx, &k, &mut [&mut data, &mut out], [groups, 1, 1]))
+            .collect();
+        let got = out.read::<u32>().iter().fold(0, |a, &w| a ^ w);
+        assert_eq!(
+            got, want,
+            "wave{subgroup}, {loads} loads: a read was left out"
+        );
+        ns.remove(0);
+        ns.sort_by(f64::total_cmp);
+        eprintln!(
+            "stream_read wave{subgroup}, {loads} loads per invocation: best {:.1} GB/s, median \
+             {:.1} GB/s over {} dispatches of {} MiB",
+            bytes as f64 / ns[0],
+            bytes as f64 / ns[ns.len() / 2],
+            ns.len(),
+            bytes >> 20
+        );
+    }
+    assert_no_validation_messages(&ctx);
+}
