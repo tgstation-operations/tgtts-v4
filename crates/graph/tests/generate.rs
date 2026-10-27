@@ -8,7 +8,10 @@
 //! The patch step is checked on a prompt of a voice's patches alone, run through the patch step a
 //! position at a time: the sampler conditioned on what the LM side computes, where its own tests
 //! make the condition up. The prompt is checked on the one the service builds, of the golden's
-//! line in its voice, run at once into the patch step's caches.
+//! line in its voice, run at once into the patch step's caches. The generator speaks that line,
+//! after f32's patches as above, its audio held to burn's f16's patches' against f32's, all
+//! decoded in f32; and run free, it stops where f32 does, its audio what the CPU's decoder makes
+//! of its own patches.
 //!
 //! The scalar quantizer rounds the base LM's output to levels, and a value near a boundary
 //! between two lands on either by luck of rounding: a level apart from f32's is a discrete event,
@@ -29,6 +32,7 @@
 
 use std::{fs, path::PathBuf, time::Instant};
 
+use audiovae::Weights;
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
@@ -40,6 +44,7 @@ use burn::{
 use graph::{
     checkpoint::Checkpoint,
     decode::{self, SUBGROUPS},
+    generator::{Generator, Settings},
     graph::{Kind, TensorId},
     kernels::Kernels,
     lm_side::{self, LmSideShape},
@@ -53,7 +58,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use testkit::{Fixture, checkpoint_dir, device};
 use voices::Latent;
 use voxcpm::{
-    Config, Dtypes, LocalEncoder, Model, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer,
+    Config, Dtypes, LocalEncoder, Model, Noise, Params, Prompt, Sampling, SeededNoise,
+    SpeechDecoder, Tokenizer,
 };
 use vulkan::Context;
 
@@ -601,7 +607,7 @@ fn keeps_the_oracles() {
         return;
     }
     voice_oracle();
-    line_oracle();
+    line_audio(&line_oracle());
 }
 
 /// The patch step over `oracle`, the voice's patches alone, its prompt run through the patch
@@ -767,4 +773,178 @@ fn the_prompt_runs_as_voxcpm_runs_it_on_the_cpu() {
         }
     }
     assert_checked(&runs);
+}
+
+/// The audio voxcpm decodes on the CPU, after the voice's last frames and in the service's chunks,
+/// of `oracle`'s patches in f32 and of burn's f16's, the decoder in f32 for both.
+fn line_audio(oracle: &Oracle) -> [Vec<f32>; 2] {
+    let (name, voice) = voice();
+    kept(&format!("line-audio-{name}-{SEED}"), || {
+        let decoder = cpu_decoder();
+        let frames = voice.frames.as_flattened();
+        oracle
+            .patches
+            .each_ref()
+            .map(|patches| cpu_speech(&decoder, frames, patches))
+    })
+}
+
+fn cpu_decoder() -> audiovae::Decoder {
+    let weights = Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap();
+    audiovae::Decoder::load(&config().audio_vae(), &weights, FloatDType::F32, &device()).unwrap()
+}
+
+/// `patches`' audio as the service decodes it on the CPU, after `voice`'s last frames.
+fn cpu_speech(decoder: &audiovae::Decoder, voice: &[f32], patches: &[Vec<f32>]) -> Vec<f32> {
+    let chunk = Params::default().decode_chunk_frames;
+    let mut speech = SpeechDecoder::new(decoder, voice, 64, chunk);
+    let shape = [patches.len(), 4, 64];
+    speech.push(Tensor::from_data(
+        TensorData::new(patches.concat(), shape),
+        &device(),
+    ))
+}
+
+/// The generator for the checkpoint, as the service would run it, with caches for `capacity`
+/// positions.
+fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize) -> Generator {
+    let weights = Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap();
+    let settings = Settings {
+        capacity,
+        max_rows: 2 * TILE,
+        timesteps: Sampling::default().timesteps,
+        chunk_frames: Params::default().decode_chunk_frames.get(),
+        timed: false,
+    };
+    let start = Instant::now();
+    let parameter = |name: &str| {
+        let name = format!("decoder.{name}");
+        weights
+            .floats(&name)
+            .map_err(|e| graph::Error::Checkpoint(e.to_string()))
+    };
+    let generator = Generator::new(ctx, kernels, &checkpoint_dir(), &settings, parameter)
+        .unwrap_or_else(|e| panic!("{e}"));
+    eprintln!(
+        "generator recorded and loaded: {:.1} s",
+        start.elapsed().as_secs_f64()
+    );
+    generator
+}
+
+/// A request's patches, `[patch_size][feat_dim]` each, and its audio.
+struct Speech {
+    patches: Vec<Vec<f32>>,
+    audio: Vec<f32>,
+}
+
+/// `oracle`'s line spoken by `generator` from its noise: each patch sampled after f32's
+/// `stale`-th before, as teacher forcing does, or after its own when `stale` is `None`.
+fn speak(generator: &mut Generator, oracle: &Oracle, stale: Option<usize>) -> Speech {
+    let (_, voice) = voice();
+    let sampling = Sampling::default();
+    let prompt = graph::prompt::Prompt {
+        tokens: &oracle.tokens,
+        patches: &oracle.prompt,
+        audio: &oracle.audio,
+    };
+    let start = Instant::now();
+    generator
+        .start(
+            prompt,
+            voice.frames.as_flattened(),
+            Params::default().max_patches,
+            sampling.temperature,
+            sampling.cfg_value,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (mut patches, mut audio) = (vec![], vec![]);
+    for (i, noise) in oracle.noise.iter().enumerate() {
+        if let Some(before) = stale.and_then(|stale| i.checked_sub(stale)) {
+            generator
+                .sample_after(&oracle.patches[0][before])
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let Some(patch) = generator
+            .next_patch(noise)
+            .unwrap_or_else(|e| panic!("{e}"))
+        else {
+            break;
+        };
+        if i == 0 {
+            eprintln!(
+                "the first patch {:.1} ms after the request (smoke, not a measurement)",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        patches.push(patch.frames);
+        audio.extend(generator.take_audio());
+        if patch.last {
+            break;
+        }
+    }
+    audio.extend(generator.finish().unwrap_or_else(|e| panic!("{e}")));
+    eprintln!(
+        "{} patches and {} samples in {:.2} s (smoke, not a measurement)",
+        patches.len(),
+        audio.len(),
+        start.elapsed().as_secs_f64()
+    );
+    Speech { patches, audio }
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
+    let oracle = line_oracle();
+    let [want, burn] = line_audio(&oracle);
+    let patches = oracle.noise.len();
+    let samples = patches * 4 * 1920;
+    assert_eq!(want.len(), samples);
+    let ctx = context();
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let capacity = (oracle.len() + Params::default().max_patches).next_multiple_of(32);
+    let mut generator = generator(&ctx, &mut kernels, capacity);
+
+    // Each patch after f32's patch before: it stops where f32 does, and its audio is as near
+    // f32's as burn's f16's patches' is, decoded by the same decoder.
+    let forced = speak(&mut generator, &oracle, Some(1));
+    // Defect: each patch after f32's two before.
+    let stale = speak(&mut generator, &oracle, Some(2));
+    // Each patch after its own, as the service generates.
+    let free = speak(&mut generator, &oracle, None);
+    assert_no_validation_messages(&ctx);
+    drop(generator);
+    drop(ctx);
+
+    assert_eq!(forced.patches.len(), patches, "stopped after another patch");
+    assert_eq!(forced.audio.len(), samples);
+    let margin = margins("audio", &forced.audio, &burn, &want);
+    assert!(margin[1] <= 1.25, "{margin:.2?}");
+    let stale_margin = match stale.audio.len() == samples {
+        true => margins("audio after stale patches", &stale.audio, &burn, &want)[1],
+        false => f64::INFINITY,
+    };
+    assert!(stale_margin > 1.25, "audio after stale patches passes");
+
+    // Run free, it stops where f32 does too, and its audio is what the service's decoder makes
+    // of its patches on the CPU, to f32 rounding, which f16 storage does not reach.
+    assert_eq!(
+        free.patches.len(),
+        patches,
+        "run free, stopped after another patch"
+    );
+    let decoder = cpu_decoder();
+    let (_, voice) = voice();
+    let cpu = cpu_speech(&decoder, voice.frames.as_flattened(), &free.patches);
+    let d = distance(&free.audio, &cpu);
+    eprintln!("run free, against the CPU's decoder over its patches: {d:?}");
+    assert!(d.max_abs <= 1e-4, "{d:?}");
+    // Defect: the CPU's decoder not primed with the voice's last frames.
+    let unprimed = cpu_speech(&decoder, &[], &free.patches);
+    let d = distance(&free.audio, &unprimed);
+    assert!(
+        d.max_abs > 1e-4,
+        "audio not after the voice's frames passes: {d:?}"
+    );
 }

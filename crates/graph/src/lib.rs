@@ -15,12 +15,14 @@
 //! - [`patch`]: a patch of VoxCPM2's generation as one step: the local encoder, the LM side and
 //!   the sampler.
 //! - [`prompt`]: a prompt run into the patch step's caches.
+//! - [`generator`]: VoxCPM2's text-to-speech from a prompt to audio, a request at a time.
 //!
 //! The tests that need a GPU are built with the `device` feature: `nix run .#device-tests` runs
 //! them under the validation layer.
 
 pub mod checkpoint;
 pub mod decode;
+pub mod generator;
 pub mod graph;
 pub mod kernels;
 pub mod lm_side;
@@ -43,6 +45,9 @@ pub enum Error {
     Checkpoint(String),
     /// Shapes the kernels cannot run, or a config VoxCPM2 does not use.
     Shape(String),
+    /// The patch, by its index, came out NaN or infinite, after which the stop head might never
+    /// say to stop.
+    NotFinite(usize),
 }
 
 impl fmt::Display for Error {
@@ -52,6 +57,7 @@ impl fmt::Display for Error {
             Error::Kernels(why) => write!(f, "kernels: {why}"),
             Error::Checkpoint(why) => write!(f, "checkpoint: {why}"),
             Error::Shape(why) => write!(f, "shape: {why}"),
+            Error::NotFinite(patch) => write!(f, "patch {patch} came out NaN or infinite"),
         }
     }
 }

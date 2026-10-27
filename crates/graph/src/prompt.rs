@@ -30,7 +30,7 @@ use crate::{
         KernelInfo, Kernels,
     },
     lm_side::{Act, Linear, Stack, append_linear, splice},
-    patch::{PatchGraph, PatchStep},
+    patch::{PatchGraph, PatchStep, transposed},
     prefill::{StackTensors, TILE, append_prefill},
     step::Program,
 };
@@ -492,14 +492,6 @@ impl Prompter {
         }
         Ok(())
     }
-}
-
-/// `[rows][columns]` as `[columns][rows]`.
-fn transposed(values: &[f32], rows: usize) -> Vec<f32> {
-    let columns = values.len() / rows;
-    (0..columns)
-        .flat_map(|c| (0..rows).map(move |r| values[r * columns + c]))
-        .collect()
 }
 
 #[cfg(test)]

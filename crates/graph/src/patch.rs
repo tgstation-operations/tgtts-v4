@@ -127,6 +127,15 @@ pub fn patch_graph(
     })
 }
 
+/// `[rows][columns]` as `[columns][rows]`: a patch's frames, `[patch_size][feat_dim]`, laid out
+/// as the patch step takes a patch when `rows` is `patch_size`, and back when it is `feat_dim`.
+pub(crate) fn transposed(values: &[f32], rows: usize) -> Vec<f32> {
+    let columns = values.len() / rows;
+    (0..columns)
+        .flat_map(|c| (0..rows).map(move |r| values[r * columns + c]))
+        .collect()
+}
+
 /// What a patch step gives.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sampled {
