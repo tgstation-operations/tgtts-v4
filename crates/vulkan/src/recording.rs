@@ -114,6 +114,8 @@ pub struct Recording {
     timed: bool,
     /// Submitted, and not yet seen finished: the GPU may be using every buffer.
     pending: bool,
+    /// Submitted at least once, so that the timestamps have been written.
+    ran: bool,
 }
 
 impl std::fmt::Debug for Recording {
@@ -192,6 +194,7 @@ impl Recording {
             timestamps: vk::QueryPool::null(),
             timed,
             pending: false,
+            ran: false,
         };
         let count = u32::try_from(dispatches.len())
             .map_err(|_| Error::Unsupported("too many dispatches".into()))?;
@@ -398,8 +401,10 @@ impl Recording {
         self.start()?.wait()
     }
 
-    /// Submits the recorded dispatches and returns without waiting for them.
+    /// Submits the recorded dispatches and returns without waiting for them; first waits again for
+    /// the last submission if waiting for it failed.
     pub fn start(&mut self) -> Result<Submission<'_>> {
+        self.finish()?;
         {
             let submit = self
                 .ctx
@@ -408,8 +413,8 @@ impl Recording {
                 .map_err(|_| Error::Unsupported("a poisoned queue lock".into()))?;
             let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(self.commands)];
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
-            // SAFETY: the command buffer is executable and not pending (a submission holds the
-            // recording until it has been waited for), and the queue is held for the call.
+            // SAFETY: the command buffer is executable and not pending (the last submission was
+            // seen finished above), and the queue is held for the call.
             unsafe {
                 self.ctx
                     .device
@@ -418,6 +423,7 @@ impl Recording {
             .call("vkQueueSubmit2")?;
         }
         self.pending = true;
+        self.ran = true;
         Ok(Submission { recording: self })
     }
 
@@ -463,6 +469,13 @@ impl Recording {
 
     /// `count` timestamps of the last submission from query `first`.
     fn stamps(&self, first: u32, count: u32) -> Result<Vec<u64>> {
+        // Waiting for a timestamp no submission has written, or one still running, could block
+        // for good.
+        if !self.ran || self.pending {
+            return Err(Error::Unsupported(
+                "the timestamps of a recording not run to the end".into(),
+            ));
+        }
         let mut stamps = vec![0u64; count as usize];
         // SAFETY: the pool holds the queries asked for, all written by the last submission, which
         // has finished.

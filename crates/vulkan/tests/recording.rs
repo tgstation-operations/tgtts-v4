@@ -229,6 +229,7 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
         0
     );
     let mut untimed = chain(&ctx, &kernels, n, false);
+    assert!(matches!(untimed.elapsed(), Err(Error::Unsupported(_))));
     untimed.buffer_mut(0).write(&x).unwrap();
     let start = Instant::now();
     untimed.submit().unwrap_or_else(|e| panic!("{e}"));
