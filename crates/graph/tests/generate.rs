@@ -1,25 +1,30 @@
-//! The patch step on the GPU against voxcpm's generation on burn's CPU backend, on VoxCPM2's real
-//! weights. The model is prompted with a voice's patches alone and generates patches from seeded
-//! noise; the GPU runs the prompt's patches through the patch step a position at a time, then
-//! samples each generated patch from the same noise after the CPU's patch before, as voxcpm's
-//! f16 is fed the f32 run's, so that all three follow one generation: the sampler conditioned on
-//! what the LM side computes, where its own tests make the condition up. Built with the `device`
-//! feature, and run with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and
-//! `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests` sets the last.
+//! VoxCPM2's generation on the GPU against voxcpm's on burn's CPU backend, on the real weights.
+//! The CPU generates patches from seeded noise in f32, and again in burn's f16 sampling each patch
+//! after f32's patch before; the GPU samples each from the same noise after f32's patch before
+//! too, so that all three follow one generation. Built with the `device` feature, and run with
+//! `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS` and
+//! `VULKAN_KERNELS` the compiled kernels, as `nix run .#device-tests` sets the last two.
+//!
+//! The patch step is checked on a prompt of a voice's patches alone, run through the patch step a
+//! position at a time: the sampler conditioned on what the LM side computes, where its own tests
+//! make the condition up. The prompt is checked on the one the service builds, of the golden's
+//! line in its voice, run at once into the patch step's caches.
 //!
 //! The scalar quantizer rounds the base LM's output to levels, and a value near a boundary
 //! between two lands on either by luck of rounding: a level apart from f32's is a discrete event,
 //! which the sampler amplifies into the patch, not an error of the rounding's size. On the real
-//! weights some levels are apart at every position, for burn's f16 as for the GPU, so the GPU is
-//! held to burn's f16 on the quantizer's input, a continuous value, by its largest and its RMS
-//! error; on how many levels are apart; on the stop logits by their largest and RMS error; and on
-//! the patches by their RMS error over all of them and by being the closer at half of them at
-//! least, not by their largest error, which is that of whichever level apart the sampler
-//! amplified most. Teacher forcing keeps a level's effect on a patch from reaching the next
-//! through the patch.
+//! weights levels are apart at most positions, for burn's f16 as for the GPU. So the GPU is held
+//! to burn's f16 on the quantizer's input, a continuous value, by its largest and its RMS error;
+//! on how many levels are apart; on the stop logits by their largest and RMS error; on the
+//! decisions to stop; and on the patches by being the closer to f32's at half of them at least,
+//! and at each where none of its levels is apart when a run has `CLEAN` such patches. Only a
+//! run with fewer is held to the patches' RMS error over all of them: where the GPU's error is
+//! otherwise small, one level apart that the sampler amplifies decides that error, and how many
+//! are apart is held already. Teacher forcing keeps a level's effect on a patch from reaching the
+//! next through the patch.
 //!
 //! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
-//! there by later runs: `keeps_the_oracle` runs it alone, touching no GPU.
+//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
 
 use std::{fs, path::PathBuf, time::Instant};
@@ -30,25 +35,29 @@ use burn::{
     store::{
         FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     },
-    tensor::{FloatDType, Tensor, TensorData},
+    tensor::{Bool, FloatDType, Int, Tensor, TensorData},
 };
 use graph::{
     checkpoint::Checkpoint,
     decode::{self, SUBGROUPS},
-    graph::Kind,
+    graph::{Kind, TensorId},
     kernels::Kernels,
     lm_side::{self, LmSideShape},
     local::{self, PatchConfig},
     patch::{PatchStep, patch_graph},
+    prefill::TILE,
+    prompt::Prompter,
 };
 use half::f16;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use testkit::{Fixture, checkpoint_dir, device};
 use voices::Latent;
-use voxcpm::{Config, Dtypes, LocalEncoder, Model, Noise, Prompt, Sampling, SeededNoise};
+use voxcpm::{
+    Config, Dtypes, LocalEncoder, Model, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer,
+};
 use vulkan::Context;
 
-/// Patches generated after the prompt.
+/// Patches sampled after the voice's patches alone.
 const GENERATED: usize = 24;
 
 const SEED: u64 = 0;
@@ -74,19 +83,26 @@ fn config_json() -> String {
     fs::read_to_string(checkpoint_dir().join("config.json")).unwrap()
 }
 
-/// The voice voxcpm's golden was made with, and its latent frames.
-fn voice() -> (String, Vec<f32>) {
-    let golden = Fixture::open(concat!(
+fn config() -> Config {
+    Config::from_json(&config_json()).unwrap()
+}
+
+fn golden() -> Fixture {
+    Fixture::open(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../voxcpm/tests/fixtures/voxcpm_checkpoint.safetensors"
-    ));
+    ))
+}
+
+/// The voice voxcpm's golden was made with, by its name.
+fn voice() -> (String, Latent) {
     let Some(dir) = std::env::var_os("VOICES_DIR").filter(|dir| !dir.is_empty()) else {
         panic!("VOICES_DIR is not set; point it at a voices directory");
     };
     let dir = std::path::absolute(dir).unwrap();
-    let name = golden.metadata()["voice"].clone();
+    let name = golden().metadata()["voice"].clone();
     let latent = Latent::read(&voices::latent_path(&dir, &name)).unwrap_or_else(|e| panic!("{e}"));
-    (name, latent.frames.as_flattened().to_vec())
+    (name, latent)
 }
 
 /// `compute`'s result, kept as JSON under `ORACLE_DIR` when it is set, by `name`: read from
@@ -106,15 +122,17 @@ fn kept<T: Serialize + DeserializeOwned>(name: &str, compute: impl FnOnce() -> T
     value
 }
 
-/// What voxcpm's model gives on the CPU, in f32 and in burn's f16, the second each step after the
-/// first's patch before.
+/// What voxcpm's model gives on the CPU for a prompt, in f32 and in burn's f16, the second each
+/// patch after the first's patch before.
 #[derive(Serialize, Deserialize)]
 struct Oracle {
-    /// The voice's latent frames, the prompt's patches.
-    voice: Vec<f32>,
-    /// The noise each generated patch is sampled from, `[feat_dim][patch_size]`.
+    /// The prompt, as voxcpm's `Prompt` holds it.
+    tokens: Vec<u32>,
+    prompt: Vec<f32>,
+    audio: Vec<bool>,
+    /// The noise each patch is sampled from, `[feat_dim][patch_size]`.
     noise: Vec<Vec<f32>>,
-    /// Each generated patch, `[patch_size][feat_dim]`.
+    /// Each patch, `[patch_size][feat_dim]`.
     patches: [Vec<Vec<f32>>; 2],
     /// The stop logits each patch was sampled beside.
     stop: [Vec<[f32; 2]>; 2],
@@ -125,14 +143,44 @@ struct Oracle {
     levels: [Vec<Vec<f32>>; 2],
 }
 
+impl Oracle {
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
 fn floats<const D: usize>(t: Tensor<D>) -> Vec<f32> {
     t.cast(FloatDType::F32).into_data().iter::<f32>().collect()
 }
 
-fn oracle() -> Oracle {
+/// The voice's patches alone as the prompt, and `GENERATED` patches after it whatever the stop
+/// head says.
+fn voice_oracle() -> Oracle {
     let (name, voice) = voice();
     kept(&format!("patch-{name}-{GENERATED}-{SEED}"), || {
-        compute_oracle(voice)
+        let frames = voice.frames.as_flattened().to_vec();
+        let len = frames.len() / (64 * 4);
+        let prompt = Prompt {
+            tokens: vec![0; len],
+            patches: frames,
+            audio: vec![true; len],
+        };
+        compute_oracle(&prompt, GENERATED, false)
+    })
+}
+
+/// The prompt the service builds for the golden's line in its voice, and the patches after it
+/// until the stop head says to stop, as the service stops.
+fn line_oracle() -> Oracle {
+    let (name, voice) = voice();
+    kept(&format!("line-{name}-{SEED}"), || {
+        let dir = checkpoint_dir();
+        let tokenizer = fs::read_to_string(dir.join("tokenizer.json")).unwrap();
+        let tokenizer = Tokenizer::from_json(&tokenizer).unwrap();
+        let text = golden().metadata()["text"].clone();
+        let tokens = tokenizer.encode(&format!("{}{text}", voice.text));
+        let prompt = Prompt::cloning(&tokens, voice.frames.as_flattened(), &config()).unwrap();
+        compute_oracle(&prompt, Params::default().max_patches, true)
     })
 }
 
@@ -145,53 +193,57 @@ fn dtypes(dtype: FloatDType) -> Dtypes {
     }
 }
 
-fn compute_oracle(voice: Vec<f32>) -> Oracle {
-    let config = Config::from_json(&config_json()).unwrap();
+/// Up to `most` patches after `prompt`, `until_stop` after the first the stop head says to stop
+/// after.
+fn compute_oracle(prompt: &Prompt, most: usize, until_stop: bool) -> Oracle {
+    let config = config();
     let weights = checkpoint_dir().join("model.safetensors");
     let cpu = device();
     let (patch_size, feat_dim) = (config.patch_size, config.feat_dim);
-    let len = voice.len() / (patch_size * feat_dim);
-    let prompt = Prompt {
-        tokens: vec![0; len],
-        patches: voice.clone(),
-        audio: vec![true; len],
-    };
     let sampling = Sampling::default();
     let tensor = |values: &[f32], shape: [usize; 3]| {
         Tensor::<3>::from_data(TensorData::new(values.to_vec(), shape), &cpu)
     };
     let start = Instant::now();
     let mut draws = SeededNoise::new(SEED);
-    let noise: Vec<Vec<f32>> = (0..GENERATED)
-        .map(|_| draws.next(feat_dim * patch_size))
-        .collect();
-    let mut patches = [vec![], vec![]];
-    let mut stop = [vec![], vec![]];
+    let (mut noise, mut patches, mut stop) = (vec![], [vec![], vec![]], [vec![], vec![]]);
     let mut base = [vec![], vec![]];
     let mut levels = [vec![], vec![]];
     for (run, dtype) in [FloatDType::F32, FloatDType::F16].into_iter().enumerate() {
         let model =
             Model::load(&config, &weights, &dtypes(dtype), &cpu).unwrap_or_else(|e| panic!("{e}"));
-        let mut generation = model.start(&prompt, GENERATED).unwrap();
-        for (i, noise) in noise.iter().enumerate() {
-            let step = generation.sample(tensor(noise, [1, feat_dim, patch_size]), &sampling);
-            let logits = floats(step.stop_logits);
-            patches[run].push(floats(step.patch));
+        let mut generation = model.start(prompt, most).unwrap();
+        for i in 0..most {
+            if run == 0 {
+                noise.push(draws.next(feat_dim * patch_size));
+            } else if i == noise.len() {
+                break;
+            }
+            let step = generation.sample(tensor(&noise[i], [1, feat_dim, patch_size]), &sampling);
+            let logits = floats(step.stop_logits.clone());
+            patches[run].push(floats(step.patch.clone()));
             stop[run].push([logits[0], logits[1]]);
+            if run == 0 && until_stop && step.stops() {
+                break;
+            }
             let before = &patches[0][i];
             generation.advance(tensor(before, [1, patch_size, feat_dim]));
         }
         drop(generation);
         drop(model);
-        let fed = &patches[0][..GENERATED - 1];
-        [base[run], levels[run]] = quantizer(&config, &voice, fed, dtype);
+        let fed = &patches[0][..noise.len() - 1];
+        [base[run], levels[run]] = quantizer(&config, prompt, fed, most, dtype);
     }
     eprintln!(
-        "{len} patches of prompt and {GENERATED} generated on the CPU, f32 and f16: {:.1} s",
+        "{} positions of prompt and {} patches after it on the CPU, f32 and f16: {:.1} s",
+        prompt.len(),
+        noise.len(),
         start.elapsed().as_secs_f64()
     );
     Oracle {
-        voice,
+        tokens: prompt.tokens.clone(),
+        prompt: prompt.patches.clone(),
+        audio: prompt.audio.clone(),
         noise,
         patches,
         stop,
@@ -214,14 +266,17 @@ struct Quantizer {
 }
 
 /// The base LM's outputs and the scalar quantizer's levels at the position before each patch,
-/// the prompt's last and then `fed`'s, as voxcpm's model computes them in `dtype`, which keeps
-/// them to itself: the local encoder and enc_to_lm_proj over the prompt's patches at once and
-/// then over each of `fed`, the base LM over the prompt at once and then a position at a time,
-/// and the quantizer over its outputs as they come.
+/// the prompt's last and then `fed`'s, as voxcpm's model computes them in `dtype` with caches for
+/// `most` patches after the prompt, which keeps them to itself: the prompt embedded as
+/// `run_prompt` embeds it, the local encoder and enc_to_lm_proj over all its patches at once and
+/// the base LM's embedding table at its tokens, and each of `fed` by the encoder and the
+/// projection; the base LM over the prompt at once and then a position at a time; and the
+/// quantizer over its outputs as they come.
 fn quantizer(
     config: &Config,
-    voice: &[f32],
+    prompt: &Prompt,
     fed: &[Vec<f32>],
+    most: usize,
     dtype: FloatDType,
 ) -> [Vec<Vec<f32>>; 2] {
     let weights = checkpoint_dir().join("model.safetensors");
@@ -229,10 +284,10 @@ fn quantizer(
     let (patch_size, feat_dim) = (config.patch_size, config.feat_dim);
     let lm = &config.lm_config;
     let hidden = lm.hidden_size;
-    let len = voice.len() / (patch_size * feat_dim);
+    let len = prompt.len();
     let encoder = LocalEncoder::load(config, &weights, dtype, &cpu).unwrap();
     let base = minicpm4::Model::load(lm, &weights, "base_lm.", dtype, &cpu).unwrap();
-    let heads = Heads {
+    let mut heads = Heads {
         enc_to_lm_proj: LinearConfig::new(config.encoder_config.hidden_dim, hidden).init(&cpu),
         fsq_layer: Quantizer {
             in_proj: LinearConfig::new(hidden, config.scalar_quantization_latent_dim).init(&cpu),
@@ -240,7 +295,6 @@ fn quantizer(
     };
     let adapter = PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype.into()));
     let mut store = SafetensorsStore::from_file(&weights).with_from_adapter(adapter);
-    let mut heads = heads;
     heads
         .load_from(&mut store)
         .unwrap_or_else(|e| panic!("{e}"));
@@ -252,8 +306,15 @@ fn quantizer(
             .enc_to_lm_proj
             .forward(encoder.forward(patches).cast(dtype))
     };
-    let mut cache = base.cache(1, len + GENERATED);
-    let mut outputs = vec![base.forward_cached(embed(voice.to_vec(), len), &mut cache)];
+    let tokens: Vec<i64> = prompt.tokens.iter().map(|&t| i64::from(t)).collect();
+    let tokens = Tensor::<2, Int>::from_data(TensorData::new(tokens, [1, len]), &cpu);
+    let audio = TensorData::new(prompt.audio.clone(), [1, len, 1]);
+    let audio = Tensor::<3, Bool>::from_data(audio, &cpu).expand([1, len, hidden]);
+    let x = base
+        .embed(tokens)
+        .mask_where(audio, embed(prompt.patches.clone(), len));
+    let mut cache = base.cache(1, len + most);
+    let mut outputs = vec![base.forward_cached(x, &mut cache)];
     for patch in fed {
         outputs.push(base.forward_cached(embed(patch.clone(), 1), &mut cache));
     }
@@ -266,7 +327,6 @@ fn quantizer(
         found[1].push(last(levels));
         found[0].push(last(out));
     }
-    assert_eq!(found[0][0].len(), hidden);
     found
 }
 
@@ -278,36 +338,21 @@ fn transposed(values: &[f32], rows: usize) -> Vec<f32> {
         .collect()
 }
 
-/// How a run differs from the oracle's.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Defect {
-    None,
-    /// Each generated patch sampled after the patch two before rather than the one before.
-    Stale,
-}
-
-/// What the GPU gives for each generated patch: the patch `[patch_size][feat_dim]`, the stop
-/// logits, the base LM's output before it and the quantizer's levels.
-struct Run {
-    patches: Vec<Vec<f32>>,
-    stop: Vec<[f32; 2]>,
-    base: Vec<Vec<f32>>,
-    levels: Vec<Vec<f32>>,
-}
-
-/// The GPU's run, the LM side's kernels at `subgroup` and the local stacks' at the device's
-/// tuning at that subgroup size (the device's default when `None`). The base LM's output and
-/// the levels are read where the step leaves them, made outputs for it.
-fn gpu(oracle: &Oracle, subgroup: Option<u32>, defect: Defect) -> Run {
-    let ctx = context();
-    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+/// The patch step on the GPU for `oracle`'s prompt and patches, recorded and loaded, the LM side's
+/// kernels at `subgroup` and the local stacks' at the device's tuning at that subgroup size (the
+/// device's default when `None`); and the tensors of the base LM's output and the quantizer's
+/// levels, made outputs for the host to read.
+fn patch_step(
+    ctx: &Context,
+    kernels: &mut Kernels,
+    oracle: &Oracle,
+    subgroup: Option<u32>,
+) -> (PatchStep, [TensorId; 2], decode::Tuning) {
     let json = config_json();
     let side_config: lm_side::Config = serde_json::from_str(&json).unwrap();
     let config: PatchConfig = serde_json::from_str(&json).unwrap();
-    let (patch_size, feat_dim) = (config.patch_size, config.feat_dim);
-    let patch = patch_size * feat_dim;
-    let len = oracle.voice.len() / patch;
-    let shape = LmSideShape::new(&side_config, (len + GENERATED).next_multiple_of(32)).unwrap();
+    let capacity = (oracle.len() + oracle.noise.len()).next_multiple_of(32);
+    let shape = LmSideShape::new(&side_config, capacity).unwrap();
     let report = ctx.report().clone();
     let lm_default = decode::Tuning::for_device(&report).unwrap_or_else(|e| panic!("{e}"));
     let subgroup = subgroup.unwrap_or(lm_default.subgroup);
@@ -316,16 +361,15 @@ fn gpu(oracle: &Oracle, subgroup: Option<u32>, defect: Defect) -> Run {
         subgroup,
         ..local::Tuning::for_device(&report).unwrap_or_else(|e| panic!("{e}"))
     };
-    let sampling = Sampling::default();
     let start = Instant::now();
-    let mut graph = patch_graph(&shape, &config, sampling.timesteps, &lm, &local)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let timesteps = Sampling::default().timesteps;
+    let mut graph =
+        patch_graph(&shape, &config, timesteps, &lm, &local).unwrap_or_else(|e| panic!("{e}"));
     let probes = [graph.side.base_out, graph.side.levels].map(|t| graph.side_ids[t.0]);
     for t in probes {
         graph.graph.tensors[t.0].kind = Kind::Output;
     }
-    let mut step =
-        PatchStep::new(&ctx, &mut kernels, graph, false).unwrap_or_else(|e| panic!("{e}"));
+    let mut step = PatchStep::new(ctx, kernels, graph, false).unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     step.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
@@ -339,22 +383,24 @@ fn gpu(oracle: &Oracle, subgroup: Option<u32>, defect: Defect) -> Run {
         kernels.len(),
         recorded.arena_bytes() / 1024
     );
-    let voice = |t: usize| &oracle.voice[t * patch..(t + 1) * patch];
-    let silence = vec![0.0; patch];
-    let run = |step: &mut PatchStep, position: usize, cond: &[f32], noise: &[f32]| {
-        let cond = transposed(cond, patch_size);
-        step.run(
-            position,
-            &cond,
-            noise,
-            sampling.temperature,
-            sampling.cfg_value,
-        )
-        .unwrap_or_else(|e| panic!("{e}"))
-    };
-    for t in 0..len - 1 {
-        run(&mut step, t, voice(t), &silence);
-    }
+    (step, probes, lm)
+}
+
+/// What the GPU gives for each patch: the patch `[patch_size][feat_dim]`, the stop logits, the
+/// base LM's output before it and the quantizer's levels.
+struct Run {
+    patches: Vec<Vec<f32>>,
+    stop: Vec<[f32; 2]>,
+    base: Vec<Vec<f32>>,
+    levels: Vec<Vec<f32>>,
+}
+
+/// Samples each of `oracle`'s patches on `step`, whose caches hold its prompt but the last
+/// position, after the patch before, its `stale`-th before rather than f32's last.
+fn sample(step: &mut PatchStep, probes: [TensorId; 2], oracle: &Oracle, stale: usize) -> Run {
+    let sampling = Sampling::default();
+    let len = oracle.len();
+    let patch = oracle.prompt.len() / len;
     let mut out = Run {
         patches: vec![],
         stop: vec![],
@@ -363,30 +409,36 @@ fn gpu(oracle: &Oracle, subgroup: Option<u32>, defect: Defect) -> Run {
     };
     let mut elapsed = 0.0;
     for (i, noise) in oracle.noise.iter().enumerate() {
-        let before = match (defect, i) {
-            (Defect::Stale, 2..) => &oracle.patches[0][i - 2],
-            (_, 0) => voice(len - 1),
-            _ => &oracle.patches[0][i - 1],
+        let before = match i.checked_sub(stale) {
+            Some(at) => &oracle.patches[0][at],
+            None => &oracle.prompt[(len - 1) * patch..],
         };
         let start = Instant::now();
-        let sampled = run(&mut step, len - 1 + i, before, noise);
+        let sampled = step
+            .run(
+                len - 1 + i,
+                &transposed(before, 4),
+                noise,
+                sampling.temperature,
+                sampling.cfg_value,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
         elapsed += start.elapsed().as_secs_f64();
-        let read = |t: graph::graph::TensorId| -> Vec<f32> {
+        let read = |t: TensorId| -> Vec<f32> {
             let bits: Vec<u16> = step.graph_step().read(t).unwrap();
             bits.iter().map(|&h| f16::from_bits(h).to_f32()).collect()
         };
         let levels = read(probes[1]).iter().map(|&l| (l * 9.0).round()).collect();
-        out.patches.push(transposed(&sampled.patch, feat_dim));
+        out.patches.push(transposed(&sampled.patch, 64));
         out.stop.push(sampled.stop_logits);
         out.base.push(read(probes[0]));
         out.levels.push(levels);
     }
     eprintln!(
-        "{GENERATED} patches at {:.1} ms each from submission to fence (smoke, not a \
-         measurement)",
-        elapsed * 1e3 / GENERATED as f64
+        "{} patches at {:.1} ms each from submission to fence (smoke, not a measurement)",
+        oracle.noise.len(),
+        elapsed * 1e3 / oracle.noise.len() as f64
     );
-    assert_no_validation_messages(&ctx);
     out
 }
 
@@ -441,6 +493,10 @@ fn flips(levels: &[Vec<f32>], want: &[Vec<f32>]) -> Vec<usize> {
     levels.iter().zip(want).map(differ).collect()
 }
 
+/// The patches where none of the GPU's levels is apart from f32's that a run must have for the
+/// GPU to be held to being the closer at each of them.
+const CLEAN: usize = 4;
+
 /// How the GPU compares with burn's f16, both against f32.
 #[derive(Debug)]
 struct Verdict {
@@ -450,24 +506,38 @@ struct Verdict {
     flips: [usize; 2],
     /// The stop logits' largest error and relative RMS error over burn's.
     stop: [f64; 2],
-    /// The patches' relative RMS error over burn's, over all of them, and how many of them are
-    /// closer to f32's than burn's are at their largest error.
+    /// The patches' relative RMS error over burn's, over all of them.
     patches: f64,
-    closer: usize,
+    /// How many patches of how many are closer to f32's than burn's are at their largest error,
+    /// and how many of those where none of the GPU's levels is apart.
+    closer: [usize; 2],
+    clean: [usize; 2],
     /// Whether the GPU and f32 decide alike whether to stop, wherever f32's margin between
     /// going on and stopping is wider than the GPU's error in the logits.
     decides_alike: bool,
 }
 
 impl Verdict {
-    fn passes(&self) -> bool {
+    /// The criteria it fails. The patches are held to their error over all of them only where
+    /// too few are clear of levels apart for the GPU to be held to being the closer at those.
+    fn fails(&self) -> Vec<&'static str> {
         let within = |m: f64| m <= 1.25;
-        self.base.into_iter().all(within)
-            && self.flips[0] <= self.flips[1]
-            && self.stop.into_iter().all(within)
-            && within(self.patches)
-            && 2 * self.closer >= GENERATED
-            && self.decides_alike
+        let patches = if self.clean[1] >= CLEAN {
+            self.clean[0] == self.clean[1]
+        } else {
+            within(self.patches)
+        };
+        [
+            ("quantizer input", self.base.into_iter().all(within)),
+            ("levels apart", self.flips[0] <= self.flips[1]),
+            ("stop logits", self.stop.into_iter().all(within)),
+            ("patches", 2 * self.closer[0] >= self.closer[1] && patches),
+            ("stop decisions", self.decides_alike),
+        ]
+        .into_iter()
+        .filter(|&(_, holds)| !holds)
+        .map(|(name, _)| name)
+        .collect()
     }
 }
 
@@ -475,13 +545,18 @@ fn judge(oracle: &Oracle, run: &Run) -> Verdict {
     let [want, burn] = &oracle.patches;
     let gpu_flips = flips(&run.levels, &oracle.levels[0]);
     let burn_flips = flips(&oracle.levels[1], &oracle.levels[0]);
-    let mut closer = 0;
-    for i in 0..GENERATED {
+    let (mut closer, mut clean) = (0, [0, 0]);
+    for i in 0..run.patches.len() {
         let (ours, theirs) = (
             distance(&run.patches[i], &want[i]),
             distance(&burn[i], &want[i]),
         );
-        closer += usize::from(ours.max_abs < theirs.max_abs);
+        let nearer = ours.max_abs < theirs.max_abs;
+        closer += usize::from(nearer);
+        if gpu_flips[i] == 0 {
+            clean[0] += usize::from(nearer);
+            clean[1] += 1;
+        }
         eprintln!(
             "patch {i}: levels apart GPU {}, burn f16 {}; GPU {ours:?}, burn f16 {theirs:?}; stop \
              logits f32 {:?}, GPU {:?}, burn f16 {:?}",
@@ -509,7 +584,8 @@ fn judge(oracle: &Oracle, run: &Run) -> Verdict {
         flips: [gpu_flips.iter().sum(), burn_flips.iter().sum()],
         stop: stop_margins,
         patches,
-        closer,
+        closer: [closer, run.patches.len()],
+        clean,
         decides_alike,
     };
     eprintln!("{verdict:.2?}");
@@ -518,37 +594,177 @@ fn judge(oracle: &Oracle, run: &Run) -> Verdict {
 
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
-            ORACLE_DIR a directory to keep the oracle in"]
-fn keeps_the_oracle() {
+            ORACLE_DIR a directory to keep the oracles in"]
+fn keeps_the_oracles() {
     if std::env::var_os("ORACLE_DIR").is_none_or(|dir| dir.is_empty()) {
-        eprintln!("ORACLE_DIR is not set: nothing to keep the oracle in");
+        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
         return;
     }
-    oracle();
+    voice_oracle();
+    line_oracle();
+}
+
+/// The patch step over `oracle`, the voice's patches alone, its prompt run through the patch
+/// step a position at a time.
+fn patches_after_a_voice(oracle: &Oracle, subgroup: Option<u32>, stale: usize) -> Verdict {
+    let ctx = context();
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let (mut step, probes, _) = patch_step(&ctx, &mut kernels, oracle, subgroup);
+    let sampling = Sampling::default();
+    let patch = oracle.prompt.len() / oracle.len();
+    let silence = vec![0.0; patch];
+    for (t, cond) in oracle
+        .prompt
+        .chunks(patch)
+        .take(oracle.len() - 1)
+        .enumerate()
+    {
+        let cond = transposed(cond, 4);
+        step.run(t, &cond, &silence, sampling.temperature, sampling.cfg_value)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+    let run = sample(&mut step, probes, oracle, stale);
+    assert_no_validation_messages(&ctx);
+    judge(oracle, &run)
+}
+
+/// The subgroup sizes the device can require: 32, as on NVIDIA, also on the Radeon.
+fn subgroups() -> Vec<u32> {
+    let report = context().report().clone();
+    let can = |&s: &u32| report.can_require_subgroup_size(s);
+    SUBGROUPS.into_iter().filter(can).collect()
+}
+
+/// A run at a subgroup size, with a defect planted and the criterion it must fail, or none.
+struct Checked {
+    subgroup: u32,
+    defect: Option<(String, &'static str)>,
+    verdict: Verdict,
+}
+
+/// Asserts that each run passes every criterion, or with a defect fails the defect's.
+fn assert_checked(runs: &[Checked]) {
+    for run in runs {
+        let (subgroup, fails) = (run.subgroup, run.verdict.fails());
+        match &run.defect {
+            None => assert!(
+                fails.is_empty(),
+                "wave{subgroup}: {fails:?}: {:?}",
+                run.verdict
+            ),
+            Some((defect, criterion)) => assert!(
+                fails.contains(criterion),
+                "wave{subgroup}: {defect} passes {criterion}: {:?}",
+                run.verdict
+            ),
+        }
+    }
 }
 
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
 fn patches_sample_as_voxcpm_generates_on_the_cpu() {
-    let oracle = oracle();
-    // At every subgroup size the device can require: 32, as on NVIDIA, also on the Radeon.
-    let report = context().report().clone();
-    let verdicts: Vec<_> = SUBGROUPS
-        .into_iter()
-        .filter(|&s| report.can_require_subgroup_size(s))
-        .map(|subgroup| {
-            (
-                subgroup,
-                judge(&oracle, &gpu(&oracle, Some(subgroup), Defect::None)),
-            )
-        })
-        .collect();
-    let stale = judge(&oracle, &gpu(&oracle, None, Defect::Stale));
-    for (subgroup, verdict) in verdicts {
-        assert!(verdict.passes(), "wave{subgroup}: {verdict:?}");
+    let oracle = voice_oracle();
+    let mut runs = vec![];
+    for subgroup in subgroups() {
+        runs.push(Checked {
+            subgroup,
+            defect: None,
+            verdict: patches_after_a_voice(&oracle, Some(subgroup), 1),
+        });
+        runs.push(Checked {
+            subgroup,
+            defect: Some((
+                "each patch after the one two before".into(),
+                "quantizer input",
+            )),
+            verdict: patches_after_a_voice(&oracle, Some(subgroup), 2),
+        });
     }
-    assert!(
-        !stale.passes(),
-        "patches after a stale patch pass: {stale:?}"
+    assert_checked(&runs);
+}
+
+/// How a prompt is run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Prompting {
+    AsVoxcpm,
+    /// The quantizer's output taken at text positions too.
+    QuantizedText,
+    /// The prompt one position on in the caches.
+    Shifted,
+}
+
+/// The prompt and the patch step over `oracle`, its prompt run at once.
+fn patches_after_a_prompt(oracle: &Oracle, subgroup: Option<u32>, how: Prompting) -> Verdict {
+    let ctx = context();
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let (mut step, probes, tuning) = patch_step(&ctx, &mut kernels, oracle, subgroup);
+    let prompter = Prompter::new(&ctx, &mut kernels, &mut step, 2 * TILE, &tuning, true)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let prompt = graph::prompt::Prompt {
+        tokens: &oracle.tokens,
+        patches: &oracle.prompt,
+        audio: &oracle.audio,
+    };
+    let start = Instant::now();
+    let (x, audio_x) = prompter
+        .embeddings(&mut step, &checkpoint, prompt)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let embedded = start.elapsed().as_secs_f64() * 1e3;
+    let ran = oracle.len() - 1;
+    let audio = match how {
+        Prompting::QuantizedText => vec![true; ran],
+        _ => oracle.audio[..ran].to_vec(),
+    };
+    let at = usize::from(how == Prompting::Shifted);
+    let start = Instant::now();
+    prompter
+        .run_rows(&mut step, at, &x, &audio_x, &audio)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let ran = start.elapsed().as_secs_f64() * 1e3;
+    let timings = step.timings().unwrap().expect("a timed prompt");
+    let ms = |label: &str| -> f64 {
+        let of = timings.iter().filter(|(l, _)| l.starts_with(label));
+        of.map(|(_, t)| t.nanoseconds / 1e6).sum()
+    };
+    eprintln!(
+        "{} positions of prompt: embedded in {embedded:.1} ms and run in {ran:.1} ms on the host, \
+         {:.1} ms on the GPU of which {:.2} between the LMs (smoke, not a measurement)",
+        oracle.len(),
+        ms(""),
+        ms("fsq_layer") + ms("select_rows") + ms("fusion_concat_proj")
     );
+    let run = sample(&mut step, probes, oracle, 1);
+    assert_no_validation_messages(&ctx);
+    judge(oracle, &run)
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn the_prompt_runs_as_voxcpm_runs_it_on_the_cpu() {
+    let oracle = line_oracle();
+    // The quantizer's output taken at text positions leaves the base LM as it is, and moves the
+    // residual LM's state, so the patches; the prompt one position on moves both.
+    let defects = [
+        (Prompting::QuantizedText, "patches"),
+        (Prompting::Shifted, "quantizer input"),
+    ];
+    let mut runs = vec![];
+    for subgroup in subgroups() {
+        runs.push(Checked {
+            subgroup,
+            defect: None,
+            verdict: patches_after_a_prompt(&oracle, Some(subgroup), Prompting::AsVoxcpm),
+        });
+        for (how, criterion) in defects {
+            runs.push(Checked {
+                subgroup,
+                defect: Some((format!("{how:?}"), criterion)),
+                verdict: patches_after_a_prompt(&oracle, Some(subgroup), how),
+            });
+        }
+    }
+    assert_checked(&runs);
 }

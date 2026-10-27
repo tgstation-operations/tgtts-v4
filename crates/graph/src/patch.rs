@@ -219,6 +219,12 @@ impl PatchStep {
         self.capacity
     }
 
+    /// The step's tensors, and the step, for programs over its weights and caches to be added to
+    /// it ([`Step::add`]) and run.
+    pub fn parts_mut(&mut self) -> (&PatchGraph, &mut Step) {
+        (&self.tensors, &mut self.step)
+    }
+
     /// Each dispatch's label and GPU time in the last run, when recorded timed.
     pub fn timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
         self.step.timings()
@@ -231,7 +237,7 @@ impl PatchStep {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         decode::{SUBGROUPS, Shape},
@@ -304,7 +310,9 @@ mod tests {
         }
     }
 
-    fn graph(subgroup: u32) -> PatchGraph {
+    /// A patch step of two layers of the base LM, one of the residual LM and two of each local
+    /// stack, at VoxCPM2's widths.
+    pub(crate) fn graph(subgroup: u32) -> PatchGraph {
         let lm = decode::Tuning::for_subgroup(subgroup);
         let local = local::Tuning::for_subgroup(subgroup);
         patch_graph(&side(), &config(), 10, &lm, &local).unwrap()

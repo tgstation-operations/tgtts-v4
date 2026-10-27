@@ -1,0 +1,76 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out = act(W x + bias) over each row of a run: gemv_linear.comp's linear layers between
+// VoxCPM2's LMs over a prompt's positions, W N x (K0 + K1) against a row of x0's K0 values
+// followed by x1's K1. A row of workgroups along y takes M rows of the run, and along x shares
+// out W's rows, each read once for the M.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K0 = 2048;
+layout(constant_id = 3) const uint K1 = 0;
+layout(constant_id = 4) const uint KC = 512;
+layout(constant_id = 5) const uint M = 32;
+layout(constant_id = 6) const uint N = 2048;
+// 0: none; 2: the scalar quantizer's, tanh rounded to a multiple of 1 / LEVELS.
+layout(constant_id = 7) const uint ACT = 0;
+layout(constant_id = 8) const float LEVELS = 9.0;
+
+const uint K = K0 + K1;
+const uint ROWS = 1;
+const uint SLOTS = N;
+const bool SPLIT = false;
+
+#include "run.glsl"
+
+layout(std430, binding = 1) readonly buffer X0 { uvec4 x0[]; };
+layout(std430, binding = 2) readonly buffer X1 { uvec4 x1[]; };
+layout(std430, binding = 3) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 4) readonly buffer Bias { float16_t bias[]; };
+layout(std430, binding = 5) writeonly buffer Out { float16_t out_[]; };
+
+#include "gemm.glsl"
+
+uint first_row() {
+    return gl_WorkGroupID.y * M;
+}
+
+void stage(uint chunk) {
+    for (uint v = gl_LocalInvocationID.x; v < M * (KC / 8); v += WORKGROUP) {
+        uint row = first_row() + v / (KC / 8);
+        uint c = chunk * (KC / 8) + v % (KC / 8);
+        uvec4 value = uvec4(0);
+        if (row < len) {
+            value = c < K0 / 8 ? x0[row * (K0 / 8) + c] : x1[row * (K1 / 8) + c - K0 / 8];
+        }
+        xs[v] = value;
+    }
+}
+
+void rows_of(uint slot, out uint rows[ROWS]) {
+    rows[0] = slot;
+}
+
+void epilogue(uint rows[ROWS], float acc[SUMS]) {
+    float sums[PER_LANE];
+    mine(acc, 0, sums);
+    [[unroll]] for (uint t = 0; t < PER_LANE; t++) {
+        uint m = t * CLUSTER + cluster_lane();
+        uint row = first_row() + m;
+        if (m < M && row < len) {
+            float v = sums[t] + float(bias[rows[0]]);
+            if (ACT == 2) {
+                // As gemv_linear.comp computes it.
+                float th = 1.0 - 2.0 / (exp(2.0 * abs(v)) + 1.0);
+                v = roundEven(sign(v) * th * LEVELS) / LEVELS;
+            }
+            out_[row * N + rows[0]] = float16_t(v);
+        }
+    }
+}
+
+void main() {
+    if (first_row() >= len) {
+        return;
+    }
+    run();
+}

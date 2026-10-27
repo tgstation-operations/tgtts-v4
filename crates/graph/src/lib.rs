@@ -14,6 +14,7 @@
 //! - [`local`]: VoxCPM2's patch sampler with its local DiT, and its local encoder, at batch 1.
 //! - [`patch`]: a patch of VoxCPM2's generation as one step: the local encoder, the LM side and
 //!   the sampler.
+//! - [`prompt`]: a prompt run into the patch step's caches.
 //!
 //! The tests that need a GPU are built with the `device` feature: `nix run .#device-tests` runs
 //! them under the validation layer.
@@ -26,6 +27,7 @@ pub mod lm_side;
 pub mod local;
 pub mod patch;
 pub mod prefill;
+pub mod prompt;
 pub mod step;
 pub mod vae;
 

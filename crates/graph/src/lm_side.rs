@@ -213,11 +213,64 @@ fn append_stack(
 
 /// What a linear layer does to its sum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Act {
+pub(crate) enum Act {
     None = 0,
     Silu = 1,
     /// The scalar quantizer's rounding.
     Levels = 2,
+}
+
+/// Appends `layer` over the inputs `x` joined, written into `out` from `offset`, to `g`, as
+/// gemv_linear runs it cut as `tuning` says, the scalar quantizer rounding to multiples of
+/// `1 / levels`. A layer of one input binds it as x1 too, which the kernel reads only past x0's
+/// columns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_linear(
+    g: &mut Graph,
+    label: &str,
+    layer: Linear,
+    x: &[TensorId],
+    act: Act,
+    (out, offset): (TensorId, usize),
+    tuning: &Tuning,
+    levels: u32,
+) -> Result<(), Error> {
+    let Tuning {
+        subgroup,
+        workgroup,
+        ..
+    } = *tuning;
+    let subgroups = (workgroup / subgroup) as usize;
+    let len = |t: TensorId| g.tensors[t.0].bytes as usize / 2;
+    let (x0, x1) = (x[0], x[x.len() - 1]);
+    let (k0, k1) = (len(x0), if x.len() > 1 { len(x1) } else { 0 });
+    for k in [k0, k1] {
+        if !k.is_multiple_of(8 * subgroup as usize) {
+            return Err(Error::Shape(format!(
+                "{label}: {k} columns in steps of {}",
+                8 * subgroup
+            )));
+        }
+    }
+    let n = len(layer.bias);
+    let pipeline = Pipeline {
+        kernel: &GEMV_LINEAR,
+        constants: vec![
+            (0, SpecValue::U32(subgroup)),
+            (1, SpecValue::U32(workgroup)),
+            (2, SpecValue::U32(k0 as u32)),
+            (3, SpecValue::U32(k1 as u32)),
+            (4, SpecValue::U32(n as u32)),
+            (5, SpecValue::U32(offset as u32)),
+            (6, SpecValue::U32(act as u32)),
+            (7, SpecValue::F32(levels as f32)),
+        ],
+        subgroup_size: Some(subgroup),
+    };
+    let groups = n.div_ceil(subgroups) as u32;
+    let bindings = [x0, x1, layer.weight, layer.bias, out];
+    g.op(label, pipeline, &bindings, [groups, 1, 1]);
+    Ok(())
 }
 
 /// The LM side of `shape` cut as `tuning` says.
@@ -232,12 +285,6 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
     }
     let base = decode_graph(b, tuning)?;
     let residual = decode_graph(r, tuning)?;
-    let Tuning {
-        subgroup,
-        workgroup,
-        ..
-    } = *tuning;
-    let subgroups = (workgroup / subgroup) as usize;
     let hidden = b.hidden;
 
     let mut g = Graph::default();
@@ -276,45 +323,13 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
     let residual_out = between("residual_lm.out", hidden);
     let stop_hidden = between("stop_hidden", hidden);
 
-    // `layer` over the inputs `x` joined, written into `out` from `offset`. A layer of one input
-    // binds it as x1 too, which the kernel reads only past x0's columns.
     let apply = |g: &mut Graph,
                  label: &str,
                  layer: Linear,
                  x: &[TensorId],
                  act: Act,
-                 (out, offset): (TensorId, usize)|
-     -> Result<(), Error> {
-        let len = |t: TensorId| g.tensors[t.0].bytes as usize / 2;
-        let (x0, x1) = (x[0], x[x.len() - 1]);
-        let (k0, k1) = (len(x0), if x.len() > 1 { len(x1) } else { 0 });
-        for k in [k0, k1] {
-            if !k.is_multiple_of(8 * subgroup as usize) {
-                return Err(Error::Shape(format!(
-                    "{label}: {k} columns in steps of {}",
-                    8 * subgroup
-                )));
-            }
-        }
-        let n = len(layer.bias);
-        let pipeline = Pipeline {
-            kernel: &GEMV_LINEAR,
-            constants: vec![
-                (0, SpecValue::U32(subgroup)),
-                (1, SpecValue::U32(workgroup)),
-                (2, SpecValue::U32(k0 as u32)),
-                (3, SpecValue::U32(k1 as u32)),
-                (4, SpecValue::U32(n as u32)),
-                (5, SpecValue::U32(offset as u32)),
-                (6, SpecValue::U32(act as u32)),
-                (7, SpecValue::F32(s.levels as f32)),
-            ],
-            subgroup_size: Some(subgroup),
-        };
-        let groups = n.div_ceil(subgroups) as u32;
-        let bindings = [x0, x1, layer.weight, layer.bias, out];
-        g.op(label, pipeline, &bindings, [groups, 1, 1]);
-        Ok(())
+                 out: (TensorId, usize)| {
+        append_linear(g, label, layer, x, act, out, tuning, s.levels)
     };
     let h = &heads;
     apply(

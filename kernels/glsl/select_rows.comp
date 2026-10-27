@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out = a where the row's flag is set, b where not, over each row of a run of K f16 values:
+// the scalar quantizer's output at a prompt's audio positions and the base LM's at its text.
+// Workgroup r takes row r.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 2048;
+
+#include "run.glsl"
+
+layout(std430, binding = 1) readonly buffer Flags { uint flags[]; };
+layout(std430, binding = 2) readonly buffer A { uvec4 a[]; };
+layout(std430, binding = 3) readonly buffer B { uvec4 b[]; };
+layout(std430, binding = 4) writeonly buffer Out { uvec4 out_[]; };
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= len) {
+        return;
+    }
+    bool chosen = flags[row] != 0;
+    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
+        uint at = row * (K / 8) + v;
+        out_[at] = chosen ? a[at] : b[at];
+    }
+}
