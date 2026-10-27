@@ -9,6 +9,7 @@ layout(constant_id = 2) const uint K = 2048;
 layout(constant_id = 3) const uint INNER = 6144;
 layout(constant_id = 4) const float EPS = 1e-5;
 layout(constant_id = 5) const uint PAIRS = 1;
+layout(constant_id = 6) const uint AHEAD = 0;
 
 const uint ROWS = 2 * PAIRS;
 
@@ -21,17 +22,18 @@ layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
 #include "norm.glsl"
 
 void main() {
-    float scale = rms_scale(EPS);
-    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
-        xs[v] = normed8(v, scale);
-    }
-    barrier();
     uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * PAIRS;
     uint rows[ROWS];
     [[unroll]] for (uint p = 0; p < PAIRS; p++) {
         rows[2 * p] = first + p;
         rows[2 * p + 1] = INNER + first + p;
     }
+    prefetch(rows);
+    float scale = rms_scale(EPS);
+    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
+        xs[v] = normed8(v, scale);
+    }
+    barrier();
     float sums[ROWS];
     dot_rows(rows, sums);
     if (gl_SubgroupInvocationID == 0) {

@@ -6,6 +6,7 @@
 
 layout(constant_id = 2) const uint K = 2048;
 layout(constant_id = 3) const uint ROWS = 2;
+layout(constant_id = 4) const uint AHEAD = 0;
 
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
@@ -15,12 +16,13 @@ layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
 #include "gemv.glsl"
 
 void main() {
-    load_plain();
     uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * ROWS;
     uint rows[ROWS];
     [[unroll]] for (uint r = 0; r < ROWS; r++) {
         rows[r] = first + r;
     }
+    prefetch(rows);
+    load_plain();
     float sums[ROWS];
     dot_rows(rows, sums);
     if (gl_SubgroupInvocationID == 0) {

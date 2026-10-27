@@ -306,8 +306,8 @@ fn one_layer_recorded_again_with_its_rows_cut_otherwise_decodes_the_same() {
             .collect()
     };
     let want = run(&mut decoder);
-    // Rows to a subgroup decide where each row is summed, not in what order; the workgroup
-    // width, which orders the norm's sum, stays.
+    // Rows to a subgroup and loads ahead decide where and when each row is summed, not in what
+    // order; the workgroup width, which orders the norm's sum, stays.
     let cuts = [
         (
             Tuning {
@@ -318,6 +318,7 @@ fn one_layer_recorded_again_with_its_rows_cut_otherwise_decodes_the_same() {
             },
             false,
         ),
+        (Tuning { ahead: 64, ..base }, false),
         (base, true),
     ];
     for (tuning, timed) in cuts {

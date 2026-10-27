@@ -189,6 +189,16 @@ fn sum_bound(k: usize, magnitude: f64) -> f64 {
     k as f64 * U32 * magnitude
 }
 
+/// What a GEMV is checked with besides its case's loads ahead: none, or as many as there are.
+fn other_ahead(ahead: usize) -> u32 {
+    if ahead == 0 { u32::MAX } else { 0 }
+}
+
+/// How many of two runs' outputs differ in any bit.
+fn bits_apart(a: &[u16], b: &[u16]) -> usize {
+    a.iter().zip(b).filter(|(a, b)| a != b).count()
+}
+
 fn timed(ctx: &Context, kernel: &Kernel, buffers: &mut [&mut Buffer], groups: [u32; 3]) -> f64 {
     let t = ctx
         .dispatch(kernel, buffers, groups)
@@ -270,33 +280,51 @@ fn gemv_case(n: usize, k: usize, seed: u32) -> GemvCase {
 #[test]
 fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
     let ctx = context();
+    // (rows, columns, rows to a subgroup, steps loaded ahead)
     let cases = [
-        (64, 512, 2),
-        (2048, 2048, 1),
-        (2048, 2048, 2),
-        (2048, 6144, 2),
-        (2048, 6144, 4),
+        (64, 512, 2, 0),
+        (2048, 2048, 1, 0),
+        (2048, 2048, 1, 2),
+        (2048, 2048, 2, 0),
+        (2048, 6144, 2, 0),
+        (2048, 6144, 2, 8),
+        (2048, 6144, 4, 0),
     ];
-    for ((n, k, rows), (subgroup, workgroup)) in cut(&ctx, &cases) {
+    for ((n, k, rows, ahead), (subgroup, workgroup)) in cut(&ctx, &cases) {
         let case = gemv_case(n, k, 11);
-        let constants = [
-            (0, u(subgroup)),
-            (1, SpecValue::U32(workgroup)),
-            (2, u(k)),
-            (3, u(rows)),
-        ];
-        let kernel = kernel(&ctx, "gemv_residual", 4, Some(subgroup as u32), &constants);
+        let gemv = |ahead: u32| {
+            let constants = [
+                (0, u(subgroup)),
+                (1, SpecValue::U32(workgroup)),
+                (2, u(k)),
+                (3, u(rows)),
+                (4, SpecValue::U32(ahead)),
+            ];
+            kernel(&ctx, "gemv_residual", 4, Some(subgroup as u32), &constants)
+        };
         let mut xb = buffer_of(&ctx, &case.x);
         let mut wb = buffer_of(&ctx, &case.w);
         let mut rb = buffer_of(&ctx, &case.residual);
         let mut out = ctx.buffer_in(2 * n as u64, Residence::Readback).unwrap();
         let groups = (n / (workgroup as usize / subgroup * rows)) as u32;
-        let mut ns = Vec::new();
-        for _ in 0..4 {
-            let buffers = &mut [&mut xb, &mut wb, &mut rb, &mut out];
-            ns.push(timed(&ctx, &kernel, buffers, [groups, 1, 1]));
-        }
-        let got = read_f16(&out);
+        let mut run = |kernel: &Kernel, times: usize| {
+            let ns: Vec<f64> = (0..times)
+                .map(|_| {
+                    let buffers = &mut [&mut xb, &mut wb, &mut rb, &mut out];
+                    timed(&ctx, kernel, buffers, [groups, 1, 1])
+                })
+                .collect();
+            (out.read::<u16>().unwrap(), ns)
+        };
+        let (bits, ns) = run(&gemv(ahead as u32), 4);
+        // When a weight is loaded changes nothing that is summed.
+        let (other, _) = run(&gemv(other_ahead(ahead)), 1);
+        let apart = bits_apart(&bits, &other);
+        assert_eq!(
+            apart, 0,
+            "{n}x{k} wave{subgroup}/{workgroup} rows {rows} ahead {ahead}"
+        );
+        let got: Vec<f64> = bits.iter().map(|&h| f16::from_bits(h).to_f64()).collect();
         let x: Vec<f64> = case.x.iter().map(|v| v.to_f64()).collect();
         let sums = dots(&case.w, &x, k, 0..n);
         let want: Vec<f64> = sums
@@ -321,8 +349,8 @@ fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
         let bytes = (n * k * 2) as f64;
         let best = ns[1..].iter().copied().fold(f64::INFINITY, f64::min);
         eprintln!(
-            "gemv_residual {n}x{k} wave{subgroup}/{workgroup} rows {rows}: worst at {:.2} of its \
-             bound; best of 3 {:.1} us, {:.0} GB/s of weights",
+            "gemv_residual {n}x{k} wave{subgroup}/{workgroup} rows {rows} ahead {ahead}: worst at \
+             {:.2} of its bound; best of 3 {:.1} us, {:.0} GB/s of weights",
             worst(&got, &want, bound),
             best / 1e3,
             bytes / best
@@ -346,8 +374,14 @@ fn normed_dot_bound(k: usize, magnitude: f64, row: &[f16], normed: &[f64]) -> f6
 #[test]
 fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
     let ctx = context();
-    let cases = [(512, 256, 1), (2048, 6144, 1), (2048, 6144, 2)];
-    for ((k, inner, pairs), (subgroup, workgroup)) in cut(&ctx, &cases) {
+    // (columns, rows of the gate and of up, pairs to a subgroup, steps loaded ahead)
+    let cases = [
+        (512, 256, 1, 0),
+        (2048, 6144, 1, 0),
+        (2048, 6144, 1, 4),
+        (2048, 6144, 2, 0),
+    ];
+    for ((k, inner, pairs, ahead), (subgroup, workgroup)) in cut(&ctx, &cases) {
         let case = gemv_case(2 * inner, k, 23);
         let g = halves(
             &uniform(k, 29, 0.5)
@@ -356,15 +390,18 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
                 .collect::<Vec<_>>(),
         );
         let eps = 1e-5;
-        let constants = [
-            (0, u(subgroup)),
-            (1, SpecValue::U32(workgroup)),
-            (2, u(k)),
-            (3, u(inner)),
-            (4, SpecValue::F32(eps as f32)),
-            (5, u(pairs)),
-        ];
-        let kernel = kernel(&ctx, "gemv_gate_up", 4, Some(subgroup as u32), &constants);
+        let gemv = |ahead: u32| {
+            let constants = [
+                (0, u(subgroup)),
+                (1, SpecValue::U32(workgroup)),
+                (2, u(k)),
+                (3, u(inner)),
+                (4, SpecValue::F32(eps as f32)),
+                (5, u(pairs)),
+                (6, SpecValue::U32(ahead)),
+            ];
+            kernel(&ctx, "gemv_gate_up", 4, Some(subgroup as u32), &constants)
+        };
         let mut xb = buffer_of(&ctx, &case.x);
         let mut gb = buffer_of(&ctx, &g);
         let mut wb = buffer_of(&ctx, &case.w);
@@ -372,12 +409,23 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
             .buffer_in(2 * inner as u64, Residence::Readback)
             .unwrap();
         let groups = (inner / (workgroup as usize / subgroup * pairs)) as u32;
-        let mut ns = Vec::new();
-        for _ in 0..4 {
-            let buffers = &mut [&mut xb, &mut gb, &mut wb, &mut out];
-            ns.push(timed(&ctx, &kernel, buffers, [groups, 1, 1]));
-        }
-        let got = read_f16(&out);
+        let mut run = |kernel: &Kernel, times: usize| {
+            let ns: Vec<f64> = (0..times)
+                .map(|_| {
+                    let buffers = &mut [&mut xb, &mut gb, &mut wb, &mut out];
+                    timed(&ctx, kernel, buffers, [groups, 1, 1])
+                })
+                .collect();
+            (out.read::<u16>().unwrap(), ns)
+        };
+        let (bits, ns) = run(&gemv(ahead as u32), 4);
+        let (other, _) = run(&gemv(other_ahead(ahead)), 1);
+        let apart = bits_apart(&bits, &other);
+        assert_eq!(
+            apart, 0,
+            "{inner}x{k} wave{subgroup}/{workgroup} pairs {pairs} ahead {ahead}"
+        );
+        let got: Vec<f64> = bits.iter().map(|&h| f16::from_bits(h).to_f64()).collect();
         let normed = rmsnorm(&case.x, &g, eps);
         let sums = dots(&case.w, &normed, k, 0..2 * inner);
         let silu = |v: f64| v / (1.0 + (-v).exp());
@@ -405,8 +453,8 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
         let bytes = (2 * inner * k * 2) as f64;
         let best = ns[1..].iter().copied().fold(f64::INFINITY, f64::min);
         eprintln!(
-            "gemv_gate_up {inner}x{k} wave{subgroup}/{workgroup} pairs {pairs}: worst at {:.2} of \
-             its bound; best of 3 {:.1} us, {:.0} GB/s of weights",
+            "gemv_gate_up {inner}x{k} wave{subgroup}/{workgroup} pairs {pairs} ahead {ahead}: \
+             worst at {:.2} of its bound; best of 3 {:.1} us, {:.0} GB/s of weights",
             worst(&got, &want, bound),
             best / 1e3,
             bytes / best
@@ -452,40 +500,57 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
     let normed = rmsnorm(&case.x, &g, eps);
     let sums = dots(&case.w, &normed, k, 0..rows);
     let sentinel = f16::from_f64(-7.0);
-    let cases = [(1, 0), (1, 37), (1, 63), (2, 5)];
-    for ((pairs, position), (subgroup, workgroup)) in cut(&ctx, &cases) {
-        let constants = [
-            (0, u(subgroup)),
-            (1, SpecValue::U32(workgroup)),
-            (2, u(k)),
-            (3, u(heads)),
-            (4, u(kv_heads)),
-            (5, u(dim)),
-            (6, u(capacity)),
-            (7, SpecValue::F32(eps as f32)),
-            (8, u(pairs)),
-        ];
-        let kernel = kernel(&ctx, "gemv_qkv_rope", 9, Some(subgroup as u32), &constants);
-        let mut xb = buffer_of(&ctx, &case.x);
-        let mut gb = buffer_of(&ctx, &g);
-        let mut wb = buffer_of(&ctx, &case.w);
-        let mut cb = ctx.buffer(4 * cos.len() as u64).unwrap();
-        cb.write(&cos).unwrap();
-        let mut sb = ctx.buffer(4 * sin.len() as u64).unwrap();
-        sb.write(&sin).unwrap();
-        let mut pb = ctx.buffer(4).unwrap();
-        pb.write(&[position as u32]).unwrap();
-        let mut qb = ctx
-            .buffer_in(2 * (heads * dim) as u64, Residence::Readback)
-            .unwrap();
-        let cache = vec![sentinel; kv_heads * capacity * dim];
-        let (mut kb, mut vb) = (buffer_of(&ctx, &cache), buffer_of(&ctx, &cache));
-        let groups = (rows / 2 / (workgroup as usize / subgroup * pairs)) as u32;
-        let buffers = &mut [
-            &mut xb, &mut gb, &mut wb, &mut cb, &mut sb, &mut pb, &mut qb, &mut kb, &mut vb,
-        ];
-        let ns = timed(&ctx, &kernel, buffers, [groups, 1, 1]);
-        let (q, kc, vc) = (read_f16(&qb), read_f16(&kb), read_f16(&vb));
+    // (pairs to a subgroup, position, steps loaded ahead)
+    let cases = [(1, 0, 0), (1, 37, 0), (1, 63, 0), (2, 5, 0), (1, 37, 3)];
+    for ((pairs, position, ahead), (subgroup, workgroup)) in cut(&ctx, &cases) {
+        // q and the k and v caches as f16 bits, and the time.
+        let run = |ahead: u32| {
+            let constants = [
+                (0, u(subgroup)),
+                (1, SpecValue::U32(workgroup)),
+                (2, u(k)),
+                (3, u(heads)),
+                (4, u(kv_heads)),
+                (5, u(dim)),
+                (6, u(capacity)),
+                (7, SpecValue::F32(eps as f32)),
+                (8, u(pairs)),
+                (9, SpecValue::U32(ahead)),
+            ];
+            let kernel = kernel(&ctx, "gemv_qkv_rope", 9, Some(subgroup as u32), &constants);
+            let mut xb = buffer_of(&ctx, &case.x);
+            let mut gb = buffer_of(&ctx, &g);
+            let mut wb = buffer_of(&ctx, &case.w);
+            let mut cb = ctx.buffer(4 * cos.len() as u64).unwrap();
+            cb.write(&cos).unwrap();
+            let mut sb = ctx.buffer(4 * sin.len() as u64).unwrap();
+            sb.write(&sin).unwrap();
+            let mut pb = ctx.buffer(4).unwrap();
+            pb.write(&[position as u32]).unwrap();
+            let mut qb = ctx
+                .buffer_in(2 * (heads * dim) as u64, Residence::Readback)
+                .unwrap();
+            let cache = vec![sentinel; kv_heads * capacity * dim];
+            let (mut kb, mut vb) = (buffer_of(&ctx, &cache), buffer_of(&ctx, &cache));
+            let groups = (rows / 2 / (workgroup as usize / subgroup * pairs)) as u32;
+            let buffers = &mut [
+                &mut xb, &mut gb, &mut wb, &mut cb, &mut sb, &mut pb, &mut qb, &mut kb, &mut vb,
+            ];
+            let ns = timed(&ctx, &kernel, buffers, [groups, 1, 1]);
+            let read = |b: &Buffer| b.read::<u16>().unwrap();
+            ([read(&qb), read(&kb), read(&vb)], ns)
+        };
+        let (bits, ns) = run(ahead as u32);
+        let (other, _) = run(other_ahead(ahead));
+        for (bits, other) in bits.iter().zip(&other) {
+            let apart = bits_apart(bits, other);
+            assert_eq!(
+                apart, 0,
+                "wave{subgroup}/{workgroup} pairs {pairs} at {position} ahead {ahead}"
+            );
+        }
+        let [q, kc, vc]: [Vec<f64>; 3] =
+            bits.map(|b| b.iter().map(|&h| f16::from_bits(h).to_f64()).collect());
 
         let half = dim / 2;
         // Every output as (got, want, bound), rotated as at `at`.
@@ -549,8 +614,8 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
         let want_other: Vec<f64> = other.iter().map(|r| r.1).collect();
         assert!(past(&got, &want_other, bound).len() > got.len() / 50);
         eprintln!(
-            "gemv_qkv_rope wave{subgroup}/{workgroup} pairs {pairs} at {position}: worst at {:.2} \
-             of its bound; {:.1} us",
+            "gemv_qkv_rope wave{subgroup}/{workgroup} pairs {pairs} ahead {ahead} at {position}: \
+             worst at {:.2} of its bound; {:.1} us",
             worst(&got, &want, bound),
             ns / 1e3
         );

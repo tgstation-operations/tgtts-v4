@@ -155,7 +155,8 @@ impl Shape {
 }
 
 /// How the kernels' work is cut: the subgroup size every kernel runs at (32 or 64 on RADV,
-/// 32 on NVIDIA), the GEMVs' workgroup width, and the rows each of their subgroups takes.
+/// 32 on NVIDIA), the GEMVs' workgroup width, the rows each of their subgroups takes, and how
+/// many of a lane's loads they issue before their prologue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub subgroup: u32,
@@ -165,10 +166,14 @@ pub struct Tuning {
     pub gate_up_pairs: u32,
     /// Rows per subgroup of the output and down projections.
     pub residual_rows: u32,
+    /// The steps of its rows each GEMV lane loads before the kernel's prologue, the norm or the
+    /// copy of x into shared memory, so that they are in flight while it runs; all of them when
+    /// a lane has no more steps than this.
+    pub ahead: u32,
 }
 
 impl Tuning {
-    /// One row, or one pair of rows, to a subgroup, at `subgroup`.
+    /// One row, or one pair of rows, to a subgroup, at `subgroup`, and no loads ahead.
     ///
     /// At 64, one subgroup to a workgroup: the fastest measured on the Radeon 8060S, which
     /// reached 220 GB/s over four layers' weights where a streaming read reaches 240; larger
@@ -186,6 +191,7 @@ impl Tuning {
             qkv_pairs: 1,
             gate_up_pairs: 1,
             residual_rows: 1,
+            ahead: 0,
         }
     }
 
@@ -300,6 +306,7 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (6, u(s.capacity)),
             (7, eps),
             (8, SpecValue::U32(tuning.qkv_pairs)),
+            (9, SpecValue::U32(tuning.ahead)),
         ],
         sub,
     );
@@ -337,7 +344,11 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
     let residual = |k: usize| {
         pipeline(
             &GEMV_RESIDUAL,
-            &[(2, u(k)), (3, SpecValue::U32(tuning.residual_rows))],
+            &[
+                (2, u(k)),
+                (3, SpecValue::U32(tuning.residual_rows)),
+                (4, SpecValue::U32(tuning.ahead)),
+            ],
             sub,
         )
     };
@@ -353,6 +364,7 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (3, u(s.inner)),
             (4, eps),
             (5, SpecValue::U32(tuning.gate_up_pairs)),
+            (6, SpecValue::U32(tuning.ahead)),
         ],
         sub,
     );
@@ -682,6 +694,32 @@ mod tests {
                 assert_eq!(rows, want, "{} at {subgroup}", op.label);
             }
         }
+    }
+
+    #[test]
+    fn every_gemv_reads_its_loads_ahead_at_the_constant_its_kernel_declares() {
+        let tuning = Tuning {
+            ahead: 3,
+            ..Tuning::for_subgroup(32)
+        };
+        let g = decode_graph(&shape(1), &tuning).unwrap();
+        let mut gemvs = 0;
+        for op in &g.graph.ops {
+            let id = match op.pipeline.kernel.name {
+                "gemv_residual" => 4,
+                "gemv_gate_up" => 6,
+                "gemv_qkv_rope" => 9,
+                _ => continue,
+            };
+            assert!(
+                op.pipeline.constants.contains(&(id, SpecValue::U32(3))),
+                "{}: {:?}",
+                op.label,
+                op.pipeline.constants
+            );
+            gemvs += 1;
+        }
+        assert_eq!(gemvs, 4);
     }
 
     #[test]

@@ -2,11 +2,28 @@
 // columns against the f16 vector in `xs`, both eight to a uvec4. A subgroup takes ROWS rows at
 // once, each lane reading 16 contiguous bytes of each row per step, and sums in f32.
 //
-// The including kernel declares the `w` buffer, K and ROWS, then includes this.
+// A lane may load its first AHEAD steps of its rows before the kernel's prologue fills xs
+// (`prefetch`), so that they are in flight while the prologue runs rather than issued after its
+// barrier. When a weight is loaded does not change what is summed, or in what order.
+//
+// The including kernel declares the `w` buffer, K, ROWS and AHEAD, then includes this.
 
 shared uvec4 xs[K / 8];
 
 const uint STEPS = K / 8 / SUBGROUP;
+const uint EARLY = AHEAD < STEPS ? AHEAD : STEPS;
+// One entry at least, as an array must have.
+uvec4 early[EARLY > 0 ? EARLY : 1][ROWS];
+
+// Loads the first EARLY steps of the rows `rows` of w into `early`.
+void prefetch(uint rows[ROWS]) {
+    uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint s = 0; s < EARLY; s++) {
+        [[unroll]] for (uint r = 0; r < ROWS; r++) {
+            early[s][r] = w[rows[r] * (K / 8) + s * SUBGROUP + lane];
+        }
+    }
+}
 
 // Sums of the rows `rows` of w with xs, each in every lane of the subgroup.
 void dot_rows(uint rows[ROWS], out float sums[ROWS]) {
@@ -20,8 +37,14 @@ void dot_rows(uint rows[ROWS], out float sums[ROWS]) {
         vec4 lo, hi;
         unpack8(xs[i], lo, hi);
         [[unroll]] for (uint r = 0; r < ROWS; r++) {
+            uvec4 q;
+            if (s < EARLY) {
+                q = early[s][r];
+            } else {
+                q = w[rows[r] * (K / 8) + i];
+            }
             vec4 wlo, whi;
-            unpack8(w[rows[r] * (K / 8) + i], wlo, whi);
+            unpack8(q, wlo, whi);
             acc[r] += dot(wlo, lo) + dot(whi, hi);
         }
     }
