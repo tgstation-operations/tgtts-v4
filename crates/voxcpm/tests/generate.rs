@@ -6,13 +6,13 @@ use std::num::NonZeroUsize;
 use audiovae::{Decoder, Weights};
 use burn::{
     store::SafetensorsStore,
-    tensor::{FloatDType, Tensor},
+    tensor::{FloatDType, Tensor, TensorData},
 };
 use common::tiny;
 use recorded::Recorded;
 use testkit::{Fixture, assert_close, device, fixture};
 use voxcpm::{
-    Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechChunks, SpeechDecoder,
+    Cfm, Dtypes, Error, Model, Noise, Prompt, Sampling, SeededNoise, SpeechChunks, SpeechDecoder,
     Stepping,
 };
 
@@ -77,6 +77,32 @@ fn generates_as_upstream() {
         assert_close(step.patch.clone(), patch, 2e-6, 1e-6);
         let logits = expected_logits.clone().narrow(0, i, 1);
         assert_close(step.stop_logits, logits, 1e-6, 1e-6);
+        generation.advance(step.patch);
+    }
+}
+
+/// The condition and the stop logits a generation gives are those its patches are sampled with:
+/// the sampler given them samples each patch bit for bit.
+#[test]
+fn samples_with_the_conditioning_it_gives() {
+    let (fixture, device) = (fixture!("voxcpm_generate"), device());
+    let (model, config) = (model(&fixture), tiny());
+    let cfm = Cfm::load(&config, fixture.path(), FloatDType::F32, &device).unwrap();
+    let prompt = prompt(&fixture);
+    let patch = config.patch_size * config.feat_dim;
+    let last = prompt.patches[prompt.patches.len() - patch..].to_vec();
+    let shape = [1, config.patch_size, config.feat_dim];
+    let mut cond = Tensor::<3>::from_data(TensorData::new(last, shape), &device);
+    let mut noise = recorded(&fixture);
+    let mut generation = model.start(&prompt, 3).unwrap();
+    for _ in 0..3 {
+        let draw = model.noise(&mut noise);
+        let (mu, stop_logits) = generation.conditioning();
+        let step = generation.sample(draw.clone(), &Sampling::default());
+        let sampled = cfm.sample(mu, cond.swap_dims(1, 2), draw, &Sampling::default());
+        assert_close(sampled.swap_dims(1, 2), step.patch.clone(), 0.0, 0.0);
+        assert_close(stop_logits, step.stop_logits, 0.0, 0.0);
+        cond = step.patch.clone();
         generation.advance(step.patch);
     }
 }

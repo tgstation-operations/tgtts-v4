@@ -467,6 +467,13 @@ impl Generation<'_> {
         )
     }
 
+    /// The DiT's condition `mu` `[1, 2 * dit hidden]` and the stop head's logits `[1, 2]` that
+    /// [`sample`](Self::sample) samples the next patch with.
+    pub fn conditioning(&self) -> (Tensor<2>, Tensor<2>) {
+        self.model
+            .conditioning(self.lm_hidden.clone(), self.residual_hidden.clone())
+    }
+
     /// Feeds `patch` `[1, patch_size, feat_dim]` to the LMs as the next position.
     pub fn advance(&mut self, patch: Tensor<3>) {
         let embed = self.model.embed_patches(patch.clone().unsqueeze_dim(1));
@@ -489,6 +496,21 @@ impl Model {
         cond: Tensor<3>,
         sample: impl FnOnce(&Cfm, Tensor<2>, Tensor<3>) -> Tensor<3>,
     ) -> Step {
+        let (mu, stop_logits) = self.conditioning(lm_hidden, residual_hidden);
+        let patch = sample(&self.cfm, mu, cond.swap_dims(1, 2));
+        Step {
+            patch: patch.swap_dims(1, 2),
+            stop_logits,
+        }
+    }
+
+    /// The DiT's condition `mu` `[rows, 2 * dit hidden]` and the stop head's logits `[rows, 2]`
+    /// for each row of the LMs' last hidden states `[rows, hidden]`.
+    fn conditioning(
+        &self,
+        lm_hidden: Tensor<2>,
+        residual_hidden: Tensor<2>,
+    ) -> (Tensor<2>, Tensor<2>) {
         let heads = &self.heads;
         let mu = Tensor::cat(
             vec![
@@ -497,12 +519,8 @@ impl Model {
             ],
             1,
         );
-        let patch = sample(&self.cfm, mu, cond.swap_dims(1, 2));
         let stop = silu(heads.stop_proj.forward(lm_hidden));
-        Step {
-            patch: patch.swap_dims(1, 2),
-            stop_logits: heads.stop_head.forward(stop),
-        }
+        (mu, heads.stop_head.forward(stop))
     }
 
     /// Runs the LMs a position further over each row of `caches`, from the embedding of its
