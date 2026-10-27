@@ -37,7 +37,8 @@
 //! - `loudness_ceiling_dbtp`: the true peak they are held under, at most 0, EBU R128's -1 by
 //!   default.
 //! - `log_level`: `DEBUG`, `INFO`, `WARNING` or `ERROR`, `INFO` by default, of the service's own
-//!   events; the crates it uses log at it but never finer than `INFO`.
+//!   events; the crates it uses log at it but never finer than `WARN`, but for the kernels
+//!   autotune tunes, at `INFO`.
 
 use std::{
     collections::HashMap,

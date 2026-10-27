@@ -18,13 +18,15 @@ use tracing_subscriber::{
 };
 use voxcpm::Dtypes;
 
-/// What is logged at `level`: the service's own events at it, and the crates' it uses at it but
-/// never past `INFO`, as cubecl logs every kernel it compiles at `DEBUG`, gigabytes in minutes,
-/// and at `INFO` the kernels autotune tunes, which [`Tunings`] counts.
+/// What is logged at `level`: the service's own events at it, the crates' it uses at it but
+/// never finer than `WARN`, as pliron logs every kernel cubecl compiles at `INFO` after each of
+/// its passes, gigabytes in minutes; and the kernels autotune tunes, which cubecl logs at `INFO`
+/// and [`Tunings`] counts, whatever the level.
 pub fn log_filter(level: LevelFilter) -> Targets {
     Targets::new()
-        .with_default(level.min(LevelFilter::INFO))
+        .with_default(level.min(LevelFilter::WARN))
         .with_target("tgtts", level)
+        .with_target("cubecl_runtime::tune", LevelFilter::INFO)
 }
 
 /// The kernels autotune has tuned in this process, as [`Tunings`] counts them.
@@ -195,23 +197,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logs_the_crates_it_uses_no_finer_than_info() {
+    fn logs_the_crates_it_uses_no_finer_than_warn() {
         use tracing::Level;
 
         let enabled =
             |filter: &Targets, target: &str, level: Level| filter.would_enable(target, &level);
         let debug = log_filter(LevelFilter::DEBUG);
         assert!(enabled(&debug, "tgtts::model", Level::DEBUG));
-        assert!(!enabled(
-            &debug,
-            "cubecl_cuda::compute::server",
-            Level::DEBUG
-        ));
+        assert!(!enabled(&debug, "pliron::pass", Level::INFO));
+        assert!(enabled(&debug, "cubecl_runtime::server", Level::WARN));
         assert!(enabled(&debug, "cubecl_runtime::tune::tuner", Level::INFO));
         let warn = log_filter(LevelFilter::WARN);
         assert!(!enabled(&warn, "tgtts::model", Level::INFO));
-        assert!(!enabled(&warn, "cubecl_runtime::tune::tuner", Level::INFO));
-        assert!(enabled(&warn, "cubecl_runtime::tune::tuner", Level::WARN));
+        assert!(enabled(&warn, "cubecl_runtime::tune::tuner", Level::INFO));
+        let error = log_filter(LevelFilter::ERROR);
+        assert!(!enabled(&error, "cubecl_runtime::server", Level::WARN));
     }
 
     #[test]
