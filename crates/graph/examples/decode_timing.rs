@@ -561,9 +561,42 @@ fn main() {
     let sweeping = ["--sweep-workgroups", "--sweep-rows", "--sweep-ahead"]
         .iter()
         .any(|a| given(a));
-    if !sweeping {
-        return;
+    if sweeping {
+        sweep(
+            &mut bench,
+            &mut kernels,
+            &shape,
+            &tuning,
+            (steps, settle, rounds),
+            floor,
+        );
     }
+    let messages = ctx.validation_messages();
+    if ctx.validating() {
+        println!("validation: {} messages", messages.len());
+        for m in messages {
+            println!("  {m}");
+        }
+    }
+}
+
+/// Each tuning the sweep's lists make together, recorded over the bench's weights and measured
+/// untimed and timed, `rounds` times round robin; and the best.
+fn sweep(
+    bench: &mut Bench,
+    kernels: &mut Kernels,
+    shape: &Shape,
+    tuning: &Tuning,
+    (steps, settle, rounds): (usize, Duration, usize),
+    floor: Option<f64>,
+) {
+    let context = bench.position;
+    let bytes = shape.weight_bytes() as f64 + shape.cache_bytes(context) as f64;
+    let of_floor = |rate: f64| {
+        floor.map_or(String::new(), |f| {
+            format!(", {:.0}% of the floor", 100.0 * rate / f)
+        })
+    };
     let workgroups = list("--sweep-workgroups", &tuning.workgroup.to_string());
     let rows = list("--sweep-rows", "");
     let aheads = list("--sweep-ahead", &tuning.ahead.to_string());
@@ -573,7 +606,7 @@ fn main() {
             let cut = Tuning {
                 workgroup: workgroup as u32,
                 ahead: ahead as u32,
-                ..tuning
+                ..*tuning
             };
             if rows.is_empty() {
                 tunings.push(cut);
@@ -590,7 +623,7 @@ fn main() {
         }
     }
     // Refused cuts, such as rows that do not divide a projection, are said and left out.
-    tunings.retain(|t| match decode_graph(&shape, t) {
+    tunings.retain(|t| match decode_graph(shape, t) {
         Ok(_) => true,
         Err(e) => {
             println!("sweep: {t:?} left out: {e}");
@@ -602,10 +635,10 @@ fn main() {
         vec![(Vec::new(), BTreeMap::new()); tunings.len()];
     for _ in 0..rounds.max(1) {
         for (t, (untimed, per_kernel)) in tunings.iter().zip(&mut results) {
-            bench.retune(&mut kernels, t, false);
+            bench.retune(kernels, t, false);
             let (phases, _) = bench.block(steps, Duration::ZERO, settle);
             untimed.push(median(&phases.iter().map(|p| p.gpu).collect::<Vec<_>>()));
-            bench.retune(&mut kernels, t, true);
+            bench.retune(kernels, t, true);
             let (_, kernels_ns) = bench.block(steps, Duration::ZERO, settle);
             for (label, ns) in kernels_ns {
                 per_kernel.entry(label).or_default().extend(ns);
@@ -615,7 +648,7 @@ fn main() {
     println!(
         "sweep, GPU ms per step untimed (median of each round's median) and each GEMV's ms timed:"
     );
-    let read = kernel_bytes(&shape, context);
+    let read = kernel_bytes(shape, context);
     let mut best: Option<(f64, Tuning)> = None;
     for (t, (untimed, per_kernel)) in tunings.iter().zip(&results) {
         let m = median(untimed);
@@ -641,7 +674,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        for line in gemv_statistics(&mut kernels, &shape, t) {
+        for line in gemv_statistics(kernels, shape, t) {
             println!("    {line}");
         }
         if best.is_none_or(|(b, _)| m < b) {
