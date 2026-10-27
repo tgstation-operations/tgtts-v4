@@ -179,7 +179,7 @@ impl VoxCpm {
     /// prompts need, later runs going on from what the prompt cache kept of earlier ones; one
     /// request and as many as run at once going past each power of two the KV length goes past
     /// before the longest's last patch, where a GPU takes other kernels; each shape of prompts
-    /// run together; and chunks of every number of requests at once through the audio decoder,
+    /// run together; and chunks of each power of two of requests at once through the decoder,
     /// all on the thread that generates. Logs what it ran and how long it took.
     ///
     /// The thread that generates keeps the graphs a GPU records of each number of requests and
@@ -239,7 +239,7 @@ impl VoxCpm {
             requests,
             past = ?boundaries,
             patches = WARM_UP_PATCHES,
-            decoder_rows = %format!("1..={requests}"),
+            decoder_rows = %format!("1..={}, powers of two", requests.next_power_of_two()),
             generation_seconds = generated.as_secs_f64(),
             graphs_captured = self.graph_counts().captured,
             kernels_tuned = device::tuned(),
@@ -380,9 +380,9 @@ impl Generating {
     /// prompt cache of their own, until each request has [`WARM_UP_PATCHES`] patches, in caches
     /// of the capacity a request has. Then it runs each shape of the runs of prompts that join
     /// together [`prefill_shapes`] gives and embeds a voice of each power of two of patches,
-    /// after every graph is captured, so that the pools hold what the largest takes beside them;
-    /// and decodes two chunks of silence for each number of requests at once. Gives how long
-    /// generating took.
+    /// after every graph is captured, each shape's memory given back before the next, so that
+    /// the pools hold what the largest takes beside them; and decodes two chunks of silence for
+    /// each power of two of requests at once. Gives how long generating took.
     fn warm_up(&self, warm_up: &WarmUp) -> Result<Duration, voxcpm::Error> {
         let started = Instant::now();
         let (tts, params) = (&*self.tts, &self.params);
@@ -408,6 +408,9 @@ impl Generating {
         let model = tts.model();
         for (rows, held, len) in prefill_shapes(warm_up.longest, warm_up.requests) {
             model.warm_prefill(rows, held, len);
+            // What each shape took goes back before the next, or the pools would hold the
+            // memory of all of them at once, which no step of serving takes.
+            self.device.memory_cleanup();
         }
         let mut patches = 1;
         while patches < warm_up.voice_patches {
@@ -421,7 +424,10 @@ impl Generating {
         };
         let patch_size = self.config.patch_size;
         let shape = [CHUNK_FRAMES / patch_size, patch_size, self.config.feat_dim];
-        for rows in 1..=warm_up.requests {
+        // Autotune rounds the rows up to a power of two, as it rounds those of prompts.
+        let rows = (0..).map(|power| 1 << power);
+        let rows = rows.take_while(|&rows| rows <= warm_up.requests.next_power_of_two());
+        for rows in rows {
             let mut decoders: Vec<_> = (0..rows).map(|_| tts.chunk_decoder(&silent)).collect();
             // A first chunk, then one after it.
             for _ in 0..2 {

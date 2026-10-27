@@ -321,7 +321,8 @@ impl Model {
     /// Runs the LMs as [`Scheduler`](crate::Scheduler) runs the prompts of requests that join
     /// together, over `rows` rows of `len` positions after `held` each: on prompts of nothing in
     /// particular, for autotune to choose the kernels of that shape and the pools to hold what it
-    /// takes before a request waits for either.
+    /// takes before a request waits for either. The held positions are counted rather than run,
+    /// as a request's come from the prompt cache.
     pub fn warm_prefill(&self, rows: usize, held: usize, len: usize) {
         let (device, hidden) = (&self.device, self.hidden);
         let mut caches = (
@@ -329,14 +330,14 @@ impl Model {
             self.residual_lm
                 .cache(rows, (held + len).next_power_of_two()),
         );
-        for run in [held, len].into_iter().filter(|&run| run > 0) {
-            self.run_prompt(
-                Tensor::zeros([rows, run], device),
-                Tensor::full([rows, run, 1], true, device),
-                Tensor::zeros([rows, run, hidden], (device, self.lm_dtype)),
-                (&mut caches.0, &mut caches.1),
-            );
-        }
+        caches.0.extend(held);
+        caches.1.extend(held);
+        self.run_prompt(
+            Tensor::zeros([rows, len], device),
+            Tensor::full([rows, len, 1], true, device),
+            Tensor::zeros([rows, len, hidden], (device, self.lm_dtype)),
+            (&mut caches.0, &mut caches.1),
+        );
     }
 
     /// Embeds a voice of `patches` patches of nothing in particular, as a prompt in a voice the
