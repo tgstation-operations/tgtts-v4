@@ -195,6 +195,8 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
         assert!(timings.iter().all(|t| t.nanoseconds > 0.0), "{timings:?}");
         let gpu: f64 = timings.iter().map(|t| t.nanoseconds).sum();
         assert!(gpu < wall, "GPU {gpu} ns > wall {wall} ns");
+        let ticks: u64 = timings.iter().map(|t| t.ticks).sum();
+        assert_eq!(recording.elapsed().unwrap().ticks, ticks);
         eprintln!(
             "{} us per dispatch, {:.1} us on the GPU in all, {:.1} us submit to fence \
              (smoke, not a measurement)",
@@ -211,8 +213,14 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
         differences(&recording.buffer(2).read::<f32>().unwrap(), &on_the_cpu(&x)),
         0
     );
-    let untimed = chain(&ctx, &kernels, 64, false);
+    let mut untimed = chain(&ctx, &kernels, n, false);
+    untimed.buffer_mut(0).write(&x).unwrap();
+    let start = Instant::now();
+    untimed.submit().unwrap_or_else(|e| panic!("{e}"));
+    let wall = start.elapsed().as_nanos() as f64;
     assert!(untimed.timings().unwrap().is_none());
+    let gpu = untimed.elapsed().unwrap().nanoseconds;
+    assert!(gpu > 0.0 && gpu < wall, "GPU {gpu} ns, wall {wall} ns");
     assert_no_validation_messages(&ctx);
 }
 

@@ -18,7 +18,7 @@
 //! - [`Context::dispatch`] runs it, waits, and returns the GPU time from timestamps.
 //! - [`Context::record`] records a chain of dispatches with the barriers between them into one
 //!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
-//!   each dispatch when asked.
+//!   each submission, and each dispatch when asked.
 //! - [`Kernel::executables`] says what the driver compiled it into: the subgroup size it runs at,
 //!   its registers and occupancy, and the machine code ([`executable`]).
 //!

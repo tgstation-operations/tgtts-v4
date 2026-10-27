@@ -9,6 +9,10 @@
 //! in one of those buffers and is written there before each submission, not baked into the
 //! commands. Buffers are bound through descriptor sets written once, at their ranges as given;
 //! nothing in the commands is a raw device address.
+//!
+//! Every submission is timed from a timestamp before its first dispatch to one after its last
+//! ([`Recording::elapsed`]), which costs two timestamps a submission; a recording made timed also
+//! times each dispatch ([`Recording::timings`]).
 
 use std::sync::Arc;
 
@@ -103,8 +107,10 @@ pub struct Recording {
     commands: vk::CommandBuffer,
     fence: vk::Fence,
     descriptors: vk::DescriptorPool,
-    /// One timestamp before the first dispatch and one after each, when timed.
-    timestamps: Option<vk::QueryPool>,
+    /// One timestamp before the first dispatch, and one after each when timed, or else one after
+    /// the last.
+    timestamps: vk::QueryPool,
+    timed: bool,
     /// Submitted, and not yet seen finished: the GPU may be using every buffer.
     pending: bool,
 }
@@ -114,7 +120,7 @@ impl std::fmt::Debug for Recording {
         f.debug_struct("Recording")
             .field("buffers", &self.buffers.len())
             .field("dispatches", &self.kernels.len())
-            .field("timed", &self.timestamps.is_some())
+            .field("timed", &self.timed)
             .finish_non_exhaustive()
     }
 }
@@ -182,7 +188,8 @@ impl Recording {
             commands: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             descriptors: vk::DescriptorPool::null(),
-            timestamps: None,
+            timestamps: vk::QueryPool::null(),
+            timed,
             pending: false,
         };
         let count = u32::try_from(dispatches.len())
@@ -218,18 +225,14 @@ impl Recording {
                     None,
                 )
                 .call("vkCreateDescriptorPool")?;
-            if timed {
-                recording.timestamps = Some(
-                    device
-                        .create_query_pool(
-                            &vk::QueryPoolCreateInfo::default()
-                                .query_type(vk::QueryType::TIMESTAMP)
-                                .query_count(count + 1),
-                            None,
-                        )
-                        .call("vkCreateQueryPool")?,
-                );
-            }
+            recording.timestamps = device
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(recording.queries()),
+                    None,
+                )
+                .call("vkCreateQueryPool")?;
         }
 
         let sets = if dispatches.is_empty() {
@@ -282,6 +285,15 @@ impl Recording {
         Ok(recording)
     }
 
+    /// The timestamps a submission writes.
+    fn queries(&self) -> u32 {
+        if self.timed {
+            self.kernels.len() as u32 + 1
+        } else {
+            2
+        }
+    }
+
     fn record(&self, dispatches: &[Dispatch], sets: &[vk::DescriptorSet]) -> Result<()> {
         let device = &self.ctx.device;
         let cmd = self.commands;
@@ -309,10 +321,9 @@ impl Recording {
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&between),
             );
-            if let Some(pool) = self.timestamps {
-                device.cmd_reset_query_pool(cmd, pool, 0, dispatches.len() as u32 + 1);
-                device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 0);
-            }
+            let pool = self.timestamps;
+            device.cmd_reset_query_pool(cmd, pool, 0, self.queries());
+            device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 0);
             let mut bound = vk::Pipeline::null();
             for (i, (d, &set)) in dispatches.iter().zip(sets).enumerate() {
                 if d.barrier && i > 0 {
@@ -338,7 +349,7 @@ impl Recording {
                     &[],
                 );
                 device.cmd_dispatch(cmd, d.groups[0], d.groups[1], d.groups[2]);
-                if let Some(pool) = self.timestamps {
+                if self.timed {
                     device.cmd_write_timestamp2(
                         cmd,
                         vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -346,6 +357,9 @@ impl Recording {
                         i as u32 + 1,
                     );
                 }
+            }
+            if !self.timed {
+                device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 1);
             }
             device.cmd_pipeline_barrier2(
                 cmd,
@@ -405,37 +419,51 @@ impl Recording {
     /// before it (or after the start) to the timestamp after it; `None` if the recording is
     /// not timed. A barrier before a dispatch counts as its time.
     pub fn timings(&self) -> Result<Option<Vec<Timing>>> {
-        let Some(pool) = self.timestamps else {
+        if !self.timed {
             return Ok(None);
-        };
-        let mut stamps = vec![0u64; self.kernels.len() + 1];
-        // SAFETY: the pool holds that many queries, all written by the last submission, which
+        }
+        let stamps = self.stamps(0, self.queries())?;
+        Ok(Some(
+            stamps.windows(2).map(|w| self.timing(w[0], w[1])).collect(),
+        ))
+    }
+
+    /// The GPU time of the last submission, from the timestamp before its first dispatch to the
+    /// one after its last.
+    pub fn elapsed(&self) -> Result<Timing> {
+        let last = self.queries() - 1;
+        let start = self.stamps(0, 1)?[0];
+        let end = self.stamps(last, 1)?[0];
+        Ok(self.timing(start, end))
+    }
+
+    /// `count` timestamps of the last submission from query `first`.
+    fn stamps(&self, first: u32, count: u32) -> Result<Vec<u64>> {
+        let mut stamps = vec![0u64; count as usize];
+        // SAFETY: the pool holds the queries asked for, all written by the last submission, which
         // has finished.
         unsafe {
             self.ctx
                 .device
                 .get_query_pool_results(
-                    pool,
-                    0,
+                    self.timestamps,
+                    first,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
                 )
                 .call("vkGetQueryPoolResults")?;
         }
+        Ok(stamps)
+    }
+
+    fn timing(&self, start: u64, end: u64) -> Timing {
         let report = &self.ctx.report;
         let valid_bits = report.queue_families[self.ctx.queue_family as usize].timestamp_valid_bits;
-        Ok(Some(
-            stamps
-                .windows(2)
-                .map(|w| {
-                    let ticks = elapsed_ticks(w[0], w[1], valid_bits);
-                    Timing {
-                        ticks,
-                        nanoseconds: ticks_to_ns(ticks, report.timestamp_period),
-                    }
-                })
-                .collect(),
-        ))
+        let ticks = elapsed_ticks(start, end, valid_bits);
+        Timing {
+            ticks,
+            nanoseconds: ticks_to_ns(ticks, report.timestamp_period),
+        }
     }
 }
 
@@ -455,9 +483,7 @@ impl Drop for Recording {
         // SAFETY: the commands have finished, so nothing recorded is in use; null handles are
         // no-ops. Buffers and kernels are dropped after this, as fields.
         unsafe {
-            if let Some(pool) = self.timestamps {
-                device.destroy_query_pool(pool, None);
-            }
+            device.destroy_query_pool(self.timestamps, None);
             device.destroy_descriptor_pool(self.descriptors, None);
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.pool, None);
