@@ -1,18 +1,23 @@
 // How gemm.mlir's linalg.matmul becomes a cooperative-matrix kernel.
 //
-// Each workgroup computes a 128 x 128 tile of C with four subgroups of 64
-// invocations (256 in all), each subgroup a 64 x 64 quarter of it held as
-// sixteen 16 x 16 accumulators for the whole K loop. Each iteration of that
-// loop covers 64 of K: sixteen 16 x 16 tiles of A and sixteen of B, loaded
-// straight from the storage buffers, and 64 multiply-adds at RADV's one
-// cooperative-matrix shape, 16 x 16 x 16. No workgroup memory: the two
-// subgroups that share rows of A each load them, and likewise for B.
+// Each workgroup computes a 128 x 128 tile of C with four subgroups of
+// @SUBGROUP@ invocations (@WORKGROUP@ in all), each subgroup a 64 x 64 quarter
+// of it held as sixteen 16 x 16 accumulators for the whole K loop. Each
+// iteration of that loop covers 64 of K: sixteen 16 x 16 tiles of A and
+// sixteen of B, loaded straight from the storage buffers, and 64
+// multiply-adds at the target's cooperative-matrix shape, 16 x 16 x 16. No
+// workgroup memory: the two subgroups that share rows of A each load them,
+// and likewise for B.
 //
 // The workgroups of a column of C's tiles run one after another, so that
 // those reading the same rows of B, a projection's weights, do so together:
 // a layer's weights outgrow the GPU's caches. With that order and steps of
 // 64 of K rather than 32, the base LM's prefill over 512 positions took
-// 163 ms on the Radeon 8060S rather than 292; steps of 128 were slower.
+// 163 ms on the Radeon 8060S in subgroups of 64 rather than 292; steps of 128
+// were slower.
+//
+// A template: the build substitutes @SUBGROUP@, 64 or 32, and @WORKGROUP@,
+// four times it; nothing else differs between the two.
 //
 // A transform library with two entry points, run by the build in this order:
 // @gemm_schedule on the tensor-level function, then outlining and
@@ -25,7 +30,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
 
     // C in 128 x 128 tiles, one per workgroup; then 64 x 64 per subgroup,
-    // numbered linearly (subgroup = invocation / 64, row-major over the 2 x 2).
+    // numbered linearly (subgroup = invocation / @SUBGROUP@, row-major over
+    // the 2 x 2).
     // The zero fill follows the matmul into both, so each subgroup starts its
     // own accumulators at zero rather than reading C.
     %mm_wg, %wg = transform.structured.tile_using_forall %matmul tile_sizes [128, 128]
@@ -46,8 +52,8 @@ module attributes {transform.with_named_sequence} {
     // Vectorize: the 64 x 64 x 64 matmul becomes one vector.contract, and the
     // fill a transfer_write of zeros. Fold f16 -> f32 extensions into the
     // contraction (the f32-accumulating instance would otherwise multiply f32
-    // matrices, which RADV does not offer), then unroll everything to the
-    // native 16 x 16 x 16.
+    // matrices, which the target does not offer), then unroll everything to
+    // the native 16 x 16 x 16.
     %func = transform.structured.match ops{["func.func"]} in %root
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %func {
@@ -74,15 +80,15 @@ module attributes {transform.with_named_sequence} {
 
     // Bufferize straight into the arguments, then put the loops on the GPU:
     // the grid follows the workgroup loop's trip counts (M / 128 across,
-    // N / 128 down), and subgroups are 64 invocations, the size @gemm_abi
-    // records for the runtime.
+    // N / 128 down), and subgroups are @SUBGROUP@ invocations, the size
+    // @gemm_abi records for the runtime.
     transform.bufferization.eliminate_empty_tensors %vfunc : !transform.any_op
     %bfunc = transform.bufferization.one_shot_bufferize %vfunc
         : (!transform.any_op) -> !transform.any_op
     %launch = transform.gpu.map_forall_to_blocks %bfunc generate_gpu_launch
         : (!transform.any_op) -> !transform.any_op
-    %mapped = transform.gpu.map_nested_forall_to_threads %launch block_dims = [256, 1, 1]
-        sync_after_distribute = false warp_size = 64 : (!transform.any_op) -> !transform.any_op
+    %mapped = transform.gpu.map_nested_forall_to_threads %launch block_dims = [@WORKGROUP@, 1, 1]
+        sync_after_distribute = false warp_size = @SUBGROUP@ : (!transform.any_op) -> !transform.any_op
     %final = transform.structured.match ops{["func.func"]} in %root
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %final {
@@ -99,11 +105,11 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @gemm_abi(%root: !transform.any_op {transform.readonly}) {
     %kernel = transform.structured.match ops{["gpu.func"]} in %root
         : (!transform.any_op) -> !transform.any_op
-    %abi = transform.param.constant #spirv.entry_point_abi<workgroup_size = [256, 1, 1]>
+    %abi = transform.param.constant #spirv.entry_point_abi<workgroup_size = [@WORKGROUP@, 1, 1]>
         -> !transform.any_param
     transform.annotate %kernel "spirv.entry_point_abi" = %abi
         : !transform.any_op, !transform.any_param
-    %subgroup = transform.param.constant 64 : i32 -> !transform.any_param
+    %subgroup = transform.param.constant @SUBGROUP@ : i32 -> !transform.any_param
     transform.annotate %kernel "kernel.required_subgroup_size" = %subgroup
         : !transform.any_op, !transform.any_param
     transform.yield

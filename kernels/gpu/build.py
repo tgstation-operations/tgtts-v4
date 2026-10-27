@@ -2,18 +2,19 @@
 """Compiles one GPU kernel from its MLIR source to SPIR-V, checks the result, and writes the
 manifest a runtime loads it by.
 
-    build.py --out DIR gemm --m 512 --n 6144 --k 2048 --acc f16
+    build.py --out DIR gemm --m 512 --n 6144 --k 2048 --acc f16 --subgroup 64
 
 Each kernel is a linear-algebra op in `<kernel>.mlir` and a transform-dialect schedule in
-`<kernel>.schedule.mlir` that tiles it and maps it onto workgroups and subgroups; `target.mlir`
-describes the device. `pipeline()` and `SPIRV_MODULE_PIPELINE` below are the whole
-compilation, in order. After them this takes the one spirv.module out of the result, makes
-two corrections upstream MLIR does not make (`fix_module`), serializes it, validates it with
-spirv-val, and reads the binary's own disassembly to check its cooperative matrices against
-those the target offers and to write `<name>.json`: entry point, workgroup size, dispatch
-grid, bindings, the subgroup size the kernel was written for, and the capabilities and
-Vulkan features it needs. Every field is either read from the compiled IR or checked against
-the binary, so the manifest cannot claim what the SPIR-V does not do.
+`<kernel>.schedule.mlir` that tiles it and maps it onto workgroups and subgroups of the size
+given; `target.mlir` describes what the devices offer. `pipeline()` and
+`SPIRV_MODULE_PIPELINE` below are the whole compilation, in order. After them this takes the
+one spirv.module out of the result, makes two corrections upstream MLIR does not make
+(`fix_module`), serializes it, validates it with spirv-val, and reads the binary's own
+disassembly to check its cooperative matrices against those the target offers and to write
+`<name>.json`: entry point, workgroup size, dispatch grid, bindings, the subgroup size the
+kernel was written for, and the capabilities and Vulkan features it needs. Every field is
+either read from the compiled IR or checked against the binary, so the manifest cannot claim
+what the SPIR-V does not do.
 
 mlir-opt, mlir-translate, spirv-val and spirv-dis are taken from PATH, and the MLIR Python
 bindings from PYTHONPATH; the gpu-kernels Nix package provides all of them.
@@ -42,20 +43,20 @@ KERNELS = {
     },
 }
 
-# The GEMM schedule's tiles: 128 x 128 of C per workgroup, 64 of K per step.
+# The GEMM schedule's tiles: 128 x 128 of C per workgroup, 64 of K per step; and its four
+# subgroups to a workgroup.
 GEMM_TILE_MN, GEMM_TILE_K = 128, 64
+GEMM_SUBGROUPS = 4
 
 
-def pipeline(kernel):
+def pipeline(kernel, libraries):
     """The pass pipeline up to SPIR-V, as mlir-opt arguments, for a kernel whose transform
-    library is `<kernel>.schedule.mlir` with entry points `@<kernel>_schedule` and
-    `@<kernel>_abi`. It has to be one invocation: the transform libraries name SPIR-V
-    attributes, and mlir-opt loads the SPIR-V dialect before the pipeline runs only if a
-    pass in the pipeline declares it (convert-gpu-to-spirv does); loading it while the pass
-    manager runs aborts."""
-    libraries = ",".join(
-        os.path.join(HERE, f) for f in ("target.mlir", f"{kernel}.schedule.mlir")
-    )
+    libraries, the target's and the schedule's, are `libraries`, the schedule with entry
+    points `@<kernel>_schedule` and `@<kernel>_abi`. It has to be one invocation: the
+    transform libraries name SPIR-V attributes, and mlir-opt loads the SPIR-V dialect before
+    the pipeline runs only if a pass in the pipeline declares it (convert-gpu-to-spirv does);
+    loading it while the pass manager runs aborts."""
+    libraries = ",".join(libraries)
     return [
         # Load the schedule and the target description; run the schedule: tile, fuse,
         # vectorize, bufferize, and map the loops onto a gpu.launch's blocks, subgroups and
@@ -457,17 +458,28 @@ FEATURES = {
 
 def build(args):
     kernel = args.kernel
-    template = open(os.path.join(HERE, f"{kernel}.mlir")).read()
-    substitutions = {"M": args.m, "N": args.n, "K": args.k, "ACC": args.acc}
-    name = f"gemm_{args.acc}acc_{args.m}x{args.n}x{args.k}"
-    source = instantiate(template, **substitutions)
+    substitutions = {
+        "M": args.m,
+        "N": args.n,
+        "K": args.k,
+        "ACC": args.acc,
+        "SUBGROUP": args.subgroup,
+        "WORKGROUP": GEMM_SUBGROUPS * args.subgroup,
+    }
+    name = f"gemm_{args.acc}acc_{args.m}x{args.n}x{args.k}_sg{args.subgroup}"
     os.makedirs(args.out, exist_ok=True)
     work = os.path.join(args.out, "ir")
     os.makedirs(work, exist_ok=True)
-    src_path = os.path.join(work, f"{name}.mlir")
-    open(src_path, "w").write(source)
+    paths = {}
+    for source in (f"{kernel}.mlir", "target.mlir", f"{kernel}.schedule.mlir"):
+        template = open(os.path.join(HERE, source)).read()
+        suffix = source.removeprefix(f"{kernel}.")
+        paths[source] = os.path.join(work, f"{name}.{suffix}")
+        open(paths[source], "w").write(instantiate(template, **substitutions))
+    src_path = paths[f"{kernel}.mlir"]
+    libraries = [paths["target.mlir"], paths[f"{kernel}.schedule.mlir"]]
 
-    lowered = run(["mlir-opt", src_path] + pipeline(kernel))
+    lowered = run(["mlir-opt", src_path] + pipeline(kernel, libraries))
     lowered = run(["mlir-opt", "-", SPIRV_MODULE_PIPELINE], input=lowered)
     with ir.Context():
         module = ir.Module.parse(lowered)
@@ -518,9 +530,10 @@ def build(args):
             f"{name}: expected OpCooperativeMatrixMulAddKHR {want}, found "
             f"{found['cooperative_matrix']} x{found['cooperative_matrix_muladds']}"
         )
-    if facts["subgroup"] is None:
+    if facts["subgroup"] != args.subgroup:
         sys.exit(
-            f"{name}: maps work onto subgroups but declares no required subgroup size"
+            f"{name}: compiled for subgroups of {args.subgroup} but declares a required "
+            f"subgroup size of {facts['subgroup']}"
         )
 
     manifest = {
@@ -582,6 +595,13 @@ def main():
     parser.add_argument("--k", type=int, required=True, help="columns of A and B")
     parser.add_argument(
         "--acc", choices=["f16", "f32"], required=True, help="accumulator type"
+    )
+    parser.add_argument(
+        "--subgroup",
+        type=int,
+        choices=[32, 64],
+        required=True,
+        help="the subgroup size the pipeline requires",
     )
     args = parser.parse_args()
     for dim, tile in (("m", GEMM_TILE_MN), ("n", GEMM_TILE_MN), ("k", GEMM_TILE_K)):

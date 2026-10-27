@@ -1,11 +1,13 @@
 { pkgs, mlir }:
 # The GPU kernels, compiled ahead of time from kernels/gpu to SPIR-V for RADV on the
-# Radeon 8060S: per kernel, <name>.spv, the manifest <name>.json a runtime loads it by, and
-# the disassembly <name>.spvasm; ir/ holds each one's instantiated source and final
-# spirv.module, and checks/ the CPU oracle's log. The build fails unless every module passes
-# spirv-val, matches its manifest and multiplies at RADV's one cooperative-matrix shape, and
-# unless the GEMM's linalg op, lowered for the CPU instead, reproduces its reference bit for
-# bit. Whether the kernels run right on the GPU is the device tests'.
+# Radeon 8060S and NVIDIA's driver on the RTX 4070 Ti SUPER, each at subgroups of 64, RADV's
+# default, and of 32, the only size NVIDIA has: per kernel, <name>.spv, the manifest
+# <name>.json a runtime loads it by, and the disassembly <name>.spvasm; ir/ holds each one's
+# instantiated sources and final spirv.module, and checks/ the CPU oracle's log. The build
+# fails unless every module passes spirv-val, matches its manifest and multiplies only at
+# cooperative-matrix shapes both GPUs offer, and unless the GEMM's linalg op, lowered for the
+# CPU instead, reproduces its reference bit for bit. Whether the kernels run right on the GPU
+# is the device tests'.
 #
 # A package rather than part of the gate: a machine without the MLIR build would compile LLVM.
 let
@@ -49,15 +51,19 @@ pkgs.stdenvNoCC.mkDerivation {
     runHook preBuild
     export PYTHONPATH=${mlir}/python_packages/mlir_core
     mkdir -p $out/checks
-    for shape in ${lib.escapeShellArgs gemms}; do
-      read -r m n k <<<"$shape"
-      for acc in f16 f32; do
-        python3 kernels/gpu/build.py --out $out gemm --m "$m" --n "$n" --k "$k" --acc "$acc"
+    for subgroup in 64 32; do
+      for shape in ${lib.escapeShellArgs gemms}; do
+        read -r m n k <<<"$shape"
+        for acc in f16 f32; do
+          python3 kernels/gpu/build.py --out $out gemm --m "$m" --n "$n" --k "$k" --acc "$acc" \
+            --subgroup "$subgroup"
+        done
       done
-    done
-    for shape in ${lib.escapeShellArgs prefillGemms}; do
-      read -r m n k <<<"$shape"
-      python3 kernels/gpu/build.py --out $out gemm --m "$m" --n "$n" --k "$k" --acc f32
+      for shape in ${lib.escapeShellArgs prefillGemms}; do
+        read -r m n k <<<"$shape"
+        python3 kernels/gpu/build.py --out $out gemm --m "$m" --n "$n" --k "$k" --acc f32 \
+          --subgroup "$subgroup"
+      done
     done
     for acc in f16 f32; do
       python3 kernels/gpu/cpu_oracle.py --mlir-lib ${mlir}/lib gemm kernels/gpu/gemm.mlir \

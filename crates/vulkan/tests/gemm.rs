@@ -1,7 +1,7 @@
 //! The cooperative-matrix GEMM from `nix build .#gpu-kernels` on the GPU, against C = A B^T in f64
 //! over the same f16 operands. Built with the `device` feature; the kernels are read from the
-//! directory `VULKAN_KERNELS` names, which `nix run .#device-tests` sets, and are compiled for
-//! RADV on the Radeon 8060S.
+//! directory `VULKAN_KERNELS` names, which `nix run .#device-tests` sets, and each runs at every
+//! subgroup size it is compiled for that the device can require.
 //!
 //! The kernels index their buffers by the shapes they were compiled for and never check bounds,
 //! so each manifest is checked against the buffers and grid before anything reaches the driver: a
@@ -19,8 +19,9 @@ use vulkan::{
     select::Features,
 };
 
-/// The subgroup size the schedule maps the GEMM's work onto.
-const SUBGROUP: u32 = 64;
+/// The subgroup sizes the GEMMs are compiled for, and the schedule's subgroups to a workgroup.
+const SUBGROUPS: [u32; 2] = [64, 32];
+const WORKGROUP_SUBGROUPS: u32 = 4;
 /// The schedule's tile of C per workgroup.
 const TILE: usize = 128;
 
@@ -69,6 +70,23 @@ fn context() -> Context {
     ctx
 }
 
+/// The sizes of [`SUBGROUPS`] the device can require.
+fn subgroups(ctx: &Context) -> Vec<u32> {
+    let sizes: Vec<u32> = SUBGROUPS
+        .into_iter()
+        .filter(|&s| ctx.report().can_require_subgroup_size(s))
+        .collect();
+    assert!(
+        !sizes.is_empty(),
+        "the device can require none of {SUBGROUPS:?}"
+    );
+    sizes
+}
+
+fn radv(ctx: &Context) -> bool {
+    ctx.report().driver_name == "radv"
+}
+
 fn assert_no_validation_messages(ctx: &Context) {
     let messages = ctx.validation_messages();
     assert!(
@@ -78,19 +96,26 @@ fn assert_no_validation_messages(ctx: &Context) {
     );
 }
 
-/// A kernel's SPIR-V and its manifest.
+/// A kernel's SPIR-V and its manifest, and the subgroup size it is compiled for.
 struct Module {
     name: String,
     spirv: Vec<u8>,
     manifest: Value,
+    subgroup: u32,
 }
 
-fn module(shape: Shape, acc: Acc) -> Module {
+fn module(shape: Shape, acc: Acc, subgroup: u32) -> Module {
     let dir = PathBuf::from(
         std::env::var_os("VULKAN_KERNELS")
             .expect("VULKAN_KERNELS names no directory; `nix run .#device-tests` sets it"),
     );
-    let name = format!("gemm_{}acc_{}x{}x{}", acc.name(), shape.m, shape.n, shape.k);
+    let name = format!(
+        "gemm_{}acc_{}x{}x{}_sg{subgroup}",
+        acc.name(),
+        shape.m,
+        shape.n,
+        shape.k
+    );
     let read = |file: String| {
         std::fs::read(dir.join(&file))
             .unwrap_or_else(|e| panic!("{}: {e}", dir.join(file).display()))
@@ -101,6 +126,7 @@ fn module(shape: Shape, acc: Acc) -> Module {
         spirv: read(format!("{name}.spv")),
         name,
         manifest,
+        subgroup,
     }
 }
 
@@ -181,13 +207,15 @@ fn check_manifest(module: &Module, shape: Shape, acc: Acc, report: &DeviceReport
     );
     assert_eq!(
         uints(&manifest["workgroup_size"]),
-        [256, 1, 1],
+        [u64::from(WORKGROUP_SUBGROUPS * module.subgroup), 1, 1],
         "{}",
         module.name
     );
     assert_eq!(
         manifest["required_subgroup_size"].as_u64(),
-        Some(SUBGROUP.into())
+        Some(module.subgroup.into()),
+        "{}",
+        module.name
     );
     assert_eq!(manifest["require_full_subgroups"].as_bool(), Some(true));
     for key in ["push_constants", "specialization_constants"] {
@@ -266,9 +294,10 @@ fn kernel(ctx: &Context, module: &Module, subgroup: u32) -> Kernel {
 }
 
 /// What disagrees between how the driver compiled `kernel` and how its manifest says it must run:
-/// at the subgroup size the schedule divides by, with as many `v_wmma` instructions of the
-/// accumulator's type as the module has cooperative-matrix multiply-adds.
-fn compiled_mismatch(kernel: &Kernel, module: &Module, acc: Acc) -> Option<String> {
+/// at the subgroup size the schedule divides by, and on RADV, whose final assembly is read, with
+/// as many `v_wmma` instructions of the accumulator's type as the module has cooperative-matrix
+/// multiply-adds. Another driver's statistics are printed.
+fn compiled_mismatch(kernel: &Kernel, module: &Module, acc: Acc, radv: bool) -> Option<String> {
     let executables = kernel.executables().unwrap_or_else(|e| panic!("{e}"));
     let [executable] = executables.as_slice() else {
         return Some(format!(
@@ -276,8 +305,17 @@ fn compiled_mismatch(kernel: &Kernel, module: &Module, acc: Acc) -> Option<Strin
             executables.len()
         ));
     };
-    if executable.subgroup_size != SUBGROUP {
+    if executable.subgroup_size != module.subgroup {
         return Some(format!("compiled at wave{}", executable.subgroup_size));
+    }
+    if !radv {
+        let statistics: Vec<String> = executable
+            .statistics
+            .iter()
+            .map(|s| format!("{} {}", s.name, s.value.as_f64()))
+            .collect();
+        eprintln!("{}: the driver's statistics {statistics:?}", module.name);
+        return None;
     }
     let Some(assembly) = executable
         .representations
@@ -397,7 +435,7 @@ fn compare(device: &[f64], value: &[f64], magnitude: &[f64], shape: Shape, acc: 
 }
 
 /// The relative RMS error an f16 accumulator may reach at `k`: four times 1.05e-4 sqrt(K), the
-/// growth measured of f16-accumulating cooperative-matrix GEMMs on this GPU.
+/// growth measured of f16-accumulating cooperative-matrix GEMMs on the Radeon 8060S.
 fn f16_rms_bound(k: usize) -> f64 {
     4.0 * 1.05e-4 * (k as f64).sqrt()
 }
@@ -448,13 +486,14 @@ fn run(ctx: &Context, gemm: &Gemm, a: &[f16], b: &[f16], reps: usize) -> Run {
     Run { c, nanoseconds }
 }
 
-/// The GEMM at `shape` on the device against the reference, the check run against a planted
-/// defect, and the compiled pipeline against its manifest. Returns each dispatch's GPU time.
-fn gemm(ctx: &Context, shape: Shape, acc: Acc, reps: usize) -> Vec<f64> {
-    let module = module(shape, acc);
+/// The GEMM at `shape` for subgroups of `subgroup` on the device against the reference, the check
+/// run against a planted defect, and the compiled pipeline against its manifest. Returns each
+/// dispatch's GPU time.
+fn gemm(ctx: &Context, shape: Shape, acc: Acc, subgroup: u32, reps: usize) -> Vec<f64> {
+    let module = module(shape, acc, subgroup);
     let grid = check_manifest(&module, shape, acc, ctx.report());
-    let kernel = kernel(ctx, &module, SUBGROUP);
-    if let Some(why) = compiled_mismatch(&kernel, &module, acc) {
+    let kernel = kernel(ctx, &module, subgroup);
+    if let Some(why) = compiled_mismatch(&kernel, &module, acc, radv(ctx)) {
         panic!("{}: {why}", module.name);
     }
     let gemm = Gemm {
@@ -514,20 +553,22 @@ fn small_gemms_agree_with_the_reference_at_either_accumulator() {
         ctx.captures_executables(),
         "the device does not report what it compiled"
     );
-    for shape in [
-        Shape {
-            m: 128,
-            n: 128,
-            k: 64,
-        },
-        Shape {
-            m: 256,
-            n: 384,
-            k: 512,
-        },
-    ] {
-        for acc in [Acc::F16, Acc::F32] {
-            gemm(&ctx, shape, acc, 1);
+    for subgroup in subgroups(&ctx) {
+        for shape in [
+            Shape {
+                m: 128,
+                n: 128,
+                k: 64,
+            },
+            Shape {
+                m: 256,
+                n: 384,
+                k: 512,
+            },
+        ] {
+            for acc in [Acc::F16, Acc::F32] {
+                gemm(&ctx, shape, acc, subgroup, 1);
+            }
         }
     }
     assert_no_validation_messages(&ctx);
@@ -535,24 +576,30 @@ fn small_gemms_agree_with_the_reference_at_either_accumulator() {
 
 #[test]
 fn a_gemm_compiled_at_another_wave_size_is_caught() {
-    // Pairs of 32-wide subgroups would compute the same tiles and write the right numbers, so
-    // only the driver's account of the pipeline shows it; it is never dispatched.
+    // Pairs of 32-wide subgroups in a kernel written for 64 would compute the same tiles and
+    // write the right numbers, so only the driver's account of the pipeline shows it; none is
+    // dispatched.
     let ctx = context();
     let shape = Shape {
         m: 128,
         n: 128,
         k: 64,
     };
-    for acc in [Acc::F16, Acc::F32] {
-        let module = module(shape, acc);
-        let why = compiled_mismatch(&kernel(&ctx, &module, 32), &module, acc);
-        assert_eq!(
-            why.as_deref(),
-            Some("compiled at wave32"),
-            "{}",
-            module.name
-        );
+    let sizes = subgroups(&ctx);
+    let mut caught = 0;
+    for written in SUBGROUPS {
+        for &other in sizes.iter().filter(|&&s| s != written) {
+            for acc in [Acc::F16, Acc::F32] {
+                let module = module(shape, acc, written);
+                let kernel = kernel(&ctx, &module, other);
+                let why = compiled_mismatch(&kernel, &module, acc, radv(&ctx));
+                let want = format!("compiled at wave{other}");
+                assert_eq!(why.as_deref(), Some(want.as_str()), "{}", module.name);
+                caught += 1;
+            }
+        }
     }
+    assert!(caught > 0, "no other size to compile at among {sizes:?}");
     assert_no_validation_messages(&ctx);
 }
 
@@ -566,24 +613,26 @@ fn a_prefill_sized_projection_agrees_with_the_reference_and_is_timed() {
         k: 2048,
     };
     let flops = 2.0 * (shape.m * shape.n * shape.k) as f64;
-    for acc in [Acc::F16, Acc::F32] {
-        let mut ns = gemm(&ctx, shape, acc, 11);
-        // The first dispatch warms caches and clocks.
-        ns.remove(0);
-        ns.sort_by(f64::total_cmp);
-        eprintln!(
-            "{}acc {}x{}x{}: GPU time min {:.3} ms, median {:.3} ms, max {:.3} ms over {} \
-             dispatches; {:.2} TFLOP/s at the median",
-            acc.name(),
-            shape.m,
-            shape.n,
-            shape.k,
-            ns[0] / 1e6,
-            ns[ns.len() / 2] / 1e6,
-            ns[ns.len() - 1] / 1e6,
-            ns.len(),
-            flops / ns[ns.len() / 2] / 1e3
-        );
+    for subgroup in subgroups(&ctx) {
+        for acc in [Acc::F16, Acc::F32] {
+            let mut ns = gemm(&ctx, shape, acc, subgroup, 11);
+            // The first dispatch warms caches and clocks.
+            ns.remove(0);
+            ns.sort_by(f64::total_cmp);
+            eprintln!(
+                "{}acc {}x{}x{} at wave{subgroup}: GPU time min {:.3} ms, median {:.3} ms, max \
+                 {:.3} ms over {} dispatches; {:.2} TFLOP/s at the median",
+                acc.name(),
+                shape.m,
+                shape.n,
+                shape.k,
+                ns[0] / 1e6,
+                ns[ns.len() / 2] / 1e6,
+                ns[ns.len() - 1] / 1e6,
+                ns.len(),
+                flops / ns[ns.len() / 2] / 1e3
+            );
+        }
     }
     assert_no_validation_messages(&ctx);
 }

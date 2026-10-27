@@ -83,7 +83,7 @@ fn main() {
     let device = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
     let tuning = Tuning::for_subgroup(arg("--subgroup", device.subgroup as usize) as u32);
     eprintln!(
-        "{} ({}), validation {}; {layers} layers, programs of up to {max_rows} rows, the GLSL \
+        "{} ({}), validation {}; {layers} layers, programs of up to {max_rows} rows, the \
          kernels at {tuning:?}",
         report.name,
         report.driver_info,

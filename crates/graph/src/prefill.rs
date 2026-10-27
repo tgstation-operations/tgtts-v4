@@ -6,15 +6,15 @@
 //! and the residual add with the next layer's input norm, or after the last layer the final norm.
 //!
 //! The projections are the cooperative-matrix GEMM of `kernels/gpu`, compiled from MLIR at static
-//! shapes for every number of rows in steps of [`TILE`] up to [`MAX_ROWS`]; the rest are GLSL. A
-//! run of positions takes the program of the fewest rows that hold it, the rows past it padding
-//! that nothing reads.
+//! shapes for every number of rows in steps of [`TILE`] up to [`MAX_ROWS`], and at each subgroup
+//! size of [`SUBGROUPS`]; the rest are GLSL. A run of positions takes the program of the fewest
+//! rows that hold it, the rows past it padding that nothing reads.
 
 use vulkan::{Context, SpecValue};
 
 use crate::{
     Error,
-    decode::{DecodeGraph, Decoder, Tuning},
+    decode::{DecodeGraph, Decoder, SUBGROUPS, Tuning},
     graph::{Graph, Kind, Pipeline, TensorId},
     kernels::{Access, KernelInfo, Kernels},
     step::Program,
@@ -28,9 +28,6 @@ pub const MAX_ROWS: usize = 1024;
 
 /// The width of the GLSL kernels' workgroups.
 const WORKGROUP: u32 = 256;
-
-/// The subgroup size the GEMMs' schedule divides their work by.
-const GEMM_SUBGROUP: u32 = 64;
 
 use Access::{Read, Write};
 
@@ -71,38 +68,47 @@ fn attention_rows(group: usize) -> usize {
 }
 
 macro_rules! gemm {
-    ($m:literal, $n:literal, $k:literal) => {
+    ($m:literal, $n:literal, $k:literal, $subgroup:literal) => {
         KernelInfo {
-            name: concat!("gemm_f32acc_", $m, "x", $n, "x", $k),
+            name: concat!("gemm_f32acc_", $m, "x", $n, "x", $k, "_sg", $subgroup),
             access: &[Read, Read, Write],
         }
     };
 }
 
 macro_rules! gemms {
-    ($($m:literal)*) => {
+    ($subgroup:literal: $($m:literal)*) => {
         [$(
-            gemm!($m, 2560, 2048),
-            gemm!($m, 2048, 2048),
-            gemm!($m, 12288, 2048),
-            gemm!($m, 2048, 6144),
+            gemm!($m, 2560, 2048, $subgroup),
+            gemm!($m, 2048, 2048, $subgroup),
+            gemm!($m, 12288, 2048, $subgroup),
+            gemm!($m, 2048, 6144, $subgroup),
         )*]
     };
 }
 
 /// The GEMMs `nix build .#gpu-kernels` compiles for the prefill, C = A B^T with f32
 /// accumulators: a, b -> c. The projections of VoxCPM2's LMs, q/k/v, output, gate/up and down,
-/// at every number of rows a program takes.
-pub static GEMMS: [KernelInfo; 32] = gemms!(128 256 384 512 640 768 896 1024);
+/// at every number of rows a program takes, for subgroups of each size of [`SUBGROUPS`] in turn.
+pub static GEMMS: [[KernelInfo; 32]; SUBGROUPS.len()] = [
+    gemms!(64: 128 256 384 512 640 768 896 1024),
+    gemms!(32: 128 256 384 512 640 768 896 1024),
+];
 
-/// The GEMM of `m` rows of A, `n` of B and `k` columns, if it was compiled.
-pub fn gemm(m: usize, n: usize, k: usize) -> Result<&'static KernelInfo, Error> {
-    let name = format!("gemm_f32acc_{m}x{n}x{k}");
-    GEMMS.iter().find(|g| g.name == name).ok_or_else(|| {
-        Error::Shape(format!(
-            "no GEMM of {m}x{n}x{k} is compiled: nix/gpu-kernels.nix and GEMMS list them"
-        ))
-    })
+/// The GEMM of `m` rows of A, `n` of B and `k` columns for subgroups of `subgroup`, if it was
+/// compiled.
+pub fn gemm(m: usize, n: usize, k: usize, subgroup: u32) -> Result<&'static KernelInfo, Error> {
+    let name = format!("gemm_f32acc_{m}x{n}x{k}_sg{subgroup}");
+    GEMMS
+        .iter()
+        .flatten()
+        .find(|g| g.name == name)
+        .ok_or_else(|| {
+            Error::Shape(format!(
+                "no GEMM of {m}x{n}x{k} for subgroups of {subgroup} is compiled: \
+             nix/gpu-kernels.nix and GEMMS list them"
+            ))
+        })
 }
 
 fn u(v: usize) -> SpecValue {
@@ -127,7 +133,7 @@ pub struct PrefillGraph {
 }
 
 /// The prefill program of `rows` rows over the stack `decode` runs, with tensors for `max_rows`,
-/// its GLSL kernels at `tuning`'s subgroup size.
+/// its kernels at `tuning`'s subgroup size.
 pub fn prefill_graph(
     decode: &DecodeGraph,
     rows: usize,
@@ -195,9 +201,9 @@ pub fn prefill_graph(
     let qkv_width = (s.heads + 2 * s.kv_heads) * s.head_dim;
     let gemm_op = |n: usize, k: usize| -> Result<(Pipeline, [u32; 3]), Error> {
         let pipeline = Pipeline {
-            kernel: gemm(rows, n, k)?,
+            kernel: gemm(rows, n, k, subgroup)?,
             constants: Vec::new(),
-            subgroup_size: Some(GEMM_SUBGROUP),
+            subgroup_size: Some(subgroup),
         };
         check(
             n.is_multiple_of(TILE),
@@ -338,7 +344,7 @@ pub struct Prefill {
 
 impl Prefill {
     /// Records the prefill programs of the stack `decoder` runs over its weights, rotation tables
-    /// and cache, for runs of up to `max_rows` positions at once, the GLSL kernels at `tuning`'s
+    /// and cache, for runs of up to `max_rows` positions at once, the kernels at `tuning`'s
     /// subgroup size; timed per dispatch when `timed`.
     pub fn new(
         ctx: &Context,
@@ -486,13 +492,15 @@ mod tests {
                 for op in gemms {
                     let [m, n, _] = op.groups.map(|g| g as usize * TILE);
                     assert_eq!(m, rows, "{}", op.label);
-                    assert!(op.pipeline.kernel.name.contains(&format!("_{rows}x{n}x")));
-                    assert_eq!(op.pipeline.subgroup_size, Some(GEMM_SUBGROUP));
+                    let name = op.pipeline.kernel.name;
+                    assert!(name.contains(&format!("_{rows}x{n}x")), "{name}");
+                    assert!(name.ends_with(&format!("_sg{subgroup}")), "{name}");
+                    assert_eq!(op.pipeline.subgroup_size, Some(subgroup));
                 }
             }
         }
-        let names: std::collections::BTreeSet<_> = GEMMS.iter().map(|g| g.name).collect();
-        assert_eq!(names.len(), GEMMS.len());
+        let names: std::collections::BTreeSet<_> = GEMMS.iter().flatten().map(|g| g.name).collect();
+        assert_eq!(names.len(), GEMMS.len() * GEMMS[0].len());
     }
 
     #[test]
