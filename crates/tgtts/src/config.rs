@@ -25,10 +25,10 @@
 //!   default; it steps eagerly on any other device.
 //! - `prefill_batch`: the most positions of prompts run together, their rows and longest each
 //!   rounded up to a power of two, 4096 by default.
-//! - `prompt_cache_bytes`: the bytes on the GPU the prompt cache keeps of the voices, 1 GiB by
+//! - `prompt_cache_bytes`: the bytes on the GPU the prompt cache keeps of the voices, 512 MiB by
 //!   default.
 //! - `prefill_graphs`: the runs of prompts joining together that replay graphs where the step
-//!   does, each as rows and positions run, `1x128 1x256 1x512 2x128 2x256 2x512` by default,
+//!   does, each as rows and positions run, `1x256 1x512` by default,
 //!   rounded up to powers of two; other runs run as they come.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
@@ -376,7 +376,7 @@ mod tests {
                 prefill_positions: 128,
                 prefill_graphs: model::PREFILL_GRAPHS.to_vec(),
                 prefill_batch: 4096,
-                prompt_cache_bytes: 1 << 30,
+                prompt_cache_bytes: 1 << 29,
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),

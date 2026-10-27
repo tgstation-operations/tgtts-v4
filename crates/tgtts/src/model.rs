@@ -35,9 +35,10 @@ const WARM_UP_LINE: &str = "Hello there, could someone please come to medbay? I 
 /// alignments past it.
 const WARM_UP_PATCHES: usize = 9;
 
-/// The bytes on the device the prompt cache keeps of the voices: on a GPU in f16 a median voice
-/// takes about 11 MB, so about 90 of them.
-pub const PROMPT_CACHE_BYTES: usize = 1 << 30;
+/// The bytes on the device the prompt cache keeps of the voices unless the configuration says
+/// otherwise: on a GPU in f16 a median voice takes about 11 MB, so about 45 of them. On real
+/// rounds twice as much made no difference to how long requests took.
+pub const PROMPT_CACHE_BYTES: usize = 1 << 29;
 
 /// The positions of waiting prompts run between two patches while other requests generate,
 /// unless the configuration says otherwise, past which only the first runs.
@@ -45,9 +46,9 @@ pub const PREFILL_POSITIONS: usize = 128;
 
 /// The runs of prompts joining together replayed from graphs unless the configuration says
 /// otherwise, as rows and positions run: on real rounds nine in ten of those that join between
-/// two patches are one prompt, and most of the rest two, of 100 to 600 positions.
-pub const PREFILL_GRAPHS: [(usize, usize); 6] =
-    [(1, 128), (1, 256), (1, 512), (2, 128), (2, 256), (2, 512)];
+/// two patches are one prompt, of 100 to 600 positions. Each graph holds pages of the GPU's
+/// memory of its own, and graphs of two prompts too took the service past 15 GB of a 16 GB card.
+pub const PREFILL_GRAPHS: [(usize, usize); 2] = [(1, 256), (1, 512)];
 
 /// How requests are batched.
 #[derive(Clone, Debug, PartialEq)]
