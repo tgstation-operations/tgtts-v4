@@ -61,9 +61,15 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         requests: 16,
         graphs,
         prefill_positions: PREFILL_POSITIONS,
-        prefill_graphs: PREFILL_GRAPHS.to_vec(),
-        prefill_batch: voxcpm::PREFILL_BATCH,
-        // As the service reads it, for a run to try another.
+        // As the service reads them, for a run to try others.
+        prefill_graphs: std::env::var("TGTTS_PREFILL_GRAPHS")
+            .map_or(PREFILL_GRAPHS.to_vec(), |runs| {
+                tgtts::config::parse_runs(&runs).unwrap()
+            }),
+        prefill_batch: std::env::var("TGTTS_PREFILL_BATCH")
+            .map_or(voxcpm::PREFILL_BATCH, |positions| {
+                positions.parse().unwrap()
+            }),
         prompt_cache_bytes: std::env::var("TGTTS_PROMPT_CACHE_BYTES")
             .map_or(PROMPT_CACHE_BYTES, |bytes| bytes.parse().unwrap()),
     };

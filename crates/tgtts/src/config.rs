@@ -295,8 +295,9 @@ impl Settings {
     }
 }
 
-/// Runs of prompts written as rows and positions, `2x256`, apart by spaces or commas.
-fn parse_runs(value: &str) -> Option<Vec<(usize, usize)>> {
+/// Runs of prompts written as rows and positions, `2x256`, apart by spaces or commas, as
+/// `prefill_graphs` takes them.
+pub fn parse_runs(value: &str) -> Option<Vec<(usize, usize)>> {
     let runs = value.split([' ', ',']).filter(|run| !run.is_empty());
     let run = |run: &str| {
         let (rows, positions) = run.split_once('x')?;
