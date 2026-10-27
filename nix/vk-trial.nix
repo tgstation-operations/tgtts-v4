@@ -1,13 +1,15 @@
 {
   pkgs,
   rustToolchain,
+  gpuKernels,
   glslKernels,
 }:
 # The vulkan and graph crates' device tests and their examples, decode_timing among them, built
 # release for a first run on an NVIDIA host. Each program loads the Vulkan loader from the store,
 # which finds the host driver's ICD under /run/opengl-driver, as NixOS puts it; the tests find
-# their fixtures in the store and the GLSL kernels where GLSL_KERNELS names them, and
-# VULKAN_VALIDATION=1 attaches the validation layer, which VK_LAYER_PATH names.
+# their fixtures in the store, the GLSL kernels where GLSL_KERNELS names them and those compiled
+# from MLIR where VULKAN_KERNELS does, and VULKAN_VALIDATION=1 attaches the validation layer,
+# which VK_LAYER_PATH names.
 let
   inherit (pkgs) lib;
 
@@ -57,12 +59,12 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin $out/libexec
-    cp $CARGO_TARGET_DIR/release/examples/{decode_timing,lm_side_timing,local_timing,properties,vae_timing} $out/libexec/
+    examples=$CARGO_TARGET_DIR/release/examples
+    cp $examples/{decode_timing,lm_side_timing,local_timing,prefill_timing,properties,vae_timing} \
+      $out/libexec/
     while read -r test; do
       name=$(basename "$test")
       name=''${name%-*}
-      # The cooperative-matrix GEMMs are compiled for RADV's 64-wide subgroups.
-      [ "$name" = gemm ] && continue
       cp "$test" "$out/libexec/test-$name"
     done <$NIX_BUILD_TOP/tests
     # Panic locations in the standard library name the toolchain's sources.
@@ -71,6 +73,7 @@ pkgs.stdenv.mkDerivation {
       makeWrapper "$program" "$out/bin/$(basename "$program")" \
         --prefix LD_LIBRARY_PATH : ${pkgs.vulkan-loader}/lib:/run/opengl-driver/lib \
         --set-default GLSL_KERNELS ${glslKernels} \
+        --set-default VULKAN_KERNELS ${gpuKernels} \
         --set-default VK_LAYER_PATH ${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d \
         --set-default VK_KHRONOS_VALIDATION_VALIDATE_SYNC true
     done
