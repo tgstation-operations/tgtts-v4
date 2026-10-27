@@ -11,7 +11,7 @@ use std::{
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
-    model::{Batching, PREFILL_POSITIONS, VoxCpm},
+    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, VoxCpm},
     service::{Limits, Logging, Loudness, Setup, Sounds},
     wav,
 };
@@ -42,6 +42,7 @@ pub fn batching() -> Batching {
         requests: 1,
         graphs: true,
         prefill_positions: PREFILL_POSITIONS,
+        prefill_graphs: PREFILL_GRAPHS.to_vec(),
     }
 }
 

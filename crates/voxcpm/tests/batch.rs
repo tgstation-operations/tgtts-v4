@@ -120,10 +120,20 @@ fn rows_of_a_batch_are_sampled_as_alone() {
 /// Requests coming in while others run, one in the voice of another, each stopping as its stop
 /// head says or at its most patches, as `stepping` steps them, against each generated alone by
 /// the eager step.
-fn a_scheduler_generates_each_request_as_alone(stepping: Stepping) {
+fn a_scheduler_generates_each_request_as_alone(stepping: Stepping, prefill_graphs: bool) {
     let fixture = fixture!("voxcpm_generate");
     let mut model = model(&fixture);
     model.set_stepping(stepping);
+    if prefill_graphs {
+        let rows = [1, 2, 4];
+        let buckets: Vec<_> = rows
+            .iter()
+            .flat_map(|&r| (0..7).map(move |p| (r, 1 << p)))
+            .collect();
+        model.set_prefill_graphs(&buckets);
+        model.warm_prefill_graphs();
+        assert_eq!(model.graph_counts().captured, buckets.len());
+    }
     let voice: Vec<f32> = fixture
         .tensor::<2>("input.voice", &device())
         .into_data()
@@ -314,17 +324,23 @@ impl Noise for Diverging {
 
 #[test]
 fn a_scheduler_generates_each_request_as_alone_by_the_eager_step() {
-    a_scheduler_generates_each_request_as_alone(Stepping::Eager);
+    a_scheduler_generates_each_request_as_alone(Stepping::Eager, false);
 }
 
 #[test]
 fn a_scheduler_generates_each_request_as_alone_by_the_stable_step() {
-    a_scheduler_generates_each_request_as_alone(Stepping::Stable);
+    a_scheduler_generates_each_request_as_alone(Stepping::Stable, false);
 }
 
 #[test]
 fn a_scheduler_generates_each_request_as_alone_by_replays() {
-    a_scheduler_generates_each_request_as_alone(Stepping::Captured);
+    a_scheduler_generates_each_request_as_alone(Stepping::Captured, false);
+}
+
+/// Prompts run together by replaying graphs of their runs, as well as the step.
+#[test]
+fn a_scheduler_generates_each_request_as_alone_by_replays_of_its_prompts_too() {
+    a_scheduler_generates_each_request_as_alone(Stepping::Captured, true);
 }
 
 /// A request whose third patch comes out NaN ends with an error in its place, and the request

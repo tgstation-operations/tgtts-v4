@@ -13,7 +13,7 @@ use std::{
 use service::real;
 use tgtts::{
     device::Kind,
-    model::{Batching, PREFILL_POSITIONS, PROMPT_CACHE_BYTES, VoxCpm},
+    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES, VoxCpm},
     synth::Synthesizer,
 };
 use voices::Voices;
@@ -61,6 +61,7 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         requests: 16,
         graphs,
         prefill_positions: PREFILL_POSITIONS,
+        prefill_graphs: PREFILL_GRAPHS.to_vec(),
     };
     let params = Params::default();
     let model = VoxCpm::load(&checkpoint, &kind.dtypes(), &device, params, batching).unwrap();

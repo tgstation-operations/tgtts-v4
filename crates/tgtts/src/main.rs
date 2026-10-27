@@ -138,6 +138,7 @@ fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send
         // on the Radeon they were measured on.
         graphs: config.step_graphs && config.device == device::Kind::Cuda,
         prefill_positions: config.prefill_positions,
+        prefill_graphs: config.prefill_graphs.clone(),
     };
     let model = VoxCpm::load(
         &config.checkpoint_dir,

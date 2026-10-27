@@ -43,8 +43,14 @@ pub const PROMPT_CACHE_BYTES: usize = 1 << 30;
 /// unless the configuration says otherwise, past which only the first runs.
 pub const PREFILL_POSITIONS: usize = 128;
 
+/// The runs of prompts joining together replayed from graphs unless the configuration says
+/// otherwise, as rows and positions run: on real rounds nine in ten of those that join between
+/// two patches are one prompt, and most of the rest two, of 100 to 600 positions.
+pub const PREFILL_GRAPHS: [(usize, usize); 6] =
+    [(1, 128), (1, 256), (1, 512), (2, 128), (2, 256), (2, 512)];
+
 /// How requests are batched.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Batching {
     /// How long the first request to an idle model waits for others to start with it.
     pub window: Duration,
@@ -54,6 +60,9 @@ pub struct Batching {
     pub graphs: bool,
     /// The positions of prompts run between two patches while other requests generate.
     pub prefill_positions: usize,
+    /// The rows and positions run of the runs of prompts that join together replayed from
+    /// graphs, where the step is.
+    pub prefill_graphs: Vec<(usize, usize)>,
 }
 
 /// VoxCPM2, synthesizing with the same parameters for every request: the requests generate
@@ -124,15 +133,16 @@ impl VoxCpm {
         let (jobs, received) = mpsc::channel();
         let (loaded, loading) = mpsc::channel();
         let (dir, dtypes, on) = (dir.to_owned(), *dtypes, device.clone());
-        let model_params = params.clone();
+        let (model_params, model_batching) = (params.clone(), batching.clone());
         // The weights are loaded on the thread that uses them, whose stream holds them.
         thread::Builder::new()
             .name("voxcpm".into())
             .spawn(move || {
                 let tts = match TextToSpeech::load(&dir, &dtypes, &on) {
                     Ok(mut tts) => {
-                        if batching.graphs {
+                        if model_batching.graphs {
                             tts.set_stepping(Stepping::for_device(&on));
+                            tts.set_prefill_graphs(&model_batching.prefill_graphs);
                         }
                         Arc::new(tts)
                     }
@@ -148,7 +158,7 @@ impl VoxCpm {
                     device: on,
                     prefill_positions: batching.prefill_positions,
                 };
-                generate(&generating, batching, &received);
+                generate(&generating, &model_batching, &received);
             })
             .map_err(|e| voxcpm::Error::Io("a thread to generate on".into(), e))?;
         let stopped = || {
@@ -344,7 +354,7 @@ impl Generating {
 /// Does each job `jobs` brings, generating the patches of requests in a batch and decoding the
 /// speech of each, until every sender of jobs is gone: an idle model waits up to
 /// `batching.window` after a request for others to start with it.
-fn generate(generating: &Generating, batching: Batching, jobs: &Receiver<Job>) {
+fn generate(generating: &Generating, batching: &Batching, jobs: &Receiver<Job>) {
     let cache = PromptCache::new(PROMPT_CACHE_BYTES);
     let mut batch = Batch {
         scheduler: Scheduler::new(generating.tts.model(), cache, generating.prefill_positions),
@@ -419,6 +429,7 @@ impl Generating {
             cache = scheduler.into_cache();
         }
         let model = tts.model();
+        model.warm_prefill_graphs();
         for (rows, held, len) in prefill_shapes(warm_up.longest, warm_up.requests) {
             model.warm_prefill(rows, held, len);
             // What each shape took goes back before the next, or the pools would hold the
@@ -664,6 +675,7 @@ mod tests {
             requests: 1,
             graphs: true,
             prefill_positions: PREFILL_POSITIONS,
+            prefill_graphs: vec![],
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
     }

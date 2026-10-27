@@ -12,7 +12,7 @@ use minicpm4::KvCache;
 
 use crate::{
     Cfm, Config, Error, GraphCounts, LocalEncoder, Noise, Prompt, Sampling, Stepper, Stepping,
-    graph::Graphs, weights,
+    graph::Graphs, prefill::PrefillGraphs, weights,
 };
 
 /// The dtype each part of the model is held and computed in.
@@ -45,6 +45,7 @@ pub struct Model {
     pub(crate) device: Device,
     stepping: Stepping,
     pub(crate) graphs: Graphs,
+    pub(crate) prefill_graphs: PrefillGraphs,
     /// The thread the weights were loaded on, whose cubecl stream holds them.
     pub(crate) loaded_on: ThreadId,
 }
@@ -127,6 +128,7 @@ impl Model {
             device: device.clone(),
             stepping: Stepping::Eager,
             graphs: Graphs::default(),
+            prefill_graphs: PrefillGraphs::new(Tensor::<1>::zeros([1], device).can_mut()),
             loaded_on: thread::current().id(),
         })
     }
@@ -138,7 +140,18 @@ impl Model {
 
     /// How many graphs of its step it has captured and destroyed.
     pub fn graph_counts(&self) -> GraphCounts {
-        self.graphs.counts()
+        let mut counts = self.graphs.counts();
+        counts.captured += self.prefill_graphs.captured();
+        counts
+    }
+
+    /// Has [`warm_prefill_graphs`](Self::warm_prefill_graphs) capture graphs of the runs of
+    /// prompts that join together of each of `buckets`, rows and positions run, each rounded up
+    /// to a power of two.
+    pub fn set_prefill_graphs(&mut self, buckets: &[(usize, usize)]) {
+        let pow2 =
+            |&(rows, run): &(usize, usize)| (rows.next_power_of_two(), run.next_power_of_two());
+        self.prefill_graphs.buckets = buckets.iter().map(pow2).collect();
     }
 
     /// Has [`patches`](Self::patches) compute each patch as `stepping` says. Steps are captured
@@ -217,7 +230,34 @@ impl Model {
         tokens: Tensor<2, Int>,
         audio: Tensor<3, Bool>,
         audio_embeds: Tensor<3>,
+        caches: (&mut KvCache, &mut KvCache),
+    ) -> (Tensor<3>, Tensor<3>) {
+        let run = minicpm4::Model::forward_cached;
+        self.run_prompt_with(tokens, audio, audio_embeds, caches, run)
+    }
+
+    /// Runs positions of prompts through the LMs as [`run_prompt`](Self::run_prompt) does, at
+    /// `positions` `[rows, len]` given on the device, as [`minicpm4::Model::forward_run`] runs
+    /// them.
+    pub(crate) fn run_prompt_at(
+        &self,
+        (tokens, audio, audio_embeds): (Tensor<2, Int>, Tensor<3, Bool>, Tensor<3>),
+        caches: (&mut KvCache, &mut KvCache),
+        positions: Tensor<2, Int>,
+    ) -> (Tensor<3>, Tensor<3>) {
+        let run = |lm: &minicpm4::Model, x, cache: &mut KvCache| {
+            lm.forward_run(x, cache, positions.clone())
+        };
+        self.run_prompt_with(tokens, audio, audio_embeds, caches, run)
+    }
+
+    fn run_prompt_with(
+        &self,
+        tokens: Tensor<2, Int>,
+        audio: Tensor<3, Bool>,
+        audio_embeds: Tensor<3>,
         (base_cache, residual_cache): (&mut KvCache, &mut KvCache),
+        run: impl Fn(&minicpm4::Model, Tensor<3>, &mut KvCache) -> Tensor<3>,
     ) -> (Tensor<3>, Tensor<3>) {
         let [rows, len] = tokens.dims();
         let audio = audio.expand([rows, len, self.hidden]);
@@ -226,16 +266,14 @@ impl Model {
             .base_lm
             .embed(tokens)
             .mask_where(audio.clone(), audio_embeds.clone());
-        let outputs = self.base_lm.forward_cached(embeds, base_cache);
+        let outputs = run(&self.base_lm, embeds, base_cache);
         let quantized = heads.fsq_layer.forward(outputs.clone());
         let outputs = outputs.mask_where(audio.clone(), quantized);
         let audio_embeds = audio_embeds.mask_fill(audio.bool_not(), 0.0);
         let residual_inputs = heads
             .fusion_concat_proj
             .forward(Tensor::cat(vec![outputs.clone(), audio_embeds], 2));
-        let residual = self
-            .residual_lm
-            .forward_cached(residual_inputs, residual_cache);
+        let residual = run(&self.residual_lm, residual_inputs, residual_cache);
         (outputs, residual)
     }
 

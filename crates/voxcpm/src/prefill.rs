@@ -1,9 +1,93 @@
-use std::{collections::HashMap, ops::Range, ptr};
+use std::{
+    collections::HashMap,
+    fmt,
+    ops::Range,
+    ptr,
+    sync::{Arc, Mutex, PoisonError},
+    thread,
+};
 
-use burn::tensor::{Bool, Int, Tensor, TensorData, kind::Basic};
+use burn::tensor::{Bool, Graph, Int, Tensor, TensorData, capture, kind::Basic};
 use minicpm4::KvCache;
 
-use crate::{Error, Generation, Model, Prompt};
+use crate::{Error, Generation, Model, Prompt, Stepping, speech::write};
+
+/// The positions of keys the graphs of runs of prompts that join together hold: past them, a
+/// prompt runs as it comes.
+pub const PREFILL_KEYS: usize = 1024;
+
+/// The graphs a model has captured of runs of prompts that join together, by the rows and
+/// positions run they were captured for, with what they read and write: the runs of the same
+/// rows share caches of keys and values. Each is kept as long as the model lives.
+pub(crate) struct PrefillGraphs {
+    /// The rows and positions run of the runs to capture, each a power of two.
+    pub(crate) buckets: Vec<(usize, usize)>,
+    kept: Mutex<HashMap<(usize, usize), PrefillGraph>>,
+    states: Mutex<HashMap<usize, Arc<Mutex<PrefillState>>>>,
+    /// Whether the device says if a tensor shares its buffer, which a write to what a graph
+    /// reads must not, or it would move where a replay does not look.
+    shares_known: bool,
+}
+
+impl PrefillGraphs {
+    pub(crate) fn new(shares_known: bool) -> Self {
+        Self {
+            buckets: vec![],
+            kept: Mutex::default(),
+            states: Mutex::default(),
+            shares_known,
+        }
+    }
+
+    /// How many it has captured.
+    pub(crate) fn captured(&self) -> usize {
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// A clone of a model captures graphs of its own.
+impl Clone for PrefillGraphs {
+    fn clone(&self) -> Self {
+        Self {
+            buckets: self.buckets.clone(),
+            ..Self::new(self.shares_known)
+        }
+    }
+}
+
+impl fmt::Debug for PrefillGraphs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PrefillGraphs({:?}, {})", self.buckets, self.captured())
+    }
+}
+
+struct PrefillGraph {
+    state: Arc<Mutex<PrefillState>>,
+    graph: Graph<(Tensor<3>, Tensor<3>), PrefillFn>,
+}
+
+type PrefillFn = Box<dyn FnMut() -> (Tensor<3>, Tensor<3>) + Send>;
+
+/// The caches the runs of some number of rows go on in, and what each run of them reads, by
+/// its positions.
+struct PrefillState {
+    caches: (KvCache, KvCache),
+    inputs: HashMap<usize, PrefillInputs>,
+}
+
+#[derive(Clone)]
+struct PrefillInputs {
+    /// Each row's tokens, whether each is audio and the embeddings of their patches.
+    tokens: Tensor<2, Int>,
+    audio: Tensor<3, Bool>,
+    embeds: Tensor<3>,
+    /// The positions each row holds before the run, `[rows]`, and `0..run`.
+    starts: Tensor<1, Int>,
+    run: Tensor<1, Int>,
+}
 
 /// What the model computes over the part of a prompt its voice alone decides, kept for the next
 /// prompts in that voice, up to a number of bytes on the device: the voice's patches as the LMs
@@ -242,6 +326,13 @@ impl Model {
         cache: &mut PromptCache,
     ) -> Vec<Generation<'a>> {
         assert!(!prefills.is_empty(), "no prompts to run");
+        for prefill in &prefills {
+            assert!(ptr::eq(self, prefill.model), "a prompt of another model");
+        }
+        let prefills = match self.prefill_replayed(prefills, cache) {
+            Ok(generations) => return generations,
+            Err(prefills) => prefills,
+        };
         let rows = prefills.len();
         let longest = prefills.iter().map(Prefill::left).max().expect("prompts");
         let held = prefills
@@ -249,15 +340,12 @@ impl Model {
             .map(|prefill| prefill.done)
             .max()
             .expect("prompts");
-        let (device, hidden) = (&self.device, self.hidden);
         let positions = (held + longest).next_power_of_two();
         let mut caches = (
             self.base_lm.cache(rows, positions),
             self.residual_lm.cache(rows, positions),
         );
-        let (mut tokens, mut audio, mut embeds) = (vec![], vec![], vec![]);
         for (row, prefill) in prefills.iter().enumerate() {
-            assert!(ptr::eq(self, prefill.model), "a prompt of another model");
             if let Some((base, residual)) = prefill.caches.as_ref().or(prefill.kept.as_ref())
                 && prefill.done > 0
             {
@@ -266,6 +354,23 @@ impl Model {
                 caches.0.truncate(row, prefill.done);
                 caches.1.truncate(row, prefill.done);
             }
+        }
+        let (tokens, audio, embeds) = self.run_inputs(&prefills, longest);
+        let outputs = self.run_prompt(tokens, audio, embeds, (&mut caches.0, &mut caches.1));
+        self.finish_together(prefills, &mut caches, &outputs, cache)
+    }
+
+    /// What [`prefill_together`](Self::prefill_together) runs for `prefills`: their tokens,
+    /// whether each is audio, and the embeddings of their patches, each followed by as many
+    /// positions as the `longest` has more.
+    fn run_inputs(
+        &self,
+        prefills: &[Prefill<'_>],
+        longest: usize,
+    ) -> (Tensor<2, Int>, Tensor<3, Bool>, Tensor<3>) {
+        let (device, hidden) = (&self.device, self.hidden);
+        let (mut tokens, mut audio, mut embeds) = (vec![], vec![], vec![]);
+        for prefill in prefills {
             let (start, left) = (prefill.done, prefill.left());
             let pad = longest - left;
             let options = (device, prefill.embeds.dtype());
@@ -285,19 +390,29 @@ impl Model {
                 Tensor::zeros([1, pad, hidden], options),
             ));
         }
-        let outputs = self.run_prompt(
+        (
             Tensor::cat(tokens, 0),
             Tensor::cat(audio, 0),
             Tensor::cat(embeds, 0),
-            (&mut caches.0, &mut caches.1),
-        );
+        )
+    }
+
+    /// The generations of `prefills`, run in the rows of `caches` and giving `outputs`, each
+    /// sharing its row of the caches, what the LMs computed over a text kept in `cache`.
+    fn finish_together<'a>(
+        &'a self,
+        prefills: Vec<Prefill<'a>>,
+        caches: &mut (KvCache, KvCache),
+        outputs: &(Tensor<3>, Tensor<3>),
+        cache: &mut PromptCache,
+    ) -> Vec<Generation<'a>> {
         prefills
             .into_iter()
             .enumerate()
             .map(|(row, mut prefill)| {
                 let len = prefill.prompt.len();
-                caches.0.truncate(row, len);
-                caches.1.truncate(row, len);
+                caches.0.hold(row, len);
+                caches.1.hold(row, len);
                 if let Some(key) = prefill.keep.take() {
                     let text = prefill.text.clone();
                     let prefix = Prefix {
@@ -316,6 +431,118 @@ impl Model {
                 generation
             })
             .collect()
+    }
+
+    /// The generations of `prefills` run by replaying the graph captured of their rows and
+    /// positions run, if it was, over caches whose rows they first write what was kept of their
+    /// prompts to; or `prefills` again.
+    fn prefill_replayed<'a>(
+        &'a self,
+        prefills: Vec<Prefill<'a>>,
+        cache: &mut PromptCache,
+    ) -> Result<Vec<Generation<'a>>, Vec<Prefill<'a>>> {
+        let graphs = &self.prefill_graphs;
+        let keys = self.graph_capacity(PREFILL_KEYS, 0);
+        let longest = prefills.iter().map(Prefill::left).max().expect("prompts");
+        let (rows, run) = (
+            prefills.len().next_power_of_two(),
+            longest.next_power_of_two(),
+        );
+        let mut kept = graphs.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let fits = prefills.iter().all(|prefill| prefill.prompt.len() <= keys);
+        let Some(graph) = kept.get_mut(&(rows, run)).filter(|_| fits) else {
+            return Err(prefills);
+        };
+        {
+            let mut state = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let PrefillState { caches, inputs } = &mut *state;
+            assert!(
+                !graphs.shares_known || caches.0.can_mut() && caches.1.can_mut(),
+                "the keys and values a graph runs over are shared, so a write would move them"
+            );
+            for (row, prefill) in prefills.iter().enumerate() {
+                match prefill.caches.as_ref().or(prefill.kept.as_ref()) {
+                    Some((base, residual)) if prefill.done > 0 => {
+                        caches.0.write_prefix(row, base, 0, prefill.done);
+                        caches.1.write_prefix(row, residual, 0, prefill.done);
+                    }
+                    _ => {
+                        caches.0.hold(row, 0);
+                        caches.1.hold(row, 0);
+                    }
+                }
+            }
+            let (tokens, audio, embeds) = self.run_inputs(&prefills, run);
+            let inputs = inputs.get_mut(&run).expect("a graph's inputs");
+            let (known, n) = (graphs.shares_known, prefills.len());
+            write(known, &mut inputs.tokens, 0..n, tokens);
+            write(known, &mut inputs.audio, 0..n, audio);
+            write(known, &mut inputs.embeds, 0..n, embeds);
+            let mut starts: Vec<i64> = prefills.iter().map(|p| p.done as i64).collect();
+            starts.resize(rows, 0);
+            let starts = Tensor::from_data(TensorData::new(starts, [rows]), &self.device);
+            write(known, &mut inputs.starts, 0..rows, starts);
+        }
+        // Safety: the closure owns the state, and with it every buffer it reads and writes; the
+        // inputs were written, and the outputs are read, on this thread, the one the model
+        // loaded on and the graph was captured on.
+        let outputs = unsafe { graph.graph.replay() }.clone();
+        let mut state = graph.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(self.finish_together(prefills, &mut state.caches, &outputs, cache))
+    }
+
+    /// Captures a graph of the runs of prompts that join together of each rows and positions run
+    /// [`set_prefill_graphs`](Self::set_prefill_graphs) gave, where the model replays graphs of
+    /// its step, on this thread, the one it loaded on: over caches of [`PREFILL_KEYS`] positions,
+    /// or as many as the LMs have, that the runs of the same rows share. Each is kept as long as
+    /// the model lives, and a run of the shape of none is run as it comes.
+    pub fn warm_prefill_graphs(&self) {
+        if self.stepping() != Stepping::Captured || thread::current().id() != self.loaded_on {
+            return;
+        }
+        let graphs = &self.prefill_graphs;
+        let keys = self.graph_capacity(PREFILL_KEYS, 0);
+        let (device, hidden) = (&self.device, self.hidden);
+        for &(rows, run) in graphs.buckets.iter().filter(|&&(_, run)| run <= keys) {
+            let mut kept = graphs.kept.lock().unwrap_or_else(PoisonError::into_inner);
+            if kept.contains_key(&(rows, run)) {
+                continue;
+            }
+            let mut states = graphs.states.lock().unwrap_or_else(PoisonError::into_inner);
+            let state = states.entry(rows).or_insert_with(|| {
+                let caches = (
+                    self.base_lm.cache(rows, keys),
+                    self.residual_lm.cache(rows, keys),
+                );
+                Arc::new(Mutex::new(PrefillState {
+                    caches,
+                    inputs: HashMap::new(),
+                }))
+            });
+            let inputs = PrefillInputs {
+                tokens: Tensor::zeros([rows, run], device),
+                audio: Tensor::full([rows, run, 1], true, device),
+                embeds: Tensor::zeros([rows, run, hidden], (device, self.lm_dtype)),
+                starts: Tensor::zeros([rows], device),
+                run: Tensor::arange(0..run as i64, device),
+            };
+            let mut held = state.lock().unwrap_or_else(PoisonError::into_inner);
+            held.inputs.insert(run, inputs);
+            drop(held);
+            let (model, state) = (self.clone(), state.clone());
+            let shared = state.clone();
+            let step: PrefillFn = Box::new(move || {
+                let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let PrefillState { caches, inputs } = &mut *state;
+                let inputs = inputs[&run].clone();
+                let starts = inputs.starts.reshape([rows, 1]).expand([rows, run]);
+                let positions = starts + inputs.run.reshape([1, run]).expand([rows, run]);
+                let run = (inputs.tokens, inputs.audio, inputs.embeds);
+                model.run_prompt_at(run, (&mut caches.0, &mut caches.1), positions)
+            });
+            let graph = capture(device, step);
+            kept.insert((rows, run), PrefillGraph { state, graph });
+        }
     }
 
     /// Runs the LMs as [`Scheduler`](crate::Scheduler) runs the prompts of requests that join

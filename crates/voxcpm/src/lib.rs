@@ -32,7 +32,7 @@ pub use crate::{
     local_encoder::LocalEncoder,
     model::{Dtypes, Generation, Model, Patches, Step},
     noise::{Noise, SeededNoise},
-    prefill::{Prefill, PromptCache},
+    prefill::{PREFILL_KEYS, Prefill, PromptCache},
     prompt::Prompt,
     speech::{CHUNK_FRAMES, ChunkDecoder, Params, SpeechChunks, SpeechDecoder, TextToSpeech},
     tokenizer::Tokenizer,

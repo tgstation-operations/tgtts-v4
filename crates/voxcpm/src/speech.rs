@@ -168,6 +168,12 @@ impl TextToSpeech {
     pub fn set_stepping(&mut self, stepping: Stepping) {
         self.model.set_stepping(stepping);
     }
+
+    /// Has the model capture graphs of the runs of prompts of `buckets`, as
+    /// [`Model::set_prefill_graphs`] does.
+    pub fn set_prefill_graphs(&mut self, buckets: &[(usize, usize)]) {
+        self.model.set_prefill_graphs(buckets);
+    }
 }
 
 /// The latent frames a [`ChunkDecoder`] decodes at a time: each chunk the same shape, so that a
@@ -431,7 +437,7 @@ impl SpeechChunks {
 /// # Panics
 ///
 /// If the device says `target` shares its buffer, which the write would then move.
-fn write<const D: usize, K: Basic>(
+pub(crate) fn write<const D: usize, K: Basic>(
     shares_known: bool,
     target: &mut Tensor<D, K>,
     rows: Range<usize>,
