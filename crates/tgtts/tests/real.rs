@@ -9,7 +9,7 @@ use burn::tensor::Device;
 use common::real;
 use tgtts::{
     device::Kind,
-    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, VoxCpm},
+    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES, VoxCpm},
     synth::Synthesizer,
 };
 use voices::Voices;
@@ -45,6 +45,8 @@ fn synthesizes_requests_at_once_as_one_at_a_time_on_the_real_model() {
         graphs: true,
         prefill_positions: PREFILL_POSITIONS,
         prefill_graphs: PREFILL_GRAPHS.to_vec(),
+        prefill_batch: voxcpm::PREFILL_BATCH,
+        prompt_cache_bytes: PROMPT_CACHE_BYTES,
     };
     let params = real::params();
     let model = VoxCpm::load(&checkpoint, &dtypes, &Device::flex(), params, batching).unwrap();

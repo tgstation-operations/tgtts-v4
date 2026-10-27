@@ -17,8 +17,8 @@ use dsp::RATE;
 use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
-    ChunkDecoder, Config, Dtypes, GraphCounts, PREFILL_BATCH, Params, Patch, Prompt, PromptCache,
-    Scheduler, SeededNoise, SpeechChunks, Stepping, TextToSpeech,
+    ChunkDecoder, Config, Dtypes, GraphCounts, Params, Patch, Prompt, PromptCache, Scheduler,
+    SeededNoise, SpeechChunks, Stepping, TextToSpeech,
 };
 
 use crate::{
@@ -60,6 +60,11 @@ pub struct Batching {
     pub graphs: bool,
     /// The positions of prompts run between two patches while other requests generate.
     pub prefill_positions: usize,
+    /// The most positions of prompts run together, rows and longest rounded up to powers of
+    /// two.
+    pub prefill_batch: usize,
+    /// The bytes on the device the prompt cache keeps of the voices.
+    pub prompt_cache_bytes: usize,
     /// The rows and positions run of the runs of prompts that join together replayed from
     /// graphs, where the step is.
     pub prefill_graphs: Vec<(usize, usize)>,
@@ -157,6 +162,8 @@ impl VoxCpm {
                     params: model_params,
                     device: on,
                     prefill_positions: batching.prefill_positions,
+                    prefill_batch: batching.prefill_batch,
+                    prompt_cache_bytes: batching.prompt_cache_bytes,
                 };
                 generate(&generating, &model_batching, &received);
             })
@@ -263,10 +270,10 @@ impl VoxCpm {
 /// The runs of prompts that join a scheduler together the warm-up runs, as rows, positions held
 /// and positions run: for each number of rows up to `requests` and of positions up to those of
 /// the `longest` prompt, each a power of two of at least 32, as autotune rounds the shapes it
-/// chooses kernels for, that come to at most [`PREFILL_BATCH`] positions, each after enough
+/// chooses kernels for, that come to at most `batch` positions, each after enough
 /// held positions to come to each power of two of keys from those positions to the longest's.
 /// Each is the largest of the shapes autotune rounds to it, which also holds the most memory.
-fn prefill_shapes(longest: usize, requests: usize) -> Vec<(usize, usize, usize)> {
+fn prefill_shapes(longest: usize, requests: usize, batch: usize) -> Vec<(usize, usize, usize)> {
     let powers = |from: usize, to: usize| {
         (0..)
             .map(move |power| 1 << power)
@@ -276,7 +283,7 @@ fn prefill_shapes(longest: usize, requests: usize) -> Vec<(usize, usize, usize)>
     let (rows, positions) = (requests.next_power_of_two(), longest.next_power_of_two());
     let mut shapes = vec![];
     for rows in powers(1, rows) {
-        for len in powers(32, positions).filter(|&len| rows * len <= PREFILL_BATCH) {
+        for len in powers(32, positions).filter(|&len| rows * len <= batch) {
             for keys in powers(len, positions) {
                 shapes.push((rows, keys - len, len));
             }
@@ -342,9 +349,18 @@ struct Generating {
     params: Params,
     device: Device,
     prefill_positions: usize,
+    prefill_batch: usize,
+    prompt_cache_bytes: usize,
 }
 
 impl Generating {
+    /// A scheduler of requests, going on from `cache`.
+    fn scheduler<K: Clone>(&self, cache: PromptCache) -> Scheduler<'_, K, SeededNoise> {
+        let mut scheduler = Scheduler::new(self.tts.model(), cache, self.prefill_positions);
+        scheduler.set_prefill_batch(self.prefill_batch);
+        scheduler
+    }
+
     /// Whether the model replays graphs of its steps, and the decoder of its chunks.
     fn graphs(&self) -> bool {
         self.tts.model().stepping() == Stepping::Captured
@@ -355,9 +371,9 @@ impl Generating {
 /// speech of each, until every sender of jobs is gone: an idle model waits up to
 /// `batching.window` after a request for others to start with it.
 fn generate(generating: &Generating, batching: &Batching, jobs: &Receiver<Job>) {
-    let cache = PromptCache::new(PROMPT_CACHE_BYTES);
+    let cache = PromptCache::new(generating.prompt_cache_bytes);
     let mut batch = Batch {
-        scheduler: Scheduler::new(generating.tts.model(), cache, generating.prefill_positions),
+        scheduler: generating.scheduler(cache),
         generating: HashMap::new(),
         next: 0,
         on: generating,
@@ -409,9 +425,9 @@ impl Generating {
     ) -> Result<Duration, voxcpm::Error> {
         let started = Instant::now();
         let (tts, params) = (&*self.tts, &self.params);
-        let mut cache = PromptCache::new(PROMPT_CACHE_BYTES);
+        let mut cache = PromptCache::new(self.prompt_cache_bytes);
         for run in &warm_up.runs {
-            let mut scheduler = Scheduler::new(tts.model(), cache, self.prefill_positions);
+            let mut scheduler = self.scheduler(cache);
             for (i, prompt) in run.iter().enumerate() {
                 let noise = SeededNoise::new(i as u64);
                 scheduler.add(i, prompt, &params.sampling, params.max_patches, noise)?;
@@ -430,7 +446,8 @@ impl Generating {
         }
         let model = tts.model();
         model.warm_prefill_graphs();
-        for (rows, held, len) in prefill_shapes(warm_up.longest, warm_up.requests) {
+        let batch = self.prefill_batch;
+        for (rows, held, len) in prefill_shapes(warm_up.longest, warm_up.requests, batch) {
             model.warm_prefill(rows, held, len);
             // What each shape took goes back before the next, or the pools would hold the
             // memory of all of them at once, which no step of serving takes.
@@ -651,6 +668,7 @@ impl Synthesizer for VoxCpm {
 mod tests {
     use burn::tensor::FloatDType;
     use serde_json::Value;
+    use voxcpm::PREFILL_BATCH;
 
     use super::*;
 
@@ -676,6 +694,8 @@ mod tests {
             graphs: true,
             prefill_positions: PREFILL_POSITIONS,
             prefill_graphs: vec![],
+            prefill_batch: voxcpm::PREFILL_BATCH,
+            prompt_cache_bytes: PROMPT_CACHE_BYTES,
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
     }
@@ -684,7 +704,7 @@ mod tests {
     /// rows, keys and positions run as a power of two each, that the scheduler lets through.
     #[test]
     fn warms_up_each_shape_of_prompts_run_together() {
-        let shapes = prefill_shapes(579, 12);
+        let shapes = prefill_shapes(579, 12, PREFILL_BATCH);
         let rounded = |n: usize| n.next_power_of_two();
         let mut keys: Vec<_> = shapes
             .iter()

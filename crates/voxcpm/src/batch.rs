@@ -238,7 +238,7 @@ fn held_rows<const D: usize>(all: &Tensor<D>, held: Option<&Tensor<1, Int>>) -> 
     }
 }
 
-/// The most positions a run of prompts that join a [`Scheduler`] takes, its rows and the
+/// The most positions a run of prompts that join a [`Scheduler`] takes by default, its rows and the
 /// positions of its longest prompt each rounded up to a power of two, as autotune rounds the
 /// shapes it chooses kernels for: what bounds the memory a run holds and the shapes there are
 /// to warm up, [`Model::warm_prefill`]'s.
@@ -261,6 +261,7 @@ pub struct Scheduler<'a, K, N> {
     waiting: VecDeque<(Request<K, N>, Prefill<'a>)>,
     running: HashMap<RowId, Request<K, N>>,
     prefill_positions: usize,
+    prefill_batch: usize,
     last_step: StepReport,
 }
 
@@ -347,6 +348,7 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             waiting: VecDeque::new(),
             running: HashMap::new(),
             prefill_positions,
+            prefill_batch: PREFILL_BATCH,
             last_step: StepReport::default(),
         }
     }
@@ -399,6 +401,12 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
         Ok(())
     }
 
+    /// Has runs of prompts that join together take at most `positions` positions, as
+    /// [`PREFILL_BATCH`] bounds them by default, rounded as it rounds them.
+    pub fn set_prefill_batch(&mut self, positions: usize) {
+        self.prefill_batch = positions;
+    }
+
     /// The model it generates from.
     pub fn model(&self) -> &'a Model {
         self.model
@@ -432,7 +440,7 @@ impl<'a, K: Clone, N: Noise> Scheduler<'a, K, N> {
             let left = prefill.left();
             let fits = positions + left <= self.prefill_positions || self.running.is_empty();
             let padded = (joining + 1).next_power_of_two() * longest.max(left).next_power_of_two();
-            if joining > 0 && (!fits || padded > PREFILL_BATCH) {
+            if joining > 0 && (!fits || padded > self.prefill_batch) {
                 break;
             }
             joining += 1;

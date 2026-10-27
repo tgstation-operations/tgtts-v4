@@ -139,6 +139,8 @@ fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send
         graphs: config.step_graphs && config.device == device::Kind::Cuda,
         prefill_positions: config.prefill_positions,
         prefill_graphs: config.prefill_graphs.clone(),
+        prefill_batch: config.prefill_batch,
+        prompt_cache_bytes: config.prompt_cache_bytes,
     };
     let model = VoxCpm::load(
         &config.checkpoint_dir,

@@ -62,8 +62,13 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
         graphs,
         prefill_positions: PREFILL_POSITIONS,
         prefill_graphs: PREFILL_GRAPHS.to_vec(),
+        prefill_batch: voxcpm::PREFILL_BATCH,
+        // As the service reads it, for a run to try another.
+        prompt_cache_bytes: std::env::var("TGTTS_PROMPT_CACHE_BYTES")
+            .map_or(PROMPT_CACHE_BYTES, |bytes| bytes.parse().unwrap()),
     };
     let params = Params::default();
+    let budget = batching.prompt_cache_bytes;
     let model = VoxCpm::load(&checkpoint, &kind.dtypes(), &device, params, batching).unwrap();
     let voices = Voices::open(real::dir("VOICES_DIR")).unwrap();
     let started = Instant::now();
@@ -80,7 +85,7 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
     let (warmed, _, page) = pools();
     let graphs = model.graph_counts();
     // The cache's budget in whole pages of the largest pool, where it keeps its keys and values.
-    let cache = (PROMPT_CACHE_BYTES as u64).div_ceil(page) * page;
+    let cache = (budget as u64).div_ceil(page) * page;
     let mib = |bytes: u64| bytes >> 20;
     let names: Vec<&str> = voices.names().collect();
     let lines = [

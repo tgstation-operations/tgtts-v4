@@ -23,6 +23,10 @@
 //!   other requests generate, 128 by default; the first waiting runs whole whatever its length.
 //! - `step_graphs`: whether the model steps by replaying graphs of its step on CUDA, `true` by
 //!   default; it steps eagerly on any other device.
+//! - `prefill_batch`: the most positions of prompts run together, their rows and longest each
+//!   rounded up to a power of two, 4096 by default.
+//! - `prompt_cache_bytes`: the bytes on the GPU the prompt cache keeps of the voices, 1 GiB by
+//!   default.
 //! - `prefill_graphs`: the runs of prompts joining together that replay graphs where the step
 //!   does, each as rows and positions run, `1x128 1x256 1x512 2x128 2x256 2x512` by default,
 //!   rounded up to powers of two; other runs run as they come.
@@ -60,7 +64,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 28] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -80,6 +84,8 @@ const KEYS: [&str; 26] = [
     "step_graphs",
     "prefill_positions",
     "prefill_graphs",
+    "prefill_batch",
+    "prompt_cache_bytes",
     "cpu_limit",
     "queue_timeout_seconds",
     "radio_wait_seconds",
@@ -108,6 +114,8 @@ pub struct Config {
     pub step_graphs: bool,
     pub prefill_positions: usize,
     pub prefill_graphs: Vec<(usize, usize)>,
+    pub prefill_batch: usize,
+    pub prompt_cache_bytes: usize,
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
     pub radio_wait: Duration,
@@ -194,6 +202,12 @@ impl Config {
                 })?,
                 None => model::PREFILL_GRAPHS.to_vec(),
             },
+            prefill_batch: settings
+                .limit("prefill_batch")?
+                .unwrap_or(voxcpm::PREFILL_BATCH),
+            prompt_cache_bytes: settings
+                .parse("prompt_cache_bytes")?
+                .unwrap_or(model::PROMPT_CACHE_BYTES),
             cpu_limit: settings.limit("cpu_limit")?.unwrap_or(cpus),
             queue_timeout: settings
                 .seconds("queue_timeout_seconds")?
@@ -360,6 +374,8 @@ mod tests {
                 step_graphs: true,
                 prefill_positions: 128,
                 prefill_graphs: model::PREFILL_GRAPHS.to_vec(),
+                prefill_batch: 4096,
+                prompt_cache_bytes: 1 << 30,
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
                 radio_wait: Duration::from_secs(10),
@@ -384,6 +400,8 @@ mod tests {
             batch_window_seconds = 0.05
             step_graphs = false
             prefill_positions = 512
+            prefill_batch = 2048
+            prompt_cache_bytes = 536870912
             prefill_graphs = \"1x64, 4x32\"
             cpu_limit = 8
             queue_timeout_seconds = 2.5
@@ -418,6 +436,10 @@ mod tests {
         assert_eq!(config.batch_window, Duration::from_millis(50));
         assert!(!config.step_graphs);
         assert_eq!(config.prefill_positions, 512);
+        assert_eq!(
+            (config.prefill_batch, config.prompt_cache_bytes),
+            (2048, 1 << 29)
+        );
         assert_eq!(config.prefill_graphs, [(1, 64), (4, 32)]);
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
         assert_eq!(config.radio_wait_ceiling, Duration::from_secs(45));
