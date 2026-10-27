@@ -71,11 +71,10 @@ impl Checkpoint {
         self.entries.get(name).map(|e| e.shape.as_slice())
     }
 
-    /// Tensor `name` as f16 bits, rounded to nearest even from bf16 or f32 as burn's cast
-    /// does, and its shape.
-    pub fn f16(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), Error> {
-        let bad =
-            |why: String| Error::Checkpoint(format!("{}: {name}: {why}", self.path.display()));
+    /// The entry of tensor `name`, and the bytes of each of its values, if its size is that of
+    /// its shape.
+    fn entry(&self, name: &str) -> Result<(&Entry, usize), Error> {
+        let bad = |why: String| self.bad(name, why);
         let entry = self
             .entries
             .get(name)
@@ -94,30 +93,25 @@ impl Checkpoint {
                 entry.dtype
             )));
         }
+        Ok((entry, width))
+    }
+
+    fn bad(&self, name: &str, why: String) -> Error {
+        Error::Checkpoint(format!("{}: {name}: {why}", self.path.display()))
+    }
+
+    /// Tensor `name` as f16 bits, rounded to nearest even from bf16 or f32 as burn's cast
+    /// does, and its shape.
+    pub fn f16(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), Error> {
+        let (entry, width) = self.entry(name)?;
+        let [start, end] = entry.data_offsets;
+        let elements = (end - start) as usize / width;
         let mut bytes = vec![0u8; (end - start) as usize];
         self.file
             .read_exact_at(&mut bytes, self.data + start)
-            .map_err(|e| bad(e.to_string()))?;
+            .map_err(|e| self.bad(name, e.to_string()))?;
         let mut out = vec![0u16; elements];
-        let convert = |src: &[u8], dst: &mut [u16]| match entry.dtype.as_str() {
-            "BF16" => {
-                for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                    let v = bf16::from_bits(u16::from_le_bytes(*s)).to_f32();
-                    *d = f16::from_f32(v).to_bits();
-                }
-            }
-            "F16" => {
-                for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                    *d = u16::from_le_bytes(*s);
-                }
-            }
-            _ => {
-                for (d, s) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
-                    let v = f32::from_le_bytes(*s);
-                    *d = f16::from_f32(v).to_bits();
-                }
-            }
-        };
+        let convert = |src: &[u8], dst: &mut [u16]| convert(&entry.dtype, src, dst);
         let threads = thread::available_parallelism().map_or(1, |t| t.get());
         let chunk = elements.div_ceil(threads).max(1 << 16);
         thread::scope(|s| {
@@ -126,6 +120,28 @@ impl Checkpoint {
             }
         });
         Ok((entry.shape.clone(), out))
+    }
+
+    /// Rows `rows` of the 2-D tensor `name` as f16 bits, converted as [`f16`](Self::f16) converts
+    /// them, one after another: a lookup in an embedding table, which reads those rows alone.
+    pub fn gather_f16(&self, name: &str, rows: &[usize]) -> Result<Vec<u16>, Error> {
+        let (entry, width) = self.entry(name)?;
+        let &[count, columns] = entry.shape.as_slice() else {
+            return Err(self.bad(name, format!("shape {:?}, not 2-D", entry.shape)));
+        };
+        let mut bytes = vec![0u8; columns * width];
+        let mut out = vec![0u16; rows.len() * columns];
+        for (&row, dst) in rows.iter().zip(out.chunks_mut(columns)) {
+            if row >= count {
+                return Err(self.bad(name, format!("row {row} of {count}")));
+            }
+            let at = self.data + entry.data_offsets[0] + (row * bytes.len()) as u64;
+            self.file
+                .read_exact_at(&mut bytes, at)
+                .map_err(|e| self.bad(name, e.to_string()))?;
+            convert(&entry.dtype, &bytes, dst);
+        }
+        Ok(out)
     }
 
     /// The 2-D tensors `names` as f16, joined along their rows, as upstream's projections are
@@ -150,5 +166,61 @@ impl Checkpoint {
             out.extend_from_slice(&values);
         }
         Ok(([rows, columns.unwrap_or(0)], out))
+    }
+}
+
+/// `src`, values of `dtype` as the checkpoint stores them, as f16 bits into `dst`.
+fn convert(dtype: &str, src: &[u8], dst: &mut [u16]) {
+    match dtype {
+        "BF16" => {
+            for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+                let v = bf16::from_bits(u16::from_le_bytes(*s)).to_f32();
+                *d = f16::from_f32(v).to_bits();
+            }
+        }
+        "F16" => {
+            for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+                *d = u16::from_le_bytes(*s);
+            }
+        }
+        _ => {
+            for (d, s) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+                let v = f32::from_le_bytes(*s);
+                *d = f16::from_f32(v).to_bits();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gather_reads_the_rows_the_whole_tensor_holds() {
+        let rows: Vec<f32> = (0..12).map(|i| i as f32 / 3.0 - 1.7).collect();
+        let data: Vec<u8> = rows
+            .iter()
+            .flat_map(|&v| bf16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let header = format!(
+            r#"{{"table":{{"dtype":"BF16","shape":[3,4],"data_offsets":[0,{}]}}}}"#,
+            data.len()
+        );
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header.as_bytes());
+        file.extend(&data);
+        let path = std::env::temp_dir().join(format!("gather-{}.safetensors", std::process::id()));
+        std::fs::write(&path, file).unwrap();
+        let checkpoint = Checkpoint::open(&path).unwrap();
+        let (_, whole) = checkpoint.f16("table").unwrap();
+        let gathered = checkpoint.gather_f16("table", &[2, 0, 2]).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let row = |r: usize| &whole[r * 4..(r + 1) * 4];
+        assert_eq!(gathered, [row(2), row(0), row(2)].concat());
+        assert!(matches!(
+            checkpoint.gather_f16("table", &[3]),
+            Err(Error::Checkpoint(_))
+        ));
     }
 }
