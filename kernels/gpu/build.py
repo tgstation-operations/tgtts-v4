@@ -9,10 +9,11 @@ Each kernel is a linear-algebra op in `<kernel>.mlir` and a transform-dialect sc
 describes the device. `pipeline()` and `SPIRV_MODULE_PIPELINE` below are the whole
 compilation, in order. After them this takes the one spirv.module out of the result, makes
 two corrections upstream MLIR does not make (`fix_module`), serializes it, validates it with
-spirv-val, and reads the binary's own disassembly to write `<name>.json`: entry point,
-workgroup size, dispatch grid, bindings, the subgroup size the kernel was written for, and
-the capabilities and Vulkan features it needs. Every field is either read from the compiled
-IR or checked against the binary, so the manifest cannot claim what the SPIR-V does not do.
+spirv-val, and reads the binary's own disassembly to check its cooperative matrices against
+those the target offers and to write `<name>.json`: entry point, workgroup size, dispatch
+grid, bindings, the subgroup size the kernel was written for, and the capabilities and
+Vulkan features it needs. Every field is either read from the compiled IR or checked against
+the binary, so the manifest cannot claim what the SPIR-V does not do.
 
 mlir-opt, mlir-translate, spirv-val and spirv-dis are taken from PATH, and the MLIR Python
 bindings from PYTHONPATH; the gpu-kernels Nix package provides all of them.
@@ -281,10 +282,32 @@ class Disassembly:
 # OpTypeCooperativeMatrixKHR's Use operand: MatrixAKHR, MatrixBKHR, MatrixAccumulatorKHR.
 USES = {0: "a", 1: "b", 2: "acc"}
 
+# Scope operands as SPIR-V numbers them, by the names MLIR prints.
+SCOPES = {"Workgroup": 2, "Subgroup": 3}
 
-def inspect(disassembly, facts, kernel):
-    """Checks the binary against the compiled IR and the kernel's declared interface, and
-    returns the manifest fields read from the binary."""
+COOP_MATRIX_PROPS = re.compile(
+    r"#spirv\.coop_matrix_props_khr<m_size = (\d+), n_size = (\d+), k_size = (\d+), "
+    r"a_type = (\w+), b_type = (\w+), c_type = (\w+), result_type = (\w+), "
+    r"acc_sat = (true|false), scope = <(\w+)>>"
+)
+
+
+def offered(target_env):
+    """The cooperative-matrix multiply-adds a spirv.target_env offers, each as (a, b, c, result,
+    m, n, k, scope, saturating) in the terms `inspect` reads the binary in."""
+    found = [
+        (a, b, c, r, int(m), int(n), int(k), SCOPES[scope], sat == "true")
+        for m, n, k, a, b, c, r, sat, scope in COOP_MATRIX_PROPS.findall(target_env)
+    ]
+    if len(found) != target_env.count("#spirv.coop_matrix_props_khr<"):
+        sys.exit(f"cannot read the cooperative matrices of {target_env}")
+    return set(found)
+
+
+def inspect(disassembly, facts, kernel, offers):
+    """Checks the binary against the compiled IR, the kernel's declared interface and the
+    cooperative-matrix multiply-adds the target `offers`, and returns the manifest fields read
+    from the binary."""
     d = Disassembly(disassembly)
     problems = []
 
@@ -362,23 +385,29 @@ def inspect(disassembly, facts, kernel):
             types[role] = coop_types[
                 d.defs[ident][1][0]
             ]  # an operand's first word is its type
-        shapes.add(
-            (
-                types["a"]["element"],
-                types["b"]["element"],
-                types["acc"]["element"],
-                coop_types[result_type]["element"],
-                types["a"]["rows"],
-                types["b"]["cols"],
-                types["a"]["cols"],
-                types["a"]["scope"],
-            )
+        shape = (
+            types["a"]["element"],
+            types["b"]["element"],
+            types["acc"]["element"],
+            coop_types[result_type]["element"],
+            types["a"]["rows"],
+            types["b"]["cols"],
+            types["a"]["cols"],
+            types["a"]["scope"],
+            any("SaturatingAccumulation" in word for word in ops[5:]),
         )
+        shapes.add(shape)
+    for shape in sorted(shapes - offers):
+        problems.append(f"multiply-add {shape} is not one the target offers")
+    # Every matrix in the role and shape of one the target offers, so no other can be loaded.
+    roles = set()
+    for a, b, c, r, m, n, k, scope, _ in offers:
+        roles |= {("a", a, m, k, scope), ("b", b, k, n, scope)}
+        roles |= {("acc", c, m, n, scope), ("acc", r, m, n, scope)}
     for ct in coop_types.values():
-        if (ct["rows"], ct["cols"]) != (16, 16) or ct["scope"] != 3:  # 3 = Subgroup
-            problems.append(
-                f"cooperative matrix {ct} is not RADV's 16x16 at subgroup scope"
-            )
+        role = (ct["use"], ct["element"], ct["rows"], ct["cols"], ct["scope"])
+        if role not in roles:
+            problems.append(f"cooperative matrix {ct} is not one the target offers")
 
     rounding = [ops for ops in d.ops("OpDecorate") if ops[1] == "FPRoundingMode"]
     if problems:
@@ -408,7 +437,7 @@ def inspect(disassembly, facts, kernel):
                 "result": r,
                 "scope": "subgroup",
             }
-            for (a, b, c, r, m, n, k, _) in sorted(shapes)
+            for (a, b, c, r, m, n, k, _, _) in sorted(shapes)
         ],
         "fp_rounding_modes": sorted({ops[2] for ops in rounding}),
     }
@@ -449,6 +478,7 @@ def build(args):
         if len(spv_modules) != 1:
             sys.exit(f"expected one spirv.module, found {len(spv_modules)}")
         spv = spv_modules[0].operation
+        offers = offered(str(spv.attributes["spirv.target_env"]))
         fix_module(spv)
         spirv_text = str(spv)
     spirv_mlir = os.path.join(work, f"{name}.spirv.mlir")
@@ -469,7 +499,7 @@ def build(args):
     disassembly = run(["spirv-dis", spv_path])
     open(os.path.join(args.out, f"{name}.spvasm"), "w").write(disassembly)
 
-    found = inspect(disassembly, facts, kernel)
+    found = inspect(disassembly, facts, kernel, offers)
     acc = args.acc
     want = [
         {

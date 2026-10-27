@@ -12,7 +12,12 @@ use std::{ffi::CString, path::PathBuf, thread};
 
 use half::f16;
 use serde_json::Value;
-use vulkan::{Context, Kernel, KernelDesc, executable::count_mnemonics, select::Features};
+use vulkan::{
+    Context, DeviceReport, Kernel, KernelDesc,
+    executable::count_mnemonics,
+    report::{component_type_name, scope_name},
+    select::Features,
+};
 
 /// The subgroup size the schedule maps the GEMM's work onto.
 const SUBGROUP: u32 = 64;
@@ -111,9 +116,9 @@ fn strings(v: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Checks the manifest against what the test binds and dispatches, and against the features the
-/// runtime enables; returns the grid.
-fn check_manifest(module: &Module, shape: Shape, acc: Acc) -> [u32; 3] {
+/// Checks the manifest against what the test binds and dispatches, against the features the
+/// runtime enables, and against the cooperative matrices the device offers; returns the grid.
+fn check_manifest(module: &Module, shape: Shape, acc: Acc, report: &DeviceReport) -> [u32; 3] {
     let Shape { m, n, k } = shape;
     let manifest = &module.manifest;
     let want = [
@@ -211,6 +216,31 @@ fn check_manifest(module: &Module, shape: Shape, acc: Acc) -> [u32; 3] {
                 .iter()
                 .any(|e| e.to_bytes() == extension.as_bytes()),
             "{}: needs {extension}, not enabled",
+            module.name
+        );
+    }
+    let offered = |coop: &Value| {
+        report.cooperative_matrix.iter().any(|c| {
+            let sizes = [("m", c.m), ("n", c.n), ("k", c.k)];
+            let types = [("a", c.a), ("b", c.b), ("c", c.c), ("result", c.result)];
+            sizes
+                .iter()
+                .all(|&(d, v)| coop[d].as_u64() == Some(v.into()))
+                && types
+                    .iter()
+                    .all(|&(t, v)| coop[t].as_str() == Some(component_type_name(v).as_ref()))
+                && coop["scope"].as_str() == Some(scope_name(c.scope).as_ref())
+                && !c.saturating
+        })
+    };
+    let coops = manifest["cooperative_matrix"]
+        .as_array()
+        .expect("cooperative_matrix");
+    assert!(!coops.is_empty(), "{}: no cooperative matrix", module.name);
+    for coop in coops {
+        assert!(
+            offered(coop),
+            "{}: multiplies at {coop}, which the device does not offer",
             module.name
         );
     }
@@ -422,7 +452,7 @@ fn run(ctx: &Context, gemm: &Gemm, a: &[f16], b: &[f16], reps: usize) -> Run {
 /// defect, and the compiled pipeline against its manifest. Returns each dispatch's GPU time.
 fn gemm(ctx: &Context, shape: Shape, acc: Acc, reps: usize) -> Vec<f64> {
     let module = module(shape, acc);
-    let grid = check_manifest(&module, shape, acc);
+    let grid = check_manifest(&module, shape, acc, ctx.report());
     let kernel = kernel(ctx, &module, SUBGROUP);
     if let Some(why) = compiled_mismatch(&kernel, &module, acc) {
         panic!("{}: {why}", module.name);
