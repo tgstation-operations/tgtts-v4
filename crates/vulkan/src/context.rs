@@ -7,12 +7,13 @@ use crate::{
     instance::Instance,
     kernel::{Kernel, KernelDesc},
     memory::Buffer,
+    recording::{Dispatch, Recording},
     report::DeviceReport,
     select::{self, Features, REQUIRED_EXTENSIONS},
 };
 
 /// How long a dispatch may take before waiting for it is abandoned as a hung GPU.
-const FENCE_TIMEOUT_NS: u64 = 60_000_000_000;
+pub(crate) const FENCE_TIMEOUT_NS: u64 = 60_000_000_000;
 
 /// The number of timestamp ticks between two readings of a counter that keeps only its
 /// low `valid_bits` bits (Vulkan's `timestampValidBits`), so the counter wrapping between
@@ -61,8 +62,8 @@ pub struct Timing {
 
 /// The objects one submission uses, reused by every dispatch and guarded together, since
 /// a queue and a command pool are externally synchronized.
-struct Submit {
-    queue: vk::Queue,
+pub(crate) struct Submit {
+    pub(crate) queue: vk::Queue,
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
     fence: vk::Fence,
@@ -75,8 +76,9 @@ pub(crate) struct Inner {
     pub(crate) report: DeviceReport,
     /// `VK_KHR_pipeline_executable_properties`, when the device offers it.
     pub(crate) executables: Option<ash::khr::pipeline_executable_properties::Device>,
-    queue_family: u32,
-    submit: Mutex<Submit>,
+    robust_buffer_access2: bool,
+    pub(crate) queue_family: u32,
+    pub(crate) submit: Mutex<Submit>,
     /// Dropped after `device` is destroyed in `Drop::drop`.
     instance: Instance,
 }
@@ -169,16 +171,43 @@ impl Context {
                 f.pipeline_executable_info == vk::TRUE
             };
 
+        // Optional: accesses out of a binding's range read zero and write nothing, rather than
+        // reach whatever memory lies past it.
+        let offers_robustness2 = report
+            .extensions
+            .iter()
+            .any(|e| e.as_bytes() == ash::ext::robustness2::NAME.to_bytes())
+            && {
+                let mut f = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+                let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut f);
+                // SAFETY: as above.
+                unsafe {
+                    instance
+                        .raw
+                        .get_physical_device_features2(physical, &mut query)
+                };
+                let robust_buffer_access = query.features.robust_buffer_access == vk::TRUE;
+                robust_buffer_access && f.robust_buffer_access2 == vk::TRUE
+            };
+
         let (mut f11, mut f12, mut f13, mut fcoop) = enabled(&Features::ALL);
         let mut fexec = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
             .pipeline_executable_info(true);
+        let mut frobust =
+            vk::PhysicalDeviceRobustness2FeaturesEXT::default().robust_buffer_access2(true);
         let mut features = vk::PhysicalDeviceFeatures2::default()
+            .features(
+                vk::PhysicalDeviceFeatures::default().robust_buffer_access(offers_robustness2),
+            )
             .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13)
             .push_next(&mut fcoop);
         if offers_executables {
             features = features.push_next(&mut fexec);
+        }
+        if offers_robustness2 {
+            features = features.push_next(&mut frobust);
         }
         let priorities = [1.0];
         let queues = [vk::DeviceQueueCreateInfo::default()
@@ -187,6 +216,9 @@ impl Context {
         let mut extensions: Vec<_> = REQUIRED_EXTENSIONS.iter().map(|e| e.as_ptr()).collect();
         if offers_executables {
             extensions.push(executables_ext.as_ptr());
+        }
+        if offers_robustness2 {
+            extensions.push(ash::ext::robustness2::NAME.as_ptr());
         }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
@@ -254,6 +286,7 @@ impl Context {
                 device,
                 report,
                 executables,
+                robust_buffer_access2: offers_robustness2,
                 queue_family,
                 submit: Mutex::new(submit),
                 instance,
@@ -278,6 +311,12 @@ impl Context {
         self.inner.executables.is_some()
     }
 
+    /// Whether `robustBufferAccess2` is enabled: then a kernel's access past the range bound to
+    /// it reads zero and writes nothing. On when the device offers `VK_EXT_robustness2`.
+    pub fn robust_buffer_access2(&self) -> bool {
+        self.inner.robust_buffer_access2
+    }
+
     /// Whether the Khronos validation layer is attached ([`VALIDATION_VAR`](crate::VALIDATION_VAR)).
     pub fn validating(&self) -> bool {
         self.inner.instance.validating()
@@ -296,6 +335,17 @@ impl Context {
     /// A compute pipeline from a SPIR-V module.
     pub fn kernel(&self, spirv: &[u8], desc: &KernelDesc<'_>) -> Result<Kernel> {
         Kernel::new(&self.inner, spirv, desc)
+    }
+
+    /// Records `dispatches` over `buffers` into one command buffer, to be submitted as often
+    /// as needed ([`Recording`]).
+    pub fn record(
+        &self,
+        buffers: Vec<Buffer>,
+        dispatches: &[Dispatch],
+        timed: bool,
+    ) -> Result<Recording> {
+        Recording::new(&self.inner, buffers, dispatches, timed)
     }
 
     /// Runs `kernel` over a grid of `groups` workgroups with `buffers` bound in order,

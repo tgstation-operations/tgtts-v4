@@ -6,13 +6,17 @@
 //!
 //! - [`Context::new`] opens the Vulkan loader, chooses the device ([`select`]) and creates it with
 //!   the features the kernels need: Vulkan 1.3, cooperative matrices, subgroup size control, f16
-//!   arithmetic and storage, the Vulkan memory model, and a compute queue with timestamps.
+//!   arithmetic and storage, the Vulkan memory model, and a compute queue with timestamps; and
+//!   `robustBufferAccess2` where the device has it.
 //! - [`DeviceReport`] is what the device says about itself; the `properties` example prints it.
 //! - [`Context::buffer`] makes a storage buffer the CPU reads and writes in place ([`memory`]
 //!   says which memory and why).
 //! - [`Context::kernel`] builds a compute pipeline from a SPIR-V blob with an explicit subgroup
 //!   size and specialization constants ([`kernel`]).
 //! - [`Context::dispatch`] runs it, waits, and returns the GPU time from timestamps.
+//! - [`Context::record`] records a chain of dispatches with the barriers between them into one
+//!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
+//!   each dispatch when asked.
 //! - [`Kernel::executables`] says what the driver compiled it into: the subgroup size it runs at,
 //!   its registers and occupancy, and the machine code ([`executable`]).
 //!
@@ -27,6 +31,7 @@ pub mod executable;
 mod instance;
 pub mod kernel;
 pub mod memory;
+pub mod recording;
 pub mod report;
 pub mod select;
 pub mod spirv;
@@ -37,4 +42,5 @@ pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};
 pub use kernel::{Kernel, KernelDesc, SpecValue};
 pub use memory::Buffer;
+pub use recording::{Binding, Dispatch, Recording};
 pub use report::DeviceReport;

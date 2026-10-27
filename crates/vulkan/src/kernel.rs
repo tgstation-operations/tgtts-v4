@@ -109,7 +109,7 @@ impl Default for KernelDesc<'_> {
 
 /// A compute pipeline and the layout it binds through.
 pub struct Kernel {
-    ctx: Arc<Inner>,
+    pub(crate) ctx: Arc<Inner>,
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) layout: vk::PipelineLayout,
     pub(crate) set_layout: vk::DescriptorSetLayout,
