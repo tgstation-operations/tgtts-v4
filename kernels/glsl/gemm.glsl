@@ -4,8 +4,9 @@
 // reading 16 contiguous bytes of each row per step, and sums every row against every token in
 // f32: each weight is read once for all the tokens.
 //
-// The including kernel declares K, KC, M, ROWS, the SLOTS of ROWS rows there are and the `w`
-// buffer, then includes this, defines `stage`, `rows_of` and `epilogue`, and calls `run`.
+// The including kernel declares K, KC, M, ROWS, the SLOTS of ROWS rows there are, SPLIT and
+// the `w` buffer, then includes this, defines `stage`, `rows_of` and `epilogue`, and calls
+// `run`.
 #extension GL_KHR_shader_subgroup_clustered : require
 
 // A literal, as glslang takes a cluster size; it divides every subgroup size there is.
@@ -95,26 +96,27 @@ void load_chunk(uint rows[ROWS], uint chunk, out uvec4 ws[LOADS]) {
 
 // The rows of `slot` of the SLOTS sets of ROWS rows times every token, chunk by chunk: each
 // chunk of the rows is loaded while the one before is summed, the first before the tokens are
-// staged, so that the weights stream while the workgroup computes.
-void sum_rows(uint slot, uint summed, inout float acc[SUMS]) {
+// staged, so that the weights stream while the workgroup computes. When SPLIT, a workgroup sums
+// only chunk WorkGroupID.y.
+void sum_rows(uint slot, uint first, uint summed, inout float acc[SUMS]) {
     uint rows[ROWS];
     rows_of(slot, rows);
     [[unroll]] for (uint j = 0; j < SUMS; j++) {
         acc[j] = 0.0;
     }
     uvec4 next[LOADS];
-    load_chunk(rows, 0, next);
+    load_chunk(rows, first, next);
     for (uint c = 0; c < summed; c++) {
         uvec4 ws[LOADS];
         [[unroll]] for (uint j = 0; j < LOADS; j++) {
             ws[j] = next[j];
         }
         if (c + 1 < summed) {
-            load_chunk(rows, c + 1, next);
+            load_chunk(rows, first + c + 1, next);
         }
         if (summed > 1) {
             barrier();
-            stage(c);
+            stage(first + c);
             barrier();
         }
         accumulate(ws, acc);
@@ -134,10 +136,12 @@ void sum_rows(uint slot, uint summed, inout float acc[SUMS]) {
 // A slot's first chunk is not loaded while the slot before is summed: the registers that would
 // take are what lets the compiler issue the tokens' loads from shared memory early.
 void run() {
+    const uint SUMMED = SPLIT ? 1 : CHUNKS;
+    uint first = SPLIT ? gl_WorkGroupID.y : 0;
     float acc[SUMS];
-    if (CHUNKS == 1) {
+    if (SUMMED == 1) {
         barrier();
-        stage(0);
+        stage(first);
         barrier();
         const uint PER_SUBGROUP = SUBGROUP / CLUSTER;
         uint cluster = gl_SubgroupInvocationID / CLUSTER;
@@ -145,12 +149,12 @@ void run() {
         uint units = SLOTS / PER_SUBGROUP;
         for (uint unit = gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID; unit < units;
              unit += stride) {
-            sum_rows(unit * PER_SUBGROUP + cluster, 1, acc);
+            sum_rows(unit * PER_SUBGROUP + cluster, first, 1, acc);
         }
     } else {
         for (uint block = gl_WorkGroupID.x; block < SLOTS / CLUSTERS;
              block += gl_NumWorkGroups.x) {
-            sum_rows(block * CLUSTERS + cluster_id(), CHUNKS, acc);
+            sum_rows(block * CLUSTERS + cluster_id(), first, SUMMED, acc);
         }
     }
 }

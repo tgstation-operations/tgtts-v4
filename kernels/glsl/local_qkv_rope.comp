@@ -19,6 +19,7 @@ layout(constant_id = 9) const uint PAIRS = 1;
 layout(constant_id = 10) const uint KC = 1024;
 layout(constant_id = 11) const uint SLOTS = 1024;
 const uint ROWS = 2 * PAIRS;
+const bool SPLIT = false;
 const uint HALF = HEAD_DIM / 2;
 
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };

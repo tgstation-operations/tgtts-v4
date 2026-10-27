@@ -1,0 +1,63 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// W x over one chunk of KC of K columns for each of the M tokens of a local stack, the row of
+// workgroups WorkGroupID.y taking chunk WorkGroupID.y: o_proj and down_proj cut along their
+// columns too, so that a workgroup stages its chunk of the tokens once for many rows, for
+// local_combine to join with the residual. W is N x K, ROWS rows to a cluster; x is `[M][K]`,
+// and the partial products `[K / KC][M][N]`, in f32.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint K = 4096;
+layout(constant_id = 3) const uint KC = 1024;
+layout(constant_id = 4) const uint M = 22;
+layout(constant_id = 5) const uint N = 1024;
+layout(constant_id = 6) const uint ROWS = 1;
+layout(constant_id = 7) const uint SLOTS = 1024;
+
+const bool SPLIT = true;
+
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 2) writeonly buffer Partial { float partial[]; };
+
+#include "gemm.glsl"
+
+void stage(uint chunk) {
+    uvec4 tokens[STAGED];
+    [[unroll]] for (uint i = 0; i < STAGED; i++) {
+        uint v = i * WORKGROUP + gl_LocalInvocationID.x;
+        if (v < M * (KC / 8)) {
+            tokens[i] = x[staged_at(v, chunk)];
+        }
+    }
+    [[unroll]] for (uint i = 0; i < STAGED; i++) {
+        uint v = i * WORKGROUP + gl_LocalInvocationID.x;
+        if (v < M * (KC / 8)) {
+            xs[v] = tokens[i];
+        }
+    }
+}
+
+void rows_of(uint slot, out uint rows[ROWS]) {
+    uint first = slot * ROWS;
+    [[unroll]] for (uint r = 0; r < ROWS; r++) {
+        rows[r] = first + r;
+    }
+}
+
+void epilogue(uint rows[ROWS], float acc[SUMS]) {
+    [[unroll]] for (uint r = 0; r < ROWS; r++) {
+        float sums[PER_LANE];
+        mine(acc, r, sums);
+        [[unroll]] for (uint t = 0; t < PER_LANE; t++) {
+            uint m = t * CLUSTER + cluster_lane();
+            if (m < M) {
+                partial[(gl_WorkGroupID.y * M + m) * N + rows[r]] = sums[t];
+            }
+        }
+    }
+}
+
+void main() {
+    run();
+}

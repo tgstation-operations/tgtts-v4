@@ -47,6 +47,18 @@ pub static LOCAL_GATE_UP: KernelInfo = KernelInfo {
     access: &[Read, Read, Read, Write],
 };
 
+/// `local_partial.comp`: x, W -> partial products over chunks of the columns.
+pub static LOCAL_PARTIAL: KernelInfo = KernelInfo {
+    name: "local_partial",
+    access: &[Read, Read, Write],
+};
+
+/// `local_combine.comp`: partial products, residual -> out.
+pub static LOCAL_COMBINE: KernelInfo = KernelInfo {
+    name: "local_combine",
+    access: &[Read, Read, Write],
+};
+
 /// `local_embed.comp`: frames, W, bias, tokens -> some of a stack's input tokens.
 pub static LOCAL_EMBED: KernelInfo = KernelInfo {
     name: "local_embed",
@@ -134,8 +146,11 @@ pub struct Tuning {
     pub down_rows: u32,
     /// The columns of the tokens each projection stages at once.
     pub chunk: u32,
-    /// The workgroups each projection dispatches, which share its rows out: one to each
-    /// workgroup's worth of rows when 0.
+    /// Whether the output and down projections are cut along their columns too, a chunk to
+    /// each row of workgroups, and joined with the residual by a dispatch of their own.
+    pub split: bool,
+    /// The workgroups each projection dispatches, which share its rows out, over its parts when
+    /// it is cut along its columns: one to each workgroup's worth of rows when 0.
     pub groups: u32,
 }
 
@@ -151,15 +166,17 @@ impl Tuning {
             o_rows: 1,
             down_rows: 1,
             chunk: 1024,
+            split: false,
             groups: 0,
         }
     }
 
     /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for
     /// that the device can require; on a device that says how many compute units it has, one
-    /// workgroup to each. On the Radeon 8060S, whose 40 compute units each hold one workgroup's
-    /// 22 tokens at once, the sampler's ten steps took 37.7 ms on the GPU so, and about 50 ms
-    /// at one workgroup to each workgroup's worth of rows.
+    /// workgroup to each, the output and down projections cut along their columns. On the
+    /// Radeon 8060S, whose 40 compute units each hold one workgroup's 22 tokens at once, the
+    /// sampler's ten steps took 28.6 ms on the GPU so, and about 50 ms at one workgroup to each
+    /// workgroup's worth of rows.
     pub fn for_device(report: &DeviceReport) -> Result<Self, Error> {
         let base = decode::Tuning::for_device(report)?;
         let units = report
@@ -167,6 +184,7 @@ impl Tuning {
             .and_then(|core| core.active_compute_units);
         Ok(match units {
             Some(units) => Tuning {
+                split: true,
                 groups: units,
                 ..Tuning::for_subgroup(base.subgroup)
             },
@@ -244,9 +262,22 @@ pub struct Stack {
 struct Pipelines {
     qkv: (Pipeline, u32),
     attention: (Pipeline, u32),
-    o: (Pipeline, u32),
+    o: Residual,
     gate_up: (Pipeline, u32),
-    down: (Pipeline, u32),
+    down: Residual,
+}
+
+/// How a projection with the residual add after it is dispatched.
+#[derive(Clone, Debug)]
+enum Residual {
+    /// At once.
+    Whole(Pipeline, u32),
+    /// Over `parts` chunks of its columns, and joined with the residual after.
+    Split {
+        partial: (Pipeline, [u32; 3]),
+        combine: (Pipeline, u32),
+        parts: usize,
+    },
 }
 
 impl Stack {
@@ -335,26 +366,38 @@ impl Stack {
             ],
         );
         let attention_groups = (m * s.heads).div_ceil(clusters) as u32;
-        let residual = |k: usize, rows: u32| -> Result<(Pipeline, u32), Error> {
-            let (slots, groups) = slots(
-                "residual rows",
-                s.hidden,
-                rows as usize,
-                clusters,
-                tuning.groups,
-            )?;
-            let pipeline = pipeline(
-                &LOCAL_RESIDUAL,
-                &[
-                    (2, u(k)),
-                    (3, u(chunk.min(k))),
-                    (4, u(m)),
-                    (5, u(s.hidden)),
-                    (6, SpecValue::U32(rows)),
-                    (7, SpecValue::U32(slots)),
-                ],
-            );
-            Ok((pipeline, groups))
+        let residual = |k: usize, rows: u32| -> Result<Residual, Error> {
+            let parts = k / chunk.min(k);
+            let groups = match tuning.groups {
+                0 => 0,
+                all if tuning.split => (all / parts as u32).max(1),
+                all => all,
+            };
+            let (slots, groups) =
+                slots("residual rows", s.hidden, rows as usize, clusters, groups)?;
+            let constants = |kernel| {
+                pipeline(
+                    kernel,
+                    &[
+                        (2, u(k)),
+                        (3, u(chunk.min(k))),
+                        (4, u(m)),
+                        (5, u(s.hidden)),
+                        (6, SpecValue::U32(rows)),
+                        (7, SpecValue::U32(slots)),
+                    ],
+                )
+            };
+            if !tuning.split {
+                return Ok(Residual::Whole(constants(&LOCAL_RESIDUAL), groups));
+            }
+            let len = m * s.hidden;
+            let combine = pipeline(&LOCAL_COMBINE, &[(2, u(len)), (3, u(parts))]);
+            Ok(Residual::Split {
+                partial: (constants(&LOCAL_PARTIAL), [groups, parts as u32, 1]),
+                combine: (combine, len.div_ceil(workgroup as usize) as u32),
+                parts,
+            })
         };
         let (gate_up_slots, gate_up_groups) = slots(
             "gate/up row pairs",
@@ -456,17 +499,53 @@ impl Stack {
                 &[input, t.input_norm, t.qkv, self.cos, self.sin, q, k, v],
             );
             op(g, "attention", &p.attention, &[q, k, v, attended]);
-            op(g, "o_proj", &p.o, &[attended, t.o, input, mid]);
+            self.residual(g, &label("o_proj"), &p.o, [attended, t.o, input, mid]);
             op(
                 g,
                 "gate_up",
                 &p.gate_up,
                 &[mid, t.post_norm, t.gate_up, mlp],
             );
-            op(g, "down_proj", &p.down, &[mlp, t.down, mid, output]);
+            self.residual(g, &label("down_proj"), &p.down, [mlp, t.down, mid, output]);
             input = output;
         }
         input
+    }
+
+    /// Appends the projection `x` -> `out` by `w` with the residual `residual` added after, as
+    /// `how` dispatches it, labelled `label`.
+    fn residual(
+        &self,
+        g: &mut Graph,
+        label: &str,
+        how: &Residual,
+        [x, w, residual, out]: [TensorId; 4],
+    ) {
+        match how {
+            Residual::Whole(pipeline, groups) => {
+                g.op(
+                    label,
+                    pipeline.clone(),
+                    &[x, w, residual, out],
+                    [*groups, 1, 1],
+                );
+            }
+            Residual::Split {
+                partial,
+                combine,
+                parts,
+            } => {
+                let bytes = 4 * (parts * self.tokens() * self.shape.hidden) as u64;
+                let partials = g.tensor(format!("{label}.partial"), bytes, Kind::Intermediate);
+                g.op(label, partial.0.clone(), &[x, w, partials], partial.1);
+                g.op(
+                    format!("{label}_combine"),
+                    combine.0.clone(),
+                    &[partials, residual, out],
+                    [combine.1, 1, 1],
+                );
+            }
+        }
     }
 
     /// Writes the rotation tables into `step`, recorded from `graph`, and the weights of the

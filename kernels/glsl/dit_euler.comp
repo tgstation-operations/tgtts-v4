@@ -19,6 +19,7 @@ layout(constant_id = 8) const float DT = 0.1;
 layout(constant_id = 9) const uint ROWS = 4;
 
 const uint KC = K;
+const bool SPLIT = false;
 const uint M = 2 * FRAMES;
 const uint SLOTS = CHANNELS / ROWS;
 const uint LEN = CHANNELS * FRAMES;

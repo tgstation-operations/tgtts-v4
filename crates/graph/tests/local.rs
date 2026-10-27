@@ -248,7 +248,8 @@ fn rounded(cases: Vec<Case>) -> Vec<Case> {
 
 /// The tunings each kernel is checked at, at either subgroup size: one row or pair to a cluster
 /// and more, in workgroups of 128 to 1024, one to each block of rows or fewer, which then take
-/// several in turn, the tokens staged in chunks of 1024 columns and fewer.
+/// several in turn, the tokens staged in chunks of 1024 columns and fewer, and the output and
+/// down projections cut along their columns or not.
 fn tunings(ctx: &Context) -> Vec<Tuning> {
     let report = ctx.report();
     [64, 32]
@@ -280,7 +281,22 @@ fn tunings(ctx: &Context) -> Vec<Tuning> {
                 cut(256, 1, 1, 1, 512, 80),
                 cut(512, 1, 1, 1, 1024, 40),
                 cut(1024, 1, 1, 1, 1024, 0),
-                cut(256, 1, 1, 1, 1024, 24),
+                Tuning {
+                    split: true,
+                    ..cut(256, 1, 1, 1, 1024, 40)
+                },
+                Tuning {
+                    split: true,
+                    ..cut(256, 1, 1, 1, 1024, 24)
+                },
+                Tuning {
+                    split: true,
+                    ..cut(256, 1, 1, 1, 1024, 80)
+                },
+                Tuning {
+                    split: true,
+                    ..cut(128, 1, 2, 2, 512, 0)
+                },
             ]
         })
         .collect()
