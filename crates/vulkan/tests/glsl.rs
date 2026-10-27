@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use half::f16;
-use vulkan::{Buffer, Context, Kernel, KernelDesc, SpecValue};
+use vulkan::{Buffer, Context, Kernel, KernelDesc, Residence, SpecValue};
 
 const WORKGROUP: u32 = 256;
 
@@ -80,14 +80,18 @@ fn bits(values: &[f16]) -> Vec<u16> {
     values.iter().map(|v| v.to_bits()).collect()
 }
 
+/// The kernels' inputs in the GPU's own memory, as a model's weights are.
 fn buffer_of(ctx: &Context, values: &[f16]) -> Buffer {
-    let mut b = ctx.buffer(2 * values.len() as u64).unwrap();
-    b.write(&bits(values));
+    let mut b = ctx
+        .buffer_in(2 * values.len() as u64, Residence::Device)
+        .unwrap();
+    b.write(&bits(values)).unwrap();
     b
 }
 
 fn read_f16(b: &Buffer) -> Vec<f64> {
     b.read::<u16>()
+        .unwrap()
         .into_iter()
         .map(|h| f16::from_bits(h).to_f64())
         .collect()
@@ -187,7 +191,7 @@ fn rmsnorm_rounds_as_upstream_in_f16() {
         ];
         let kernel = kernel(&ctx, "rmsnorm", 3, Some(subgroup as u32), &constants);
         let (mut xb, mut gb) = (buffer_of(&ctx, &x), buffer_of(&ctx, &g));
-        let mut out = ctx.buffer(2 * k as u64).unwrap();
+        let mut out = ctx.buffer_in(2 * k as u64, Residence::Readback).unwrap();
         let ns = timed(&ctx, &kernel, &mut [&mut xb, &mut gb, &mut out], [1, 1, 1]);
         let got = read_f16(&out);
         let want = rmsnorm(&x, &g, eps);
@@ -260,7 +264,7 @@ fn gemv_with_the_residual_sums_in_f32_and_keeps_subnormal_weights() {
         let mut xb = buffer_of(&ctx, &case.x);
         let mut wb = buffer_of(&ctx, &case.w);
         let mut rb = buffer_of(&ctx, &case.residual);
-        let mut out = ctx.buffer(2 * n as u64).unwrap();
+        let mut out = ctx.buffer_in(2 * n as u64, Residence::Readback).unwrap();
         let groups = (n / (WORKGROUP as usize / subgroup * rows)) as u32;
         let mut ns = Vec::new();
         for _ in 0..4 {
@@ -343,7 +347,9 @@ fn gate_up_is_silu_of_the_gate_times_up_after_the_norm() {
         let mut xb = buffer_of(&ctx, &case.x);
         let mut gb = buffer_of(&ctx, &g);
         let mut wb = buffer_of(&ctx, &case.w);
-        let mut out = ctx.buffer(2 * inner as u64).unwrap();
+        let mut out = ctx
+            .buffer_in(2 * inner as u64, Residence::Readback)
+            .unwrap();
         let groups = (inner / (WORKGROUP as usize / subgroup * pairs)) as u32;
         let mut ns = Vec::new();
         for _ in 0..4 {
@@ -442,12 +448,14 @@ fn qkv_projects_rotates_and_writes_the_cache_at_the_position() {
         let mut gb = buffer_of(&ctx, &g);
         let mut wb = buffer_of(&ctx, &case.w);
         let mut cb = ctx.buffer(4 * cos.len() as u64).unwrap();
-        cb.write(&cos);
+        cb.write(&cos).unwrap();
         let mut sb = ctx.buffer(4 * sin.len() as u64).unwrap();
-        sb.write(&sin);
+        sb.write(&sin).unwrap();
         let mut pb = ctx.buffer(4).unwrap();
-        pb.write(&[position as u32]);
-        let mut qb = ctx.buffer(2 * (heads * dim) as u64).unwrap();
+        pb.write(&[position as u32]).unwrap();
+        let mut qb = ctx
+            .buffer_in(2 * (heads * dim) as u64, Residence::Readback)
+            .unwrap();
         let cache = vec![sentinel; kv_heads * capacity * dim];
         let (mut kb, mut vb) = (buffer_of(&ctx, &cache), buffer_of(&ctx, &cache));
         let groups = (rows / 2 / (WORKGROUP as usize / subgroup * pairs)) as u32;
@@ -617,10 +625,16 @@ fn split_attention_joined_matches_softmax_attention_up_to_the_position() {
             let mut kb = buffer_of(&ctx, &k_here);
             let mut vb = buffer_of(&ctx, &v_here);
             let mut pb = ctx.buffer(4).unwrap();
-            pb.write(&[position as u32]);
-            let mut ob = ctx.buffer((heads * chunks * dim * 4) as u64).unwrap();
-            let mut mlb = ctx.buffer((heads * chunks * 8) as u64).unwrap();
-            let mut out = ctx.buffer((heads * dim * 2) as u64).unwrap();
+            pb.write(&[position as u32]).unwrap();
+            let mut ob = ctx
+                .buffer_in((heads * chunks * dim * 4) as u64, Residence::Device)
+                .unwrap();
+            let mut mlb = ctx
+                .buffer_in((heads * chunks * 8) as u64, Residence::Device)
+                .unwrap();
+            let mut out = ctx
+                .buffer_in((heads * dim * 2) as u64, Residence::Readback)
+                .unwrap();
             let split_ns = timed(
                 &ctx,
                 &split,
@@ -674,8 +688,8 @@ fn streaming_reads_reach_the_bandwidth_the_kernels_are_held_to() {
         })
         .collect();
     let want = pattern.iter().fold(0, |a, &w| a ^ w);
-    let mut data = ctx.buffer(bytes as u64).unwrap();
-    data.write(&pattern);
+    let mut data = ctx.buffer_in(bytes as u64, Residence::Device).unwrap();
+    data.write(&pattern).unwrap();
     drop(pattern);
     for (subgroup, loads) in [(64, 1), (64, 4), (64, 16), (32, 4)] {
         let k = kernel(
@@ -691,11 +705,13 @@ fn streaming_reads_reach_the_bandwidth_the_kernels_are_held_to() {
         );
         let groups = (bytes / 16 / (WORKGROUP * loads) as usize) as u32;
         let subgroups = (WORKGROUP / subgroup) as u64;
-        let mut out = ctx.buffer(4 * u64::from(groups) * subgroups).unwrap();
+        let mut out = ctx
+            .buffer_in(4 * u64::from(groups) * subgroups, Residence::Readback)
+            .unwrap();
         let mut ns: Vec<f64> = (0..10)
             .map(|_| timed(&ctx, &k, &mut [&mut data, &mut out], [groups, 1, 1]))
             .collect();
-        let got = out.read::<u32>().iter().fold(0, |a, &w| a ^ w);
+        let got = out.read::<u32>().unwrap().iter().fold(0, |a, &w| a ^ w);
         assert_eq!(
             got, want,
             "wave{subgroup}, {loads} loads: a read was left out"

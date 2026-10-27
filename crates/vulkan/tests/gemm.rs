@@ -390,8 +390,10 @@ fn run(ctx: &Context, gemm: &Gemm, a: &[f16], b: &[f16], reps: usize) -> Run {
     let buffer = |len: usize| ctx.buffer(len as u64).unwrap_or_else(|e| panic!("{e}"));
     let (mut ab, mut bb) = (buffer(2 * a.len()), buffer(2 * b.len()));
     let mut cb = buffer(gemm.acc.bytes() * gemm.shape.m * gemm.shape.n);
-    ab.write(&a.iter().map(|v| v.to_bits()).collect::<Vec<u16>>());
-    bb.write(&b.iter().map(|v| v.to_bits()).collect::<Vec<u16>>());
+    ab.write(&a.iter().map(|v| v.to_bits()).collect::<Vec<u16>>())
+        .unwrap();
+    bb.write(&b.iter().map(|v| v.to_bits()).collect::<Vec<u16>>())
+        .unwrap();
     let nanoseconds = (0..reps)
         .map(|_| {
             ctx.dispatch(&gemm.kernel, &mut [&mut ab, &mut bb, &mut cb], gemm.grid)
@@ -402,10 +404,16 @@ fn run(ctx: &Context, gemm: &Gemm, a: &[f16], b: &[f16], reps: usize) -> Run {
     let c = match gemm.acc {
         Acc::F16 => cb
             .read::<u16>()
+            .unwrap()
             .into_iter()
             .map(|h| f16::from_bits(h).to_f64())
             .collect(),
-        Acc::F32 => cb.read::<f32>().into_iter().map(f64::from).collect(),
+        Acc::F32 => cb
+            .read::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f64::from)
+            .collect(),
     };
     Run { c, nanoseconds }
 }

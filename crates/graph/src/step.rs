@@ -1,10 +1,11 @@
-//! A [`Graph`] made runnable: its arena and buffers allocated as [`plan`] lays them out, and its
+//! A [`Graph`] made runnable: its arena and buffers allocated as [`plan`] lays them out, each in
+//! the memory its kind wants ([`Kind::residence`](crate::graph::Kind::residence)), and its
 //! dispatches recorded once, with the barriers [`barriers`] finds, into a [`Recording`]
 //! submitted every step.
 
 use std::time::{Duration, Instant};
 
-use vulkan::{Binding, Context, Dispatch, Recording, Timing};
+use vulkan::{Binding, Context, Dispatch, Recording, Residence, Timing, memory::Plain};
 
 use crate::{
     Error,
@@ -20,28 +21,6 @@ enum Place {
     /// In a buffer of its own.
     Own(usize),
 }
-
-/// A value the host writes into a tensor or reads out of it.
-pub trait Scalar: Copy {
-    const SIZE: usize;
-    fn put(self, out: &mut [u8]);
-    fn get(bytes: &[u8]) -> Self;
-}
-
-macro_rules! scalar {
-    ($($t:ty),*) => {$(
-        impl Scalar for $t {
-            const SIZE: usize = size_of::<$t>();
-            fn put(self, out: &mut [u8]) {
-                out.copy_from_slice(&self.to_ne_bytes());
-            }
-            fn get(bytes: &[u8]) -> Self {
-                <$t>::from_ne_bytes(bytes.try_into().expect("a whole value"))
-            }
-        }
-    )*};
-}
-scalar!(u16, u32, f32);
 
 /// A graph recorded for the GPU, with the buffers it binds.
 pub struct Step {
@@ -74,13 +53,13 @@ impl Step {
     ) -> Result<Self, Error> {
         let plan = plan(graph);
         let needs_barrier = barriers(graph, &plan);
-        let mut buffers = vec![ctx.buffer(plan.arena_bytes.max(ALIGN))?];
+        let mut buffers = vec![ctx.buffer_in(plan.arena_bytes.max(ALIGN), Residence::Device)?];
         let mut places = Vec::with_capacity(graph.tensors.len());
         for (tensor, offset) in graph.tensors.iter().zip(&plan.offsets) {
             places.push(match offset {
                 Some(offset) => Place::Arena(*offset),
                 None => {
-                    buffers.push(ctx.buffer(tensor.bytes)?);
+                    buffers.push(ctx.buffer_in(tensor.bytes, tensor.kind.residence())?);
                     Place::Own(buffers.len() - 1)
                 }
             });
@@ -112,39 +91,37 @@ impl Step {
         })
     }
 
-    fn range(&self, t: TensorId) -> (usize, std::ops::Range<usize>) {
-        let len = self.bytes[t.0] as usize;
+    /// The buffer tensor `t` lives in, and where in it.
+    fn place(&self, t: TensorId) -> (usize, u64) {
         match self.places[t.0] {
-            Place::Arena(offset) => (0, offset as usize..offset as usize + len),
-            Place::Own(buffer) => (buffer, 0..len),
+            Place::Arena(offset) => (0, offset),
+            Place::Own(buffer) => (buffer, 0),
         }
     }
 
-    /// Writes `values` into tensor `t`, which they must fill exactly.
+    /// Writes `values` into tensor `t`, which they must fill exactly: in place if the host maps
+    /// it, through a staging copy if it lives in the GPU's own memory.
     ///
     /// # Panics
     ///
-    /// If they do not.
-    pub fn write<T: Scalar>(&mut self, t: TensorId, values: &[T]) {
-        let (buffer, range) = self.range(t);
+    /// If they do not fill it.
+    pub fn write<T: Plain>(&mut self, t: TensorId, values: &[T]) -> Result<(), Error> {
+        let len = self.bytes[t.0];
         assert_eq!(
-            values.len() * T::SIZE,
-            range.len(),
-            "tensor {} is {} bytes",
-            t.0,
-            range.len()
+            size_of_val(values) as u64,
+            len,
+            "tensor {} is {len} bytes",
+            t.0
         );
-        let bytes = &mut self.recording.buffer_mut(buffer).bytes_mut()[range];
-        for (v, out) in values.iter().zip(bytes.chunks_exact_mut(T::SIZE)) {
-            v.put(out);
-        }
+        let (buffer, offset) = self.place(t);
+        Ok(self.recording.buffer_mut(buffer).write_at(offset, values)?)
     }
 
     /// Tensor `t`'s contents.
-    pub fn read<T: Scalar>(&self, t: TensorId) -> Vec<T> {
-        let (buffer, range) = self.range(t);
-        let bytes = &self.recording.buffer(buffer).bytes()[range];
-        bytes.chunks_exact(T::SIZE).map(T::get).collect()
+    pub fn read<T: Plain>(&self, t: TensorId) -> Result<Vec<T>, Error> {
+        let (buffer, offset) = self.place(t);
+        let count = self.bytes[t.0] as usize / size_of::<T>();
+        Ok(self.recording.buffer(buffer).read_at(offset, count)?)
     }
 
     /// Runs the step once and waits for it.

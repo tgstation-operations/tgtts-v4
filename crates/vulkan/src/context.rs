@@ -6,7 +6,7 @@ use crate::{
     error::{Error, Result, VkCall},
     instance::Instance,
     kernel::{Kernel, KernelDesc},
-    memory::Buffer,
+    memory::{Buffer, Residence},
     recording::{Dispatch, Recording},
     report::DeviceReport,
     select::{self, Features, REQUIRED_EXTENSIONS},
@@ -81,6 +81,50 @@ pub(crate) struct Inner {
     pub(crate) submit: Mutex<Submit>,
     /// Dropped after `device` is destroyed in `Drop::drop`.
     instance: Instance,
+}
+
+impl Inner {
+    /// Records commands with `record` into the shared command buffer, submits them, and waits
+    /// for them to finish.
+    pub(crate) fn run_once(
+        &self,
+        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+    ) -> Result<()> {
+        let submit = self
+            .submit
+            .lock()
+            .map_err(|_| Error::Unsupported("a poisoned queue lock".into()))?;
+        let device = &self.device;
+        let cmd = submit.commands;
+        // SAFETY: the command buffer is not pending (every user waits for its fence before
+        // releasing the lock), and `record` records only objects its caller keeps alive until
+        // this returns.
+        unsafe {
+            device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .call("vkResetCommandBuffer")?;
+            device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .call("vkBeginCommandBuffer")?;
+            record(device, cmd);
+            device.end_command_buffer(cmd).call("vkEndCommandBuffer")?;
+            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            let submits = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
+            device
+                .queue_submit2(submit.queue, &submits, submit.fence)
+                .call("vkQueueSubmit2")?;
+            // On a timeout the work is still pending, and this context must not be used again.
+            device
+                .wait_for_fences(&[submit.fence], true, FENCE_TIMEOUT_NS)
+                .call("vkWaitForFences")?;
+            device.reset_fences(&[submit.fence]).call("vkResetFences")?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Inner {
@@ -327,9 +371,15 @@ impl Context {
         self.inner.instance.validation_messages()
     }
 
-    /// A zero-filled storage buffer of `size` bytes, mapped for the CPU.
+    /// A zero-filled storage buffer of `size` bytes, mapped for the host to write in place
+    /// ([`Residence::Upload`]).
     pub fn buffer(&self, size: u64) -> Result<Buffer> {
-        Buffer::new(&self.inner, size)
+        Buffer::new(&self.inner, size, Residence::Upload)
+    }
+
+    /// A zero-filled storage buffer of `size` bytes in `residence`.
+    pub fn buffer_in(&self, size: u64, residence: Residence) -> Result<Buffer> {
+        Buffer::new(&self.inner, size, residence)
     }
 
     /// A compute pipeline from a SPIR-V module.

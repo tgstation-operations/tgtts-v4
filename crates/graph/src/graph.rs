@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use vulkan::SpecValue;
+use vulkan::{Residence, SpecValue};
 
 use crate::kernels::{Access, KernelInfo};
 
@@ -21,9 +21,9 @@ pub enum Kind {
     /// Written by the host before each step, such as the position: small, and read by the
     /// dispatches that need it rather than baked into them.
     Param,
-    /// Written by the host before each step, in the arena.
+    /// Written by the host before each step.
     Input,
-    /// Read by the host after each step, in the arena.
+    /// Read by the host after each step.
     Output,
     /// Written and read within the step, in the arena.
     Intermediate,
@@ -32,7 +32,17 @@ pub enum Kind {
 impl Kind {
     /// Whether tensors of this kind share the step's one arena, each for its lifetime.
     pub fn in_arena(self) -> bool {
-        matches!(self, Kind::Input | Kind::Output | Kind::Intermediate)
+        self == Kind::Intermediate
+    }
+
+    /// Where a tensor of this kind lives: the GPU's own memory for what only the GPU touches
+    /// every step, mapped memory for what the host writes or reads every step.
+    pub fn residence(self) -> Residence {
+        match self {
+            Kind::Constant | Kind::State | Kind::Intermediate => Residence::Device,
+            Kind::Param | Kind::Input => Residence::Upload,
+            Kind::Output => Residence::Readback,
+        }
     }
 }
 
@@ -132,10 +142,9 @@ impl Graph {
             .zip(op.pipeline.kernel.access.iter().copied())
     }
 
-    /// The ops each arena tensor is live across, first to last inclusive: an input from the
-    /// start, an output to the end. None for a tensor outside the arena or no op uses.
+    /// The ops each arena tensor is live across, first to last inclusive. None for a tensor
+    /// outside the arena or no op uses.
     pub fn lifetimes(&self) -> Vec<Option<Range<usize>>> {
-        let last = self.ops.len().saturating_sub(1);
         let mut spans: Vec<Option<(usize, usize)>> = vec![None; self.tensors.len()];
         for i in 0..self.ops.len() {
             for (t, _) in self.accesses(i) {
@@ -147,17 +156,8 @@ impl Graph {
             .iter()
             .zip(spans)
             .map(|(tensor, span)| {
-                let (mut first, mut end) = span?;
-                if !tensor.kind.in_arena() {
-                    return None;
-                }
-                if tensor.kind == Kind::Input {
-                    first = 0;
-                }
-                if tensor.kind == Kind::Output {
-                    end = last;
-                }
-                Some(first..end + 1)
+                let (first, end) = span?;
+                tensor.kind.in_arena().then_some(first..end + 1)
             })
             .collect()
     }
@@ -304,46 +304,50 @@ mod tests {
 
     #[test]
     fn tensors_never_live_together_share_the_arena_and_others_never_do() {
-        let (g, [x, a, b, c, out]) = chain();
+        let (g, [_, a, b, c, _]) = chain();
         let lifetimes = g.lifetimes();
-        assert_eq!(lifetimes[x.0], Some(0..1));
+        assert_eq!(lifetimes[a.0], Some(0..2));
         assert_eq!(lifetimes[b.0], Some(1..3));
-        assert_eq!(lifetimes[out.0], Some(3..4));
+        assert_eq!(lifetimes[c.0], Some(2..4));
         let plan = plan(&g);
-        for (s, t) in [(x, a), (a, b), (b, c), (c, out), (x, out)] {
-            if lifetimes[s.0].clone().unwrap().end > lifetimes[t.0].clone().unwrap().start {
-                assert!(!overlaps(&plan, &g, s, t), "{s:?} and {t:?}");
-            }
+        for (s, t) in [(a, b), (b, c)] {
+            assert!(!overlaps(&plan, &g, s, t), "{s:?} and {t:?}");
         }
-        assert!(overlaps(&plan, &g, x, b), "x is dead once a is written");
+        assert!(overlaps(&plan, &g, a, c), "a is dead once c is written");
         // Two live at once at most, each rounded up to the alignment.
         assert_eq!(plan.arena_bytes, 2 * 1024);
-        assert!(plan.offsets.iter().all(|o| o.unwrap() % ALIGN == 0));
+        assert!(plan.offsets.iter().flatten().all(|o| o % ALIGN == 0));
     }
 
     #[test]
-    fn an_input_lives_from_the_start_and_an_output_to_the_end() {
+    fn what_the_host_reaches_and_what_outlives_a_step_have_buffers_of_their_own() {
         let mut g = Graph::default();
         let x = g.tensor("x", 64, Kind::Input);
         let y = g.tensor("y", 64, Kind::Intermediate);
         let z = g.tensor("z", 64, Kind::Intermediate);
         let out = g.tensor("out", 64, Kind::Output);
         let w = g.tensor("w", 64, Kind::Constant);
-        g.op("a", pipeline(&COPY), &[w, y], [1, 1, 1]);
+        let cache = g.tensor("cache", 64, Kind::State);
+        let position = g.tensor("position", 4, Kind::Param);
+        g.op("a", pipeline(&ADD), &[w, position, y], [1, 1, 1]);
         g.op("b", pipeline(&ADD), &[x, y, out], [1, 1, 1]);
-        g.op("c", pipeline(&COPY), &[w, z], [1, 1, 1]);
-        g.op("d", pipeline(&COPY), &[w, z], [1, 1, 1]);
+        g.op("c", pipeline(&ADD), &[w, cache, z], [1, 1, 1]);
+        g.op("d", pipeline(&COPY), &[z, cache], [1, 1, 1]);
         let lifetimes = g.lifetimes();
-        assert_eq!(lifetimes[x.0], Some(0..2), "x is written before the step");
-        assert_eq!(lifetimes[out.0], Some(1..4), "out is read after it");
-        assert_eq!(lifetimes[w.0], None, "a constant has a buffer of its own");
         let plan = plan(&g);
-        assert!(!overlaps(&plan, &g, x, y));
-        assert!(
-            !overlaps(&plan, &g, out, z),
-            "z must not overwrite the output"
-        );
-        assert_eq!(plan.offsets[w.0], None);
+        for t in [x, out, w, cache, position] {
+            assert_eq!(lifetimes[t.0], None, "{}", g.tensors[t.0].name);
+            assert_eq!(plan.offsets[t.0], None, "{}", g.tensors[t.0].name);
+        }
+        assert!(overlaps(&plan, &g, y, z));
+        // Only the host's own tensors are mapped for it.
+        let residence = |t: TensorId| g.tensors[t.0].kind.residence();
+        for t in [w, cache, y, z] {
+            assert_eq!(residence(t), Residence::Device);
+        }
+        assert_eq!(residence(x), Residence::Upload);
+        assert_eq!(residence(position), Residence::Upload);
+        assert_eq!(residence(out), Residence::Readback);
     }
 
     #[test]
@@ -376,12 +380,12 @@ mod tests {
         let a = g.tensor("a", 256, Kind::Intermediate);
         let b = g.tensor("b", 256, Kind::Output);
         let w = g.tensor("w", 256, Kind::Constant);
-        let c = g.tensor("c", 256, Kind::Output);
+        let c = g.tensor("c", 256, Kind::Intermediate);
         g.op("a", pipeline(&COPY), &[x, a], [1, 1, 1]);
         g.op("b", pipeline(&COPY), &[a, b], [1, 1, 1]);
         g.op("c", pipeline(&COPY), &[w, c], [1, 1, 1]);
         let plan = plan(&g);
-        assert!(overlaps(&plan, &g, a, c) || overlaps(&plan, &g, x, c));
+        assert!(overlaps(&plan, &g, a, c));
         assert_eq!(barriers(&g, &plan), [false, true, true]);
         // Planted defect: a planner that put c apart from everything would need no barrier
         // there, so the check is of the bytes, not the names.

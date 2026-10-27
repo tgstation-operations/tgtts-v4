@@ -5,7 +5,9 @@
 
 use std::{sync::Arc, time::Instant};
 
-use vulkan::{Binding, Context, Dispatch, Error, Kernel, KernelDesc, SpecValue, groups_for};
+use vulkan::{
+    Binding, Context, Dispatch, Error, Kernel, KernelDesc, Residence, SpecValue, groups_for,
+};
 
 const AXPB: &[u8] = include_bytes!("kernels/axpb.spv");
 const WIDTH: u32 = 64;
@@ -71,12 +73,15 @@ fn on_the_cpu(x: &[f32]) -> Vec<f32> {
 /// sizes every link writes. The second link reads and writes ranges of buffer 1.
 fn chain(ctx: &Context, kernels: &[Arc<Kernel>], n: usize, timed: bool) -> vulkan::Recording {
     let bytes = 4 * n as u64;
-    let buffer = |size| ctx.buffer(size).unwrap_or_else(|e| panic!("{e}"));
+    let buffer = |size, residence| {
+        ctx.buffer_in(size, residence)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
     let buffers = vec![
-        buffer(bytes),
-        buffer(2 * bytes),
-        buffer(bytes),
-        buffer(bytes),
+        buffer(bytes, Residence::Upload),
+        buffer(2 * bytes, Residence::Device),
+        buffer(bytes, Residence::Readback),
+        buffer(bytes, Residence::Readback),
     ];
     let first = Binding::range(1, 0, bytes);
     let second = Binding::range(1, bytes, bytes);
@@ -120,18 +125,21 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
 
     // The links one at a time, each a submission of its own.
     let x = inputs(n, 1);
-    let buffer = |size| ctx.buffer(size).unwrap_or_else(|e| panic!("{e}"));
-    let mut values = buffer(4 * n as u64);
-    values.write(&x);
-    let mut sizes = buffer(4 * n as u64);
+    let buffer = |residence| {
+        ctx.buffer_in(4 * n as u64, residence)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let mut values = buffer(Residence::Upload);
+    values.write(&x).unwrap();
+    let mut sizes = buffer(Residence::Readback);
     let groups = [groups_for(n as u64, WIDTH) as u32, 1, 1];
     for kernel in &kernels {
-        let mut next = buffer(4 * n as u64);
+        let mut next = buffer(Residence::Readback);
         ctx.dispatch(kernel, &mut [&mut values, &mut next, &mut sizes], groups)
             .unwrap_or_else(|e| panic!("{e}"));
         values = next;
     }
-    let one_at_a_time = values.read::<f32>();
+    let one_at_a_time = values.read::<f32>().unwrap();
     assert_eq!(differences(&one_at_a_time, &on_the_cpu(&x)), 0);
 
     let mut recording = chain(&ctx, &kernels, n, false);
@@ -141,15 +149,22 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
     for step in 0..submissions {
         // A value the host changes between submissions, as a position would be.
         let x = inputs(n, step + 1);
-        recording.buffer_mut(0).write(&x);
+        recording.buffer_mut(0).write(&x).unwrap();
         recording.submit().unwrap_or_else(|e| panic!("{e}"));
-        let got = recording.buffer(2).read::<f32>();
+        let got = recording.buffer(2).read::<f32>().unwrap();
         if step == 0 {
             assert_eq!(differences(&got, &one_at_a_time), 0, "the first submission");
         }
         let wrong = differences(&got, &on_the_cpu(&x));
         assert_eq!(wrong, 0, "submission {step}: {wrong} of {n} differ");
-        assert!(recording.buffer(3).read::<u32>().iter().all(|&s| s == 64));
+        assert!(
+            recording
+                .buffer(3)
+                .read::<u32>()
+                .unwrap()
+                .iter()
+                .all(|&s| s == 64)
+        );
     }
     eprintln!(
         "{submissions} submissions of 3 dispatches over {n} elements, bit-exact each time; \
@@ -166,7 +181,7 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
     let n = 1 << 22;
     let mut recording = chain(&ctx, &kernels, n, true);
     let x = inputs(n, 7);
-    recording.buffer_mut(0).write(&x);
+    recording.buffer_mut(0).write(&x).unwrap();
     for _ in 0..3 {
         let start = Instant::now();
         recording.submit().unwrap_or_else(|e| panic!("{e}"));
@@ -189,7 +204,7 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
         );
     }
     assert_eq!(
-        differences(&recording.buffer(2).read::<f32>(), &on_the_cpu(&x)),
+        differences(&recording.buffer(2).read::<f32>().unwrap(), &on_the_cpu(&x)),
         0
     );
     let untimed = chain(&ctx, &kernels, 64, false);

@@ -9,8 +9,10 @@
 //!   arithmetic and storage, the Vulkan memory model, and a compute queue with timestamps; and
 //!   `robustBufferAccess2` where the device has it.
 //! - [`DeviceReport`] is what the device says about itself; the `properties` example prints it.
-//! - [`Context::buffer`] makes a storage buffer the CPU reads and writes in place ([`memory`]
-//!   says which memory and why).
+//! - [`Context::buffer_in`] makes a storage buffer where its [`Residence`] says: in the GPU's
+//!   own memory, which the host fills and reads through staging copies, or mapped for the host
+//!   to write or read in place ([`memory`] says which memory and why); [`Context::buffer`] is
+//!   the mapped kind the host writes.
 //! - [`Context::kernel`] builds a compute pipeline from a SPIR-V blob with an explicit subgroup
 //!   size and specialization constants ([`kernel`]).
 //! - [`Context::dispatch`] runs it, waits, and returns the GPU time from timestamps.
@@ -41,6 +43,6 @@ pub use error::{Error, Result};
 pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};
 pub use kernel::{Kernel, KernelDesc, SpecValue};
-pub use memory::Buffer;
+pub use memory::{Buffer, Residence};
 pub use recording::{Binding, Dispatch, Recording};
 pub use report::DeviceReport;

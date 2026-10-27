@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use ash::vk;
 use vulkan::{
-    Context, Error, KernelDesc, SpecValue, groups_for,
+    Context, Error, KernelDesc, Residence, SpecValue, groups_for,
     kernel::required_subgroup_size_allowed,
-    memory::{STORAGE_PREFERENCE, choose_memory_type},
+    memory::{STAGING_BYTES, choose_memory_type},
 };
 
 /// `y[i] = a * x[i] + b; s[i] = SubgroupSize` (source and build command in
@@ -87,19 +87,24 @@ fn run_axpb(
     };
     let kernel = ctx.kernel(AXPB, &desc).unwrap_or_else(|e| panic!("{e}"));
     let n = x.len() as u64;
-    let buffer = |bytes| ctx.buffer(bytes).unwrap_or_else(|e| panic!("{e}"));
-    let (mut xs, mut ys, mut ss) = (buffer(4 * n), buffer(4 * (n + 1)), buffer(4 * (n + 1)));
-    xs.write(x);
+    let buffer = |bytes, residence| {
+        ctx.buffer_in(bytes, residence)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let mut xs = buffer(4 * n, Residence::Upload);
+    let mut ys = buffer(4 * (n + 1), Residence::Readback);
+    let mut ss = buffer(4 * (n + 1), Residence::Readback);
+    xs.write(x).unwrap();
     let mut sentinel = vec![0f32; x.len()];
     sentinel.push(-12_345.0);
-    ys.write(&sentinel);
+    ys.write(&sentinel).unwrap();
     let groups = u32::try_from(groups_for(n, width))
         .unwrap_or_else(|_| panic!("{n} elements is too many workgroups"));
     let timing = ctx
         .dispatch(&kernel, &mut [&mut xs, &mut ys, &mut ss], [groups, 1, 1])
         .unwrap_or_else(|e| panic!("{e}"));
-    let mut y = ys.read::<f32>();
-    let mut s = ss.read::<u32>();
+    let mut y = ys.read::<f32>().unwrap();
+    let mut s = ss.read::<u32>().unwrap();
     assert_eq!(
         y.pop(),
         Some(-12_345.0),
@@ -151,22 +156,25 @@ fn the_device_offers_what_the_runtime_relies_on() {
     }
     assert!(r.timestamp_period > 0.0);
 
-    let chosen =
-        choose_memory_type(&r.types, &r.heaps, u32::MAX, 1 << 20).expect("a storage memory type");
-    assert!(
-        r.types[chosen as usize]
-            .flags
-            .contains(STORAGE_PREFERENCE[0]),
-        "no device-local, host-visible memory type"
-    );
-    let buffer = ctx.buffer(1 << 20).unwrap();
-    assert_eq!(buffer.memory_type(), chosen);
-    assert!(
-        r.types[buffer.memory_type() as usize]
-            .flags
-            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
-        "buffers are not in device-local memory"
-    );
+    // Each residence's buffers in the memory its preference names, wherever the device
+    // offers it; where it does not, the fallbacks still give the GPU device-local memory and
+    // the host mapped memory.
+    for residence in [Residence::Device, Residence::Upload, Residence::Readback] {
+        let buffer = ctx.buffer_in(1 << 20, residence).unwrap();
+        let flags = r.types[buffer.memory_type() as usize].flags;
+        let preferred =
+            choose_memory_type(&r.types, &r.heaps, u32::MAX, 1 << 20, residence).unwrap();
+        eprintln!(
+            "{residence:?} buffers: memory type {} ({flags:?}); the device's preferred is {preferred}",
+            buffer.memory_type()
+        );
+        let needs = if residence.mapped() {
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+        } else {
+            vk::MemoryPropertyFlags::DEVICE_LOCAL
+        };
+        assert!(flags.contains(needs), "{residence:?}: {flags:?}");
+    }
     assert_no_validation_messages(&ctx);
 }
 
@@ -203,6 +211,89 @@ fn axpb_matches_the_cpu_bit_for_bit_at_each_required_subgroup_size() {
             run.nanoseconds / 1e3
         );
     }
+    assert_no_validation_messages(&ctx);
+}
+
+#[test]
+fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
+    let ctx = context();
+    let r = ctx.report();
+    // A quarter of a staging buffer more than one, and not a whole word of it, so that each
+    // transfer below takes a whole chunk and a part of one.
+    let n = (STAGING_BYTES as usize * 5 / 4 + 12) / 4;
+    let device = |bytes| {
+        ctx.buffer_in(bytes, Residence::Device)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let (mut xs, mut ys, mut ss) = (
+        device(4 * n as u64),
+        device(4 * n as u64),
+        device(4 * n as u64),
+    );
+    // Where the device has device-local memory the host cannot map, as the Radeon 8060S and a
+    // discrete GPU do, these buffers are in it, and staging is the host's only way in.
+    let hidden = vk::MemoryPropertyFlags::HOST_VISIBLE;
+    let has_hidden = r.types.iter().any(|t| {
+        t.flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) && !t.flags.intersects(hidden)
+    });
+    for b in [&xs, &ys, &ss] {
+        let flags = r.types[b.memory_type() as usize].flags;
+        assert!(
+            flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            "{flags:?}"
+        );
+        assert!(!has_hidden || !flags.intersects(hidden), "{flags:?}");
+    }
+    assert!(
+        ys.read::<u32>().unwrap().iter().all(|&v| v == 0),
+        "a device buffer starts zero-filled"
+    );
+
+    let x = inputs(n);
+    xs.write(&x).unwrap();
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+    assert!(
+        bits(&xs.read::<f32>().unwrap()) == bits(&x),
+        "x does not come back as written"
+    );
+    let (a, b) = (1.7f32, -0.3f32);
+    let constants = [
+        (WIDTH, SpecValue::U32(64)),
+        (A, SpecValue::F32(a)),
+        (B, SpecValue::F32(b)),
+    ];
+    let desc = KernelDesc {
+        storage_buffers: 3,
+        constants: &constants,
+        ..KernelDesc::default()
+    };
+    let kernel = ctx.kernel(AXPB, &desc).unwrap_or_else(|e| panic!("{e}"));
+    let groups = groups_for(n as u64, 64) as u32;
+    ctx.dispatch(&kernel, &mut [&mut xs, &mut ys, &mut ss], [groups, 1, 1])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let want: Vec<f32> = x.iter().map(|&v| a * v + b).collect();
+    let got = ys.read::<f32>().unwrap();
+    let wrong = (0..n)
+        .filter(|&i| got[i].to_bits() != want[i].to_bits())
+        .count();
+    assert_eq!(wrong, 0, "{wrong} of {n} elements differ from the CPU");
+
+    // A write and a read across the boundary between two chunks, neither at a whole word.
+    let at = STAGING_BYTES - 5;
+    let bytes: Vec<u8> = (1..=11).collect();
+    let around = |b: &vulkan::Buffer| b.read_at::<u8>(at - 1, 13).unwrap();
+    let before = around(&ys);
+    ys.write_at(at, &bytes).unwrap();
+    let after = around(&ys);
+    assert_eq!(after[0], before[0]);
+    assert_eq!(after[1..12], bytes[..]);
+    assert_eq!(after[12], before[12]);
+    eprintln!(
+        "{} MiB through staging each way, in chunks of {} MiB; device memory type {}",
+        (4 * n) >> 20,
+        STAGING_BYTES >> 20,
+        ys.memory_type()
+    );
     assert_no_validation_messages(&ctx);
 }
 

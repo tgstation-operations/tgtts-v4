@@ -1,12 +1,17 @@
 //! Storage buffers, and the memory type they live in.
 //!
-//! On an APU such as the Radeon 8060S the GPU has no memory of its own: every heap the driver
-//! reports is the same system memory, and which type a buffer lives in decides how the CPU maps it
-//! and how the GPU's caches treat it, not where its bytes are. So every buffer is host-visible and
-//! stays mapped for its whole life, the CPU writing inputs and reading results in place with no
-//! staging copy, and the type is chosen by [`choose_memory_type`], preferring one the driver also
-//! marks device-local ([`STORAGE_PREFERENCE`]). A discrete GPU offers such a type only through a
-//! resizable BAR, and would want its own memory and staging copies instead.
+//! Where a buffer lives is its [`Residence`], and each residence has a list of memory properties
+//! in order of preference ([`Residence::preference`]), so the choice follows what the device
+//! reports rather than who made it ([`choose_memory_type`]).
+//!
+//! What the GPU reads every step, weights and a model's working memory, is
+//! [`Residence::Device`]: device-local memory, preferring a type the host cannot map, which on a
+//! discrete GPU is its own memory and on an APU is the same system memory as any other. The host
+//! reaches it only through a staging buffer and a copy on the queue, a chunk at a time
+//! ([`STAGING_BYTES`]). What the host writes or reads every step, small inputs and outputs, is
+//! mapped for the buffer's whole life and read and written in place: [`Residence::Upload`] in
+//! device-local memory the host can map where the device has it (an APU's, or a discrete GPU's
+//! through a resizable BAR), [`Residence::Readback`] in host-cached memory where it has that.
 
 use std::{ptr::NonNull, sync::Arc};
 
@@ -18,51 +23,97 @@ use crate::{
     report::{MemoryHeap, MemoryType},
 };
 
-/// The memory properties a storage buffer's type must have, most preferred first.
-///
-/// Device-local and host-visible first: the type the driver means for memory the GPU works in and
-/// the CPU reaches directly. It is not host-cached, so the CPU's reads of it may be slow, a cost
-/// for reading results back rather than for kernels. Plain host-visible memory is the fallback for
-/// a device without such a type.
-pub const STORAGE_PREFERENCE: [vk::MemoryPropertyFlags; 2] = [
-    vk::MemoryPropertyFlags::from_raw(
-        vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw()
-            | vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
-            | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
-    ),
-    vk::MemoryPropertyFlags::from_raw(
-        vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
-            | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
-    ),
-];
+type Flags = vk::MemoryPropertyFlags;
 
-/// Properties a storage buffer's type must not have: AMD's device-coherent, uncached
-/// memory bypasses the GPU's caches on every access, which is for debugging markers, not
-/// for kernels.
-pub const STORAGE_AVOID: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
-    vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD.as_raw()
-        | vk::MemoryPropertyFlags::DEVICE_UNCACHED_AMD.as_raw(),
-);
+const fn all(flags: &[Flags]) -> Flags {
+    let mut raw = 0;
+    let mut i = 0;
+    while i < flags.len() {
+        raw |= flags[i].as_raw();
+        i += 1;
+    }
+    Flags::from_raw(raw)
+}
 
-/// The index of the memory type a buffer of `size` bytes is allocated from: the first
-/// type, in the device's order, that `type_bits` (the buffer's `memoryTypeBits`) allows,
-/// has every property of the most preferred entry of [`STORAGE_PREFERENCE`] any allowed
-/// type matches, has none of [`STORAGE_AVOID`], and sits in a heap at least `size` large.
+const DEVICE_LOCAL: Flags = Flags::DEVICE_LOCAL;
+const MAPPABLE: Flags = all(&[Flags::HOST_VISIBLE, Flags::HOST_COHERENT]);
+
+/// Properties no buffer's type may have: AMD's device-coherent, uncached memory bypasses the
+/// GPU's caches on every access, which is for debugging markers, not for kernels.
+pub const AVOID: Flags = all(&[Flags::DEVICE_COHERENT_AMD, Flags::DEVICE_UNCACHED_AMD]);
+
+/// The most a staging buffer holds: a larger transfer is copied a chunk at a time, so moving a
+/// model's weights pins no more host memory than this.
+pub const STAGING_BYTES: u64 = 64 << 20;
+
+/// Where a buffer lives, and so how the host reaches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Residence {
+    /// The GPU's own memory, filled and read through staging copies.
+    Device,
+    /// Mapped memory the host writes and the GPU reads. It is not host-cached, so the host's
+    /// reads of it may be slow.
+    Upload,
+    /// Mapped memory the GPU writes and the host reads; staging buffers live here too.
+    Readback,
+}
+
+impl Residence {
+    /// The (wanted, unwanted) memory properties of this residence's type, most preferred first.
+    /// Every entry also refuses [`AVOID`].
+    pub fn preference(self) -> &'static [(Flags, Flags)] {
+        const DEVICE: &[(Flags, Flags)] = &[
+            (DEVICE_LOCAL, Flags::HOST_VISIBLE),
+            (DEVICE_LOCAL, Flags::empty()),
+        ];
+        const UPLOAD: &[(Flags, Flags)] = &[
+            (all(&[DEVICE_LOCAL, MAPPABLE]), Flags::empty()),
+            (MAPPABLE, Flags::empty()),
+        ];
+        const READBACK: &[(Flags, Flags)] = &[
+            (all(&[MAPPABLE, Flags::HOST_CACHED]), Flags::empty()),
+            (MAPPABLE, Flags::empty()),
+        ];
+        match self {
+            Residence::Device => DEVICE,
+            Residence::Upload => UPLOAD,
+            Residence::Readback => READBACK,
+        }
+    }
+
+    /// Whether buffers of this residence are mapped for the host.
+    pub fn mapped(self) -> bool {
+        self != Residence::Device
+    }
+}
+
+/// The index of the memory type a buffer of `size` bytes in `residence` is allocated from: for
+/// the first entry of [`Residence::preference`] any type matches, the first type, in the
+/// device's order, that `type_bits` (the buffer's `memoryTypeBits`) allows, has the entry's
+/// wanted properties and none of its unwanted ones nor of [`AVOID`], and sits in a heap at least
+/// `size` large.
 pub fn choose_memory_type(
     types: &[MemoryType],
     heaps: &[MemoryHeap],
     type_bits: u32,
     size: u64,
+    residence: Residence,
 ) -> Option<u32> {
-    STORAGE_PREFERENCE.iter().find_map(|wanted| {
-        types.iter().enumerate().find_map(|(i, t)| {
-            let allowed = i < 32 && type_bits & (1 << i) != 0;
-            let fits = heaps.get(t.heap as usize).is_some_and(|h| h.size >= size);
-            (allowed && fits && t.flags.contains(*wanted) && !t.flags.intersects(STORAGE_AVOID))
+    residence
+        .preference()
+        .iter()
+        .find_map(|&(wanted, unwanted)| {
+            types.iter().enumerate().find_map(|(i, t)| {
+                let allowed = i < 32 && type_bits & (1 << i) != 0;
+                let fits = heaps.get(t.heap as usize).is_some_and(|h| h.size >= size);
+                (allowed
+                    && fits
+                    && t.flags.contains(wanted)
+                    && !t.flags.intersects(unwanted | AVOID))
                 .then(|| u32::try_from(i).ok())
                 .flatten()
+            })
         })
-    })
 }
 
 /// Element types a buffer may be read and written as: plain values with no padding and
@@ -95,16 +146,18 @@ unsafe impl Plain for f32 {}
 // SAFETY: as above.
 unsafe impl Plain for f64 {}
 
-/// A storage buffer in host-visible memory, mapped for as long as it lives. One buffer is
-/// one allocation; suballocation waits until a model's hundreds of tensors make the
-/// driver's allocation-count limit matter.
+/// A storage buffer in the memory its [`Residence`] chooses, mapped for as long as it lives when
+/// that is host memory. One buffer is one allocation; suballocation waits until a model's hundreds
+/// of tensors make the driver's allocation-count limit matter.
 pub struct Buffer {
     pub(crate) ctx: Arc<Inner>,
     pub(crate) raw: vk::Buffer,
     memory: vk::DeviceMemory,
-    ptr: NonNull<u8>,
+    /// The mapping, for a residence the host maps.
+    ptr: Option<NonNull<u8>>,
     size: u64,
     memory_type: u32,
+    residence: Residence,
 }
 
 // SAFETY: the mapped pointer is owned by this buffer alone, and access through it follows
@@ -118,21 +171,53 @@ impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
             .field("size", &self.size)
+            .field("residence", &self.residence)
             .field("memory_type", &self.memory_type)
             .finish_non_exhaustive()
     }
 }
 
+/// Accesses to any buffer by earlier dispatches and copies, ordered before a copy's (`dst_*`).
+fn after_earlier_work(
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+) -> [vk::MemoryBarrier2<'static>; 1] {
+    [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)]
+}
+
+/// A copy's or a fill's writes, made visible to every later dispatch and copy.
+fn before_later_work() -> [vk::MemoryBarrier2<'static>; 1] {
+    [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER)
+        .dst_access_mask(
+            vk::AccessFlags2::SHADER_STORAGE_READ
+                | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                | vk::AccessFlags2::TRANSFER_READ
+                | vk::AccessFlags2::TRANSFER_WRITE,
+        )]
+}
+
 impl Buffer {
-    /// A zero-filled storage buffer of `size` bytes (more than zero).
-    pub(crate) fn new(ctx: &Arc<Inner>, size: u64) -> Result<Self> {
+    /// A zero-filled storage buffer of `size` bytes (more than zero) in `residence`.
+    pub(crate) fn new(ctx: &Arc<Inner>, size: u64, residence: Residence) -> Result<Self> {
         if size == 0 {
             return Err(Error::Unsupported("a buffer of zero bytes".to_string()));
         }
         let device = &ctx.device;
+        // Whole words, so that a fill reaches the last byte.
         let info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .size(size.next_multiple_of(4))
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: the device is live and `info` is complete.
         let raw = unsafe { device.create_buffer(&info, None) }.call("vkCreateBuffer")?;
@@ -142,9 +227,10 @@ impl Buffer {
             ctx: Arc::clone(ctx),
             raw,
             memory: vk::DeviceMemory::null(),
-            ptr: NonNull::dangling(),
+            ptr: None,
             size,
             memory_type: u32::MAX,
+            residence,
         };
         // SAFETY: `raw` is a live buffer of this device.
         let needs = unsafe { device.get_buffer_memory_requirements(raw) };
@@ -154,6 +240,7 @@ impl Buffer {
             &report.heaps,
             needs.memory_type_bits,
             needs.size,
+            residence,
         )
         .ok_or(Error::NoMemoryType {
             type_bits: needs.memory_type_bits,
@@ -166,7 +253,23 @@ impl Buffer {
         buffer.memory = unsafe { device.allocate_memory(&alloc, None) }.call("vkAllocateMemory")?;
         // SAFETY: fresh memory of the required size and an allowed type, bound at offset 0.
         unsafe { device.bind_buffer_memory(raw, buffer.memory, 0) }.call("vkBindBufferMemory")?;
-        // SAFETY: the memory is host-visible (every preferred type is) and not yet mapped.
+        if !residence.mapped() {
+            // Vulkan does not promise zeroed memory, and this constructor's contract is
+            // zero-filled.
+            ctx.run_once(|device, cmd| {
+                // SAFETY: the buffer is live and was created for transfers.
+                unsafe {
+                    device.cmd_fill_buffer(cmd, raw, 0, vk::WHOLE_SIZE, 0);
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&before_later_work()),
+                    );
+                }
+            })?;
+            return Ok(buffer);
+        }
+        // SAFETY: the memory is host-visible (every mapped residence's type is) and not yet
+        // mapped.
         let mapped = unsafe {
             device.map_memory(
                 buffer.memory,
@@ -176,13 +279,13 @@ impl Buffer {
             )
         }
         .call("vkMapMemory")?;
-        buffer.ptr = NonNull::new(mapped.cast::<u8>()).ok_or(Error::Vk {
+        let ptr = NonNull::new(mapped.cast::<u8>()).ok_or(Error::Vk {
             call: "vkMapMemory",
             result: vk::Result::ERROR_MEMORY_MAP_FAILED,
         })?;
-        // SAFETY: the mapping covers at least `size` bytes. Vulkan does not promise zeroed
-        // memory, and this constructor's contract is zero-filled.
-        unsafe { std::ptr::write_bytes(buffer.ptr.as_ptr(), 0, size as usize) };
+        // SAFETY: the mapping covers at least `size` bytes; zero-filled as above.
+        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, size as usize) };
+        buffer.ptr = Some(ptr);
         Ok(buffer)
     }
 
@@ -196,58 +299,160 @@ impl Buffer {
         self.memory_type
     }
 
-    /// The buffer's bytes, read in place.
-    pub fn bytes(&self) -> &[u8] {
-        // SAFETY: the mapping is live for `self`'s lifetime and covers `size` bytes; the
-        // GPU does not write while `&self` is held outside a dispatch.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.size as usize) }
+    pub fn residence(&self) -> Residence {
+        self.residence
     }
 
-    /// The buffer's bytes, written in place.
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as for `bytes`, and `&mut self` makes this the only access.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size as usize) }
+    /// Panics unless `len` bytes from `offset` lie inside the buffer.
+    fn check(&self, offset: u64, len: usize) {
+        assert!(
+            offset
+                .checked_add(len as u64)
+                .is_some_and(|end| end <= self.size),
+            "{len} bytes from {offset} do not fit in a buffer of {}",
+            self.size
+        );
     }
 
     /// Copies `values` to the start of the buffer. Panics if they do not fit.
-    pub fn write<T: Plain>(&mut self, values: &[T]) {
-        let len = std::mem::size_of_val(values);
-        assert!(
-            len as u64 <= self.size,
-            "{len} bytes do not fit in a buffer of {}",
-            self.size
-        );
-        // SAFETY: `values` is `len` readable bytes of a `Plain` type, the destination
-        // holds at least `len` bytes, and the two cannot overlap (one is mapped memory).
-        unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), self.ptr.as_ptr(), len)
-        };
+    pub fn write<T: Plain>(&mut self, values: &[T]) -> Result<()> {
+        self.write_at(0, values)
     }
 
-    /// The whole buffer as values of `T`, copied out; trailing bytes short of a whole `T`
-    /// are left out.
-    pub fn read<T: Plain>(&self) -> Vec<T> {
-        let n = self.size as usize / std::mem::size_of::<T>();
-        let mut out = Vec::<T>::with_capacity(n);
-        // SAFETY: `n` whole values fit in the mapping, `out` has room for them, the bytes
-        // are a valid `T` whatever they are (`Plain`), and the copy is bytewise, so the
-        // mapping's alignment does not matter.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.ptr.as_ptr(),
-                out.as_mut_ptr().cast::<u8>(),
-                n * size_of::<T>(),
-            );
-            out.set_len(n);
+    /// Copies `values` into the buffer from byte `offset`: in place when the buffer is mapped,
+    /// through a staging buffer when it is not. Panics if they do not fit.
+    pub fn write_at<T: Plain>(&mut self, offset: u64, values: &[T]) -> Result<()> {
+        let len = std::mem::size_of_val(values);
+        self.check(offset, len);
+        // SAFETY: `values` is `len` readable bytes of a `Plain` type, so every byte is
+        // initialized.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), len) };
+        if let Some(ptr) = self.ptr {
+            // SAFETY: the destination lies inside the mapping (checked above), and cannot
+            // overlap `values`, which is not mapped memory of this buffer while `&mut self` is
+            // held.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    ptr.as_ptr().add(offset as usize),
+                    len,
+                )
+            };
+            return Ok(());
         }
-        out
+        if len == 0 {
+            return Ok(());
+        }
+        let mut staging = Buffer::new(
+            &self.ctx,
+            (len as u64).min(STAGING_BYTES),
+            Residence::Readback,
+        )?;
+        let mut done = 0;
+        for chunk in bytes.chunks(STAGING_BYTES as usize) {
+            staging.write_at(0, chunk)?;
+            let region = [vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(offset + done)
+                .size(chunk.len() as u64)];
+            let (from, to) = (staging.raw, self.raw);
+            self.ctx.run_once(|device, cmd| {
+                let before = after_earlier_work(
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+                // SAFETY: both buffers are live and were created for transfers, and the
+                // region lies inside each.
+                unsafe {
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&before),
+                    );
+                    device.cmd_copy_buffer(cmd, from, to, &region);
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&before_later_work()),
+                    );
+                }
+            })?;
+            done += chunk.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// The whole buffer as values of `T`, copied out; trailing bytes short of a whole `T` are
+    /// left out.
+    pub fn read<T: Plain>(&self) -> Result<Vec<T>> {
+        self.read_at(0, self.size as usize / size_of::<T>())
+    }
+
+    /// `count` values of `T` from byte `offset`, copied out: in place when the buffer is mapped,
+    /// through a staging buffer when it is not. Panics if they do not fit.
+    pub fn read_at<T: Plain>(&self, offset: u64, count: usize) -> Result<Vec<T>> {
+        let len = count * size_of::<T>();
+        self.check(offset, len);
+        let mut out = Vec::<T>::with_capacity(count);
+        let dst = out.as_mut_ptr().cast::<u8>();
+        if let Some(ptr) = self.ptr {
+            // SAFETY: the source lies inside the mapping, `out` has room for `len` bytes, and
+            // the copy is bytewise, so the mapping's alignment does not matter; the GPU does
+            // not write while `&self` is held outside a dispatch.
+            unsafe { std::ptr::copy_nonoverlapping(ptr.as_ptr().add(offset as usize), dst, len) };
+        } else if len > 0 {
+            let staging = Buffer::new(
+                &self.ctx,
+                (len as u64).min(STAGING_BYTES),
+                Residence::Readback,
+            )?;
+            let staged = staging.ptr.expect("a staging buffer is mapped");
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(STAGING_BYTES as usize);
+                let region = [vk::BufferCopy::default()
+                    .src_offset(offset + done as u64)
+                    .dst_offset(0)
+                    .size(n as u64)];
+                let (from, to) = (self.raw, staging.raw);
+                self.ctx.run_once(|device, cmd| {
+                    let before = after_earlier_work(
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    );
+                    let to_host = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                        .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+                    // SAFETY: as for `write_at`.
+                    unsafe {
+                        device.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&before),
+                        );
+                        device.cmd_copy_buffer(cmd, from, to, &region);
+                        device.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&to_host),
+                        );
+                    }
+                })?;
+                // SAFETY: the copy has finished and its writes are visible to the host; `out`
+                // has room for `len` bytes, of which `done` are written.
+                unsafe { std::ptr::copy_nonoverlapping(staged.as_ptr(), dst.add(done), n) };
+                done += n;
+            }
+        }
+        // SAFETY: `len` bytes, `count` whole values, were written, and any bytes are a valid
+        // `T` (`Plain`).
+        unsafe { out.set_len(count) };
+        Ok(out)
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        // SAFETY: dispatches wait for the GPU before returning, so the buffer is idle;
-        // freeing the memory unmaps it.
+        // SAFETY: dispatches and copies wait for the GPU before returning, so the buffer is
+        // idle; freeing the memory unmaps it.
         unsafe {
             self.ctx.device.destroy_buffer(self.raw, None);
             self.ctx.device.free_memory(self.memory, None);
@@ -259,11 +464,11 @@ impl Drop for Buffer {
 mod tests {
     use super::*;
 
-    const DL: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-    const HV: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_VISIBLE;
-    const HC: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_COHERENT;
-    const CACHED: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::HOST_CACHED;
-    const AMD: vk::MemoryPropertyFlags = STORAGE_AVOID;
+    const DL: Flags = Flags::DEVICE_LOCAL;
+    const HV: Flags = Flags::HOST_VISIBLE;
+    const HC: Flags = Flags::HOST_COHERENT;
+    const CACHED: Flags = Flags::HOST_CACHED;
+    const AMD: Flags = AVOID;
 
     fn heap(size: u64) -> MemoryHeap {
         MemoryHeap {
@@ -274,7 +479,7 @@ mod tests {
         }
     }
 
-    fn ty(flags: vk::MemoryPropertyFlags, heap: u32) -> MemoryType {
+    fn ty(flags: Flags, heap: u32) -> MemoryType {
         MemoryType { flags, heap }
     }
 
@@ -298,46 +503,103 @@ mod tests {
         (types, heaps)
     }
 
+    /// A discrete GPU of 16 GiB laid out as NVIDIA's driver lays one out: heap 0 its own memory,
+    /// heap 1 system memory, heap 2 the window the host maps into the GPU's memory, `bar` bytes:
+    /// 256 MiB without a resizable BAR, all of it with one.
+    fn discrete(bar: u64) -> (Vec<MemoryType>, Vec<MemoryHeap>) {
+        let heaps = vec![heap(16 << 30), heap(32 << 30), heap(bar)];
+        let types = vec![
+            ty(Flags::empty(), 1),
+            ty(DL, 0),
+            ty(DL, 0),
+            ty(HV | HC, 1),
+            ty(HV | HC | CACHED, 1),
+            ty(DL | HV | HC, 2),
+        ];
+        (types, heaps)
+    }
+
+    fn choose(
+        (types, heaps): &(Vec<MemoryType>, Vec<MemoryHeap>),
+        type_bits: u32,
+        size: u64,
+        residence: Residence,
+    ) -> Option<u32> {
+        choose_memory_type(types, heaps, type_bits, size, residence)
+    }
+
     #[test]
-    fn device_local_host_visible_memory_is_preferred() {
-        let (types, heaps) = radv_gfx1151();
+    fn each_residence_takes_its_preferred_type_on_an_apu() {
+        let radv = radv_gfx1151();
+        assert_eq!(choose(&radv, u32::MAX, 1 << 20, Residence::Device), Some(0));
+        assert_eq!(choose(&radv, u32::MAX, 1 << 20, Residence::Upload), Some(3));
         assert_eq!(
-            choose_memory_type(&types, &heaps, u32::MAX, 1 << 20),
-            Some(3)
+            choose(&radv, u32::MAX, 1 << 20, Residence::Readback),
+            Some(5)
         );
         // The buffer's own allowed types narrow the choice to the second such type.
         assert_eq!(
-            choose_memory_type(&types, &heaps, 1 << 4 | 1 << 2, 1 << 20),
+            choose(&radv, 1 << 4 | 1 << 2, 1 << 20, Residence::Upload),
             Some(4)
         );
     }
 
     #[test]
-    fn plain_host_visible_memory_is_the_fallback_and_amd_uncached_memory_is_never_used() {
-        let (types, heaps) = radv_gfx1151();
-        let no_device_local_visible = !(1 << 3 | 1 << 4);
+    fn each_residence_takes_its_preferred_type_on_a_discrete_gpu() {
+        for bar in [256 << 20, 16 << 30] {
+            let gpu = discrete(bar);
+            assert_eq!(choose(&gpu, u32::MAX, 1 << 30, Residence::Device), Some(1));
+            assert_eq!(choose(&gpu, u32::MAX, 4096, Residence::Upload), Some(5));
+            assert_eq!(choose(&gpu, u32::MAX, 4096, Residence::Readback), Some(4));
+        }
+        // Past the window without a resizable BAR, mapped memory is the host's.
+        let small_bar = discrete(256 << 20);
         assert_eq!(
-            choose_memory_type(&types, &heaps, no_device_local_visible, 64),
-            Some(2)
+            choose(&small_bar, u32::MAX, 512 << 20, Residence::Upload),
+            Some(3)
         );
-        let only_amd = 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10;
-        assert_eq!(choose_memory_type(&types, &heaps, only_amd, 64), None);
-        let only_device_local = 1 << 0 | 1 << 1;
         assert_eq!(
-            choose_memory_type(&types, &heaps, only_device_local, 64),
-            None
+            choose(&discrete(16 << 30), u32::MAX, 512 << 20, Residence::Upload),
+            Some(5)
         );
     }
 
     #[test]
-    fn a_heap_smaller_than_the_buffer_is_passed_over() {
-        let (types, heaps) = radv_gfx1151();
-        // Larger than heap 0, smaller than heap 1.
+    fn the_fallbacks_are_taken_in_order_and_amd_uncached_memory_is_never_used() {
+        let radv = radv_gfx1151();
+        let no_device_local_visible = !(1 << 3 | 1 << 4);
         assert_eq!(
-            choose_memory_type(&types, &heaps, 1 << 2 | 1 << 3, 12 << 30),
+            choose(&radv, no_device_local_visible, 64, Residence::Upload),
+            Some(2)
+        );
+        let visible_device_local = 1 << 3 | 1 << 4;
+        assert_eq!(
+            choose(&radv, visible_device_local, 64, Residence::Device),
             Some(3)
         );
-        assert_eq!(choose_memory_type(&types, &heaps, 1 << 2, 12 << 30), None);
-        assert_eq!(choose_memory_type(&types, &heaps, u32::MAX, 22 << 30), None);
+        let uncached = 1 << 2 | 1 << 3;
+        assert_eq!(choose(&radv, uncached, 64, Residence::Readback), Some(2));
+        let only_amd = 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10;
+        for residence in [Residence::Device, Residence::Upload, Residence::Readback] {
+            assert_eq!(choose(&radv, only_amd, 64, residence), None);
+        }
+        let only_device_local = 1 << 0 | 1 << 1;
+        assert_eq!(
+            choose(&radv, only_device_local, 64, Residence::Upload),
+            None
+        );
+        assert_eq!(choose(&radv, 1 << 5, 64, Residence::Device), None);
+    }
+
+    #[test]
+    fn a_heap_smaller_than_the_buffer_is_passed_over() {
+        let radv = radv_gfx1151();
+        // Larger than heap 0, smaller than heap 1.
+        assert_eq!(
+            choose(&radv, 1 << 2 | 1 << 3, 12 << 30, Residence::Upload),
+            Some(3)
+        );
+        assert_eq!(choose(&radv, 1 << 2, 12 << 30, Residence::Upload), None);
+        assert_eq!(choose(&radv, u32::MAX, 22 << 30, Residence::Device), None);
     }
 }

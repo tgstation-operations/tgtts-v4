@@ -486,8 +486,8 @@ impl Decoder {
         let tensors = decode_graph(shape, tuning)?;
         let mut step = Step::new(ctx, kernels, &tensors.graph, timed)?;
         let (cos, sin) = shape.rope_tables();
-        step.write(tensors.cos, &cos);
-        step.write(tensors.sin, &sin);
+        step.write(tensors.cos, &cos)?;
+        step.write(tensors.sin, &sin)?;
         Ok(Decoder { step, tensors })
     }
 
@@ -510,8 +510,7 @@ impl Decoder {
                     values.len()
                 )));
             }
-            self.step.write(t, &values);
-            Ok(())
+            self.step.write(t, &values)
         };
         for (l, t) in self.tensors.layers.clone().iter().enumerate() {
             let n = |what: &str| format!("layers.{l}.{what}.weight");
@@ -537,10 +536,10 @@ impl Decoder {
                 "position {position} in a cache of {capacity}"
             )));
         }
-        self.step.write(self.tensors.x, x);
-        self.step.write(self.tensors.position, &[position as u32]);
+        self.step.write(self.tensors.x, x)?;
+        self.step.write(self.tensors.position, &[position as u32])?;
         self.step.submit()?;
-        Ok(self.step.read(self.tensors.out))
+        self.step.read(self.tensors.out)
     }
 
     /// Each dispatch's label and GPU time in the last step, when recorded timed.
