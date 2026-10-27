@@ -17,5 +17,6 @@ vulkan = { path = "../vulkan" }
 
 [dev-dependencies]
 burn = { workspace = true, features = ["std"] }
+libc.workspace = true
 minicpm4 = { path = "../minicpm4" }
 testkit = { path = "../testkit" }

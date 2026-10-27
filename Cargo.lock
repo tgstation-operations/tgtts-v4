@@ -3151,6 +3151,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "half",
+ "libc",
  "minicpm4",
  "serde",
  "serde_json",
