@@ -56,6 +56,29 @@ impl Weights {
         Ok(data.iter::<i64>().collect())
     }
 
+    /// The parameter `name` as f32, in torch's layout, and its shape: a weight-normed
+    /// convolution's `<conv>.weight` folded from its `weight_g` and `weight_v` as loading folds
+    /// it, for a runtime other than burn to take the values a module would load.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such parameter, or it cannot be read as floats.
+    pub fn floats(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), Error> {
+        let tensor = match self.tensors.get(name) {
+            Some(tensor) => tensor.clone(),
+            None => {
+                let part = |suffix: &str| {
+                    self.tensors
+                        .get(&format!("{name}{suffix}"))
+                        .ok_or_else(|| Error::Weights(format!("no tensor {name}")))
+                };
+                folded(name.to_owned(), part("_g")?, part("_v")?.clone())?
+            }
+        };
+        let values = f32s(&tensor).map_err(|e| Error::Weights(e.to_string()))?;
+        Ok((tensor.shape.to_vec(), values))
+    }
+
     /// `module` with its parameters set from the tensors named `<prefix>.<parameter path>`,
     /// cast to `dtype`, and weight norm folded. Every tensor under the prefix has to be used
     /// but those under `skip`, and every parameter set.
@@ -156,4 +179,31 @@ fn f32s(tensor: &PackTensor) -> Result<Vec<f32>, PackError> {
     bridge::to_data(tensor)?
         .try_to_vec_as::<f32>()
         .map_err(|e| PackError::ValidationError(format!("{}: {e:?}", tensor.name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::{nn::conv::Conv1dConfig, store::SafetensorsStore};
+    use testkit::{device, fixture};
+
+    use super::*;
+    use crate::layers::causal;
+
+    #[test]
+    fn floats_are_what_a_module_loads() {
+        let mut store = SafetensorsStore::from_file(fixture!("audiovae").path());
+        let weights = Weights::from_store(&mut store).unwrap();
+        let conv = causal(Conv1dConfig::new(3, 4, 10).with_stride(5), 3, 1).init(&device());
+        let conv = weights.load("conv", conv, FloatDType::F32, &[]).unwrap();
+        let loaded = |data: TensorData| data.try_to_vec::<f32>().unwrap();
+        let (shape, folded) = weights.floats("conv.weight").unwrap();
+        assert_eq!(shape, [4, 3, 10]);
+        assert_eq!(folded, loaded(conv.weight.val().into_data()));
+        let bias = conv.bias.as_ref().unwrap().val().into_data();
+        assert_eq!(
+            weights.floats("conv.bias").unwrap(),
+            (vec![4], loaded(bias))
+        );
+        assert!(weights.floats("conv.scale").is_err());
+    }
 }
