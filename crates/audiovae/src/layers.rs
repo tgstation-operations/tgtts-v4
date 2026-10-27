@@ -66,36 +66,55 @@ pub(crate) fn sequential_push(layers: &[Layer], x: Tensor<3>, carry: &mut Carry)
 /// What the layers that reach back across a chunk boundary carry from one chunk to the next:
 /// each one's last inputs, in the order the layers run.
 #[derive(Debug)]
+/// What each stream of a batch of chunks carries over from its chunk before: a stream's own
+/// batch, or a row each where there are several.
 pub(crate) struct Carry {
-    last: vec::IntoIter<Tensor<3>>,
-    next: Vec<Tensor<3>>,
+    last: Vec<vec::IntoIter<Tensor<3>>>,
+    next: Vec<Vec<Tensor<3>>>,
 }
 
 impl Carry {
-    /// The carry out of the chunk before, `kept` as [`into_kept`](Self::into_kept) gave it, or
-    /// nothing before the first.
-    pub(crate) fn new(kept: Vec<Tensor<3>>) -> Self {
+    /// The carry out of the chunks before, each row's `kept` as [`into_kept`](Self::into_kept)
+    /// gave it, or nothing before its first.
+    pub(crate) fn new(kept: Vec<Vec<Tensor<3>>>) -> Self {
         Self {
-            last: kept.into_iter(),
-            next: vec![],
+            next: vec![vec![]; kept.len()],
+            last: kept.into_iter().map(Vec::into_iter).collect(),
         }
     }
 
-    /// What the next chunk takes over.
-    pub(crate) fn into_kept(self) -> Vec<Tensor<3>> {
+    /// What each row's next chunk takes over.
+    pub(crate) fn into_kept(self) -> Vec<Vec<Tensor<3>>> {
         self.next
     }
 
-    /// `x` after the `length` inputs before it: those the next layer to run kept from the
-    /// chunk before, or zeros in the first chunk, as the layer pads a whole sequence. The last
-    /// `length` of the result are kept for that layer's next chunk.
+    /// `x` after the `length` inputs before it: those each row's next layer to run kept from
+    /// the chunk before, or zeros in its first chunk, as the layer pads a whole sequence. The
+    /// last `length` of the result are kept for that layer's next chunk.
     fn extend(&mut self, x: Tensor<3>, length: usize) -> Tensor<3> {
-        let x = match self.last.next() {
-            Some(kept) => Tensor::cat(vec![kept, x], 2),
-            None => x.pad([(length, 0)], PadMode::Constant(0.0)),
+        let [rows, channels, _] = x.dims();
+        let options = (&x.device(), x.dtype());
+        let kept: Vec<Option<Tensor<3>>> = self.last.iter_mut().map(Iterator::next).collect();
+        let x = match &kept[..] {
+            [None] => x.pad([(length, 0)], PadMode::Constant(0.0)),
+            [Some(kept)] => Tensor::cat(vec![kept.clone(), x], 2),
+            _ => {
+                let fresh = || Tensor::zeros([1, channels, length], options);
+                let kept = kept.into_iter().map(|kept| kept.unwrap_or_else(fresh));
+                Tensor::cat(vec![Tensor::cat(kept.collect(), 0), x], 2)
+            }
         };
         let total = x.dims()[2];
-        self.next.push(x.clone().narrow(2, total - length, length));
+        let kept = x.clone().narrow(2, total - length, length);
+        match &mut self.next[..] {
+            // One stream keeps its whole batch.
+            [next] => next.push(kept),
+            next => {
+                for (row, next) in next.iter_mut().enumerate().take(rows) {
+                    next.push(kept.clone().narrow(0, row, 1));
+                }
+            }
+        }
         x
     }
 }

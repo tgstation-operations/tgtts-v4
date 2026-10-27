@@ -1,8 +1,8 @@
 mod chunks;
 mod common;
 
-use audiovae::{AudioVaeConfig, Decoder, Error};
-use burn::tensor::FloatDType;
+use audiovae::{AudioVaeConfig, DecodeStream, Decoder, Error};
+use burn::tensor::{FloatDType, Tensor};
 use chunks::{Draws, streamed};
 use common::{tiny, weights};
 use testkit::{assert_close, device, fixture};
@@ -48,6 +48,40 @@ fn streams_in_chunks_of_any_length_as_it_decodes_whole() {
         let audio = streamed(&decoder, latents.clone(), &lengths);
         assert_close(audio, whole.clone(), 1e-12, 0.0);
     }
+}
+
+/// Two streams decoded together a chunk at a time, the second starting a chunk after the first:
+/// each comes out bit for bit as decoded alone in the same chunks.
+#[test]
+fn streams_decoded_together_come_out_as_alone() {
+    let device = device();
+    let decoder = Decoder::load(&tiny(), &weights(), FloatDType::F64, &device).unwrap();
+    let mut draws = Draws::new(4);
+    let (chunk, chunks) = (6, 4);
+    let latents = draws.latents([2, 4, chunk * chunks], &device);
+    let at = |row: usize, i: usize| {
+        latents
+            .clone()
+            .narrow(0, row, 1)
+            .narrow(2, i * chunk, chunk)
+    };
+    let alone = |row: usize, chunks: usize| {
+        let mut stream = decoder.stream();
+        let audio = (0..chunks).map(|i| stream.push(at(row, i)));
+        Tensor::cat(audio.collect(), 2)
+    };
+    let (first, second) = (alone(0, chunks), alone(1, chunks - 1));
+    let (mut one, mut two) = (decoder.stream(), decoder.stream());
+    let mut audio = vec![one.push(at(0, 0))];
+    let mut together = vec![];
+    for i in 1..chunks {
+        let both = Tensor::cat(vec![at(0, i), at(1, i - 1)], 0);
+        let decoded = DecodeStream::push_together(&mut [&mut one, &mut two], both);
+        audio.push(decoded.clone().narrow(0, 0, 1));
+        together.push(decoded.narrow(0, 1, 1));
+    }
+    assert_close(Tensor::cat(audio, 2), first, 0.0, 0.0);
+    assert_close(Tensor::cat(together, 2), second, 0.0, 0.0);
 }
 
 #[test]

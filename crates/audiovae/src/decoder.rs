@@ -149,13 +149,40 @@ impl DecodeStream<'_> {
     /// audio `[batch, 1, samples]`, as [`Decoder::decode`] does. Every chunk must have the
     /// batch of the first.
     pub fn push(&mut self, latents: Tensor<3>) -> Tensor<3> {
-        let decoder = self.decoder;
+        Self::push_together(&mut [self], latents)
+    }
+
+    /// Decodes the next latents of each of `streams` at once, as each [`push`](Self::push)
+    /// would alone: `latents` `[streams, latent_dim, frames]`, a row each, into their audio
+    /// `[streams, 1, samples]`. A stream may be at its first chunk beside others past theirs.
+    ///
+    /// # Panics
+    ///
+    /// If there is no stream, the streams are of other decoders, or `latents` has another
+    /// number of rows than there are streams, where there are several.
+    pub fn push_together(streams: &mut [&mut Self], latents: Tensor<3>) -> Tensor<3> {
+        let decoder = streams.first().expect("a stream to decode").decoder;
+        assert!(
+            streams
+                .iter()
+                .all(|stream| std::ptr::eq(stream.decoder, decoder)),
+            "streams of other decoders"
+        );
+        let rows = latents.dims()[0];
+        assert!(
+            streams.len() == 1 || rows == streams.len(),
+            "{rows} rows of latents for {} streams",
+            streams.len()
+        );
         let buckets = decoder.buckets(&latents);
-        let mut carry = Carry::new(mem::take(&mut self.kept));
+        let kept = streams.iter_mut().map(|stream| mem::take(&mut stream.kept));
+        let mut carry = Carry::new(kept.collect());
         let audio = decoder.forward(latents.cast(decoder.dtype), buckets, |layer, x| {
             layer.push(x, &mut carry)
         });
-        self.kept = carry.into_kept();
+        for (stream, kept) in streams.iter_mut().zip(carry.into_kept()) {
+            stream.kept = kept;
+        }
         audio
     }
 }
