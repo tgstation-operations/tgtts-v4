@@ -3146,6 +3146,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "half",
+ "minicpm4",
+ "serde",
+ "serde_json",
+ "testkit",
+ "vulkan",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

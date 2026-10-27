@@ -16,8 +16,9 @@ pkgs.writeShellApplication {
     pkgs.spirv-tools
   ];
   text = ''
-    # device-tests [CARGO_TEST_ARGS...]: the vulkan crate's tests on the GPU, the GPU kernels
-    # among them, each failing on any message of the validation layer.
+    # device-tests [CARGO_TEST_ARGS...]: the vulkan and graph crates' tests on the GPU, the GPU
+    # kernels among them, each failing on any message of the validation layer. The graph crate's
+    # on the real weights are ignored unless --include-ignored, with VOXCPM2_DIR set.
     cd "$(git rev-parse --show-toplevel)"
     export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true CARGO_BUILD_FINGERPRINT=content \
       CARGO_UNSTABLE_RUSTDOC_DEPINFO=true
@@ -41,6 +42,7 @@ pkgs.writeShellApplication {
     done < <(git ls-files -z 'crates/*.spvasm')
 
     # One test at a time: they share the GPU, and time it.
-    cargo test --locked --release -p vulkan --features device -- --test-threads 1 "$@"
+    cargo test --locked --release -p vulkan -p graph --features vulkan/device,graph/device -- \
+      --test-threads 1 "$@"
   '';
 }

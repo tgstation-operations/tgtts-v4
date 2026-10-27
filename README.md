@@ -24,7 +24,9 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   code stays the oracle it is checked against. Its kernels are MLIR compiled
   ahead of time to SPIR-V, from `kernels/gpu`: `nix build .#gpu-kernels`, which
   builds LLVM first where the store does not have it. The decode step's kernels
-  are GLSL, from `kernels/glsl`: `nix build .#glsl-kernels`.
+  are GLSL, from `kernels/glsl`: `nix build .#glsl-kernels`. With
+  `-- --include-ignored` and `VOXCPM2_DIR`, the `graph` crate's decode step runs
+  on the real weights against minicpm4 on the CPU.
 - `nix run .#bench` times release builds of the hot paths on the real data
   (`VOXCPM2_DIR`, `VOICES_DIR` for a converted voices directory and `ASSETS_DIR`
   for the radio's sounds) and writes each run as JSON;

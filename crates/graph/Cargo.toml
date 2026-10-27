@@ -1,0 +1,21 @@
+[package]
+name = "graph"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+# The tests that run on the GPU, built only with it.
+device = []
+
+[dependencies]
+half.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+vulkan = { path = "../vulkan" }
+
+[dev-dependencies]
+burn = { workspace = true, features = ["std"] }
+minicpm4 = { path = "../minicpm4" }
+testkit = { path = "../testkit" }
