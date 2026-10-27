@@ -219,6 +219,26 @@ impl Model {
     ) -> Tensor<3> {
         let [batch, len, _] = x.dims();
         assert_eq!(len, 1, "a step of {len} positions");
+        self.forward_run(x, cache, positions.reshape([batch, 1]))
+    }
+
+    /// Runs the stack causally over `x` `[batch, len, hidden]` as positions `positions` `[batch,
+    /// len]` given on the device of each row of `cache`, as [`forward_at`](Self::forward_at) runs a
+    /// position: attending over the whole capacity of each row, the keys after each position
+    /// hidden, the cache counting none of them until [`KvCache::extend`] or
+    /// [`KvCache::truncate`] says to. Positions of a row past the sequence it is given write keys
+    /// and values there that a later position overwrites before any position attends to them.
+    ///
+    /// # Panics
+    ///
+    /// As [`forward_at`](Self::forward_at).
+    pub fn forward_run(
+        &self,
+        x: Tensor<3>,
+        cache: &mut KvCache,
+        positions: Tensor<2, Int>,
+    ) -> Tensor<3> {
+        let [batch, len, _] = x.dims();
         assert_eq!(batch, cache.rows(), "a cache of {} rows", cache.rows());
         let capacity = cache.capacity;
         let (heads, dim) = (self.config.num_key_value_heads, self.config.head_dim());
@@ -227,13 +247,15 @@ impl Model {
             .rope
             .as_ref()
             .map(|rope| rope.select(positions.clone(), capacity));
-        let at = positions.reshape([batch, 1, 1, 1]);
         // Once for each query head of a group, as attention stacks them along the sequence.
-        let mask = [batch, 1, groups, capacity];
+        let mask = [batch, 1, groups * len, capacity];
+        let queries = positions.clone().repeat_dim(1, groups);
+        let queries = queries.reshape([batch, 1, groups * len, 1]).expand(mask);
         let keys = cache.slots.clone().reshape([1, 1, 1, capacity]);
-        let mask = keys.expand(mask).greater(at.clone().expand(mask));
+        let mask = keys.expand(mask).greater(queries);
+        let at = positions.reshape([batch, 1, len, 1]);
         let append = Append {
-            at: Slots::Rows(Box::new(at.expand([batch, heads, 1, dim]))),
+            at: Slots::Rows(Box::new(at.expand([batch, heads, len, dim]))),
             total: capacity,
         };
         let layers = self.layers.iter().zip(&mut cache.layers);

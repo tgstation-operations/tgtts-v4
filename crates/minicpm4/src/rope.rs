@@ -92,23 +92,24 @@ impl Rope {
         }
     }
 
-    /// The rotations of a position for each row, at `positions` `[batch]` on the device,
-    /// `[batch, 1, 1, head_dim]`.
+    /// The rotations of positions given for each row on the device, `positions` `[batch, len]`,
+    /// `[batch, 1, len, head_dim]`.
     ///
     /// # Panics
     ///
     /// If positions below `bound`, which the positions are taken to be, reach past
     /// `max_position_embeddings`: being on the device, they are not checked themselves.
-    pub(crate) fn select(&self, positions: Tensor<1, Int>, bound: usize) -> Rotation {
+    pub(crate) fn select(&self, positions: Tensor<2, Int>, bound: usize) -> Rotation {
         let [table, dim] = self.cos.dims();
         assert!(
             bound <= table,
             "positions below {bound} reach past the {table} RoPE has rotations for"
         );
-        let [batch] = positions.dims();
+        let [batch, len] = positions.dims();
+        let positions = positions.reshape([batch * len]);
         let rows = |table: &Tensor<2>| {
             let rows = table.clone().select(0, positions.clone());
-            rows.reshape([batch, 1, 1, dim])
+            rows.reshape([batch, 1, len, dim])
         };
         Rotation {
             cos: rows(&self.cos),

@@ -167,6 +167,61 @@ impl KvCache {
         }
     }
 
+    /// Writes the first `len` positions of row `from_row` of `from`, a cache of the same stack,
+    /// over those of `row`, in place, and makes `row` hold them: what a run at positions given on
+    /// the device goes on from, which leaves the positions after them as they were.
+    ///
+    /// # Panics
+    ///
+    /// If `from_row` holds fewer than `len` positions, or this cache has no room for them.
+    pub fn write_prefix(&mut self, row: usize, from: &KvCache, from_row: usize, len: usize) {
+        let held = from.lens[from_row].unwrap_or(0);
+        assert!(
+            len <= held,
+            "a prefix of {len} positions of a row of {held}"
+        );
+        assert!(
+            len <= self.capacity,
+            "{len} positions in a cache of {}",
+            self.capacity
+        );
+        self.lens[row] = Some(len);
+        if len == 0 {
+            return;
+        }
+        for (layer, from) in self.layers.iter_mut().zip(&from.layers) {
+            let copy = |cache: &mut Tensor<4>, from: &Tensor<4>| {
+                let [_, heads, _, dim] = from.dims();
+                let prefix = from.clone().narrow(0, from_row, 1).narrow(2, 0, len);
+                let at = [row..row + 1, 0..heads, 0..len, 0..dim];
+                cache.inplace(|cache| cache.slice_assign(at, prefix));
+            };
+            copy(&mut layer.keys, &from.keys);
+            copy(&mut layer.values, &from.values);
+        }
+    }
+
+    /// Makes `row` hold `len` positions, those a run at positions given on the device wrote.
+    ///
+    /// # Panics
+    ///
+    /// If that is past its capacity.
+    pub fn hold(&mut self, row: usize, len: usize) {
+        assert!(
+            len <= self.capacity,
+            "{len} positions in a cache of {}",
+            self.capacity
+        );
+        self.lens[row] = Some(len);
+    }
+
+    /// Whether no other tensor shares its buffers, as a write in place needs, or the write
+    /// copies them first.
+    pub fn can_mut(&self) -> bool {
+        let layer = |layer: &LayerCache| layer.keys.can_mut() && layer.values.can_mut();
+        self.layers.iter().all(layer)
+    }
+
     /// Makes `row` hold only the first `len` positions of its sequence.
     ///
     /// # Panics

@@ -210,6 +210,34 @@ fn steps_at_positions_as_alone(config: &Config, prefix: &str, input: &str) {
     assert_eq!((batch.len(0), batch.len(1)), (Some(6), None));
 }
 
+/// Rows prefilled to 3 and 5 positions, then run two positions further at once at positions
+/// given on the device, over the whole cache: each comes out as run alone by `forward_cached`.
+fn runs_at_positions_as_alone(config: &Config, prefix: &str, input: &str) {
+    let (fixture, device) = (fixture!("minicpm4"), device());
+    let model = load(config, &fixture, prefix).unwrap();
+    let x = fixture.tensor::<3>(input, &device);
+    let first = alone(&model, &x, 0, &[3, 2]);
+    let second = alone(&model, &x, 1, &[5, 2]);
+
+    let mut batch = model.cache(2, 7);
+    batch.insert(0, &prefilled(&model, &x, 0, 3), 0);
+    batch.insert(1, &prefilled(&model, &x, 1, 5), 0);
+    let at = Tensor::from_data([[3, 4], [5, 6]], &device);
+    let out = model.forward_run(positions(&x, &[(0, 3), (1, 5)], 2), &mut batch, at);
+    assert_as_alone(out.clone(), 0, &first[1]);
+    assert_as_alone(out, 1, &second[1]);
+}
+
+#[test]
+fn base_lm_runs_at_positions_as_alone() {
+    runs_at_positions_as_alone(&tiny().lm, "base_lm.", "output.base_lm.embeds");
+}
+
+#[test]
+fn residual_lm_runs_at_positions_as_alone() {
+    runs_at_positions_as_alone(&tiny().residual_lm, "residual_lm.", "input.residual_lm.x");
+}
+
 #[test]
 fn base_lm_steps_at_positions_as_alone() {
     steps_at_positions_as_alone(&tiny().lm, "base_lm.", "output.base_lm.embeds");
