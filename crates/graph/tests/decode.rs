@@ -259,3 +259,12 @@ fn one_layer_decodes_as_minicpm4_does_on_the_cpu() {
     let (_, margin) = check(&oracle.f32, &oracle.f16, &shifted, 70);
     assert!(!within(margin), "positions one slot on pass: {margin:?}");
 }
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn the_base_lm_decodes_as_minicpm4_does_on_the_cpu() {
+    let oracle = oracle(28, 70);
+    let got = gpu(28, &oracle.x, 0);
+    let (_, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
+    assert!(within(margin), "{margin:?}");
+}

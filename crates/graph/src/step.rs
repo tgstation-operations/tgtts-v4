@@ -2,6 +2,8 @@
 //! dispatches recorded once, with the barriers [`barriers`] finds, into a [`Recording`]
 //! submitted every step.
 
+use std::time::{Duration, Instant};
+
 use vulkan::{Binding, Context, Dispatch, Recording, Timing};
 
 use crate::{
@@ -49,6 +51,7 @@ pub struct Step {
     labels: Vec<String>,
     barriers: usize,
     arena_bytes: u64,
+    recorded_in: Duration,
 }
 
 impl std::fmt::Debug for Step {
@@ -96,8 +99,11 @@ impl Step {
                 barrier,
             });
         }
+        let start = Instant::now();
+        let recording = ctx.record(buffers, &dispatches, timed)?;
         Ok(Step {
-            recording: ctx.record(buffers, &dispatches, timed)?,
+            recording,
+            recorded_in: start.elapsed(),
             places,
             bytes,
             labels: graph.ops.iter().map(|op| op.label.clone()).collect(),
@@ -162,5 +168,10 @@ impl Step {
 
     pub fn arena_bytes(&self) -> u64 {
         self.arena_bytes
+    }
+
+    /// How long writing the descriptor sets and recording the commands took.
+    pub fn recorded_in(&self) -> Duration {
+        self.recorded_in
     }
 }
