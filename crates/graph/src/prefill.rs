@@ -14,7 +14,7 @@ use vulkan::{Context, SpecValue};
 
 use crate::{
     Error,
-    decode::{DecodeGraph, Decoder, SUBGROUPS, Tuning},
+    decode::{DecodeGraph, Decoder, LayerTensors, SUBGROUPS, Shape, Tuning},
     graph::{Graph, Kind, Pipeline, TensorId},
     kernels::{Access, KernelInfo, Kernels},
     step::Program,
@@ -132,6 +132,29 @@ pub struct PrefillGraph {
     pub out: TensorId,
 }
 
+/// A stack's tensors in a graph, which a prefill runs over: its weights, its cache and the
+/// rotation tables.
+#[derive(Clone, Copy, Debug)]
+pub struct StackTensors<'a> {
+    pub shape: &'a Shape,
+    pub layers: &'a [LayerTensors],
+    pub norm: TensorId,
+    pub cos: TensorId,
+    pub sin: TensorId,
+}
+
+impl<'a> From<&'a DecodeGraph> for StackTensors<'a> {
+    fn from(decode: &'a DecodeGraph) -> Self {
+        StackTensors {
+            shape: &decode.shape,
+            layers: &decode.layers,
+            norm: decode.norm,
+            cos: decode.cos,
+            sin: decode.sin,
+        }
+    }
+}
+
 /// The prefill program of `rows` rows over the stack `decode` runs, with tensors for `max_rows`,
 /// its kernels at `tuning`'s subgroup size.
 pub fn prefill_graph(
@@ -140,7 +163,47 @@ pub fn prefill_graph(
     max_rows: usize,
     tuning: &Tuning,
 ) -> Result<PrefillGraph, Error> {
-    let s = &decode.shape;
+    let mut g = decode.graph.clone();
+    g.ops.clear();
+    let half = (max_rows * decode.shape.hidden * 2) as u64;
+    let run = g.tensor("prefill.run", 8, Kind::Param);
+    let x = g.tensor("prefill.x", half, Kind::Input);
+    let out = g.tensor("prefill.out", half, Kind::Output);
+    let stack = StackTensors::from(decode);
+    append_prefill(
+        &mut g,
+        "prefill",
+        stack,
+        rows,
+        max_rows,
+        tuning,
+        [run, x, out],
+    )?;
+    Ok(PrefillGraph {
+        graph: g,
+        rows,
+        max_rows,
+        run,
+        x,
+        out,
+    })
+}
+
+/// Appends to `g` the run of `rows` rows through `stack`, one of `g`'s, from the hidden states
+/// `x` of the positions `run` gives to their outputs after the final norm, `out`, both
+/// `[max_rows][hidden]` in f16; its tensors of its own named after `name` and sized for
+/// `max_rows` rows, so that the runs of any rows lay them out alike. Its kernels run at
+/// `tuning`'s subgroup size.
+pub fn append_prefill(
+    g: &mut Graph,
+    name: &str,
+    stack: StackTensors,
+    rows: usize,
+    max_rows: usize,
+    tuning: &Tuning,
+    [run, x, out]: [TensorId; 3],
+) -> Result<(), Error> {
+    let s = stack.shape;
     let check = |ok: bool, why: String| if ok { Ok(()) } else { Err(Error::Shape(why)) };
     check(
         rows > 0 && rows.is_multiple_of(TILE) && rows <= max_rows,
@@ -216,30 +279,32 @@ pub fn prefill_graph(
     let gate_up_gemm = gemm_op(2 * s.inner, s.hidden)?;
     let down_gemm = gemm_op(s.hidden, s.inner)?;
 
-    let mut g = decode.graph.clone();
-    g.ops.clear();
     let half = |n: usize| (max_rows * n * 2) as u64;
     let single = |n: usize| (max_rows * n * 4) as u64;
-    let run = g.tensor("prefill.run", 8, Kind::Param);
-    let x = g.tensor("prefill.x", half(s.hidden), Kind::Input);
-    let out = g.tensor("prefill.out", half(s.hidden), Kind::Output);
+    for (t, want) in [(run, 8), (x, half(s.hidden)), (out, half(s.hidden))] {
+        let bytes = g.tensors[t.0].bytes;
+        check(
+            bytes == want,
+            format!("{name}: tensor {} of {bytes} bytes, not {want}", t.0),
+        )?;
+    }
     let row_groups = [rows as u32, 1, 1];
     let mut input = x;
     let mut normed = g.tensor(
-        "prefill.layers.0.normed",
+        format!("{name}.layers.0.normed"),
         half(s.hidden),
         Kind::Intermediate,
     );
     g.op(
-        "prefill.input_norm",
+        format!("{name}.input_norm"),
         norm,
-        &[run, x, decode.layers[0].input_norm, normed],
+        &[run, x, stack.layers[0].input_norm, normed],
         row_groups,
     );
-    for (l, w) in decode.layers.iter().enumerate() {
+    for (l, w) in stack.layers.iter().enumerate() {
         let mut t = |what: &str, bytes| {
             g.tensor(
-                format!("prefill.layers.{l}.{what}"),
+                format!("{name}.layers.{l}.{what}"),
                 bytes,
                 Kind::Intermediate,
             )
@@ -254,16 +319,16 @@ pub fn prefill_graph(
         let mlp = t("mlp", half(s.inner));
         let down = t("down", single(s.hidden));
         let output = t("out", half(s.hidden));
-        let (next_normed, gain) = match decode.layers.get(l + 1) {
+        let (next_normed, gain) = match stack.layers.get(l + 1) {
             Some(next) => (
                 g.tensor(
-                    format!("prefill.layers.{}.normed", l + 1),
+                    format!("{name}.layers.{}.normed", l + 1),
                     half(s.hidden),
                     Kind::Intermediate,
                 ),
                 next.input_norm,
             ),
-            None => (out, decode.norm),
+            None => (out, stack.norm),
         };
         g.op(
             "qkv_proj",
@@ -274,7 +339,7 @@ pub fn prefill_graph(
         g.op(
             "rope_rows",
             rope_pipeline.clone(),
-            &[run, qkv, decode.cos, decode.sin, q, w.k_cache, w.v_cache],
+            &[run, qkv, stack.cos, stack.sin, q, w.k_cache, w.v_cache],
             row_groups,
         );
         g.op(
@@ -317,14 +382,7 @@ pub fn prefill_graph(
         input = output;
         normed = next_normed;
     }
-    Ok(PrefillGraph {
-        graph: g,
-        rows,
-        max_rows,
-        run,
-        x,
-        out,
-    })
+    Ok(())
 }
 
 /// A stack's prefill on the GPU: programs over a [`Decoder`]'s memory, one for each number of
