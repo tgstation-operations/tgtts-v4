@@ -150,7 +150,7 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
     assert_eq!(differences(&one_at_a_time, &on_the_cpu(&x)), 0);
 
     let mut recording = chain(&ctx, &kernels, n, false);
-    assert_eq!(recording.dispatches(), 3);
+    assert_eq!(recording.dispatches(0), 3);
     let submissions = 200;
     let start = Instant::now();
     for step in 0..submissions {
@@ -189,6 +189,93 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
         "{submissions} submissions of 3 dispatches over {n} elements, bit-exact each time; \
          {:.1} us each with the host's writes and reads (smoke, not a measurement)",
         start.elapsed().as_secs_f64() * 1e6 / f64::from(submissions)
+    );
+    assert_no_validation_messages(&ctx);
+}
+
+#[test]
+fn programs_over_shared_buffers_run_alternately_each_as_its_own_dispatches_would() {
+    let ctx = context();
+    let kernels: Vec<_> = LINKS.iter().map(|&(a, b)| axpb(&ctx, a, b)).collect();
+    let n = 10_007;
+    let bytes = 4 * n as u64;
+    // The first program, the chain, from x in buffer 0 to buffer 2. The second takes the chain's
+    // output on through its second and first links, into a buffer added for it, by way of the
+    // range of buffer 1 the chain's first link writes.
+    let mut recording = chain(&ctx, &kernels, n, false);
+    let out = recording
+        .add_buffer(
+            ctx.buffer_in(bytes, Residence::Readback)
+                .unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    let scratch = Binding::range(1, 0, bytes);
+    let links = [
+        (1, Binding::whole(2), scratch),
+        (0, scratch, Binding::whole(out)),
+    ];
+    let dispatches: Vec<_> = links
+        .iter()
+        .map(|&(link, from, to)| Dispatch {
+            kernel: Arc::clone(&kernels[link]),
+            bindings: vec![from, to, Binding::whole(3)],
+            groups: [groups_for(n as u64, WIDTH) as u32, 1, 1],
+            barrier: true,
+        })
+        .collect();
+    let second = recording
+        .add_program(&dispatches, true)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((second, recording.programs()), (1, 2));
+    assert_eq!(recording.dispatches(second), 2);
+    let on = |x: &[f32]| -> Vec<f32> {
+        let link = |v: f32, (a, b): (f32, f32)| a * v + b;
+        x.iter()
+            .map(|&v| link(link(v, LINKS[1]), LINKS[0]))
+            .collect()
+    };
+
+    for step in 0..6 {
+        let x = inputs(n, step + 1);
+        recording.buffer_mut(0).write(&x).unwrap();
+        recording.submit().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            recording.timings().unwrap().is_none(),
+            "the chain is untimed"
+        );
+        let chained = recording.buffer(2).read::<f32>().unwrap();
+        assert_eq!(differences(&chained, &on_the_cpu(&x)), 0, "step {step}");
+        // Twice on some steps: a program may follow itself as well as the other.
+        for _ in 0..1 + step % 2 {
+            recording
+                .submit_program(second)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let timings = recording.timings().unwrap().expect("a timed program");
+        assert_eq!(timings.len(), 2);
+        let got = recording.buffer(out).read::<f32>().unwrap();
+        assert_eq!(differences(&got, &on(&chained)), 0, "step {step}");
+    }
+    assert!(matches!(
+        recording.start_program(2),
+        Err(Error::Unsupported(_))
+    ));
+
+    // The second program recorded again as one link, in place.
+    let one = &dispatches[1..];
+    recording
+        .replace_program(second, one, false)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(matches!(recording.timings(), Err(Error::Unsupported(_))));
+    recording
+        .submit_program(second)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let scratch: Vec<f32> = recording.buffer(1).read::<f32>().unwrap()[..n].to_vec();
+    let link = |&v: &f32| LINKS[0].0 * v + LINKS[0].1;
+    let got = recording.buffer(out).read::<f32>().unwrap();
+    assert_eq!(
+        differences(&got, &scratch.iter().map(link).collect::<Vec<_>>()),
+        0
     );
     assert_no_validation_messages(&ctx);
 }

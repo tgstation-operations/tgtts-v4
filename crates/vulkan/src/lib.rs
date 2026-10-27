@@ -18,7 +18,8 @@
 //! - [`Context::dispatch`] runs it, waits, and returns the GPU time from timestamps.
 //! - [`Context::record`] records a chain of dispatches with the barriers between them into one
 //!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
-//!   each submission, and each dispatch when asked.
+//!   each submission, and each dispatch when asked; [`Recording::add_program`] records more such
+//!   chains over the same buffers, the programs of one model, to run one at a time.
 //! - [`Context::set_fence_spin`] has every wait for the GPU poll for a while before it blocks.
 //! - [`Context::calibrate`] reads the GPU's timestamp counter beside the host's clock, which places
 //!   a submission's ends ([`Recording::ends`]) on the host's timeline.

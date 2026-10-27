@@ -1,6 +1,7 @@
-//! A whole chain of dispatches recorded once into one command buffer and submitted as often as
+//! Chains of dispatches recorded once, each into one command buffer, and submitted as often as
 //! needed: a model's step, whose shapes do not change from one step to the next, costs the host
-//! one submission and one wait, not a recording per kernel.
+//! one submission and one wait, not a recording per kernel. A recording holds several such
+//! programs over the buffers they share, one running at a time.
 //!
 //! The recording owns the buffers it binds, so none of them can be freed, or touched by the host,
 //! while the GPU may be using it: [`Recording::submit`] takes it mutably and waits for the GPU
@@ -12,8 +13,8 @@
 //! address.
 //!
 //! Every submission is timed from a timestamp before its first dispatch to one after its last
-//! ([`Recording::elapsed`]), which costs two timestamps a submission; a recording made timed also
-//! times each dispatch ([`Recording::timings`]).
+//! ([`Recording::elapsed`]), which costs two timestamps a submission; a program recorded timed
+//! also times each dispatch ([`Recording::timings`]).
 
 use std::{mem::ManuallyDrop, sync::Arc};
 
@@ -98,32 +99,53 @@ pub fn binding_range(
     Ok(size)
 }
 
-/// A chain of dispatches recorded into one command buffer, and the buffers it binds.
+/// Chains of dispatches over one set of buffers, each recorded into a command buffer of its own
+/// and submitted as often as needed, one at a time: the programs of a model over the weights and
+/// state they share, such as its decode step and its prefill, or the stages of a pipeline. The
+/// first program is recorded with the recording; more programs, and the buffers they need, are
+/// added as they come.
 pub struct Recording {
     ctx: Arc<Inner>,
     buffers: Vec<Buffer>,
+    pool: vk::CommandPool,
+    fence: vk::Fence,
+    programs: Vec<Program>,
+    /// Submitted, and not yet seen finished: the GPU may be using every buffer.
+    pending: bool,
+    /// The program the last submission ran, whose timestamps it has written.
+    last: Option<usize>,
+}
+
+/// One chain of dispatches: its commands, the descriptor sets they bind through, and its
+/// timestamps.
+struct Program {
     /// Kept alive while the commands name their pipelines.
     kernels: Vec<Arc<Kernel>>,
-    pool: vk::CommandPool,
     commands: vk::CommandBuffer,
-    fence: vk::Fence,
     descriptors: vk::DescriptorPool,
     /// One timestamp before the first dispatch, and one after each when timed, or else one after
     /// the last.
     timestamps: vk::QueryPool,
     timed: bool,
-    /// Submitted, and not yet seen finished: the GPU may be using every buffer.
-    pending: bool,
-    /// Submitted at least once, so that the timestamps have been written.
-    ran: bool,
+}
+
+impl Program {
+    /// The timestamps a submission writes.
+    fn queries(&self) -> u32 {
+        if self.timed {
+            self.kernels.len() as u32 + 1
+        } else {
+            2
+        }
+    }
 }
 
 impl std::fmt::Debug for Recording {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dispatches: Vec<usize> = self.programs.iter().map(|p| p.kernels.len()).collect();
         f.debug_struct("Recording")
             .field("buffers", &self.buffers.len())
-            .field("dispatches", &self.kernels.len())
-            .field("timed", &self.timed)
+            .field("dispatches", &dispatches)
             .finish_non_exhaustive()
     }
 }
@@ -135,8 +157,81 @@ impl Recording {
         dispatches: &[Dispatch],
         timed: bool,
     ) -> Result<Self> {
+        // Owned from here on: a failure below releases what exists through `Drop`
+        // (destroying a null handle is a no-op).
+        let mut recording = Recording {
+            ctx: Arc::clone(ctx),
+            buffers,
+            pool: vk::CommandPool::null(),
+            fence: vk::Fence::null(),
+            programs: Vec::new(),
+            pending: false,
+            last: None,
+        };
+        let device = &ctx.device;
+        // SAFETY: the device is live and each create-info outlives its call.
+        unsafe {
+            recording.pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family),
+                    None,
+                )
+                .call("vkCreateCommandPool")?;
+            recording.fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .call("vkCreateFence")?;
+        }
+        recording.add_program(dispatches, timed)?;
+        Ok(recording)
+    }
+
+    /// Takes `buffer` among those programs bind, and returns its index.
+    pub fn add_buffer(&mut self, buffer: Buffer) -> Result<usize> {
+        if !Arc::ptr_eq(&buffer.ctx, &self.ctx) {
+            return Err(Error::Unsupported("a buffer of another context".into()));
+        }
+        self.buffers.push(buffer);
+        Ok(self.buffers.len() - 1)
+    }
+
+    /// Records `dispatches` as another program over the buffers, timing each dispatch when
+    /// `timed`, and returns its index.
+    pub fn add_program(&mut self, dispatches: &[Dispatch], timed: bool) -> Result<usize> {
+        let program = self.program(dispatches, timed)?;
+        self.programs.push(program);
+        Ok(self.programs.len() - 1)
+    }
+
+    /// Records `dispatches` in place of program `program`, timing each dispatch when `timed`;
+    /// first waits for the last submission if waiting for it failed.
+    pub fn replace_program(
+        &mut self,
+        program: usize,
+        dispatches: &[Dispatch],
+        timed: bool,
+    ) -> Result<()> {
+        if program >= self.programs.len() {
+            return Err(Error::Unsupported(format!(
+                "program {program} of {}",
+                self.programs.len()
+            )));
+        }
+        self.finish()?;
+        let fresh = self.program(dispatches, timed)?;
+        let old = std::mem::replace(&mut self.programs[program], fresh);
+        self.release(&old);
+        if self.last == Some(program) {
+            self.last = None;
+        }
+        Ok(())
+    }
+
+    /// `dispatches` recorded as a program over the buffers, every binding checked before anything
+    /// reaches the driver.
+    fn program(&self, dispatches: &[Dispatch], timed: bool) -> Result<Program> {
+        let ctx = &self.ctx;
         let report = &ctx.report;
-        // Every binding is checked before anything reaches the driver.
+        let buffers = &self.buffers;
         let mut ranges = Vec::with_capacity(dispatches.len());
         for (i, d) in dispatches.iter().enumerate() {
             if !Arc::ptr_eq(&d.kernel.ctx, ctx) {
@@ -179,49 +274,45 @@ impl Recording {
                 .collect::<Result<Vec<u64>>>()?;
             ranges.push(sizes);
         }
-
-        let device = &ctx.device;
-        // Owned from here on: a failure below releases what exists through `Drop`
-        // (destroying a null handle is a no-op).
-        let mut recording = Recording {
-            ctx: Arc::clone(ctx),
-            buffers,
+        let mut program = Program {
             kernels: dispatches.iter().map(|d| Arc::clone(&d.kernel)).collect(),
-            pool: vk::CommandPool::null(),
             commands: vk::CommandBuffer::null(),
-            fence: vk::Fence::null(),
             descriptors: vk::DescriptorPool::null(),
             timestamps: vk::QueryPool::null(),
             timed,
-            pending: false,
-            ran: false,
         };
+        if let Err(e) = self.build(&mut program, dispatches, &ranges) {
+            self.release(&program);
+            return Err(e);
+        }
+        Ok(program)
+    }
+
+    /// Creates `program`'s objects and records its commands, each dispatch bound at `ranges`.
+    fn build(
+        &self,
+        program: &mut Program,
+        dispatches: &[Dispatch],
+        ranges: &[Vec<u64>],
+    ) -> Result<()> {
+        let device = &self.ctx.device;
         let count = u32::try_from(dispatches.len())
             .map_err(|_| Error::Unsupported("too many dispatches".into()))?;
         let bindings: u32 = dispatches.iter().map(|d| d.kernel.storage_buffers).sum();
         // SAFETY: the device is live and each create-info outlives its call.
         unsafe {
-            recording.pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family),
-                    None,
-                )
-                .call("vkCreateCommandPool")?;
-            recording.commands = device
+            program.commands = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(recording.pool)
+                        .command_pool(self.pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
                         .command_buffer_count(1),
                 )
                 .call("vkAllocateCommandBuffers")?[0];
-            recording.fence = device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .call("vkCreateFence")?;
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(bindings.max(1))];
-            recording.descriptors = device
+            program.descriptors = device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
                         .max_sets(count.max(1))
@@ -229,11 +320,11 @@ impl Recording {
                     None,
                 )
                 .call("vkCreateDescriptorPool")?;
-            recording.timestamps = device
+            program.timestamps = device
                 .create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(recording.queries()),
+                        .query_count(program.queries()),
                     None,
                 )
                 .call("vkCreateQueryPool")?;
@@ -247,7 +338,7 @@ impl Recording {
             unsafe {
                 device.allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(recording.descriptors)
+                        .descriptor_pool(program.descriptors)
                         .set_layouts(&layouts),
                 )
             }
@@ -255,14 +346,14 @@ impl Recording {
         };
         let infos: Vec<Vec<[vk::DescriptorBufferInfo; 1]>> = dispatches
             .iter()
-            .zip(&ranges)
+            .zip(ranges)
             .map(|(d, sizes)| {
                 d.bindings
                     .iter()
                     .zip(sizes)
                     .map(|(b, &size)| {
                         [vk::DescriptorBufferInfo::default()
-                            .buffer(recording.buffers[b.buffer].raw)
+                            .buffer(self.buffers[b.buffer].raw)
                             .offset(b.offset)
                             .range(size)]
                     })
@@ -282,25 +373,34 @@ impl Recording {
                 })
             })
             .collect();
-        // SAFETY: every buffer is live and owned by the recording; no set is in use.
+        // SAFETY: every buffer is live and owned by the recording; the sets are fresh.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        recording.record(dispatches, &sets)?;
-        Ok(recording)
+        self.record(program, dispatches, &sets)
     }
 
-    /// The timestamps a submission writes.
-    fn queries(&self) -> u32 {
-        if self.timed {
-            self.kernels.len() as u32 + 1
-        } else {
-            2
+    /// Destroys `program`'s objects, which no pending submission may be using; null handles
+    /// are no-ops.
+    fn release(&self, program: &Program) {
+        let device = &self.ctx.device;
+        // SAFETY: as above; the command buffer was allocated from this recording's pool.
+        unsafe {
+            device.destroy_query_pool(program.timestamps, None);
+            device.destroy_descriptor_pool(program.descriptors, None);
+            if program.commands != vk::CommandBuffer::null() {
+                device.free_command_buffers(self.pool, &[program.commands]);
+            }
         }
     }
 
-    fn record(&self, dispatches: &[Dispatch], sets: &[vk::DescriptorSet]) -> Result<()> {
+    fn record(
+        &self,
+        program: &Program,
+        dispatches: &[Dispatch],
+        sets: &[vk::DescriptorSet],
+    ) -> Result<()> {
         let device = &self.ctx.device;
-        let cmd = self.commands;
+        let cmd = program.commands;
         let between = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -319,14 +419,14 @@ impl Recording {
             device
                 .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
                 .call("vkBeginCommandBuffer")?;
-            // The previous submission's writes and reads, earlier in submission order, are
-            // ordered before this one's.
+            // The previous submission's writes and reads, of whichever program, earlier in
+            // submission order, are ordered before this one's.
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&between),
             );
-            let pool = self.timestamps;
-            device.cmd_reset_query_pool(cmd, pool, 0, self.queries());
+            let pool = program.timestamps;
+            device.cmd_reset_query_pool(cmd, pool, 0, program.queries());
             device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 0);
             let mut bound = vk::Pipeline::null();
             for (i, (d, &set)) in dispatches.iter().zip(sets).enumerate() {
@@ -353,7 +453,7 @@ impl Recording {
                     &[],
                 );
                 device.cmd_dispatch(cmd, d.groups[0], d.groups[1], d.groups[2]);
-                if self.timed {
+                if program.timed {
                     device.cmd_write_timestamp2(
                         cmd,
                         vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -362,7 +462,7 @@ impl Recording {
                     );
                 }
             }
-            if !self.timed {
+            if !program.timed {
                 device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, 1);
             }
             device.cmd_pipeline_barrier2(
@@ -374,9 +474,14 @@ impl Recording {
         Ok(())
     }
 
-    /// The number of dispatches recorded.
-    pub fn dispatches(&self) -> usize {
-        self.kernels.len()
+    /// The number of programs recorded.
+    pub fn programs(&self) -> usize {
+        self.programs.len()
+    }
+
+    /// The number of dispatches program `program` records.
+    pub fn dispatches(&self, program: usize) -> usize {
+        self.programs[program].kernels.len()
     }
 
     /// Buffer `i`, read in place between submissions.
@@ -395,15 +500,33 @@ impl Recording {
         Ok(std::mem::take(&mut self.buffers))
     }
 
-    /// Runs the recorded dispatches once and waits for them: when this returns, everything they
-    /// wrote is visible to the host.
+    /// Runs the first program once and waits for it: when this returns, everything it wrote is
+    /// visible to the host.
     pub fn submit(&mut self) -> Result<()> {
-        self.start()?.wait()
+        self.submit_program(0)
     }
 
-    /// Submits the recorded dispatches and returns without waiting for them; first waits again for
-    /// the last submission if waiting for it failed.
+    /// Submits the first program and returns without waiting for it.
     pub fn start(&mut self) -> Result<Submission<'_>> {
+        self.start_program(0)
+    }
+
+    /// Runs program `program` once and waits for it, as [`submit`](Self::submit) runs the
+    /// first.
+    pub fn submit_program(&mut self, program: usize) -> Result<()> {
+        self.start_program(program)?.wait()
+    }
+
+    /// Submits program `program` and returns without waiting for it; first waits again for the
+    /// last submission if waiting for it failed.
+    pub fn start_program(&mut self, program: usize) -> Result<Submission<'_>> {
+        let commands = self
+            .programs
+            .get(program)
+            .ok_or_else(|| {
+                Error::Unsupported(format!("program {program} of {}", self.programs.len()))
+            })?
+            .commands;
         self.finish()?;
         {
             let submit = self
@@ -411,10 +534,10 @@ impl Recording {
                 .submit
                 .lock()
                 .map_err(|_| Error::Unsupported("a poisoned queue lock".into()))?;
-            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(self.commands)];
+            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(commands)];
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
-            // SAFETY: the command buffer is executable and not pending (the last submission was
-            // seen finished above), and the queue is held for the call.
+            // SAFETY: the command buffer is executable and not pending (the last submission, of
+            // whichever program, was seen finished above), and the queue is held for the call.
             unsafe {
                 self.ctx
                     .device
@@ -423,7 +546,7 @@ impl Recording {
             .call("vkQueueSubmit2")?;
         }
         self.pending = true;
-        self.ran = true;
+        self.last = Some(program);
         Ok(Submission { recording: self })
     }
 
@@ -441,13 +564,14 @@ impl Recording {
     }
 
     /// The GPU time of each dispatch in the last submission, from the timestamp after the one
-    /// before it (or after the start) to the timestamp after it; `None` if the recording is
-    /// not timed. A barrier before a dispatch counts as its time.
+    /// before it (or after the start) to the timestamp after it; `None` if its program is not
+    /// timed. A barrier before a dispatch counts as its time.
     pub fn timings(&self) -> Result<Option<Vec<Timing>>> {
-        if !self.timed {
+        let program = self.ran()?;
+        if !program.timed {
             return Ok(None);
         }
-        let stamps = self.stamps(0, self.queries())?;
+        let stamps = self.stamps(0, program.queries())?;
         Ok(Some(
             stamps.windows(2).map(|w| self.timing(w[0], w[1])).collect(),
         ))
@@ -463,19 +587,25 @@ impl Recording {
     /// The last submission's timestamps before its first dispatch and after its last, in ticks,
     /// which a [`Calibration`](crate::Calibration) places on the host's clock.
     pub fn ends(&self) -> Result<[u64; 2]> {
-        let last = self.queries() - 1;
+        let last = self.ran()?.queries() - 1;
         Ok([self.stamps(0, 1)?[0], self.stamps(last, 1)?[0]])
+    }
+
+    /// The program the last submission ran, once it has run to the end.
+    fn ran(&self) -> Result<&Program> {
+        // Waiting for a timestamp no submission has written, or one still running, could block
+        // for good.
+        match self.last {
+            Some(program) if !self.pending => Ok(&self.programs[program]),
+            _ => Err(Error::Unsupported(
+                "the timestamps of a recording not run to the end".into(),
+            )),
+        }
     }
 
     /// `count` timestamps of the last submission from query `first`.
     fn stamps(&self, first: u32, count: u32) -> Result<Vec<u64>> {
-        // Waiting for a timestamp no submission has written, or one still running, could block
-        // for good.
-        if !self.ran || self.pending {
-            return Err(Error::Unsupported(
-                "the timestamps of a recording not run to the end".into(),
-            ));
-        }
+        let program = self.ran()?;
         let mut stamps = vec![0u64; count as usize];
         // SAFETY: the pool holds the queries asked for, all written by the last submission, which
         // has finished.
@@ -483,7 +613,7 @@ impl Recording {
             self.ctx
                 .device
                 .get_query_pool_results(
-                    self.timestamps,
+                    program.timestamps,
                     first,
                     &mut stamps,
                     vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
@@ -545,14 +675,15 @@ impl Drop for Recording {
             // The GPU may still read and write them: leaking the buffers and the commands is
             // the only safe end, freeing them would hand it memory reused by something else.
             std::mem::forget(std::mem::take(&mut self.buffers));
-            std::mem::forget(std::mem::take(&mut self.kernels));
+            std::mem::forget(std::mem::take(&mut self.programs));
             return;
+        }
+        for program in &self.programs {
+            self.release(program);
         }
         // SAFETY: the commands have finished, so nothing recorded is in use; null handles are
         // no-ops. Buffers and kernels are dropped after this, as fields.
         unsafe {
-            device.destroy_query_pool(self.timestamps, None);
-            device.destroy_descriptor_pool(self.descriptors, None);
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.pool, None);
         }

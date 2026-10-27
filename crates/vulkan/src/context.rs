@@ -489,7 +489,8 @@ impl Context {
     }
 
     /// Records `dispatches` over `buffers` into one command buffer, to be submitted as often
-    /// as needed ([`Recording`]), timing each dispatch when `timed`.
+    /// as needed ([`Recording`]), timing each dispatch when `timed`: the recording's first
+    /// program, to which more over the same buffers may be added.
     pub fn record(
         &self,
         buffers: Vec<Buffer>,
