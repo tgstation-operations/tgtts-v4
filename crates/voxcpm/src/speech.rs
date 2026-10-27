@@ -401,17 +401,27 @@ impl SpeechChunks {
         let powers = (0..).map(|power| 1usize << power);
         let most = self.spare.next_power_of_two();
         for rows in powers.take_while(|&rows| rows <= most) {
-            let shape = [rows, self.channels, CHUNK_FRAMES];
-            let latents = Tensor::random(shape, normal, &self.device);
-            let at = Tensor::<1, Int>::full([rows], self.spare as i64, &self.device);
             if !self.captured {
-                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.slots.push(at, latents);
+                // Through decode, whose chunks reach the decoder in a layout of their own, which
+                // keys the kernels autotune chooses.
+                let frames = [CHUNK_FRAMES, self.channels];
+                let decoder = |_| ChunkDecoder {
+                    slot: self.spare,
+                    pending: vec![Tensor::random(frames, normal, &self.device)],
+                    frames: CHUNK_FRAMES,
+                    context: 0,
+                };
+                let mut decoders: Vec<_> = (0..rows).map(decoder).collect();
+                let mut decoding: Vec<_> = decoders.iter_mut().collect();
+                self.decode(&mut decoding, &vec![false; rows]);
                 continue;
             }
             if self.graphs.contains_key(&rows) {
                 continue;
             }
+            let shape = [rows, self.channels, CHUNK_FRAMES];
+            let latents = Tensor::random(shape, normal, &self.device);
+            let at = Tensor::<1, Int>::full([rows], self.spare as i64, &self.device);
             let state = self.state.clone();
             state
                 .lock()
