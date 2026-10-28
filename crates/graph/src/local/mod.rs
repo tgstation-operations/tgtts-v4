@@ -176,11 +176,16 @@ pub struct Tuning {
 
 impl Tuning {
     /// One pair of tiles or one tile to a subgroup, the output and down projections cut into 2
-    /// and 4 parts, in workgroups of 256 that each take a workgroup's worth of them, the tokens
-    /// staged 512 columns at a time in blocks of 32, the weights loaded 8 steps ahead, at
-    /// `subgroup`. On the Radeon 8060S the sampler's ten steps for one request took 24.4 ms on
-    /// the GPU so, and 26.2 ms staging 256 columns 4 steps ahead.
+    /// and 4 parts, in workgroups of 256 that each take a workgroup's worth of them, the tokens in
+    /// blocks of 32, at `subgroup`; at 64 the tokens staged 512 columns at a time and the weights
+    /// loaded 8 steps ahead, at 32 256 columns and 4 steps.
+    ///
+    /// On the Radeon 8060S at 64 the sampler's ten steps for one request took 24.4 ms on the GPU
+    /// so, and 26.2 ms staging 256 columns 4 steps ahead. On the RTX 4070 Ti SUPER at 32 they took
+    /// 23.5 ms from submission to fence for 16 requests so, against 30.3 loaded 8 steps ahead,
+    /// and no less staging other columns or blocks of tokens.
     pub fn for_subgroup(subgroup: u32) -> Self {
+        let wide = subgroup >= 64;
         Tuning {
             subgroup,
             workgroup: 256,
@@ -190,9 +195,9 @@ impl Tuning {
             down_tiles: 1,
             o_parts: 2,
             down_parts: 4,
-            chunk: 512,
+            chunk: if wide { 512 } else { 256 },
             block: 32,
-            depth: 8,
+            depth: if wide { 8 } else { 4 },
             groups: 0,
         }
     }
@@ -217,17 +222,20 @@ impl Tuning {
 
     /// This tuning staging fewer columns, down to 256, and then fewer tokens at once, until it
     /// fits the shared memory of the device `report` describes: 48 KiB on NVIDIA's.
-    pub fn fit(mut self, report: &DeviceReport) -> Result<Self, Error> {
-        while self.shared_bytes() > report.max_shared_memory as usize {
+    pub fn fit(self, report: &DeviceReport) -> Result<Self, Error> {
+        self.fit_within(report.max_shared_memory as usize)
+    }
+
+    fn fit_within(mut self, bytes: usize) -> Result<Self, Error> {
+        while self.shared_bytes() > bytes {
             if self.chunk > 256 {
                 self.chunk /= 2;
             } else if self.block > TILE as u32 {
                 self.block -= TILE as u32;
             } else {
                 return Err(Error::Shape(format!(
-                    "{} bytes of shared memory for a block of {TILE} tokens, of {}",
-                    self.shared_bytes(),
-                    report.max_shared_memory
+                    "{} bytes of shared memory for a block of {TILE} tokens, of {bytes}",
+                    self.shared_bytes()
                 )));
             }
         }
@@ -727,6 +735,40 @@ pub fn tiled(values: &[u16], k: usize) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_defaults_run_as_they_are_on_the_devices_they_were_measured_on() {
+        // NVIDIA's 48 KiB of shared memory at 32, the Radeon's 64 at either.
+        for (subgroup, bytes) in [(32, 48 << 10), (32, 64 << 10), (64, 64 << 10)] {
+            let tuning = Tuning::for_subgroup(subgroup);
+            assert_eq!(
+                tuning.fit_within(bytes).unwrap(),
+                tuning,
+                "{subgroup} in {bytes}"
+            );
+        }
+        let at = |subgroup| {
+            let t = Tuning::for_subgroup(subgroup);
+            (t.chunk, t.depth)
+        };
+        assert_eq!(at(32), (256, 4));
+        assert_eq!(at(64), (512, 8));
+    }
+
+    #[test]
+    fn a_tuning_too_large_stages_fewer_columns_then_fewer_tokens() {
+        let wide = Tuning {
+            chunk: 1024,
+            block: 64,
+            ..Tuning::for_subgroup(32)
+        };
+        let fitted = wide.fit_within(48 << 10).unwrap();
+        assert_eq!((fitted.chunk, fitted.block), (256, 48));
+        assert!(fitted.shared_bytes() <= 48 << 10);
+        let fitted = wide.fit_within(32 << 10).unwrap();
+        assert_eq!((fitted.chunk, fitted.block), (256, 16));
+        assert!(wide.fit_within(16 << 10).is_err());
+    }
 
     #[test]
     fn tiles_hold_16_rows_of_16_columns_and_follow_each_other_along_the_rows() {
