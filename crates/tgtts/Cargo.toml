@@ -39,7 +39,7 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-toml = { workspace = true, features = ["parse", "std"] }
+toml = { workspace = true, features = ["display", "parse", "serde", "std"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "std", "tracing-log"] }
 vorbis_rs.workspace = true
