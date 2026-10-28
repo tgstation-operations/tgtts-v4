@@ -912,42 +912,51 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
     drop(generator);
     drop(ctx);
 
-    assert_eq!(forced.patches.len(), patches, "stopped after another patch");
-    assert_eq!(forced.audio.len(), samples);
-    let margin = margins("audio", &forced.audio, &burn, &want);
-    assert!(margin[1] <= 1.25, "{margin:.2?}");
-    let stale_margin = match stale.audio.len() == samples {
-        true => margins("audio after stale patches", &stale.audio, &burn, &want)[1],
-        false => f64::INFINITY,
+    let audio_margins = |name: &str, speech: &Speech| match speech.audio.len() == samples {
+        true => margins(name, &speech.audio, &burn, &want),
+        false => [f64::INFINITY; 2],
     };
-    assert!(stale_margin > 1.25, "audio after stale patches passes");
+    let margin = audio_margins("audio", &forced);
+    let stale_margin = audio_margins("audio after stale patches", &stale);
 
     // Run free, it stops where f32 does too, and its audio is what the service's decoder makes
     // of its patches on the CPU, to f32 rounding, which f16 storage does not reach.
-    assert_eq!(
-        free.patches.len(),
-        patches,
-        "run free, stopped after another patch"
-    );
     let decoder = cpu_decoder();
     let (_, voice) = voice();
     let cpu = cpu_speech(&decoder, voice.frames.as_flattened(), &free.patches);
     let d = distance(&free.audio, &cpu);
     eprintln!("run free, against the CPU's decoder over its patches: {d:?}");
-    assert!(d.max_abs <= 1e-4, "{d:?}");
     // The audio VAE carries its state from chunk to chunk, so audio decoded early in chunks
     // of fewer frames is the same audio.
-    assert_eq!(early.patches, free.patches);
-    assert!(
-        early.audio == free.audio,
-        "decoded early: {:?}",
-        distance(&early.audio, &free.audio)
-    );
+    if early.audio.len() == free.audio.len() {
+        let early = distance(&early.audio, &free.audio);
+        eprintln!("decoded early, against run free: {early:?}");
+    }
     // Defect: the CPU's decoder not primed with the voice's last frames.
     let unprimed = cpu_speech(&decoder, &[], &free.patches);
-    let d = distance(&free.audio, &unprimed);
+    let unprimed = distance(&free.audio, &unprimed);
+    eprintln!("run free, against the CPU's decoder not primed: {unprimed:?}");
+
+    // Every check is made before any fails, so that a run reports the free run's too.
+    let fails: Vec<&str> = [
+        ("stops", forced.patches.len() == patches),
+        ("audio", margin[1] <= 1.25),
+        ("audio after stale patches fails", stale_margin[1] > 1.25),
+        ("run free, stops", free.patches.len() == patches),
+        ("run free, audio", d.max_abs <= 1e-4),
+        ("early, same patches", early.patches == free.patches),
+        ("early, same audio", early.audio == free.audio),
+        ("audio not primed fails", unprimed.max_abs > 1e-4),
+    ]
+    .into_iter()
+    .filter(|&(_, holds)| !holds)
+    .map(|(name, _)| name)
+    .collect();
     assert!(
-        d.max_abs > 1e-4,
-        "audio not after the voice's frames passes: {d:?}"
+        fails.is_empty(),
+        "{fails:?}: {} patches of {patches}, {} run free; audio {margin:.2?}, after stale \
+         patches {stale_margin:.2?}; run free {d:?}, not primed {unprimed:?}",
+        forced.patches.len(),
+        free.patches.len()
     );
 }
