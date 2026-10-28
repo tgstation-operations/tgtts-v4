@@ -303,6 +303,19 @@ fn seeded_noise_is_standard_normal_and_repeats_for_a_seed() {
     assert!((variance - 1.0).abs() < 0.1, "variance {variance}");
 }
 
+/// The noise seeds draw, as they always have: an update of rand or rand_distr that drew other
+/// noise would change the speech of every seed.
+#[test]
+fn seeds_draw_the_noise_they_always_have() {
+    let first = [
+        0.712813, 0.85833144, -2.4362438, 0.16334426, -1.2750102, 1.287171, -1.4814075, 0.61259484,
+    ];
+    assert_eq!(SeededNoise::new(0).next(8), first);
+    let drawn = SeededNoise::new(7).next(4096);
+    let bytes: Vec<u8> = drawn.iter().flat_map(|x| x.to_le_bytes()).collect();
+    assert_eq!(crc32fast::hash(&bytes), 0x202b_a547);
+}
+
 #[test]
 fn decodes_after_the_voices_last_frames_as_upstream() {
     let (fixture, device) = (fixture!("voxcpm_generate"), device());
