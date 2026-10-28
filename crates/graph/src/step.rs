@@ -322,6 +322,14 @@ impl Step {
         Ok(self.start_program(program)?.wait()?)
     }
 
+    /// The step's first graph, as a program to [`run`](Self::run) beside those added.
+    pub fn first(&self) -> Program {
+        Program {
+            step: self.id,
+            index: 0,
+        }
+    }
+
     /// Whether `program` was recorded for this step, and so may run on it.
     pub fn holds(&self, program: Program) -> bool {
         program.step == self.id

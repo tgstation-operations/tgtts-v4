@@ -1,5 +1,5 @@
-//! A patch of VoxCPM2's generation at batch 1 as one recorded step: the local encoder embeds the
-//! patch before, the LM side runs it through both LMs at the next position and gives the DiT's
+//! A patch of VoxCPM2's generation as one recorded step: the local encoder embeds the patch
+//! before, the LM side runs it through both LMs at the next position and gives the DiT's
 //! condition and the stop logits, and the sampler samples the patch from noise. The host writes
 //! the patch before, the noise and the position, and reads the patch and the stop logits.
 //!
@@ -8,26 +8,33 @@
 //! past it. The step for the first patch after a prompt that ends in audio runs the prompt's last
 //! position too, its patch as the patch before: the prompt's other positions are what a prefill
 //! leaves in the caches.
+//!
+//! A step runs a [`Batch`] of rows, each a request at its own position in its own slot of both
+//! LMs' caches, a row of each tensor the host writes and reads; a row comes out bit for bit as it
+//! does alone. A [`PatchStep`] holds a program for each of several numbers of rows over one set of
+//! weights and caches, and runs the fewest rows that hold the requests under way.
+
+use std::mem;
 
 use vulkan::{Context, Timing};
 
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    decode,
+    decode::{self, Batch, Row},
     graph::{Graph, Kind, TensorId},
     kernels::Kernels,
-    lm_side::{LmSideGraph, LmSideShape, lm_side_graph, load_lm_side, splice},
+    lm_side::{LmSideGraph, LmSideShape, lm_side_batch_graph, load_lm_side, splice},
     local::{
         self, PatchConfig,
         dit::{SamplerGraph, load_sampler, sampler_graph},
         encoder::{EncoderGraph, encoder_graph, load_encoder},
     },
-    step::Step,
+    step::{Program, Step},
 };
 
 /// The patch step's graph, the graphs spliced into it with where each of their tensors went, and
-/// the tensors the host writes and reads.
+/// the tensors the host writes and reads, a row of each for every row of the batch.
 #[derive(Clone, Debug)]
 pub struct PatchGraph {
     pub graph: Graph,
@@ -39,7 +46,8 @@ pub struct PatchGraph {
     pub sampler_ids: Vec<TensorId>,
     /// The patch before, `[feat_dim][patch_size]` in f32, as the sampler gives a patch.
     pub cond: TensorId,
-    /// The position the patch before goes to in both LMs' caches, a u32.
+    /// Where the patch before goes in both LMs' caches, [`Batch::words`] u32: at batch 1, the one
+    /// position.
     pub position: TensorId,
     /// The noise the patch is sampled from, laid out as `cond`.
     pub noise: TensorId,
@@ -51,8 +59,33 @@ pub struct PatchGraph {
     pub stop_logits: TensorId,
 }
 
-/// The patch step of the LM side `side` and the local stacks of `config`, the sampler in
-/// `timesteps` steps, the LM side's kernels cut as `lm` says and the local stacks' as `local`.
+impl PatchGraph {
+    pub fn batch(&self) -> Batch {
+        self.side.batch
+    }
+
+    /// The graph with each of its tensors where `ids` puts it, in `graph`.
+    fn moved(self, graph: Graph, ids: &[TensorId]) -> Self {
+        let at = |t: TensorId| ids[t.0];
+        let all = |ids: Vec<TensorId>| ids.into_iter().map(at).collect();
+        PatchGraph {
+            graph,
+            encoder_ids: all(self.encoder_ids),
+            side_ids: all(self.side_ids),
+            sampler_ids: all(self.sampler_ids),
+            cond: at(self.cond),
+            position: at(self.position),
+            noise: at(self.noise),
+            sampling: at(self.sampling),
+            patch: at(self.patch),
+            stop_logits: at(self.stop_logits),
+            ..self
+        }
+    }
+}
+
+/// The patch step of the LM side `side` and the local stacks of `config` at batch 1, the sampler
+/// in `timesteps` steps, the LM side's kernels cut as `lm` says and the local stacks' as `local`.
 pub fn patch_graph(
     side: &LmSideShape,
     config: &PatchConfig,
@@ -60,9 +93,21 @@ pub fn patch_graph(
     lm: &decode::Tuning,
     local: &local::Tuning,
 ) -> Result<PatchGraph, Error> {
-    let encoder = encoder_graph(config, 1, local)?;
-    let side = lm_side_graph(side, lm)?;
-    let sampler = sampler_graph(config, timesteps, 1, local)?;
+    patch_batch_graph(side, config, timesteps, lm, local, Batch::ONE)
+}
+
+/// The patch step of [`patch_graph`] for `batch`.
+pub fn patch_batch_graph(
+    side: &LmSideShape,
+    config: &PatchConfig,
+    timesteps: usize,
+    lm: &decode::Tuning,
+    local: &local::Tuning,
+    batch: Batch,
+) -> Result<PatchGraph, Error> {
+    let encoder = encoder_graph(config, batch.rows, local)?;
+    let side = lm_side_batch_graph(side, lm, batch)?;
+    let sampler = sampler_graph(config, timesteps, batch.rows, local)?;
     let mut g = Graph::default();
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
     let cond = g.tensor("cond", bytes(&sampler.graph, sampler.cond), Kind::Input);
@@ -127,6 +172,52 @@ pub fn patch_graph(
     })
 }
 
+/// `rest` as programs over `first`'s weights and caches, and `first` as one beside them: each
+/// graph over `first`'s tensors and then the others' own in turn, a program's constants and state
+/// taken as `first`'s, which it must have alike and in the same order, and the rest its own.
+fn shared(first: PatchGraph, rest: Vec<PatchGraph>) -> Result<Vec<PatchGraph>, Error> {
+    let kept = |g: &Graph| -> Vec<TensorId> {
+        let tensors = g.tensors.iter().enumerate();
+        let kept = tensors.filter(|(_, t)| matches!(t.kind, Kind::Constant | Kind::State));
+        kept.map(|(i, _)| TensorId(i)).collect()
+    };
+    let weights = kept(&first.graph);
+    let mut tensors = Graph {
+        tensors: first.graph.tensors.clone(),
+        ops: Vec::new(),
+    };
+    let mut programs = Vec::with_capacity(rest.len());
+    for p in rest {
+        let theirs = kept(&p.graph);
+        let alike = |(a, b): (&TensorId, &TensorId)| {
+            let (a, b) = (&p.graph.tensors[a.0], &tensors.tensors[b.0]);
+            (&a.name, a.bytes, a.kind) == (&b.name, b.bytes, b.kind)
+        };
+        if theirs.len() != weights.len() || !theirs.iter().zip(&weights).all(alike) {
+            return Err(Error::Shape(format!(
+                "a program of {} rows over other weights or caches",
+                p.batch().rows
+            )));
+        }
+        let pairs: Vec<(TensorId, TensorId)> = theirs.into_iter().zip(weights.clone()).collect();
+        let prefix = format!("rows{}.", p.batch().rows);
+        let ids = splice(&mut tensors, &p.graph, &prefix, &pairs);
+        let ops = mem::take(&mut tensors.ops);
+        programs.push((p, ids, ops));
+    }
+    let over = |ops: Vec<_>| Graph {
+        tensors: tensors.tensors.clone(),
+        ops,
+    };
+    let ids: Vec<TensorId> = (0..first.graph.tensors.len()).map(TensorId).collect();
+    let ops = first.graph.ops.clone();
+    let mut all = vec![first.moved(over(ops), &ids)];
+    for (p, ids, ops) in programs {
+        all.push(p.moved(over(ops), &ids));
+    }
+    Ok(all)
+}
+
 /// `[rows][columns]` as `[columns][rows]`: a patch's frames, `[patch_size][feat_dim]`, laid out
 /// as the patch step takes a patch when `rows` is `patch_size`, and back when it is `feat_dim`.
 pub(crate) fn transposed(values: &[f32], rows: usize) -> Vec<f32> {
@@ -152,11 +243,26 @@ impl Sampled {
     }
 }
 
-/// VoxCPM2's patch step on the GPU, with its weights and both LMs' KV caches.
+/// A request's row of a patch step: where it runs, and what its patch is sampled from.
+#[derive(Clone, Copy, Debug)]
+pub struct PatchRow<'a> {
+    /// The position its patch before goes to, in its slot of the caches.
+    pub at: Row,
+    /// The patch before and the noise, laid out as the module's documentation says.
+    pub cond: &'a [f32],
+    pub noise: &'a [f32],
+    pub temperature: f32,
+    /// The guidance scale.
+    pub cfg: f32,
+}
+
+/// VoxCPM2's patch step on the GPU, with its weights and both LMs' KV caches: a program for each
+/// of several numbers of rows over them.
 #[derive(Debug)]
 pub struct PatchStep {
     step: Step,
-    tensors: PatchGraph,
+    /// Fewest rows first, each graph over every tensor the step holds.
+    programs: Vec<(Program, PatchGraph)>,
     capacity: usize,
 }
 
@@ -169,7 +275,41 @@ impl PatchStep {
         tensors: PatchGraph,
         timed: bool,
     ) -> Result<Self, Error> {
-        let mut step = Step::new(ctx, kernels, &tensors.graph, timed)?;
+        Self::with_rows(ctx, kernels, vec![tensors], timed)
+    }
+
+    /// Records `graphs`, each a graph [`patch_batch_graph`] gives for a number of rows of its
+    /// own over caches of as many slots as the others', as programs over one set of weights and
+    /// caches, as [`new`](Self::new) records one.
+    pub fn with_rows(
+        ctx: &Context,
+        kernels: &mut Kernels,
+        mut graphs: Vec<PatchGraph>,
+        timed: bool,
+    ) -> Result<Self, Error> {
+        graphs.sort_by_key(|g| g.batch().rows);
+        let rows: Vec<usize> = graphs.iter().map(|g| g.batch().rows).collect();
+        let slots = graphs.first().map(|g| g.batch().slots);
+        if slots.is_none()
+            || rows.windows(2).any(|w| w[0] == w[1])
+            || graphs.iter().any(|g| Some(g.batch().slots) != slots)
+        {
+            return Err(Error::Shape(format!(
+                "programs of {rows:?} rows over caches of {:?} slots",
+                graphs.iter().map(|g| g.batch().slots).collect::<Vec<_>>()
+            )));
+        }
+        let rest = graphs.split_off(1);
+        let first = graphs.remove(0);
+        let mut step = Step::new(ctx, kernels, &first.graph, timed)?;
+        let all = shared(first, rest)?;
+        let added: Vec<&Graph> = all[1..].iter().map(|p| &p.graph).collect();
+        let programs = step.add(ctx, kernels, &added, timed)?;
+        let programs: Vec<(Program, PatchGraph)> = std::iter::once(step.first())
+            .chain(programs)
+            .zip(all)
+            .collect();
+        let tensors = &programs[0].1;
         let base = &tensors.side.shape.base;
         let (cos, sin) = base.rope_tables();
         let at = |t: TensorId| tensors.side_ids[t.0];
@@ -178,23 +318,24 @@ impl PatchStep {
         Ok(PatchStep {
             capacity: base.capacity,
             step,
-            tensors,
+            programs,
         })
     }
 
     /// Writes the weights of the LM side, the DiT and the local encoder from VoxCPM2's
     /// checkpoint, converted to f16, and the sampler's time tokens.
     pub fn load(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
-        let t = &self.tensors;
+        let t = &self.programs[0].1;
         let (step, g) = (&mut self.step, &t.graph);
         load_encoder(step, g, &t.encoder, &t.encoder_ids, checkpoint)?;
         load_lm_side(step, g, &t.side, &t.side_ids, checkpoint)?;
         load_sampler(step, g, &t.sampler, &t.sampler_ids, checkpoint)
     }
 
-    /// Runs `cond`, the patch before, through both LMs at `position`, writing their keys and
-    /// values there, and samples the patch from `noise` at `temperature` and guidance scale
-    /// `cfg`; `cond` and `noise` are laid out as the module's documentation says.
+    /// Runs `cond`, the patch before, through both LMs at `position` of the caches' first slot,
+    /// writing their keys and values there, and samples the patch from `noise` at `temperature`
+    /// and guidance scale `cfg`; `cond` and `noise` are laid out as the module's documentation
+    /// says.
     pub fn run(
         &mut self,
         position: usize,
@@ -203,35 +344,97 @@ impl PatchStep {
         temperature: f32,
         cfg: f32,
     ) -> Result<Sampled, Error> {
-        if position >= self.capacity {
-            return Err(Error::Shape(format!(
-                "position {position} in a cache of {}",
-                self.capacity
-            )));
-        }
-        let t = &self.tensors;
-        self.step.write(t.cond, cond)?;
-        self.step.write(t.noise, noise)?;
-        self.step.write(t.position, &[position as u32])?;
-        self.step.write(t.sampling, &[temperature, cfg])?;
-        self.step.submit()?;
-        let logits: Vec<u16> = self.step.read(t.stop_logits)?;
-        let logit = |i: usize| half::f16::from_bits(logits[i]).to_f32();
-        Ok(Sampled {
-            patch: self.step.read(t.patch)?,
-            stop_logits: [logit(0), logit(1)],
-        })
+        let row = PatchRow {
+            at: Row { position, slot: 0 },
+            cond,
+            noise,
+            temperature,
+            cfg,
+        };
+        let mut sampled = self.run_rows(&[Some(row)])?;
+        Ok(sampled.remove(0).expect("a row that runs"))
     }
 
-    /// The positions the caches hold.
+    /// Runs `rows`, each a request's or spare, as [`run`](Self::run) runs one, each in its own
+    /// slot: on the program of the fewest rows that holds them, the rows past them spare. Gives
+    /// what each row sampled, none for a spare row.
+    pub fn run_rows(
+        &mut self,
+        rows: &[Option<PatchRow<'_>>],
+    ) -> Result<Vec<Option<Sampled>>, Error> {
+        let Some((program, t)) = self
+            .programs
+            .iter()
+            .find(|(_, t)| t.batch().rows >= rows.len())
+        else {
+            return Err(Error::Shape(format!(
+                "{} rows, of at most {}",
+                rows.len(),
+                self.rows().last().copied().unwrap_or(0)
+            )));
+        };
+        let batch = t.batch();
+        let len = t.sampler.feat_dim * t.sampler.patch_size;
+        let mut placed = vec![None; batch.rows];
+        let mut cond = vec![0.0; batch.rows * len];
+        let mut noise = vec![0.0; batch.rows * len];
+        let mut sampling = vec![0.0; 2 * batch.rows];
+        for (b, row) in rows.iter().enumerate() {
+            let Some(row) = row else {
+                continue;
+            };
+            if row.cond.len() != len || row.noise.len() != len {
+                return Err(Error::Shape(format!(
+                    "row {b}: a patch before of {} values and noise of {}, of {len}",
+                    row.cond.len(),
+                    row.noise.len()
+                )));
+            }
+            placed[b] = Some(row.at);
+            cond[b * len..(b + 1) * len].copy_from_slice(row.cond);
+            noise[b * len..(b + 1) * len].copy_from_slice(row.noise);
+            sampling[2 * b..2 * b + 2].copy_from_slice(&[row.temperature, row.cfg]);
+        }
+        let words = batch.placement(&placed, self.capacity)?;
+        self.step.write(t.cond, &cond)?;
+        self.step.write(t.noise, &noise)?;
+        self.step.write(t.position, &words)?;
+        self.step.write(t.sampling, &sampling)?;
+        self.step.run(*program)?;
+        let logits: Vec<u16> = self.step.read(t.stop_logits)?;
+        let patches: Vec<f32> = self.step.read(t.patch)?;
+        let logit = |i: usize| half::f16::from_bits(logits[i]).to_f32();
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(b, row)| {
+                row.map(|_| Sampled {
+                    patch: patches[b * len..(b + 1) * len].to_vec(),
+                    stop_logits: [logit(2 * b), logit(2 * b + 1)],
+                })
+            })
+            .collect())
+    }
+
+    /// The positions each slot of the caches holds.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// The step's tensors, and the step, for programs over its weights and caches to be added to
-    /// it ([`Step::add`]) and run.
+    /// The slots of the caches.
+    pub fn slots(&self) -> usize {
+        self.programs[0].1.batch().slots
+    }
+
+    /// The numbers of rows it has a program for, fewest first.
+    pub fn rows(&self) -> Vec<usize> {
+        self.programs.iter().map(|(_, t)| t.batch().rows).collect()
+    }
+
+    /// The tensors of the program of the fewest rows, over every tensor of the step, and the
+    /// step, for programs over its weights and caches to be added to it ([`Step::add`]) and run.
     pub fn parts_mut(&mut self) -> (&PatchGraph, &mut Step) {
-        (&self.tensors, &mut self.step)
+        (&self.programs[0].1, &mut self.step)
     }
 
     /// Each dispatch's label and GPU time in the last run, when recorded timed.
@@ -239,7 +442,8 @@ impl PatchStep {
         self.step.timings()
     }
 
-    /// The recorded step's dispatches, barriers and arena.
+    /// The recorded step's dispatches, barriers and arena: those of the program of the fewest
+    /// rows.
     pub fn graph_step(&self) -> &Step {
         &self.step
     }
@@ -247,6 +451,8 @@ impl PatchStep {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::{
         decode::{SUBGROUPS, Shape},
@@ -387,5 +593,67 @@ pub(crate) mod tests {
             assert_eq!(enc, p.side_ids[p.side.enc.0]);
             assert_eq!(g.tensors[enc.0].kind, Kind::Intermediate);
         }
+    }
+
+    /// [`graph`] for `rows` rows over caches of `slots` slots, the LM side cut as a batch of as
+    /// many rows is.
+    fn batch_graph(subgroup: u32, rows: usize, slots: usize) -> PatchGraph {
+        let lm = decode::Tuning::for_batch(subgroup, rows);
+        let local = local::Tuning::for_subgroup(subgroup);
+        let batch = Batch { rows, slots };
+        patch_batch_graph(&side(), &config(), 10, &lm, &local, batch).unwrap()
+    }
+
+    #[test]
+    fn programs_share_the_weights_and_caches_and_keep_their_rows_to_themselves() {
+        let rows = [1, 4, 16];
+        let graphs: Vec<PatchGraph> = rows.iter().map(|&r| batch_graph(32, r, 16)).collect();
+        let held = graphs[0].graph.tensors.len();
+        let all = shared(graphs[0].clone(), graphs[1..].to_vec()).unwrap();
+        let tensors = &all[0].graph.tensors;
+        let at = |p: &PatchGraph, t: TensorId| p.side_ids[t.0];
+        let mut owner: HashMap<TensorId, usize> = HashMap::new();
+        for (i, p) in all.iter().enumerate() {
+            assert_eq!(p.batch().rows, rows[i]);
+            assert_eq!(p.graph.tensors.len(), tensors.len());
+            for op in &p.graph.ops {
+                for &t in &op.bindings {
+                    let name = &tensors[t.0].name;
+                    if matches!(tensors[t.0].kind, Kind::Constant | Kind::State) {
+                        assert!(
+                            t.0 < held,
+                            "{} of {} rows: its own {name}",
+                            op.label,
+                            rows[i]
+                        );
+                        continue;
+                    }
+                    let first = *owner.entry(t).or_insert(i);
+                    assert_eq!(first, i, "{} of {} rows: {name}", op.label, rows[i]);
+                    assert_eq!(
+                        t.0 < held,
+                        i == 0,
+                        "{} of {} rows: {name}",
+                        op.label,
+                        rows[i]
+                    );
+                }
+            }
+            let bytes = |t: TensorId| tensors[t.0].bytes;
+            assert_eq!(bytes(p.cond), (rows[i] * 64 * 4 * 4) as u64);
+            assert_eq!(bytes(p.position), (2 * rows[i] * 4) as u64);
+            let (head, cache) = (p.side.heads.stop_head.weight, p.side.base.layers[0].k_cache);
+            let first = &all[0];
+            assert_eq!(at(p, head), at(first, first.side.heads.stop_head.weight));
+            assert_eq!(at(p, cache), at(first, first.side.base.layers[0].k_cache));
+        }
+        let labels = |g: &Graph| g.ops.iter().map(|op| op.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels(&all[0].graph), labels(&graphs[0].graph));
+        // A program over caches of other slots is refused.
+        let other = batch_graph(32, 4, 8);
+        assert!(matches!(
+            shared(graphs[0].clone(), vec![other]),
+            Err(Error::Shape(_))
+        ));
     }
 }
