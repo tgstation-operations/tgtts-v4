@@ -26,6 +26,16 @@
 //! are apart is held already. Teacher forcing keeps a level's effect on a patch from reaching the
 //! next through the patch.
 //!
+//! The audio is the decoder's of those patches, a level apart that the sampler amplifies with
+//! them. The decoder's causal convolutions put a patch's error in the audio of its frames and of
+//! the next patch's first, and, measured on the real weights, at most 0.2% of its energy in any
+//! frame after: so the audio of a patch's frames after its first is that patch's own. The audio
+//! is held to being the closer to f32's at half of those spans at least, at their largest error;
+//! and to burn's f16's RMS error over the spans of the patches where none of the GPU's levels is
+//! apart, together, when a run has `CLEAN` such patches. Only a run with fewer is held to the RMS
+//! error over all of the audio. A span's own largest error is not held: what the decoder carries
+//! on from a level apart amplified in the patch before can outweigh burn's error there.
+//!
 //! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
 //! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
@@ -817,18 +827,22 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize, subgroup: u3
     generator
 }
 
-/// A request's patches, `[patch_size][feat_dim]` each, and its audio.
+/// A request's patches, `[patch_size][feat_dim]` each, the quantizer's levels each was sampled
+/// after, and its audio.
+#[derive(Clone)]
 struct Speech {
     patches: Vec<Vec<f32>>,
+    levels: Vec<Vec<f32>>,
     audio: Vec<f32>,
 }
 
-/// `oracle`'s line spoken by `generator` from its noise: each patch sampled after f32's
+/// `oracle`'s line spoken by `generator`, each patch from its `noise`: sampled after f32's
 /// `stale`-th before, as teacher forcing does, or after its own when `stale` is `None`; the
 /// frames waiting decoded at once after each patch whose number `early` has, counting from 1.
 fn speak(
     generator: &mut Generator,
     oracle: &Oracle,
+    noise: &[Vec<f32>],
     stale: Option<usize>,
     early: &[usize],
 ) -> Speech {
@@ -849,8 +863,8 @@ fn speak(
             sampling.cfg_value,
         )
         .unwrap_or_else(|e| panic!("{e}"));
-    let (mut patches, mut audio) = (vec![], vec![]);
-    for (i, noise) in oracle.noise.iter().enumerate() {
+    let (mut patches, mut levels, mut audio) = (vec![], vec![], vec![]);
+    for (i, noise) in noise.iter().enumerate() {
         if let Some(before) = stale.and_then(|stale| i.checked_sub(stale)) {
             generator
                 .sample_after(&oracle.patches[0][before])
@@ -872,6 +886,7 @@ fn speak(
         if early.contains(&patches.len()) {
             generator.decode_waiting().unwrap_or_else(|e| panic!("{e}"));
         }
+        levels.push(generator.levels().unwrap_or_else(|e| panic!("{e}")));
         audio.extend(generator.take_audio());
         if patch.last {
             break;
@@ -884,7 +899,105 @@ fn speak(
         audio.len(),
         start.elapsed().as_secs_f64()
     );
-    Speech { patches, audio }
+    Speech {
+        patches,
+        levels,
+        audio,
+    }
+}
+
+/// How the GPU's audio compares with burn's f16's, both against f32's, in spans of each patch's
+/// frames after its first.
+#[derive(Debug)]
+struct AudioVerdict {
+    /// How many spans of how many are closer to f32's than burn's are at their largest error.
+    closer: [usize; 2],
+    /// The patches where none of the GPU's levels is apart.
+    clean: usize,
+    /// The relative RMS error over burn's over those patches' spans together, and over all of
+    /// the audio.
+    rms: [f64; 2],
+}
+
+impl AudioVerdict {
+    /// The criteria it fails. The audio is held over the spans of the patches clear of levels
+    /// apart where a run has enough of them, and over all of it only where it has fewer.
+    fn fails(&self) -> Vec<&'static str> {
+        let enough = self.clean >= CLEAN;
+        [
+            ("audio closer", 2 * self.closer[0] >= self.closer[1]),
+            ("clean audio", !enough || self.rms[0] <= 1.25),
+            ("all audio", enough || self.rms[1] <= 1.25),
+        ]
+        .into_iter()
+        .filter(|&(_, holds)| !holds)
+        .map(|(name, _)| name)
+        .collect()
+    }
+}
+
+/// The GPU's `speech` against f32's, beside burn's f16's, by its levels at each patch against
+/// f32's; each span printed when `table`.
+fn judge_audio(
+    name: &str,
+    speech: &Speech,
+    oracle: &Oracle,
+    [want, burn]: [&[f32]; 2],
+    table: bool,
+) -> AudioVerdict {
+    let (audio, levels) = (&speech.audio[..], &speech.levels[..]);
+    let patches = oracle.noise.len();
+    if audio.len() != want.len() || levels.len() != patches {
+        eprintln!(
+            "{name}: {} samples of {} and the levels of {} patches of {patches}",
+            audio.len(),
+            want.len(),
+            levels.len()
+        );
+        return AudioVerdict {
+            closer: [0, patches],
+            clean: 0,
+            rms: [f64::INFINITY; 2],
+        };
+    }
+    let gpu_flips = flips(levels, &oracle.levels[0]);
+    let burn_flips = flips(&oracle.levels[1], &oracle.levels[0]);
+    let frame = want.len() / (4 * patches);
+    let (mut closer, mut clean) = (0, [vec![], vec![], vec![]]);
+    for i in 0..patches {
+        let span = (4 * i + 1) * frame..(4 * i + 4) * frame;
+        let [ours, theirs] =
+            [audio, burn].map(|got| distance(&got[span.clone()], &want[span.clone()]));
+        closer += usize::from(ours.max_abs < theirs.max_abs);
+        if gpu_flips[i] == 0 {
+            for (kept, of) in clean.iter_mut().zip([audio, burn, want]) {
+                kept.extend_from_slice(&of[span.clone()]);
+            }
+        }
+        if table {
+            eprintln!(
+                "{name}, patch {i}'s frames after its first: levels apart GPU {}, burn f16 {}; \
+                 GPU {ours:?}, burn f16 {theirs:?}",
+                gpu_flips[i], burn_flips[i]
+            );
+        }
+    }
+    let [ours, theirs, wanted] = &clean;
+    let verdict = AudioVerdict {
+        closer: [closer, patches],
+        clean: gpu_flips.iter().filter(|&&apart| apart == 0).count(),
+        rms: [
+            margins(
+                &format!("{name} where no level is apart"),
+                ours,
+                theirs,
+                wanted,
+            )[1],
+            margins(name, audio, burn, want)[1],
+        ],
+    };
+    eprintln!("{name}: {verdict:.2?}");
+    verdict
 }
 
 #[test]
@@ -921,23 +1034,40 @@ fn speech_at(
     [want, burn]: [&[f32]; 2],
 ) -> Result<(), String> {
     let patches = oracle.noise.len();
-    let samples = want.len();
+    let mut next_noise = oracle.noise.clone();
+    next_noise.rotate_left(1);
     // Each patch after f32's patch before: it stops where f32 does, and its audio is as near
     // f32's as burn's f16's patches' is, decoded by the same decoder.
-    let forced = speak(generator, oracle, Some(1), &[]);
-    // Defect: each patch after f32's two before.
-    let stale = speak(generator, oracle, Some(2), &[]);
+    let forced = speak(generator, oracle, &oracle.noise, Some(1), &[]);
+    // Defect: each patch after f32's two before, which moves the levels.
+    let stale = speak(generator, oracle, &oracle.noise, Some(2), &[]);
+    // Defect: each patch from the next one's noise, which leaves the levels as they are.
+    let noisy = speak(generator, oracle, &next_noise, Some(1), &[]);
     // Each patch after its own, as the service generates.
-    let free = speak(generator, oracle, None, &[]);
+    let free = speak(generator, oracle, &oracle.noise, None, &[]);
     // Decoding the frames waiting after the patches a stream decodes early at.
-    let early = speak(generator, oracle, None, &[1, 2, 4, 8]);
+    let early = speak(generator, oracle, &oracle.noise, None, &[1, 2, 4, 8]);
 
-    let audio_margins = |name: &str, speech: &Speech| match speech.audio.len() == samples {
-        true => margins(name, &speech.audio, &burn, &want),
-        false => [f64::INFINITY; 2],
+    let judge = |name: &str, speech: &Speech, table: bool| {
+        judge_audio(name, speech, oracle, [want, burn], table)
     };
-    let margin = audio_margins("audio", &forced);
-    let stale_margin = audio_margins("audio after stale patches", &stale);
+    let verdict = judge("audio", &forced, true);
+    let mut fails: Vec<String> = verdict.fails().into_iter().map(String::from).collect();
+    // Defect: the audio 5% louder, as a decoder off in its gain would make it.
+    let louder = Speech {
+        audio: forced.audio.iter().map(|a| 1.05 * a).collect(),
+        ..forced.clone()
+    };
+    let defects = [
+        ("audio after stale patches", &stale, "all audio"),
+        ("audio from the next patch's noise", &noisy, "clean audio"),
+        ("audio 5% louder", &louder, "clean audio"),
+    ];
+    for (defect, speech, criterion) in defects {
+        if !judge(defect, speech, false).fails().contains(&criterion) {
+            fails.push(format!("{defect} passes {criterion}"));
+        }
+    }
 
     // Run free, it stops where f32 does too, and its audio is what the service's decoder makes
     // of its patches on the CPU, to f32 rounding, which f16 storage does not reach.
@@ -956,26 +1086,22 @@ fn speech_at(
     eprintln!("run free, against the CPU's decoder not primed: {unprimed:?}");
 
     // Every check is made before any fails, so that a run reports the free run's too.
-    let fails: Vec<&str> = [
+    let checks = [
         ("stops", forced.patches.len() == patches),
-        ("audio", margin[1] <= 1.25),
-        ("audio after stale patches fails", stale_margin[1] > 1.25),
         ("run free, stops", free.patches.len() == patches),
         ("run free, audio", d.max_abs <= 1e-4),
         ("early, same patches", early.patches == free.patches),
         ("early, same audio", early.audio == free.audio),
         ("audio not primed fails", unprimed.max_abs > 1e-4),
-    ]
-    .into_iter()
-    .filter(|&(_, holds)| !holds)
-    .map(|(name, _)| name)
-    .collect();
+    ];
+    let failed = checks.into_iter().filter(|&(_, holds)| !holds);
+    fails.extend(failed.map(|(name, _)| name.to_string()));
     if fails.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "{fails:?}: {} patches of {patches}, {} run free; audio {margin:.2?}, after stale \
-         patches {stale_margin:.2?}; run free {d:?}, not primed {unprimed:?}",
+        "{fails:?}: {} patches of {patches}, {} run free; {verdict:.2?}; run free {d:?}, not \
+         primed {unprimed:?}",
         forced.patches.len(),
         free.patches.len()
     ))

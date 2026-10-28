@@ -8,18 +8,21 @@
 
 use std::{fs, mem, path::Path};
 
+use half::f16;
 use serde::Deserialize;
-use vulkan::{Context, Timing};
+use vulkan::{Buffer, Context, Residence, Timing};
 
 use crate::{
     Error,
     checkpoint::Checkpoint,
     decode,
+    graph::{Kind, TensorId},
     kernels::Kernels,
     lm_side,
     local::{self, PatchConfig},
     patch::{PatchStep, patch_graph, transposed},
     prompt::{Prompt, PromptCache, Prompter},
+    step::Region,
     vae::{Parameter, VaeConfig, VaeDecoder, VaeShape},
 };
 
@@ -94,6 +97,9 @@ pub struct Generator {
     vae: VaeDecoder,
     checkpoint: Checkpoint,
     settings: Settings,
+    /// The scalar quantizer's levels in the patch step, the buffer [`levels`](Self::levels)
+    /// copies them out into, and the levels to a unit they are multiples of.
+    levels: (TensorId, Buffer, u32),
     patch_size: usize,
     feat_dim: usize,
     request: Option<Request>,
@@ -126,7 +132,11 @@ impl Generator {
         let lm = decode::Tuning::for_subgroup(subgroup);
         let local = local::Tuning::for_subgroup(subgroup).fit(report)?;
         let shape = lm_side::LmSideShape::new(&side_config, settings.capacity)?;
-        let graph = patch_graph(&shape, &config, settings.timesteps, &lm, &local)?;
+        let mut graph = patch_graph(&shape, &config, settings.timesteps, &lm, &local)?;
+        let levels = graph.side_ids[graph.side.levels.0];
+        // Out of the arena, whose later ops would reuse its bytes before they are copied out.
+        graph.graph.tensors[levels.0].kind = Kind::State;
+        let out = ctx.buffer_in(graph.graph.tensors[levels.0].bytes, Residence::Readback)?;
         let mut step = PatchStep::new(ctx, kernels, graph, settings.timed)?;
         let checkpoint = Checkpoint::open(dir.join("model.safetensors"))?;
         step.load(&checkpoint)?;
@@ -148,6 +158,7 @@ impl Generator {
             vae,
             checkpoint,
             settings: settings.clone(),
+            levels: (levels, out, shape.levels),
             patch_size: config.patch_size,
             feat_dim: config.feat_dim,
             request: None,
@@ -268,6 +279,24 @@ impl Generator {
         let request = self.request.as_mut().ok_or_else(no_request)?;
         let frames = mem::take(&mut request.frames);
         decode(&mut self.vae, request, &frames)
+    }
+
+    /// The scalar quantizer's levels the last patch was sampled after, integers: for checking a
+    /// generation against another's, as [`sample_after`](Self::sample_after) is. Generating reads
+    /// them nowhere else, and each call copies them out of the GPU's memory.
+    pub fn levels(&mut self) -> Result<Vec<f32>, Error> {
+        let (tensor, out, unit) = &mut self.levels;
+        let bytes = out.size();
+        let region = Region {
+            tensor: *tensor,
+            offset: 0,
+            other: 0,
+            bytes,
+        };
+        self.step.parts_mut().1.copy_out(&[region], out)?;
+        let halves: Vec<u16> = out.read_at(0, bytes as usize / 2)?;
+        let level = |h: &u16| (f16::from_bits(*h).to_f32() * *unit as f32).round();
+        Ok(halves.iter().map(level).collect())
     }
 
     /// What the generator keeps of the voices.
