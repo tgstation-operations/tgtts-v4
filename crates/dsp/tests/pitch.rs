@@ -4,7 +4,10 @@
 mod common;
 
 use common::Tensors;
-use dsp::{float, pitch::pitch_shift};
+use dsp::{
+    float,
+    pitch::{Shifter, pitch_shift},
+};
 
 /// librosa inverts its float32 spectrogram in float32, through pocketfft, where this inverts
 /// in float64 and rounds: with that step taken in float64 in librosa too, the two agree to the
@@ -52,6 +55,75 @@ fn matches_librosa() {
             fraction <= MAX_PCM_DIFFERING,
             "{case}: {differing} samples differ"
         );
+    }
+}
+
+/// `input` through a shifter by `steps` of `bins` to the octave, `chunk` samples at a time,
+/// and the most samples its output fell behind the input past the first quarter second.
+fn streamed(input: &[f32], steps: f64, bins: u32, chunk: usize) -> (Vec<f32>, usize) {
+    let mut shifter = Shifter::new(48000, steps, bins);
+    let (mut output, mut taken, mut lag) = (Vec::new(), 0, 0);
+    for piece in input.chunks(chunk) {
+        shifter.process(piece, &mut output);
+        taken += piece.len();
+        if taken > 12000 {
+            lag = lag.max(taken - output.len());
+        }
+    }
+    shifter.finish(&mut output);
+    (output, lag)
+}
+
+fn bits(x: &[f32]) -> Vec<u32> {
+    x.iter().map(|s| s.to_bits()).collect()
+}
+
+/// On a stream the shift is the same, to the bit, however the input is cut up: the cases
+/// above, which end within a few frames of their start, and two seconds of a voice-like tone.
+#[test]
+fn a_stream_gives_what_the_whole_does() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_pitch"));
+    let mut cases: Vec<(Vec<f32>, f64, u32)> = (0..fx.int("cases"))
+        .map(|case| {
+            let name = |what: &str| format!("{case}/{what}");
+            let input = float::from_pcm(&fx.pcm(&name("input")));
+            let steps = fx.f64s(&name("steps"))[0];
+            (input, steps, fx.int(&name("bins_per_octave")) as u32)
+        })
+        .collect();
+    let voice: Vec<f32> = (0..96000)
+        .map(|i| {
+            let t = f64::from(i) / 48000.0;
+            let f0 = 140.0 + 20.0 * (2.0 * std::f64::consts::PI * 3.0 * t).sin();
+            (1..12)
+                .map(|h| (2.0 * std::f64::consts::PI * f0 * f64::from(h) * t).sin() / f64::from(h))
+                .sum::<f64>() as f32
+                * 0.2
+        })
+        .collect();
+    cases.extend([(voice.clone(), 5.0, 24), (voice, -12.0, 24)]);
+    for (input, steps, bins) in &cases {
+        let whole = bits(&pitch_shift(input, 48000, *steps, *bins));
+        for chunk in [1, 480, 4096] {
+            let (output, _) = streamed(input, *steps, *bins, chunk);
+            assert!(
+                bits(&output) == whole,
+                "{steps}/{bins} in chunks of {chunk}"
+            );
+        }
+    }
+}
+
+/// In 10 ms chunks the shift keeps within the time its frames, its vocoder and libsoxr hold
+/// back: over speech, the most it fell behind was 112 ms an octave down and 57 ms up.
+#[test]
+fn a_stream_keeps_up() {
+    let input: Vec<f32> = (0..96000)
+        .map(|i| (f64::from(i) * 0.0293).sin() as f32 * 0.3)
+        .collect();
+    for (steps, most) in [(-24.0, 5400), (-4.0, 3500), (4.0, 3100), (24.0, 2900)] {
+        let (_, lag) = streamed(&input, steps, 24, 480);
+        assert!(lag <= most, "{steps} steps: {lag} samples behind");
     }
 }
 
