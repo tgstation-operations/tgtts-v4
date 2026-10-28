@@ -140,7 +140,7 @@ pkgs.writeShellApplication {
     # code is linted on its own.
     stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
     stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts -p bench --all-targets \
-      --features gpu/vulkan,tgtts/vulkan,bench/vulkan -- -D warnings
+      --features gpu/vulkan,tgtts/vulkan,tgtts/rt,bench/vulkan -- -D warnings
     # cubecl's CUDA runtime links the LLVM its build script finds there.
     stage clippy-cuda env XDG_DATA_HOME=${tracelLlvm} cargo clippy --locked -p gpu -p tgtts \
       -p bench --all-targets --features gpu/nvrtc,tgtts/cuda,bench/cuda -- -D warnings

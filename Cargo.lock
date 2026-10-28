@@ -6044,12 +6044,14 @@ checksum = "aa672c55ab69f787dbc9126cc387dbe57fdd595f585e4524cf89018fa44ab819"
 name = "tgtts"
 version = "0.1.0"
 dependencies = [
+ "audiovae",
  "axum",
  "blake3",
  "burn",
  "dsp",
  "effects",
  "gpu",
+ "graph",
  "rand 0.10.3",
  "rusqlite",
  "serde",
@@ -6064,6 +6066,7 @@ dependencies = [
  "voices",
  "vorbis_rs",
  "voxcpm",
+ "vulkan",
 ]
 
 [[package]]

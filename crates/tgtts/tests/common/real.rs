@@ -11,8 +11,9 @@ use std::{
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
-    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES, VoxCpm},
+    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES},
     service::{Limits, Logging, Loudness, Setup, Sounds},
+    synth::Synthesizer,
     wav,
 };
 use tracing::level_filters::LevelFilter;
@@ -56,7 +57,7 @@ fn frames_at_48k(assets: &Path, name: &str) -> usize {
 
 /// Serves `model`, which `prepare` readies with the voices while the health check answers 503,
 /// and asks for a message for everyone, as the game asks for it.
-pub fn serves_a_message(model: VoxCpm, prepare: impl FnOnce(&VoxCpm, &Voices)) {
+pub fn serves_a_message<S: Synthesizer>(model: S, prepare: impl FnOnce(&S, &Voices)) {
     let (voices, assets) = (dir("VOICES_DIR"), dir("ASSETS_DIR"));
     let table = Voices::open(&voices).unwrap();
     let speaker = table.names().next().unwrap().to_owned();

@@ -15,6 +15,7 @@ use tgtts::{
     metrics::Metrics,
     model::{Batching, VoxCpm},
     service::{self, Limits, Logging, Service, Setup, Sounds},
+    synth::Synthesizer,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -105,8 +106,12 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         // A thread of its own, which shutting down does not wait for as it would for the
         // runtime's blocking pool.
         thread::spawn(move || {
-            let model = load(&config, &device).map(|model| ready.ready(Arc::new(model)));
-            let _ = loaded.send(model);
+            let model = match &device {
+                device::Opened::Burn(device) => load(&config, device),
+                #[cfg(feature = "rt")]
+                device::Opened::Rt => load_rt(&config),
+            };
+            let _ = loaded.send(model.map(|model| ready.ready(model)));
         });
         let serve = axum::serve(listener, service::router(service))
             .with_graceful_shutdown(shutdown())
@@ -123,7 +128,10 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
 
 /// VoxCPM2 as `config` asks for it, on `device`, warmed up where its kernels are chosen as each
 /// shape first runs.
-fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send + Sync>> {
+fn load(
+    config: &Config,
+    device: &Device,
+) -> Result<Arc<dyn Synthesizer>, Box<dyn Error + Send + Sync>> {
     info!(
         checkpoint = %config.checkpoint_dir.display(),
         device = %config.device,
@@ -155,7 +163,30 @@ fn load(config: &Config, device: &Device) -> Result<VoxCpm, Box<dyn Error + Send
         model.warm_up(&voices)?;
     }
     info!("ready");
-    Ok(model)
+    Ok(Arc::new(model))
+}
+
+/// VoxCPM2 on the rt device as `config` asks for it, warmed up.
+#[cfg(feature = "rt")]
+fn load_rt(config: &Config) -> Result<Arc<dyn Synthesizer>, Box<dyn Error + Send + Sync>> {
+    info!(
+        checkpoint = %config.checkpoint_dir.display(),
+        device = %config.device,
+        "loading VoxCPM2"
+    );
+    let started = Instant::now();
+    let kernels = |dir: &Option<PathBuf>| dir.clone().expect("the config requires it for rt");
+    let model = tgtts::rt::Rt::load(
+        &config.checkpoint_dir,
+        &kernels(&config.glsl_kernels_dir),
+        &kernels(&config.mlir_kernels_dir),
+        &Params::default(),
+        config.prompt_cache_bytes,
+    )?;
+    info!(seconds = started.elapsed().as_secs_f64(), "loaded VoxCPM2");
+    model.warm_up(&Voices::open(&config.voices_dir)?)?;
+    info!("ready");
+    Ok(Arc::new(model))
 }
 
 async fn shutdown() {

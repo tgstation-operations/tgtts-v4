@@ -73,6 +73,8 @@ pub enum Kind {
     Vulkan,
     /// The first CUDA device, or the first `CUDA_VISIBLE_DEVICES` names.
     Cuda,
+    /// tts-rs's own runtime on the Vulkan GPU the `vulkan` crate chooses, rather than burn.
+    Rt,
 }
 
 impl Kind {
@@ -84,7 +86,8 @@ impl Kind {
 
     /// What each part of the model runs in by default: f32 on the CPU, and on a GPU f16 but for
     /// the audio decoder, whose first transposed convolution sums in f16 there and takes its
-    /// audio to 46 dB of upstream's, where the CPU in f16 reaches 56 dB.
+    /// audio to 46 dB of upstream's, where the CPU in f16 reaches 56 dB. The rt device runs in
+    /// those alone, storing f16 and computing in f32.
     pub fn dtypes(self) -> Dtypes {
         let (f32, f16) = (FloatDType::F32, FloatDType::F16);
         match self {
@@ -94,7 +97,7 @@ impl Kind {
                 local_dit: f32,
                 audio_decoder: f32,
             },
-            Self::Vulkan | Self::Cuda => Dtypes {
+            Self::Vulkan | Self::Cuda | Self::Rt => Dtypes {
                 lm: f16,
                 local_encoder: f16,
                 local_dit: f16,
@@ -112,7 +115,8 @@ impl FromStr for Kind {
             "cpu" => Ok(Self::Cpu),
             "vulkan" => Ok(Self::Vulkan),
             "cuda" => Ok(Self::Cuda),
-            _ => Err("not cpu, vulkan or cuda".to_owned()),
+            "rt" => Ok(Self::Rt),
+            _ => Err("not cpu, vulkan, cuda or rt".to_owned()),
         }
     }
 }
@@ -123,6 +127,7 @@ impl fmt::Display for Kind {
             Self::Cpu => "cpu",
             Self::Vulkan => "vulkan",
             Self::Cuda => "cuda",
+            Self::Rt => "rt",
         })
     }
 }
@@ -137,6 +142,16 @@ pub fn parse_dtype(name: &str) -> Result<FloatDType, String> {
     }
 }
 
+/// What the model is opened on.
+#[derive(Debug)]
+pub enum Opened {
+    /// burn's device.
+    Burn(Device),
+    /// tts-rs's own runtime, which opens its GPU as the model loads.
+    #[cfg(feature = "rt")]
+    Rt,
+}
+
 /// Opens the device of `kind`, with autotune keeping its results in `autotune_dir` on a GPU,
 /// where cubecl would keep them without one, and checks that it computes in each of `dtypes`.
 ///
@@ -144,11 +159,12 @@ pub fn parse_dtype(name: &str) -> Result<FloatDType, String> {
 ///
 /// If the build cannot open such a device, it is not what it should be, or it does not compute
 /// in one of the dtypes.
-pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<Device, String> {
+pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<Opened, String> {
     let device = match kind {
         Kind::Cpu => Device::flex(),
         Kind::Vulkan => vulkan(autotune_dir)?,
         Kind::Cuda => cuda(autotune_dir)?,
+        Kind::Rt => return rt(dtypes),
     };
     let parts = [
         ("lm_dtype", dtypes.lm),
@@ -163,7 +179,7 @@ pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<
             ));
         }
     }
-    Ok(device)
+    Ok(Opened::Burn(device))
 }
 
 #[cfg(feature = "vulkan")]
@@ -190,6 +206,22 @@ fn cuda(autotune_dir: Option<&Path>) -> Result<Device, String> {
 #[cfg(not(feature = "cuda"))]
 fn cuda(_: Option<&Path>) -> Result<Device, String> {
     Err("device cuda: this build has no CUDA; build tgtts with --features cuda".to_owned())
+}
+
+#[cfg(feature = "rt")]
+fn rt(dtypes: &Dtypes) -> Result<Opened, String> {
+    if *dtypes != Kind::Rt.dtypes() {
+        return Err(format!(
+            "the rt device computes in its own dtypes alone, {:?}",
+            Kind::Rt.dtypes()
+        ));
+    }
+    Ok(Opened::Rt)
+}
+
+#[cfg(not(feature = "rt"))]
+fn rt(_: &Dtypes) -> Result<Opened, String> {
+    Err("device rt: this build has no rt; build tgtts with --features rt".to_owned())
 }
 
 #[cfg(test)]
@@ -234,6 +266,7 @@ mod tests {
         assert_eq!("cpu".parse(), Ok(Kind::Cpu));
         assert_eq!("vulkan".parse(), Ok(Kind::Vulkan));
         assert_eq!("cuda".parse(), Ok(Kind::Cuda));
+        assert_eq!("rt".parse(), Ok(Kind::Rt));
         assert!("rocm".parse::<Kind>().is_err());
         assert_eq!(parse_dtype("bf16"), Ok(FloatDType::BF16));
         assert!(parse_dtype("f64").is_err());
@@ -246,8 +279,29 @@ mod tests {
             ..Kind::Cpu.dtypes()
         };
         for dtypes in [Kind::Cpu.dtypes(), Kind::Vulkan.dtypes(), bf16] {
-            open(Kind::Cpu, &dtypes, None).unwrap();
+            assert!(matches!(
+                open(Kind::Cpu, &dtypes, None),
+                Ok(Opened::Burn(_))
+            ));
         }
+    }
+
+    #[cfg(feature = "rt")]
+    #[test]
+    fn opens_rt_in_its_own_dtypes_alone() {
+        assert!(matches!(
+            open(Kind::Rt, &Kind::Rt.dtypes(), None),
+            Ok(Opened::Rt)
+        ));
+        let error = open(Kind::Rt, &Kind::Cpu.dtypes(), None).unwrap_err();
+        assert!(error.contains("its own dtypes"), "{error}");
+    }
+
+    #[cfg(not(feature = "rt"))]
+    #[test]
+    fn refuses_rt_in_a_build_without_it() {
+        let error = open(Kind::Rt, &Kind::Rt.dtypes(), None);
+        assert!(error.unwrap_err().contains("--features rt"));
     }
 
     #[cfg(not(feature = "vulkan"))]

@@ -6,14 +6,16 @@
 //! - `voices_dir`: the voices directory.
 //! - `assets_dir`: the radio's clicks and static and the silicon effect's impulse responses.
 //! - `checkpoint_dir`: the VoxCPM2 checkpoint.
-//! - `device`: what the model runs on, `cpu` by default, `vulkan` or `cuda`, which need a build
-//!   with the feature of the same name.
+//! - `device`: what the model runs on, `cpu` by default, `vulkan`, `cuda` or `rt`, tts-rs's own
+//!   runtime on a Vulkan GPU, which need a build with the feature of the same name.
 //! - `lm_dtype`, `local_encoder_dtype`, `local_dit_dtype`, `audio_decoder_dtype`: what each part
 //!   of the model computes in, `f32`, `f16` or `bf16`; f32 throughout by default on the CPU, f16
 //!   but for the audio decoder's f32 on a GPU.
 //! - `cache_dir`: where the speech cache is kept.
 //! - `autotune_cache_dir`: where autotune keeps the kernels it chose on a GPU, for the next
 //!   start to skip choosing them again; `vulkan` and `cuda` need it.
+//! - `glsl_kernels_dir`, `mlir_kernels_dir`: the kernels the rt device runs, as `nix build
+//!   .#glsl-kernels` and `nix build .#gpu-kernels` compile them; `rt` needs both.
 //! - `metrics_db`: the SQLite database the metrics go to, none by default.
 //! - `ffmpeg`: the ffmpeg to run, `ffmpeg` on the `PATH` by default.
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
@@ -64,7 +66,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 28] = [
+const KEYS: [&str; 30] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -77,6 +79,8 @@ const KEYS: [&str; 28] = [
     "audio_decoder_dtype",
     "cache_dir",
     "autotune_cache_dir",
+    "glsl_kernels_dir",
+    "mlir_kernels_dir",
     "metrics_db",
     "ffmpeg",
     "synthesis_limit",
@@ -107,6 +111,8 @@ pub struct Config {
     pub dtypes: Dtypes,
     pub cache_dir: PathBuf,
     pub autotune_cache_dir: Option<PathBuf>,
+    pub glsl_kernels_dir: Option<PathBuf>,
+    pub mlir_kernels_dir: Option<PathBuf>,
     pub metrics_db: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     pub synthesis_limit: usize,
@@ -163,6 +169,18 @@ impl Config {
             let reason = format!("autotune_cache_dir is not set, which the {device} device needs");
             return Err(Error(reason));
         }
+        let glsl_kernels_dir = settings.parse("glsl_kernels_dir")?;
+        let mlir_kernels_dir = settings.parse("mlir_kernels_dir")?;
+        for (key, dir) in [
+            ("glsl_kernels_dir", &glsl_kernels_dir),
+            ("mlir_kernels_dir", &mlir_kernels_dir),
+        ] {
+            if device == Kind::Rt && dir.is_none() {
+                return Err(Error(format!(
+                    "{key} is not set, which the rt device needs"
+                )));
+            }
+        }
         Ok(Self {
             listen: settings
                 .parse("listen")?
@@ -186,6 +204,8 @@ impl Config {
             },
             cache_dir: settings.required("cache_dir")?,
             autotune_cache_dir,
+            glsl_kernels_dir,
+            mlir_kernels_dir,
             metrics_db: settings.parse("metrics_db")?,
             ffmpeg: settings.parse("ffmpeg")?.unwrap_or_else(|| "ffmpeg".into()),
             synthesis_limit: settings.limit("synthesis_limit")?.unwrap_or(16),
@@ -368,6 +388,8 @@ mod tests {
                 dtypes: Kind::Cpu.dtypes(),
                 cache_dir: "/var/cache/tgtts".into(),
                 autotune_cache_dir: None,
+                glsl_kernels_dir: None,
+                mlir_kernels_dir: None,
                 metrics_db: None,
                 ffmpeg: "ffmpeg".into(),
                 synthesis_limit: 16,
@@ -513,6 +535,20 @@ mod tests {
             let error = error(REQUIRED, &[("TGTTS_DEVICE", device)]);
             assert!(error.starts_with("autotune_cache_dir"), "{error}");
         }
+        let rt = [
+            ("TGTTS_DEVICE", "rt"),
+            ("TGTTS_GLSL_KERNELS_DIR", "/k/glsl"),
+        ];
+        assert!(error(REQUIRED, &rt[..1]).starts_with("glsl_kernels_dir"));
+        assert!(error(REQUIRED, &rt).starts_with("mlir_kernels_dir"));
+        let rt = [rt.as_slice(), &[("TGTTS_MLIR_KERNELS_DIR", "/k/mlir")]].concat();
+        let config = load(REQUIRED, &rt).unwrap();
+        assert_eq!(config.device, Kind::Rt);
+        assert_eq!(config.dtypes, Kind::Rt.dtypes());
+        assert_eq!(
+            [config.glsl_kernels_dir, config.mlir_kernels_dir],
+            [Some("/k/glsl".into()), Some("/k/mlir".into())]
+        );
         for (key, value) in [
             ("TGTTS_LOUDNESS_TARGET_LUFS", "NaN"),
             ("TGTTS_LOUDNESS_TARGET_LUFS", "-inf"),
