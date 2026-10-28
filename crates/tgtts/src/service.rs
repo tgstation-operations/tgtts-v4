@@ -592,22 +592,24 @@ impl Service {
             None => Segment::new(dsp::RATE, Vec::new()),
             Some(text) => self.spoken(voice, text, trace).await?,
         };
-        self.finish(spoken, pitch, trace).await
+        self.finish(voice, spoken, pitch, trace).await
     }
 
-    /// What the model said, finished as the old frontend finished it and brought to the
-    /// service's loudness.
+    /// What the model said in `voice`, finished as the old frontend finished it and brought to
+    /// the service's loudness, by no more than the voice's level allows.
     async fn finish(
         &self,
+        voice: &str,
         spoken: Segment,
         pitch: i32,
         trace: &mut Trace,
     ) -> Result<Segment, Failure> {
         let loudness = self.loudness;
+        let most = self.levels.most_gain(voice, loudness.target);
         let normalized = self
             .cpu(trace, move || {
                 let finished = dsp::speech::finish(&spoken, pitch);
-                dsp::loudness::normalize(&finished, loudness.target, loudness.ceiling)
+                dsp::loudness::normalize(&finished, loudness.target, loudness.ceiling, most)
             })
             .await?;
         Ok(leveled(normalized, trace))
@@ -742,6 +744,7 @@ impl Service {
                 &blips,
                 loudness.target,
                 loudness.ceiling,
+                f64::INFINITY,
             ))
         })
         .await?

@@ -9,6 +9,11 @@ use crate::{limiter::limit, segment::Segment};
 /// EBU R128's highest true peak, in dBTP.
 pub const CEILING: f64 = -1.0;
 
+/// The integrated loudness under which [`normalize`] takes audio for the silence it nearly is,
+/// in LUFS: brought to the target, a model's near-silent output is its noise and clicks raised
+/// by tens of decibels, or by hundreds where the limiter holds the clicks down.
+pub const FLOOR: f64 = -60.0;
+
 /// How near the target [`normalize`] brings the loudness, in LU, where the limiter has lowered it.
 const NEAR: f64 = 0.05;
 /// The most gains [`normalize`] tries.
@@ -27,17 +32,17 @@ pub struct Normalized {
     pub limited: f64,
 }
 
-/// `segment` brought to an integrated loudness of `target` LUFS by a gain, and its true peak held
-/// at or under `ceiling` dBTP by the [limiter](crate::limiter). Where the limiter takes enough
-/// off to lower the loudness, the gain is raised and the limiter run again until the loudness is
-/// within 0.05 LU of the target. Silence, and anything else the gates leave nothing of, is left as
-/// it is.
-pub fn normalize(segment: &Segment, target: f64, ceiling: f64) -> Normalized {
+/// `segment` brought to an integrated loudness of `target` LUFS by a gain of at most `most` dB,
+/// and its true peak held at or under `ceiling` dBTP by the [limiter](crate::limiter). Where the
+/// limiter takes enough off to lower the loudness, the gain is raised and the limiter run again
+/// until the loudness is within 0.05 LU of the target, or the gain is `most`. Anything quieter
+/// than [`FLOOR`], silence among it, is left as it is.
+pub fn normalize(segment: &Segment, target: f64, ceiling: f64, most: f64) -> Normalized {
     let samples: Vec<f64> = (segment.samples.iter())
         .map(|&s| f64::from(s) / 32768.0)
         .collect();
     let loudness = integrated(&samples, segment.rate);
-    if loudness == f64::NEG_INFINITY {
+    if loudness < FLOOR {
         return Normalized {
             segment: segment.clone(),
             gain: 0.0,
@@ -45,7 +50,7 @@ pub fn normalize(segment: &Segment, target: f64, ceiling: f64) -> Normalized {
             limited: 0.0,
         };
     }
-    let mut gain = target - loudness;
+    let mut gain = (target - loudness).min(most);
     let mut last: Option<(f64, f64)> = None;
     let mut tries = 0;
     let limited = loop {
@@ -54,14 +59,15 @@ pub fn normalize(segment: &Segment, target: f64, ceiling: f64) -> Normalized {
         let limited = limit(&scaled, segment.rate, ceiling);
         let reached = integrated(&limited.samples, segment.rate);
         tries += 1;
-        if (reached - target).abs() <= NEAR || tries == TRIES {
+        let capped = gain == most && reached < target;
+        if (reached - target).abs() <= NEAR || tries == TRIES || capped {
             break limited;
         }
         // Where the limiter holds peaks down, the loudness rises by less than the gain: the next
         // gain follows its rise between the last two tries.
         let rise = last.map_or(1.0, |(g, r)| (reached - r) / (gain - g));
         last = Some((gain, reached));
-        gain += (target - reached) / rise.clamp(0.1, 1.0);
+        gain = (gain + (target - reached) / rise.clamp(0.1, 1.0)).min(most);
     };
     let pcm = limited.samples.iter().map(|s| (s * 32768.0).round() as i16);
     Normalized {

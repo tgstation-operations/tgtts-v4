@@ -48,6 +48,14 @@ pub const LINES: [&str; 12] = [
     "I am not a changeling, I swear! Ask anyone who knows me.",
 ];
 
+/// How much more than its voice's gain the whole-file path may raise a line by, in dB: 7189 of
+/// the 7197 lines 600 voices said in a gains run came within 12 dB under their voice's level.
+pub const MARGIN: f64 = 12.0;
+
+/// The most the whole-file path raises speech in a voice without a level by, in dB: more than
+/// 589 of those 600 voices' levels allow with [`MARGIN`].
+pub const MOST_GAIN: f64 = 24.0;
+
 /// The voices' levels.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -119,6 +127,13 @@ impl Levels {
         }
         let all: Vec<f64> = self.voices.values().map(|l| l.loudness_lufs).collect();
         median(&all)
+    }
+
+    /// The most the whole-file path raises speech in `voice` by to bring it to `target` LUFS, in
+    /// dB: the gain that brings the voice's level there and [`MARGIN`], or for a voice without
+    /// a level, [`MOST_GAIN`].
+    pub fn most_gain(&self, voice: &str, target: f64) -> f64 {
+        (self.voices.get(voice)).map_or(MOST_GAIN, |level| target - level.loudness_lufs + MARGIN)
     }
 
     /// The peaks the radio scales `voice`'s streamed speech by, or for a voice without them the
@@ -367,8 +382,8 @@ impl Measure<'_> {
         // Today's: the speech leveled, finished and brought to the loudness whole, then put on
         // the radio whole.
         let finished = dsp::speech::finish(&synth::level(&pcm), 0);
-        let whole =
-            dsp::loudness::normalize(&finished, self.loudness.target, self.loudness.ceiling);
+        let (target, ceiling) = (self.loudness.target, self.loudness.ceiling);
+        let whole = dsp::loudness::normalize(&finished, target, ceiling, MOST_GAIN);
         let radio = radio::radio(&mono(&whole.segment.samples), self.radio);
         Some(Measured {
             line,
@@ -690,6 +705,19 @@ mod tests {
         assert_eq!(levels.loudness("B"), Some(-30.0));
         assert_eq!(levels.loudness("Z"), Some(-32.0));
         assert_eq!(median(&[1.0, 4.0, 2.0, 3.0]), Some(2.5));
+    }
+
+    #[test]
+    fn the_whole_file_path_raises_a_voice_by_its_gain_and_the_margin_at_most() {
+        let mut levels = Levels::default();
+        let level = Level {
+            loudness_lufs: -30.0,
+            lines: 12,
+            radio: None,
+        };
+        levels.set("A", level);
+        assert_eq!(levels.most_gain("A", -16.0), 14.0 + MARGIN);
+        assert_eq!(levels.most_gain("B", -16.0), MOST_GAIN);
     }
 
     #[test]

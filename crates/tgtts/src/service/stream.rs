@@ -710,7 +710,7 @@ impl Service {
                     (Some(_), Some(take)) => take,
                     (Some(text), None) => self.synthesized(voice, text, None, trace).await?.0,
                 };
-                let finished = self.finish(spoken, message.pitch, trace).await?;
+                let finished = self.finish(voice, spoken, message.pitch, trace).await?;
                 let audio = self.treat(&params, finished, treatment, trace).await?;
                 if let Some(mut out) = speech {
                     let routes = out.routes.clone();
@@ -871,7 +871,8 @@ mod tests {
         let peak = raw.iter().fold(0f32, |m, s| m.max(s.abs()));
         let leveled = synth::level(&synth::to_segment(raw));
         let finished = dsp::speech::finish(&leveled, pitch);
-        let whole = dsp::loudness::normalize(&finished, -16.0, dsp::loudness::CEILING);
+        let whole =
+            dsp::loudness::normalize(&finished, -16.0, dsp::loudness::CEILING, f64::INFINITY);
         // From the model's samples, the leveling's gain and then the loudness's.
         let leveling = f64::from(leveled.max()) / 32768.0 / f64::from(peak);
         let gain = leveling * 10f64.powf(whole.gain / 20.0);

@@ -3,7 +3,7 @@
 
 use std::{error, time::Duration};
 
-use dsp::{RATE, segment::Segment};
+use dsp::{RATE, loudness::FLOOR, segment::Segment};
 use voices::Latent;
 
 /// An error from a synthesizer, which the service reports and fails the request on.
@@ -92,7 +92,17 @@ pub fn to_segment(samples: &[f32]) -> Segment {
 /// `effects.normalize` at its default headroom brought it in the old model service, so that the
 /// cache's 16 bits hold as much of it as they can; the service brings it to its loudness after.
 /// That service also computed a -25 dBFS loudness and a -5 dBFS cap, then threw both away.
+///
+/// Speech quieter than [`FLOOR`] with the silence after it is kept as it is, which the service
+/// serves as the silence it nearly is: leveled, its loudest click would be at full scale.
 pub fn level(speech: &Segment) -> Segment {
+    let finished = dsp::speech::finish(speech, 0);
+    let samples: Vec<f64> = (finished.samples.iter())
+        .map(|&s| f64::from(s) / 32768.0)
+        .collect();
+    if dsp::loudness::integrated(&samples, speech.rate) < FLOOR {
+        return speech.clone();
+    }
     speech.normalize(0.1)
 }
 
@@ -127,9 +137,21 @@ mod tests {
 
     #[test]
     fn levels_the_peak_at_a_tenth_of_a_decibel_down() {
-        let speech = Segment::new(48000, vec![0, 1000, -2000, 500]);
+        let speech = Segment::new(48000, [0, 1000, -2000, 500].repeat(2400));
         assert_eq!(level(&speech).max(), 32393);
         let silence = Segment::new(48000, vec![0; 4]);
         assert_eq!(level(&silence), silence);
+    }
+
+    #[test]
+    fn keeps_what_is_quieter_than_the_floor_as_it_is() {
+        // A patch of noise a few dozen steps high, which leveled would come up by 56 dB.
+        let noise: Vec<i16> = (0..7680)
+            .map(|i: i32| ((i * 7919) % 97 - 48) as i16)
+            .collect();
+        let noise = Segment::new(48000, noise);
+        assert_eq!(level(&noise), noise);
+        let louder = Segment::new(48000, noise.samples.iter().map(|&s| s * 4).collect());
+        assert_eq!(level(&louder).max(), 32393);
     }
 }

@@ -801,7 +801,8 @@ fn brings_speech_and_blips_to_the_loudness() {
     assert_eq!(cached, wav::write_pcm16(dsp::RATE, 1, &take.samples));
     // What is played is the take finished, then brought to the loudness.
     let finished = dsp::speech::finish(&take, 2);
-    let expected = dsp::loudness::normalize(&finished, target, ceiling).segment;
+    let most = levels().most_gain(VOICE, target);
+    let expected = dsp::loudness::normalize(&finished, target, ceiling, most).segment;
     let expected = wav::Audio::from_segment(&expected);
     assert_eq!(
         common::decode(&speech.body),
@@ -1088,7 +1089,9 @@ fn records_metrics_without_the_text() {
     let (target, ceiling) = (-4.5, -1.0);
     let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
     let take = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
-    let speech_leveling = dsp::loudness::normalize(&dsp::speech::finish(&take, 0), target, ceiling);
+    let finished = dsp::speech::finish(&take, 0);
+    let most = levels().most_gain(VOICE, target);
+    let speech_leveling = dsp::loudness::normalize(&finished, target, ceiling, most);
     assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);
     let speech_rms = wav::Audio::from_segment(&speech_leveling.segment).rms_dbfs();
     let speech_leveling = Some((

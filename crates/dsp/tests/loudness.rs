@@ -7,7 +7,7 @@ use std::f64::consts::PI;
 
 use common::Tensors;
 use dsp::{
-    loudness::{CEILING, integrated, normalize, true_peak},
+    loudness::{CEILING, FLOOR, integrated, normalize, true_peak},
     segment::Segment,
 };
 
@@ -126,7 +126,7 @@ fn measured(segment: &Segment) -> Vec<f64> {
 fn normalizes_to_the_target() {
     for seconds in [3.0, 0.2] {
         let quiet = pcm(&tone(&[-40.0], &[seconds]));
-        let normalized = normalize(&quiet, -20.0, CEILING);
+        let normalized = normalize(&quiet, -20.0, CEILING, f64::INFINITY);
         let loudness = integrated(&measured(&normalized.segment), RATE);
         assert!((loudness + 20.0).abs() < 0.01, "{seconds} s: {loudness}");
         assert_eq!((normalized.reduction, normalized.limited), (0.0, 0.0));
@@ -150,7 +150,7 @@ fn limits_the_peaks_to_reach_the_target() {
     // One click, and then so many that the limiter is never done with them, which takes the
     // loudness down and the gain back up.
     for every in [10.0, 0.05] {
-        let normalized = normalize(&pcm(&clicked(every)), -20.0, CEILING);
+        let normalized = normalize(&pcm(&clicked(every)), -20.0, CEILING, f64::INFINITY);
         let x = measured(&normalized.segment);
         let (loudness, peak) = (integrated(&x, RATE), true_peak(&x));
         assert!((loudness + 20.0).abs() < 0.1, "{every} s: {loudness} LUFS");
@@ -164,11 +164,51 @@ fn limits_the_peaks_to_reach_the_target() {
 fn leaves_silence_as_it_is() {
     for x in [vec![0.0; 48000], tone(&[-80.0], &[1.0])] {
         let silence = pcm(&x);
-        let normalized = normalize(&silence, -20.0, CEILING);
+        let normalized = normalize(&silence, -20.0, CEILING, f64::INFINITY);
         assert_eq!(normalized.segment, silence);
         assert_eq!(
             (normalized.gain, normalized.reduction, normalized.limited),
             (0.0, 0.0, 0.0)
         );
     }
+}
+
+#[test]
+fn leaves_what_is_quieter_than_the_floor_as_it_is() {
+    // A tone 3 LU under the floor, and a patch of noise a few dozen steps of 16 bits high, with
+    // the silence the service puts after speech, as a model gives for a line it hardly said.
+    let mut noise: Vec<f64> = (0..7680)
+        .map(|i| f64::from((i * 7919) % 97 - 48) / 32768.0)
+        .collect();
+    noise.resize(19680, 0.0);
+    for x in [tone(&[FLOOR], &[1.0]), noise] {
+        let near = pcm(&x);
+        let loudness = integrated(&measured(&near), RATE);
+        assert!((-70.0..FLOOR).contains(&loudness), "{loudness} LUFS");
+        let normalized = normalize(&near, -16.0, CEILING, f64::INFINITY);
+        assert_eq!(normalized.segment, near);
+        assert_eq!(normalized.gain, 0.0);
+    }
+}
+
+#[test]
+fn raises_by_no_more_than_the_most() {
+    let quiet = pcm(&tone(&[-50.0], &[1.0]));
+    let normalized = normalize(&quiet, -16.0, CEILING, 12.0);
+    let loudness = integrated(&measured(&normalized.segment), RATE);
+    assert_eq!(normalized.gain, 12.0);
+    assert!((loudness + 41.0).abs() < 0.01, "{loudness} LUFS");
+
+    // Clicks in silence the limiter holds down, so that no gain brings them to the target: the
+    // gain runs on to hundreds of decibels unless it is held.
+    let mut clicks = vec![0.0; 19680];
+    for at in [300, 2000, 5100, 7000] {
+        clicks[at] = 0.99;
+    }
+    let clicks = pcm(&clicks);
+    let held = normalize(&clicks, -16.0, CEILING, 24.0);
+    assert_eq!(held.gain, 24.0);
+    assert!(held.reduction < 26.0, "{held:?}");
+    let unheld = normalize(&clicks, -16.0, CEILING, f64::INFINITY);
+    assert!(unheld.gain > 100.0, "{} dB", unheld.gain);
 }
