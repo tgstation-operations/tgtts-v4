@@ -306,15 +306,14 @@ fn as_alone(got: &[f32], alone: &[f32], len: usize) -> Result<(), String> {
 /// a subgroup and more, in workgroups of 64 to 512, one to each workgroup's worth of tiles or
 /// fewer, which then take several in turn; the tokens staged in chunks of 512 columns and fewer,
 /// at once or chunk by chunk, in blocks of 16 tokens and more; the weights loaded 1 to 8 steps
-/// ahead; and the output and down projections cut into 1 to 8 parts. Each fits the device's
-/// shared memory.
+/// ahead; and the output and down projections cut into 1 to 8 parts. Those the device's shared
+/// memory does not hold are left out, and said so.
 fn tunings(ctx: &Context) -> Vec<Tuning> {
     let report = ctx.report();
-    let tunings: Vec<Tuning> = [64, 32]
+    let tunings: Vec<Tuning> = subgroups(ctx)
         .into_iter()
-        .filter(|&s| report.can_require_subgroup_size(s))
         .flat_map(|s| {
-            let base = Tuning::for_subgroup(s);
+            let base = fitted(ctx, Tuning::for_subgroup(s));
             let cut = |workgroup, pairs, tiles, chunk, block, depth, groups| Tuning {
                 workgroup,
                 qkv_pairs: pairs,
@@ -334,10 +333,6 @@ fn tunings(ctx: &Context) -> Vec<Tuning> {
             };
             [
                 base,
-                Tuning {
-                    subgroup: s,
-                    ..Tuning::for_device(report).unwrap()
-                },
                 cut(64, 1, 1, 256, 32, 4, 0),
                 cut(128, 2, 2, 128, 32, 2, 0),
                 cut(256, 2, 4, 64, 16, 1, 0),
@@ -349,14 +344,32 @@ fn tunings(ctx: &Context) -> Vec<Tuning> {
             ]
         })
         .collect();
-    for tuning in &tunings {
-        assert!(
-            tuning.shared_bytes() <= report.max_shared_memory as usize,
-            "{tuning:?} takes {} bytes of shared memory",
-            tuning.shared_bytes()
+    let (held, left): (Vec<Tuning>, Vec<Tuning>) = tunings
+        .into_iter()
+        .partition(|t| t.shared_bytes() <= report.max_shared_memory as usize);
+    for tuning in left {
+        eprintln!(
+            "left out: {tuning:?} takes {} bytes of shared memory, of {}",
+            tuning.shared_bytes(),
+            report.max_shared_memory
         );
     }
-    tunings
+    held
+}
+
+/// The subgroup sizes the kernels are written for that the device can require: 32 alone on
+/// NVIDIA's.
+fn subgroups(ctx: &Context) -> Vec<u32> {
+    let report = ctx.report();
+    [64, 32]
+        .into_iter()
+        .filter(|&s| report.can_require_subgroup_size(s))
+        .collect()
+}
+
+/// `tuning` [fit](Tuning::fit) to the device.
+fn fitted(ctx: &Context, tuning: Tuning) -> Tuning {
+    tuning.fit(ctx.report()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 #[test]
@@ -404,7 +417,8 @@ fn one_euler_step_samples_as_voxcpm_does_on_the_cpu() {
             ..case.clone()
         })
         .collect();
-    let got = gpu(&ctx, &unguided, 2, ROWS, &Tuning::for_subgroup(64));
+    let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+    let got = gpu(&ctx, &unguided, 2, ROWS, &tuning);
     let margins = margins_of(&got, &want, &burn_f16);
     assert!(!within(margins), "without mu: {margins:.2?}");
     assert_no_validation_messages(&ctx);
@@ -420,15 +434,8 @@ fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
     let want = oracle(&cases, timesteps, FloatDType::F32);
     let burn_f16 = oracle(&cases, timesteps, FloatDType::F16);
     let ctx = context();
-    let report = ctx.report();
-    for subgroup in [64, 32]
-        .into_iter()
-        .filter(|&s| report.can_require_subgroup_size(s))
-    {
-        let tuning = Tuning {
-            subgroup,
-            ..Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"))
-        };
+    for subgroup in subgroups(&ctx) {
+        let tuning = fitted(&ctx, Tuning::for_subgroup(subgroup));
         let alone = gpu(&ctx, &cases, timesteps, 1, &tuning);
         let margins = margins_of(&alone, &want, &burn_f16);
         assert!(within(margins), "{tuning:?}: {margins:.2?}");
@@ -438,7 +445,7 @@ fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
         }
     }
     // Defect: a step short, the last step's velocity left out.
-    let tuning = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
+    let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let short = gpu(&ctx, &cases, timesteps - 1, ROWS, &tuning);
     let margins = margins_of(&short, &want, &burn_f16);
     assert!(!within(margins), "a step short: {margins:.2?}");
@@ -554,13 +561,8 @@ fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
             frames.concat()
         })
         .collect();
-    let got = embed(
-        &ctx,
-        &checkpoint,
-        &reversed,
-        ROWS,
-        &Tuning::for_subgroup(64),
-    );
+    let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+    let got = embed(&ctx, &checkpoint, &reversed, ROWS, &tuning);
     let margins = margins_of(&got, &want, &burn_f16);
     assert!(!within(margins), "frames reversed: {margins:.2?}");
     assert_no_validation_messages(&ctx);
@@ -651,12 +653,8 @@ fn the_projections_compile_to_matrix_products_over_wide_loads() {
     }
     let config = patch_config();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let report = ctx.report();
-    for subgroup in [64, 32]
-        .into_iter()
-        .filter(|&s| report.can_require_subgroup_size(s))
-    {
-        let tuning = Tuning::for_subgroup(subgroup);
+    for subgroup in subgroups(&ctx) {
+        let tuning = fitted(&ctx, Tuning::for_subgroup(subgroup));
         let sampler = sampler_graph(&config, 2, 1, &tuning).unwrap_or_else(|e| panic!("{e}"));
         let mut seen = std::collections::BTreeSet::new();
         for op in &sampler.graph.ops {

@@ -198,25 +198,29 @@ impl Tuning {
     }
 
     /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for
-    /// that the device can require, staging fewer columns and then fewer tokens at once where its
-    /// shared memory holds less.
+    /// that the device can require, [`fit`](Self::fit) to it.
     pub fn for_device(report: &DeviceReport) -> Result<Self, Error> {
         let base = decode::Tuning::for_device(report)?;
-        let mut tuning = Tuning::for_subgroup(base.subgroup);
-        while tuning.shared_bytes() > report.max_shared_memory as usize {
-            if tuning.chunk > 256 {
-                tuning.chunk /= 2;
-            } else if tuning.block > TILE as u32 {
-                tuning.block -= TILE as u32;
+        Tuning::for_subgroup(base.subgroup).fit(report)
+    }
+
+    /// This tuning staging fewer columns, down to 256, and then fewer tokens at once, until it
+    /// fits the shared memory of the device `report` describes: 48 KiB on NVIDIA's.
+    pub fn fit(mut self, report: &DeviceReport) -> Result<Self, Error> {
+        while self.shared_bytes() > report.max_shared_memory as usize {
+            if self.chunk > 256 {
+                self.chunk /= 2;
+            } else if self.block > TILE as u32 {
+                self.block -= TILE as u32;
             } else {
                 return Err(Error::Shape(format!(
                     "{} bytes of shared memory for a block of {TILE} tokens, of {}",
-                    tuning.shared_bytes(),
+                    self.shared_bytes(),
                     report.max_shared_memory
                 )));
             }
         }
-        Ok(tuning)
+        Ok(self)
     }
 
     /// The most shared memory a projection's workgroup takes: a block of tokens staged, and
