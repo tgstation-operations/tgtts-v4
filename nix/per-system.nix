@@ -38,6 +38,15 @@ in
         ;
     };
     fixtures = import ./scripts/fixtures.nix { inherit pkgs ffmpeg; };
+    tgtts = import ./tgtts.nix {
+      inherit
+        pkgs
+        rustToolchain
+        ffmpeg
+        gpuKernels
+        glslKernels
+        ;
+    };
     vk-trial = import ./vk-trial.nix {
       inherit
         pkgs

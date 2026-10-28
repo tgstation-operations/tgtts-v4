@@ -65,7 +65,9 @@ autotune_cache_dir = "autotune"
 
 where autotune keeps the kernels it chose. `/health-check` answers 503 until the
 model has loaded and warmed up: a minute after the first start, half a minute
-once autotune has kept its choices.
+once autotune has kept its choices. `nix build .#tgtts` builds the service as
+the servers run it, on tts-rs's own runtime alone, with no burn in it: it takes
+`device = "rt"`, and its wrapper names the kernels and ffmpeg.
 Point the game's `TTS_HTTP_URL` at `http://127.0.0.1:5002` with
 the token as `TTS_HTTP_TOKEN`. The service runs ffmpeg for the filter strings
 the game sent before effects, which needs rubberband, as the devshell's has.
