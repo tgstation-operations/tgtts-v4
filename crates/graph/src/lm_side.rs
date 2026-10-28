@@ -277,6 +277,7 @@ fn append_batch_linear(
         }
     }
     let n = g.tensors[layer.bias.0].bytes as usize / 2;
+    let (taken, split) = tuning.split(rows);
     let pipeline = Pipeline {
         kernel: &GEMV_LINEAR,
         constants: vec![
@@ -288,13 +289,14 @@ fn append_batch_linear(
             (5, SpecValue::U32(offset as u32)),
             (6, SpecValue::U32(act as u32)),
             (7, SpecValue::F32(levels as f32)),
-            (8, SpecValue::U32(rows as u32)),
-            (9, SpecValue::U32(tuning.span(k0 + k1, rows)?)),
+            (8, SpecValue::U32(taken as u32)),
+            (9, SpecValue::U32(tuning.span(k0 + k1, taken, 0)?)),
             (10, SpecValue::U32(len(out) as u32)),
+            (11, SpecValue::U32(split as u32)),
         ],
         subgroup_size: Some(subgroup),
     };
-    let groups = n.div_ceil(subgroups) as u32;
+    let groups = (n.div_ceil(subgroups) * split) as u32;
     let bindings = [x0, x1, layer.weight, layer.bias, out];
     g.op(label, pipeline, &bindings, [groups, 1, 1]);
     Ok(())
@@ -742,7 +744,7 @@ mod tests {
         {
             let out = g.graph.tensors[op.bindings[4].0].bytes;
             let (n, offset, stride) = (constant(op, 4), constant(op, 5), constant(op, 10));
-            assert_eq!(constant(op, 8), 4, "{}", op.label);
+            assert_eq!(constant(op, 8) * constant(op, 11), 4, "{}", op.label);
             assert_eq!(4 * stride * 2, out, "{}", op.label);
             assert!(offset + n <= stride, "{}", op.label);
             layers += 1;

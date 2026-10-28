@@ -10,6 +10,8 @@ layout(constant_id = 3) const uint HEAD_DIM = 128;
 layout(constant_id = 4) const uint CAPACITY = 1024;
 layout(constant_id = 5) const uint BATCH = 1;
 layout(constant_id = 6) const uint SLOTS = 1;
+// A workgroup to each row of the batch.
+const uint GROUPS = 1;
 
 // As attention_split's.
 const uint CHUNK = 32;

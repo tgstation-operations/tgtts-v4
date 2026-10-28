@@ -110,19 +110,13 @@ pub fn shared_memory(pipeline: &Pipeline) -> Option<u64> {
             _ => u64::from(default),
         }
     };
-    // common.glsl's, and a float of norm.glsl's for each subgroup.
+    // norm.glsl's partial sums, a float to each of common.glsl's subgroups.
     let partials = 4 * (constant(1, 256) / constant(0, 64));
     // gemv.glsl's vectors: `batch` rows of the span of the columns, or of all `k`, in f16.
     let vectors = |k: u64, batch: u64, span: u64| batch * if span == 0 { k } else { span } * 2;
     Some(match pipeline.kernel.name {
-        "gemv_qkv_rope" => {
-            let batch = constant(11, 1);
-            vectors(constant(2, 2048), batch, constant(13, 0)) + partials + 4 * batch
-        }
-        "gemv_gate_up" => {
-            let batch = constant(7, 1);
-            vectors(constant(2, 2048), batch, constant(8, 0)) + partials + 4 * batch
-        }
+        "gemv_qkv_rope" => vectors(constant(2, 2048), constant(11, 1), constant(13, 0)) + partials,
+        "gemv_gate_up" => vectors(constant(2, 2048), constant(7, 1), constant(8, 0)) + partials,
         "gemv_residual" => vectors(constant(2, 2048), constant(6, 1), constant(7, 0)),
         "gemv_linear" => vectors(
             constant(2, 2048) + constant(3, 0),
@@ -340,9 +334,11 @@ mod tests {
             let op = g.graph.ops.iter().find(|op| op.label == label).unwrap();
             op.clone()
         };
-        // A stage of all of RADV's shared memory: the vectors leave room for the norm's floats.
+        // A stage of all of RADV's shared memory for a workgroup taking all 16 rows: the vectors
+        // leave room for the norm's partial sum.
         let whole = Tuning {
             stage: 65536,
+            vectors: 16,
             ..Tuning::for_subgroup(64)
         };
         let g = decode_batch_graph(&shape, &whole, batch).unwrap();
@@ -353,17 +349,15 @@ mod tests {
                 .all(|op| fits_shared_memory(op, radv).is_ok())
         );
         let gate_up = op(&whole, "gate_up");
-        assert_eq!(
-            shared_memory(&gate_up.pipeline),
-            Some(16 * 1024 * 2 + 4 + 16 * 4)
-        );
-        // A stage past it stages all 64 KiB of the vectors, and the floats go past the device's.
+        assert_eq!(shared_memory(&gate_up.pipeline), Some(16 * 1024 * 2 + 4));
+        // A stage past it stages all 64 KiB of the vectors, and the partial sum goes past the
+        // device's.
         let past = Tuning {
             stage: 98304,
             ..whole
         };
         let gate_up = op(&past, "gate_up");
-        assert_eq!(shared_memory(&gate_up.pipeline), Some(65536 + 4 + 16 * 4));
+        assert_eq!(shared_memory(&gate_up.pipeline), Some(65536 + 4));
         assert!(matches!(
             fits_shared_memory(&gate_up, radv),
             Err(Error::Shape(_))

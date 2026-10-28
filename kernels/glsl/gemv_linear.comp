@@ -16,28 +16,29 @@ layout(constant_id = 8) const uint BATCH = 1;
 layout(constant_id = 9) const uint SPAN = 0;
 // The length of a row of out, which holds OFFSET + N values of it at least.
 layout(constant_id = 10) const uint STRIDE = 2048;
+layout(constant_id = 11) const uint GROUPS = 1;
 
 const uint K = K0 + K1;
 const uint ROWS = 1;
 // The layers between the stacks are a hundredth of a patch's time: no loads ahead.
 const uint AHEAD = 0;
 
-// [BATCH][K0] and [BATCH][K1]
+// [BATCH * GROUPS][K0] and [BATCH * GROUPS][K1]
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer X1 { uvec4 x1[]; };
 layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 3) readonly buffer Bias { float16_t bias[]; };
-// [BATCH][STRIDE]
+// [BATCH * GROUPS][STRIDE]
 layout(std430, binding = 4) writeonly buffer Out { float16_t out_[]; };
 
 #include "gemv.glsl"
 
-uvec4 x_at(uint b, uint v) {
+uvec4 x_at(uint j, uint b, uint v) {
     return v < K0 / 8 ? x[b * (K0 / 8) + v] : x1[b * (K1 / 8) + v - K0 / 8];
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID;
+    uint row = row_block() * SUBGROUPS + gl_SubgroupID;
     // A subgroup past the last row sums that row again: every subgroup stages the vectors.
     uint rows[ROWS];
     rows[0] = min(row, N - 1);
@@ -56,6 +57,6 @@ void main() {
             float t = 1.0 - 2.0 / (exp(2.0 * abs(v)) + 1.0);
             v = roundEven(sign(v) * t * LEVELS) / LEVELS;
         }
-        out_[b * STRIDE + OFFSET + row] = float16_t(v);
+        out_[(first_vector() + b) * STRIDE + OFFSET + row] = float16_t(v);
     }
 }

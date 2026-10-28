@@ -250,9 +250,13 @@ pub struct Tuning {
     /// copy of x into shared memory, so that they are in flight while it runs; all of them when
     /// a lane has no more steps than this.
     pub ahead: u32,
-    /// The bytes of shared memory a GEMV takes at most, most of them for its vectors, a batch's
-    /// rows of them: when they are longer, a part of each at a time.
+    /// The bytes of shared memory a GEMV takes at most, most of them for its vectors, the rows
+    /// of a batch it takes: when they are longer, a part of each at a time.
     pub stage: u32,
+    /// The rows of a batch a GEMV workgroup takes at most. A batch of more is shared out over
+    /// workgroups side by side, which take the same rows of the weight and so read them from
+    /// cache after the first.
+    pub vectors: u32,
 }
 
 impl Tuning {
@@ -277,6 +281,27 @@ impl Tuning {
             residual_rows: 1,
             ahead: 0,
             stage: 32 << 10,
+            vectors: 1,
+        }
+    }
+
+    /// The cut for a batch of `rows` at `subgroup`: [`for_subgroup`](Self::for_subgroup)'s, a
+    /// row of the batch to each workgroup, up to 4 rows, and from there workgroups of four
+    /// subgroups taking 4 rows each.
+    ///
+    /// On the Radeon 8060S at 64, the base LM's step at position 481 took 12.7 and 12.9 ms at 2
+    /// and 4 rows cut so, about what it takes at batch 1, against 13.3 and 14.3 with every row
+    /// in every workgroup. At 8 and 16 rows, four-subgroup workgroups took 14.5 and 20.7 ms with
+    /// a row each, 14.7 and 16.8 with four each, and 18.9 and 27.6 with every row in each.
+    pub fn for_batch(subgroup: u32, rows: usize) -> Self {
+        let base = Self::for_subgroup(subgroup);
+        if rows <= 4 {
+            return base;
+        }
+        Tuning {
+            workgroup: 4 * subgroup,
+            vectors: 4,
+            ..base
         }
     }
 
@@ -286,12 +311,21 @@ impl Tuning {
         Self::for_subgroup(self.subgroup).workgroup
     }
 
+    /// The rows of a batch of `rows` a GEMV workgroup takes, the most that divide them up to
+    /// [`vectors`](Self::vectors), and the workgroups side by side that take them all.
+    pub(crate) fn split(&self, rows: usize) -> (usize, usize) {
+        let most = (self.vectors as usize).clamp(1, rows);
+        let taken = (1..=most)
+            .rev()
+            .find(|v| rows.is_multiple_of(*v))
+            .unwrap_or(1);
+        (taken, rows / taken)
+    }
+
     /// The columns of each of `rows` vectors of `k` a GEMV stages at once, as its SPAN constant:
-    /// 0 when all of them fit in [`stage`](Self::stage) beside the rest of its shared memory, and
-    /// otherwise the most that do in whole steps of its subgroups that divide `k`.
-    pub(crate) fn span(&self, k: usize, rows: usize) -> Result<u32, Error> {
-        // The norm's partial sum of each subgroup and each row's scale, a float each.
-        let others = 4 * ((self.workgroup / self.subgroup) as usize + rows);
+    /// 0 when all of them fit in [`stage`](Self::stage) beside the `others` bytes of its shared
+    /// memory, and otherwise the most that do in whole steps of its subgroups that divide `k`.
+    pub(crate) fn span(&self, k: usize, rows: usize, others: usize) -> Result<u32, Error> {
         let stage = (self.stage as usize).saturating_sub(others);
         if rows * k * 2 <= stage {
             return Ok(0);
@@ -449,7 +483,10 @@ pub fn decode_batch_graph(
     };
     let eps = SpecValue::F32(s.eps);
     let norm_width = SpecValue::U32(tuning.norm_width());
-    let span = |k: usize| tuning.span(k, rows).map(SpecValue::U32);
+    let (taken, split) = tuning.split(rows);
+    let span = |k: usize, others: usize| tuning.span(k, taken, others).map(SpecValue::U32);
+    // norm.glsl's partial sums, a float to a subgroup.
+    let partials = 4 * subgroups;
     let qkv_pipeline = pipeline(
         &GEMV_QKV_ROPE,
         &[
@@ -462,10 +499,11 @@ pub fn decode_batch_graph(
             (8, SpecValue::U32(tuning.qkv_pairs)),
             (9, SpecValue::U32(tuning.ahead)),
             (10, SpecValue::Bool(s.rope)),
-            (11, u(rows)),
+            (11, u(taken)),
             (12, u(slots)),
-            (13, span(s.hidden)?),
+            (13, span(s.hidden, partials)?),
             (14, norm_width),
+            (15, u(split)),
         ],
         sub,
     );
@@ -473,7 +511,7 @@ pub fn decode_batch_graph(
         "q/k/v row pairs",
         (s.heads + 2 * s.kv_heads) * s.head_dim / 2,
         subgroups * tuning.qkv_pairs as usize,
-    )?;
+    )? * split as u32;
     let split_pipeline = Pipeline {
         kernel: &ATTENTION_SPLIT,
         constants: vec![
@@ -512,8 +550,9 @@ pub fn decode_batch_graph(
                 (3, SpecValue::U32(tuning.residual_rows)),
                 (4, SpecValue::U32(tuning.ahead)),
                 (5, u(s.hidden)),
-                (6, u(rows)),
-                (7, span(k)?),
+                (6, u(taken)),
+                (7, span(k, 0)?),
+                (8, u(split)),
             ],
             sub,
         ))
@@ -524,7 +563,7 @@ pub fn decode_batch_graph(
         "residual rows",
         s.hidden,
         subgroups * tuning.residual_rows as usize,
-    )?;
+    )? * split as u32;
     let gate_up_pipeline = pipeline(
         &GEMV_GATE_UP,
         &[
@@ -533,9 +572,10 @@ pub fn decode_batch_graph(
             (4, eps),
             (5, SpecValue::U32(tuning.gate_up_pairs)),
             (6, SpecValue::U32(tuning.ahead)),
-            (7, u(rows)),
-            (8, span(s.hidden)?),
+            (7, u(taken)),
+            (8, span(s.hidden, partials)?),
             (9, norm_width),
+            (10, u(split)),
         ],
         sub,
     );
@@ -543,7 +583,7 @@ pub fn decode_batch_graph(
         "gate/up row pairs",
         s.inner,
         subgroups * tuning.gate_up_pairs as usize,
-    )?;
+    )? * split as u32;
     // A workgroup to a row, summing in the order batch 1's does.
     let norm_pipeline = Pipeline {
         kernel: &RMSNORM,
@@ -1051,7 +1091,10 @@ mod tests {
     #[test]
     fn a_batch_scales_its_rows_tensors_and_grids_and_not_the_weights() {
         let s = shape(2);
-        let tuning = Tuning::for_subgroup(32);
+        let tuning = Tuning {
+            vectors: 4,
+            ..Tuning::for_subgroup(32)
+        };
         let one = decode_graph(&s, &tuning).unwrap();
         let batch = Batch { rows: 4, slots: 6 };
         let four = decode_batch_graph(&s, &tuning, batch).unwrap();
@@ -1087,23 +1130,85 @@ mod tests {
     #[test]
     fn vectors_are_staged_whole_unless_a_batch_of_them_does_not_fit() {
         let tuning = Tuning::for_subgroup(64);
-        assert_eq!(tuning.span(6144, 1).unwrap(), 0);
-        assert_eq!(tuning.span(2048, 4).unwrap(), 0);
-        assert_eq!(tuning.span(6144, 4).unwrap(), 3072);
-        // Rows of 32 KiB in all leave no room in 32 KiB for the norm's floats beside them.
-        assert_eq!(tuning.span(2048, 8).unwrap(), 1024);
-        assert_eq!(tuning.span(2048, 16).unwrap(), 512);
+        assert_eq!(tuning.span(6144, 1, 4).unwrap(), 0);
+        assert_eq!(tuning.span(2048, 8, 0).unwrap(), 0);
+        assert_eq!(tuning.span(6144, 4, 4).unwrap(), 3072);
+        // Rows of 32 KiB in all leave no room in 32 KiB for the norm's partial sums beside them.
+        assert_eq!(tuning.span(2048, 8, 4).unwrap(), 1024);
+        assert_eq!(tuning.span(2048, 16, 0).unwrap(), 1024);
+        assert_eq!(tuning.span(2048, 16, 4).unwrap(), 512);
         let wider = Tuning {
             stage: 48 << 10,
             ..tuning
         };
-        assert_eq!(wider.span(2048, 16).unwrap(), 1024);
-        assert_eq!(wider.span(6144, 16).unwrap(), 1024);
+        assert_eq!(wider.span(6144, 16, 16).unwrap(), 1024);
         let small = Tuning {
             stage: 1024,
             ..tuning
         };
-        assert!(matches!(small.span(2048, 16), Err(Error::Shape(_))));
+        assert!(matches!(small.span(2048, 16, 0), Err(Error::Shape(_))));
+    }
+
+    #[test]
+    fn a_batch_is_shared_out_over_workgroups_side_by_side() {
+        let tuning = Tuning::for_subgroup(64);
+        let cut = |vectors| Tuning { vectors, ..tuning };
+        assert_eq!(cut(4).split(16), (4, 4));
+        assert_eq!(cut(4).split(2), (2, 1));
+        assert_eq!(cut(4).split(6), (3, 2));
+        assert_eq!(cut(16).split(16), (16, 1));
+        assert_eq!(cut(0).split(5), (1, 5));
+        for subgroup in SUBGROUPS {
+            assert_eq!(
+                Tuning::for_batch(subgroup, 4),
+                Tuning::for_subgroup(subgroup)
+            );
+            assert_eq!(Tuning::for_batch(subgroup, 16).split(16), (4, 4));
+        }
+        let s = shape(1);
+        let batch = Batch {
+            rows: 16,
+            slots: 16,
+        };
+        let whole = decode_batch_graph(&s, &cut(16), batch).unwrap();
+        let split = decode_batch_graph(&s, &cut(4), batch).unwrap();
+        for (a, b) in whole.graph.ops.iter().zip(&split.graph.ops) {
+            let constant = |op: &crate::graph::Op, id| {
+                op.pipeline
+                    .constants
+                    .iter()
+                    .find(|c| c.0 == id)
+                    .map(|c| c.1)
+            };
+            let (groups_id, batch_id) = match b.pipeline.kernel.name {
+                "gemv_qkv_rope" => (15, 11),
+                "gemv_gate_up" => (10, 7),
+                "gemv_residual" => (8, 6),
+                _ => {
+                    assert_eq!(a.groups, b.groups, "{}", b.label);
+                    continue;
+                }
+            };
+            assert_eq!(b.groups[0], 4 * a.groups[0], "{}", b.label);
+            assert_eq!(
+                constant(b, batch_id),
+                Some(SpecValue::U32(4)),
+                "{}",
+                b.label
+            );
+            assert_eq!(
+                constant(b, groups_id),
+                Some(SpecValue::U32(4)),
+                "{}",
+                b.label
+            );
+            assert_eq!(
+                constant(a, groups_id),
+                Some(SpecValue::U32(1)),
+                "{}",
+                a.label
+            );
+        }
     }
 
     #[test]

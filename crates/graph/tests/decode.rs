@@ -202,9 +202,9 @@ fn gpu(stack: Stack, layers: usize, x: &[u16], shift: usize, subgroup: Option<u3
     gpu_rows(stack, layers, x, shift, subgroup, 1).remove(0)
 }
 
-/// [`gpu`]'s outputs for each of `rows` requests run at once: request r from step 2 r on, in slot
-/// `rows - 1 - r` of the cache, in a row that changes from step to step, the rows without one
-/// spare.
+/// [`gpu`]'s outputs for each of `rows` requests run at once, cut as [`Tuning::for_batch`] cuts
+/// them: request r from step 2 r on, in slot `rows - 1 - r` of the cache, in a row that changes
+/// from step to step, the rows without one spare.
 fn gpu_rows(
     stack: Stack,
     layers: usize,
@@ -224,10 +224,11 @@ fn gpu_rows(
     };
     let shape = Shape::new(&config, layers, (len + shift).next_multiple_of(32)).unwrap();
     let start = Instant::now();
-    let tuning = match subgroup {
-        Some(s) => Tuning::for_subgroup(s),
-        None => Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}")),
-    };
+    let subgroup = subgroup.unwrap_or_else(|| {
+        let device = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+        device.subgroup
+    });
+    let tuning = Tuning::for_batch(subgroup, rows);
     let batch = Batch { rows, slots: rows };
     let mut decoder = Decoder::with_batch(&ctx, &mut kernels, &shape, &tuning, batch, false)
         .unwrap_or_else(|e| panic!("{e}"));

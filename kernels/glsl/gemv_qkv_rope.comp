@@ -25,18 +25,19 @@ layout(constant_id = 11) const uint BATCH = 1;
 layout(constant_id = 12) const uint SLOTS = 1;
 layout(constant_id = 13) const uint SPAN = 0;
 layout(constant_id = 14) const uint NORM_WIDTH = 64;
+layout(constant_id = 15) const uint GROUPS = 1;
 
 const uint ROWS = 2 * PAIRS;
 const uint HALF = HEAD_DIM / 2;
 
-// [BATCH][K]
+// [BATCH * GROUPS][K]
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
 layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 3) readonly buffer Cos { float cos_[]; };
 layout(std430, binding = 4) readonly buffer Sin { float sin_[]; };
 layout(std430, binding = 5) readonly buffer At { uint at_[]; };
-// [BATCH][HEADS][HEAD_DIM]
+// [BATCH * GROUPS][HEADS][HEAD_DIM]
 layout(std430, binding = 6) writeonly buffer Q { float16_t q[]; };
 // [SLOTS][KV_HEADS][CAPACITY][HEAD_DIM]
 layout(std430, binding = 7) writeonly buffer KCache { float16_t k_cache[]; };
@@ -48,7 +49,7 @@ layout(std430, binding = 8) writeonly buffer VCache { float16_t v_cache[]; };
 #include "gemv_norm.glsl"
 
 void main() {
-    uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * PAIRS;
+    uint first = (row_block() * SUBGROUPS + gl_SubgroupID) * PAIRS;
     uint rows[ROWS];
     [[unroll]] for (uint p = 0; p < PAIRS; p++) {
         uint pair = first + p;
@@ -64,8 +65,9 @@ void main() {
         return;
     }
     [[unroll]] for (uint b = 0; b < BATCH; b++) {
+        uint row = first_vector() + b;
         uint pos, slot;
-        if (!placed(b, pos, slot)) {
+        if (!placed(row, pos, slot)) {
             continue;
         }
         [[unroll]] for (uint p = 0; p < PAIRS; p++) {
@@ -91,7 +93,7 @@ void main() {
                 rc = c * co + a * si;
             }
             if (head < HEADS) {
-                uint at = (b * HEADS + head) * HEAD_DIM + i;
+                uint at = (row * HEADS + head) * HEAD_DIM + i;
                 q[at] = float16_t(ra);
                 q[at + HALF] = float16_t(rc);
             } else {

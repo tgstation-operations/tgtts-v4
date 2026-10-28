@@ -256,7 +256,8 @@ fn row_inputs(
 /// The GPU's conditions and stop logits for the oracle's patches, from the prompt's last on, with
 /// the kernels at `subgroup` (the device's default when `None`), the residual LM rotated by RoPE
 /// as `shape` says unless `residual_rope` says otherwise; for each of `rows` requests run at
-/// once, request r from step 2 r on in slot `rows - 1 - r` of the caches.
+/// once, cut as [`Tuning::for_batch`] cuts them, request r from step 2 r on in slot
+/// `rows - 1 - r` of the caches.
 fn gpu(
     config: &lm_side::Config,
     oracle: &Oracle,
@@ -271,10 +272,11 @@ fn gpu(
     if let Some(rope) = residual_rope {
         shape.residual.rope = rope;
     }
-    let tuning = match subgroup {
-        Some(s) => Tuning::for_subgroup(s),
-        None => Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}")),
-    };
+    let subgroup = subgroup.unwrap_or_else(|| {
+        let device = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+        device.subgroup
+    });
+    let tuning = Tuning::for_batch(subgroup, rows);
     let start = Instant::now();
     let batch = Batch { rows, slots: rows };
     let mut side = LmSide::with_batch(&ctx, &mut kernels, &shape, &tuning, batch, false)
@@ -558,8 +560,8 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
                 .collect()
         };
         // Cuts that change where and when a row is summed, never in what order: the workgroup
-        // and the rows to a subgroup, loads ahead, and the vectors staged a step at a time, in
-        // a stage short of two.
+        // and the rows to a subgroup, loads ahead, the vectors staged a step at a time, in a stage
+        // short of two, and the batch shared out over workgroups a row or two each.
         let cuts = [
             base,
             Tuning {
@@ -575,6 +577,13 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
                 stage: (2 * batch.rows * 8 * subgroup as usize * 2 - 1) as u32,
                 ..base
             },
+            Tuning {
+                workgroup: 256,
+                vectors: 1,
+                ..base
+            },
+            Tuning { vectors: 2, ..base },
+            Tuning::for_batch(subgroup, 16),
         ];
         for tuning in cuts {
             let mut rows = side(&tuning, batch, &mut kernels);

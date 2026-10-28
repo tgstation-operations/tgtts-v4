@@ -13,14 +13,15 @@ layout(constant_id = 6) const uint AHEAD = 0;
 layout(constant_id = 7) const uint BATCH = 1;
 layout(constant_id = 8) const uint SPAN = 0;
 layout(constant_id = 9) const uint NORM_WIDTH = 64;
+layout(constant_id = 10) const uint GROUPS = 1;
 
 const uint ROWS = 2 * PAIRS;
 
-// [BATCH][K]
+// [BATCH * GROUPS][K]
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
 layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
-// [BATCH][INNER]
+// [BATCH * GROUPS][INNER]
 layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
 
 #include "gemv.glsl"
@@ -28,7 +29,7 @@ layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
 #include "gemv_norm.glsl"
 
 void main() {
-    uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * PAIRS;
+    uint first = (row_block() * SUBGROUPS + gl_SubgroupID) * PAIRS;
     uint rows[ROWS];
     [[unroll]] for (uint p = 0; p < PAIRS; p++) {
         rows[2 * p] = first + p;
@@ -43,7 +44,8 @@ void main() {
             [[unroll]] for (uint p = 0; p < PAIRS; p++) {
                 float gate = sums[b * ROWS + 2 * p];
                 float up = sums[b * ROWS + 2 * p + 1];
-                out_[b * INNER + first + p] = float16_t(gate / (1.0 + exp(-gate)) * up);
+                out_[(first_vector() + b) * INNER + first + p] =
+                    float16_t(gate / (1.0 + exp(-gate)) * up);
             }
         }
     }

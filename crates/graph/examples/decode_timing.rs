@@ -12,21 +12,22 @@
 //! - the step recorded untimed and timed per dispatch in turn, `--rounds` times, and each
 //!   kernel's time summed over the layers;
 //! - a sweep over the tunings `--sweep-workgroups`, `--sweep-rows` (row pairs or rows to a
-//!   subgroup, of every GEMV), `--sweep-ahead` and `--sweep-stage` make together, each recorded
-//!   over the same weights, `--rounds` times round robin, with what the driver compiled each GEMV
-//!   into.
+//!   subgroup, of every GEMV), `--sweep-ahead`, `--sweep-stage` and `--sweep-vectors` make
+//!   together, each recorded over the same weights, `--rounds` times round robin, with what the
+//!   driver compiled each GEMV into.
 //!
 //! ```text
 //! cargo run --release -p graph --example decode_timing -- [--layers 28] [--context 481]
 //!     [--capacity 768] [--steps 50] [--batch 1] [--subgroup S] [--workgroup W]
 //!     [--qkv-pairs 1] [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--stage 32768]
-//!     [--floor-mib 512] [--warmup-ms 2000] [--settle-ms 200] [--spins-us 0,50000]
-//!     [--gaps-ms 0,1,4,16] [--idle-ms 1000] [--rounds 3] [--sweep-workgroups 64,128]
-//!     [--sweep-rows 1,2] [--sweep-ahead 0,4,8] [--sweep-stage 16384,32768]
+//!     [--vectors V] [--floor-mib 512] [--warmup-ms 2000] [--settle-ms 200]
+//!     [--spins-us 0,50000] [--gaps-ms 0,1,4,16] [--idle-ms 1000] [--rounds 3]
+//!     [--sweep-workgroups 64,128] [--sweep-rows 1,2] [--sweep-ahead 0,4,8]
+//!     [--sweep-stage 16384,32768] [--sweep-vectors 1,4,16]
 //! ```
 //!
 //! The subgroup size defaults to the widest the kernels are written for that the device can
-//! require, and the rest of the tuning to [`Tuning::for_subgroup`]'s at it. `--floor-mib 0` skips
+//! require, and the rest of the tuning to [`Tuning::for_batch`]'s at it. `--floor-mib 0` skips
 //! the streaming read, and an empty list skips its part; the sweep runs when any of its lists is
 //! given, the others defaulting to the tuning's own value. Each block of `--steps` steps follows
 //! `--settle-ms` of steps back to back, so that it starts at the clocks of a busy GPU.
@@ -361,7 +362,7 @@ fn main() {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     let report = ctx.report();
     let device = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
-    let base = Tuning::for_subgroup(arg("--subgroup", device.subgroup as usize) as u32);
+    let base = Tuning::for_batch(arg("--subgroup", device.subgroup as usize) as u32, rows);
     let tuning = Tuning {
         workgroup: arg("--workgroup", base.workgroup as usize) as u32,
         qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
@@ -369,6 +370,7 @@ fn main() {
         residual_rows: arg("--residual-rows", base.residual_rows as usize) as u32,
         ahead: arg("--ahead", base.ahead as usize) as u32,
         stage: arg("--stage", base.stage as usize) as u32,
+        vectors: arg("--vectors", base.vectors as usize) as u32,
         ..base
     };
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
@@ -543,6 +545,7 @@ fn main() {
         "--sweep-rows",
         "--sweep-ahead",
         "--sweep-stage",
+        "--sweep-vectors",
     ]
     .iter()
     .any(|a| given(a));
@@ -588,14 +591,19 @@ fn sweep(
     let rows = list("--sweep-rows", "");
     let aheads = list("--sweep-ahead", &tuning.ahead.to_string());
     let stages = list("--sweep-stage", &tuning.stage.to_string());
+    let vectors = list("--sweep-vectors", &tuning.vectors.to_string());
     let mut tunings = Vec::new();
     for &workgroup in &workgroups {
         for &ahead in &aheads {
-            for &stage in &stages {
+            for (&stage, &vectors) in stages
+                .iter()
+                .flat_map(|s| vectors.iter().map(move |v| (s, v)))
+            {
                 let cut = Tuning {
                     workgroup: workgroup as u32,
                     ahead: ahead as u32,
                     stage: stage as u32,
+                    vectors: vectors as u32,
                     ..*tuning
                 };
                 if rows.is_empty() {
@@ -652,13 +660,14 @@ fn sweep(
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "  w{} r{}/{}/{} a{} s{}: {:.3} ms [{}]; {gemv}",
+            "  w{} r{}/{}/{} a{} s{} v{}: {:.3} ms [{}]; {gemv}",
             t.workgroup,
             t.qkv_pairs,
             t.gate_up_pairs,
             t.residual_rows,
             t.ahead,
             t.stage,
+            t.vectors,
             m / 1e6,
             untimed
                 .iter()

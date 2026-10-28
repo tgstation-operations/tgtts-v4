@@ -6,12 +6,13 @@
 //! ```text
 //! cargo run --release -p graph --example lm_side_timing -- [--context 481] [--capacity 768]
 //!     [--steps 30] [--batch 1,2,4,8,16] [--subgroup S] [--workgroup W] [--qkv-pairs 1]
-//!     [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--stage 32768] [--floor-mib 512]
+//!     [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--stage 32768] [--vectors V]
+//!     [--floor-mib 512]
 //! ```
 //!
 //! The subgroup size defaults to the widest the kernels are written for that the device can
-//! require, and the rest of the tuning to [`Tuning::for_subgroup`]'s at it. `--floor-mib 0` skips
-//! the streaming read.
+//! require, and the rest of the tuning to [`Tuning::for_batch`]'s at it for each batch, which the
+//! options override. `--floor-mib 0` skips the streaming read.
 //!
 //! `VOXCPM2_DIR` names the checkpoint and `GLSL_KERNELS` the compiled kernels. The patches run at
 //! positions from `--context` on, each request of a batch in a slot of the caches of its own,
@@ -113,27 +114,30 @@ fn main() {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     let report = ctx.report();
     let device = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
-    let base = Tuning::for_subgroup(arg("--subgroup", device.subgroup as usize) as u32);
-    let tuning = Tuning {
-        workgroup: arg("--workgroup", base.workgroup as usize) as u32,
-        qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
-        gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
-        residual_rows: arg("--residual-rows", base.residual_rows as usize) as u32,
-        ahead: arg("--ahead", base.ahead as usize) as u32,
-        stage: arg("--stage", base.stage as usize) as u32,
-        ..base
+    let subgroup = arg("--subgroup", device.subgroup as usize) as u32;
+    let tuning = |rows: usize| {
+        let base = Tuning::for_batch(subgroup, rows);
+        Tuning {
+            workgroup: arg("--workgroup", base.workgroup as usize) as u32,
+            qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
+            gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
+            residual_rows: arg("--residual-rows", base.residual_rows as usize) as u32,
+            ahead: arg("--ahead", base.ahead as usize) as u32,
+            stage: arg("--stage", base.stage as usize) as u32,
+            vectors: arg("--vectors", base.vectors as usize) as u32,
+            ..base
+        }
     };
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "{} ({}), validation {}; {} and {} layers, {tuning:?}",
+        "{} ({}), validation {}; {} and {} layers",
         report.name,
         report.driver_info,
         if ctx.validating() { "on" } else { "off" },
         shape.base.layers,
         shape.residual.layers,
     );
-    let floor =
-        (floor_mib > 0).then(|| stream_read(&ctx, &mut kernels, tuning.subgroup, floor_mib << 20));
+    let floor = (floor_mib > 0).then(|| stream_read(&ctx, &mut kernels, subgroup, floor_mib << 20));
 
     let position = context + warmup + steps / 2;
     let weights = (shape.base.weight_bytes() + shape.residual.weight_bytes()) as f64;
@@ -151,13 +155,15 @@ fn main() {
     let mut measured = Vec::new();
     for &rows in &batches {
         let batch = Batch { rows, slots: rows };
+        let tuning = tuning(rows);
         let start = Instant::now();
         let mut side = LmSide::with_batch(&ctx, &mut kernels, &shape, &tuning, batch, false)
             .unwrap_or_else(|e| panic!("{e}"));
         side.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
         let step = side.graph_step();
         eprintln!(
-            "{rows} rows: {} dispatches, {} barriers, arena {} KiB; built and loaded in {:.1} s",
+            "{rows} rows at {tuning:?}: {} dispatches, {} barriers, arena {} KiB; built and \
+             loaded in {:.1} s",
             step.dispatches(),
             step.barriers(),
             step.arena_bytes() / 1024,
