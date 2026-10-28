@@ -6070,6 +6070,7 @@ dependencies = [
  "voices",
  "vorbis_rs",
  "voxcpm",
+ "voxcpm-core",
  "vulkan",
 ]
 

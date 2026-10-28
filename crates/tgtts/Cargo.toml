@@ -46,6 +46,7 @@ tracing-subscriber = { workspace = true, features = ["fmt", "std", "tracing-log"
 vorbis_rs.workspace = true
 voices = { path = "../voices" }
 voxcpm = { path = "../voxcpm" }
+voxcpm-core = { path = "../voxcpm-core" }
 vulkan = { path = "../vulkan", optional = true }
 
 [build-dependencies]

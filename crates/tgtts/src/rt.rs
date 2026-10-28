@@ -32,9 +32,9 @@ use graph::{
 };
 use tracing::{debug, error, info};
 use voices::{Latent, Voices};
-use voxcpm::{Config, Prompt, Tokenizer};
+use voxcpm_core::{Config, Prompt, Tokenizer};
 #[cfg(feature = "rt")]
-use voxcpm::{Noise, Params, Sampling, SeededNoise};
+use voxcpm_core::{Noise, Params, Sampling, SeededNoise};
 
 use crate::synth::{self, Sink, Speech, Start, Synthesizer};
 
