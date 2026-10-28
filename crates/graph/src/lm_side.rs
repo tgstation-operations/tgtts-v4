@@ -755,6 +755,19 @@ mod tests {
     }
 
     #[test]
+    fn every_batch_builds_at_its_cut_at_either_subgroup_size() {
+        let s = shape();
+        for subgroup in SUBGROUPS {
+            for rows in 1..=16 {
+                let batch = Batch { rows, slots: rows };
+                let tuning = Tuning::for_batch(subgroup, rows);
+                let built = lm_side_batch_graph(&s, &tuning, batch);
+                assert!(built.is_ok(), "{rows} rows at {tuning:?}: {built:?}");
+            }
+        }
+    }
+
+    #[test]
     fn stacks_that_do_not_meet_are_refused() {
         let tuning = Tuning::for_subgroup(64);
         let mut s = shape();

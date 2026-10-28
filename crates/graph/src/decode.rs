@@ -286,22 +286,39 @@ impl Tuning {
     }
 
     /// The cut for a batch of `rows` at `subgroup`: [`for_subgroup`](Self::for_subgroup)'s, a
-    /// row of the batch to each workgroup, up to 4 rows, and from there workgroups of four
-    /// subgroups taking 4 rows each.
+    /// row of the batch to each workgroup, up to 4 rows. From there, at 64, workgroups of four
+    /// subgroups taking 4 rows each; at 32, workgroups of eight taking 8 rows each, staged 16 KiB
+    /// at a time. As with `for_subgroup`, each is what was fastest on the device that runs at
+    /// that size by default.
     ///
     /// On the Radeon 8060S at 64, the base LM's step at position 481 took 12.7 and 12.9 ms at 2
     /// and 4 rows cut so, about what it takes at batch 1, against 13.3 and 14.3 with every row
     /// in every workgroup. At 8 and 16 rows, four-subgroup workgroups took 14.5 and 20.7 ms with
     /// a row each, 14.7 and 16.8 with four each, and 18.9 and 27.6 with every row in each.
+    ///
+    /// On the RTX 4070 Ti SUPER at 32, it took 4.63 and 4.83 ms at 2 and 4 rows cut so, against
+    /// 4.56 at batch 1. At 8 and 16 rows, eight-subgroup workgroups staging 16 KiB took 5.35 and
+    /// 6.46 ms with 8 rows each, 5.57 and 7.49 with four, 7.78 and 13.79 with one, and 6.72 at
+    /// 16 with every row in each; staging 32 KiB, 5.60 and 6.83 with 8 rows each. Cut as the
+    /// Radeon's, in four-subgroup workgroups taking 4 rows, it took 5.53 and 8.86.
     pub fn for_batch(subgroup: u32, rows: usize) -> Self {
         let base = Self::for_subgroup(subgroup);
         if rows <= 4 {
             return base;
         }
-        Tuning {
-            workgroup: 4 * subgroup,
-            vectors: 4,
-            ..base
+        if subgroup >= 64 {
+            Tuning {
+                workgroup: 4 * subgroup,
+                vectors: 4,
+                ..base
+            }
+        } else {
+            Tuning {
+                workgroup: 8 * subgroup,
+                vectors: 8,
+                stage: 16 << 10,
+                ..base
+            }
         }
     }
 
@@ -1128,6 +1145,25 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_is_cut_as_was_fastest_at_its_subgroup_size() {
+        for subgroup in SUBGROUPS {
+            for rows in 1..=4 {
+                let tuning = Tuning::for_batch(subgroup, rows);
+                assert_eq!(tuning, Tuning::for_subgroup(subgroup), "{rows} rows");
+            }
+        }
+        // The Radeon's: four subgroups of 64 taking 4 rows.
+        let radeon = Tuning::for_batch(64, 16);
+        assert_eq!((radeon.workgroup, radeon.stage), (256, 32 << 10));
+        assert_eq!((radeon.split(16), radeon.split(8)), ((4, 4), (4, 2)));
+        // NVIDIA's: eight subgroups of 32 taking 8 rows, staged 16 KiB at a time.
+        let nvidia = Tuning::for_batch(32, 16);
+        assert_eq!((nvidia.workgroup, nvidia.stage), (256, 16 << 10));
+        assert_eq!((nvidia.split(16), nvidia.split(8)), ((8, 2), (8, 1)));
+        assert_eq!(Tuning::for_batch(32, 5).split(5), (5, 1));
+    }
+
+    #[test]
     fn vectors_are_staged_whole_unless_a_batch_of_them_does_not_fit() {
         let tuning = Tuning::for_subgroup(64);
         assert_eq!(tuning.span(6144, 1, 4).unwrap(), 0);
@@ -1158,13 +1194,6 @@ mod tests {
         assert_eq!(cut(4).split(6), (3, 2));
         assert_eq!(cut(16).split(16), (16, 1));
         assert_eq!(cut(0).split(5), (1, 5));
-        for subgroup in SUBGROUPS {
-            assert_eq!(
-                Tuning::for_batch(subgroup, 4),
-                Tuning::for_subgroup(subgroup)
-            );
-            assert_eq!(Tuning::for_batch(subgroup, 16).split(16), (4, 4));
-        }
         let s = shape(1);
         let batch = Batch {
             rows: 16,
