@@ -15,16 +15,8 @@ use crate::{
     graph::Graphs, prefill::PrefillGraphs, weights,
 };
 
-/// The dtype each part of the model is held and computed in.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Dtypes {
-    /// The base and residual LMs, and the projections and heads around them.
-    pub lm: FloatDType,
-    pub local_encoder: FloatDType,
-    pub local_dit: FloatDType,
-    /// The audio VAE's decoder, which [`TextToSpeech`](crate::TextToSpeech) loads beside the model.
-    pub audio_decoder: FloatDType,
-}
+/// The dtype each part of the model is held and computed in, as burn names it.
+pub type Dtypes = voxcpm_core::Dtypes<FloatDType>;
 
 /// VoxCPM2 short of its audio VAE: from a prompt of text and audio latents to the latents that
 /// follow, as upstream's `VoxCPM2Model._inference` computes them and nanovllm-voxcpm stops.

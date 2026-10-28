@@ -17,9 +17,10 @@ use dsp::RATE;
 use tracing::{debug, error, info, warn};
 use voices::{Latent, Voices};
 use voxcpm::{
-    ChunkDecoder, Config, Dtypes, GraphCounts, Params, Patch, Prompt, PromptCache, Scheduler,
-    SeededNoise, SpeechChunks, Stepping, TextToSpeech,
+    ChunkDecoder, Config, GraphCounts, Params, Patch, Prompt, PromptCache, Scheduler, SeededNoise,
+    SpeechChunks, Stepping, TextToSpeech,
 };
+use voxcpm_core::Dtypes;
 
 use crate::{
     device,
@@ -147,7 +148,7 @@ impl VoxCpm {
         thread::Builder::new()
             .name("voxcpm".into())
             .spawn(move || {
-                let tts = match TextToSpeech::load(&dir, &dtypes, &on) {
+                let tts = match TextToSpeech::load(&dir, &dtypes.map(device::float_dtype), &on) {
                     Ok(mut tts) => {
                         if model_batching.graphs {
                             tts.set_stepping(Stepping::for_device(&on));
@@ -689,9 +690,9 @@ impl Synthesizer for VoxCpm {
 
 #[cfg(test)]
 mod tests {
-    use burn::tensor::FloatDType;
     use serde_json::Value;
     use voxcpm::PREFILL_BATCH;
+    use voxcpm_core::Dtype;
 
     use super::*;
 
@@ -704,7 +705,7 @@ mod tests {
     }
 
     fn load(dir: &Path) -> voxcpm::Error {
-        let f32 = FloatDType::F32;
+        let f32 = Dtype::F32;
         let dtypes = Dtypes {
             lm: f32,
             local_encoder: f32,

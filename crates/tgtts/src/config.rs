@@ -62,9 +62,8 @@ use std::{
     time::Duration,
 };
 
-use burn::tensor::FloatDType;
 use tracing::level_filters::LevelFilter;
-use voxcpm::Dtypes;
+use voxcpm_core::{Dtype, Dtypes};
 
 use crate::{
     device::{self, Kind},
@@ -300,7 +299,7 @@ impl Settings {
             .ok_or_else(|| Error(format!("{key} is not set")))
     }
 
-    fn dtype(&self, key: &str) -> Result<Option<FloatDType>, Error> {
+    fn dtype(&self, key: &str) -> Result<Option<Dtype>, Error> {
         self.0
             .get(key)
             .map(|value| {
@@ -462,7 +461,7 @@ mod tests {
         assert_eq!(config.listen, "0.0.0.0:5011".parse().unwrap());
         assert_eq!(config.device, Kind::Vulkan);
         let dtypes = Dtypes {
-            local_dit: FloatDType::BF16,
+            local_dit: Dtype::BF16,
             ..Kind::Vulkan.dtypes()
         };
         assert_eq!(config.dtypes, dtypes);
@@ -509,8 +508,8 @@ mod tests {
         ];
         let config = load(&toml, &env).unwrap();
         let dtypes = Dtypes {
-            lm: FloatDType::F16,
-            local_dit: FloatDType::BF16,
+            lm: Dtype::F16,
+            local_dit: Dtype::BF16,
             ..Kind::Cpu.dtypes()
         };
         assert_eq!((config.device, config.dtypes), (Kind::Cpu, dtypes));

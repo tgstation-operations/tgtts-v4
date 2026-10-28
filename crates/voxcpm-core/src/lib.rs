@@ -1,10 +1,13 @@
 //! The parts of VoxCPM2 that compute no tensors: the checkpoint's `config.json`, with its
 //! stacks' and audio VAE's sections, the tokenizer, the prompt a request is laid out as, how its
 //! patches are sampled and the noise they are sampled from. The `voxcpm` crate, which runs the
-//! model on burn, re-exports them, and the service's own runtime takes them without burn.
+//! model on burn, re-exports them, and the service's own runtime takes them without burn. The
+//! dtypes each part may be held in are named here too, for a configuration read without burn;
+//! `voxcpm` holds burn's own.
 
 mod audio_vae;
 mod config;
+mod dtypes;
 pub mod minicpm4;
 mod noise;
 mod params;
@@ -16,6 +19,7 @@ use std::fmt;
 pub use crate::{
     audio_vae::AudioVaeConfig,
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
+    dtypes::{Dtype, Dtypes},
     noise::{Noise, SeededNoise},
     params::{Params, Sampling},
     prompt::Prompt,

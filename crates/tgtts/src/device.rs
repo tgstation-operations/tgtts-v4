@@ -16,7 +16,7 @@ use tracing_subscriber::{
     filter::{LevelFilter, Targets},
     layer::{Context, Layer},
 };
-use voxcpm::Dtypes;
+use voxcpm_core::{Dtype, Dtypes};
 
 /// What is logged at `level`: the service's own events at it, the crates' it uses at it but
 /// never finer than `WARN`, as pliron logs every kernel cubecl compiles at `INFO` after each of
@@ -89,7 +89,7 @@ impl Kind {
     /// audio to 46 dB of upstream's, where the CPU in f16 reaches 56 dB. The rt device runs in
     /// those alone, storing f16 and computing in f32.
     pub fn dtypes(self) -> Dtypes {
-        let (f32, f16) = (FloatDType::F32, FloatDType::F16);
+        let (f32, f16) = (Dtype::F32, Dtype::F16);
         match self {
             Self::Cpu => Dtypes {
                 lm: f32,
@@ -133,12 +133,21 @@ impl fmt::Display for Kind {
 }
 
 /// A dtype as the configuration names it.
-pub fn parse_dtype(name: &str) -> Result<FloatDType, String> {
+pub fn parse_dtype(name: &str) -> Result<Dtype, String> {
     match name {
-        "f32" => Ok(FloatDType::F32),
-        "f16" => Ok(FloatDType::F16),
-        "bf16" => Ok(FloatDType::BF16),
+        "f32" => Ok(Dtype::F32),
+        "f16" => Ok(Dtype::F16),
+        "bf16" => Ok(Dtype::BF16),
         _ => Err("not f32, f16 or bf16".to_owned()),
+    }
+}
+
+/// `dtype` as burn names it.
+pub fn float_dtype(dtype: Dtype) -> FloatDType {
+    match dtype {
+        Dtype::F32 => FloatDType::F32,
+        Dtype::F16 => FloatDType::F16,
+        Dtype::BF16 => FloatDType::BF16,
     }
 }
 
@@ -173,7 +182,7 @@ pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<
         ("audio_decoder_dtype", dtypes.audio_decoder),
     ];
     for (key, dtype) in parts {
-        if !device.supports_dtype(dtype) {
+        if !device.supports_dtype(float_dtype(dtype)) {
             return Err(format!(
                 "{key}: the {kind} device does not compute in {dtype:?}"
             ));
@@ -268,14 +277,14 @@ mod tests {
         assert_eq!("cuda".parse(), Ok(Kind::Cuda));
         assert_eq!("rt".parse(), Ok(Kind::Rt));
         assert!("rocm".parse::<Kind>().is_err());
-        assert_eq!(parse_dtype("bf16"), Ok(FloatDType::BF16));
+        assert_eq!(parse_dtype("bf16"), Ok(Dtype::BF16));
         assert!(parse_dtype("f64").is_err());
     }
 
     #[test]
     fn opens_the_cpu_in_every_dtype() {
         let bf16 = Dtypes {
-            lm: FloatDType::BF16,
+            lm: Dtype::BF16,
             ..Kind::Cpu.dtypes()
         };
         for dtypes in [Kind::Cpu.dtypes(), Kind::Vulkan.dtypes(), bf16] {
