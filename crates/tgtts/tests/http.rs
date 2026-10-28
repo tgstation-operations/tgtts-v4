@@ -21,6 +21,7 @@ use common::{Message, Reply, Server, VOICE, call};
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
+    levels::{Level, Levels},
     metrics::Metrics,
     service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::{self, Speech, Synthesizer},
@@ -33,17 +34,22 @@ use voices::{BlipSet, Latent, Voices};
 const FRAMES_PER_CHAR: usize = 1200;
 /// The silence the old frontend put after speech.
 const TAIL: usize = 12000;
+/// The samples of a patch of the model's.
+const PATCH: usize = 7680;
 /// The seed of the blips' draws, so that every request draws the same.
 const BLIP_SEED: u64 = 0;
 
 /// A model that says a tone as long as the text, counting what it is asked and how many it
-/// is asked at once, and failing on text with "Fail" in it.
+/// is asked at once, and failing on text with "Fail" in it. Streamed, it gives the tone a
+/// patch's worth at a time, after the whole is said.
 #[derive(Default)]
 struct Fake {
     texts: Mutex<Vec<String>>,
     gate: Option<Gate>,
+    pause: Option<Gate>,
     active: AtomicUsize,
     most: AtomicUsize,
+    streamed: AtomicUsize,
 }
 
 /// Holds each synthesis until the test releases it, saying when one starts.
@@ -67,12 +73,43 @@ impl Fake {
         (fake, entries, release)
     }
 
+    /// A fake whose streams wait after their first patch, which says so, until released.
+    fn paused() -> (Self, mpsc::Receiver<String>, mpsc::Sender<()>) {
+        let (gated, entries, release) = Self::gated();
+        let fake = Self {
+            pause: gated.gate,
+            ..Self::default()
+        };
+        (fake, entries, release)
+    }
+
     fn texts(&self) -> Vec<String> {
         self.texts.lock().unwrap().clone()
     }
 }
 
 impl Synthesizer for Fake {
+    /// Holds each stream after its first patch, where it has a pause, until the test releases
+    /// it.
+    fn stream(
+        &self,
+        text: &str,
+        voice: &Latent,
+        seed: u64,
+        audio: &mut synth::Sink<'_>,
+    ) -> Result<Speech, synth::Error> {
+        self.streamed.fetch_add(1, Ordering::SeqCst);
+        let speech = self.synthesize(text, voice, seed)?;
+        for (i, patch) in speech.samples.chunks(PATCH).enumerate() {
+            audio(patch);
+            if let (0, Some(pause)) = (i, &self.pause) {
+                pause.entered.lock().unwrap().send(text.to_owned()).unwrap();
+                pause.release.lock().unwrap().recv().unwrap();
+            }
+        }
+        Ok(speech)
+    }
+
     fn synthesize(&self, text: &str, _: &Latent, _: u64) -> Result<Speech, synth::Error> {
         self.texts.lock().unwrap().push(text.to_owned());
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -230,12 +267,41 @@ fn harness(fake: Fake, limits: Limits) -> Harness {
 }
 
 fn harness_at(fake: Fake, limits: Limits, loudness: Loudness) -> Harness {
-    serve_fake(fake, limits, loudness, true)
+    serve_fake(fake, limits, loudness, levels(), true)
+}
+
+/// A longer line, which "Woman (Test)" has its level of.
+const LONGER: &str = "Hello there, could someone please come to medbay?";
+
+/// Each voice's level as `tgtts-gains` would find it for the fake model, from a line and the
+/// silence after it: that of the default message's tone, but for "Woman (Test)", whose level is
+/// that of [`LONGER`]'s.
+fn levels() -> Levels {
+    let level = |text: &str| {
+        let mut tone: Vec<f64> = said(text).iter().map(|&s| f64::from(s)).collect();
+        tone.resize(tone.len() + TAIL, 0.0);
+        Level {
+            loudness_lufs: dsp::loudness::integrated(&tone, 48000),
+            lines: 1,
+        }
+    };
+    let mut levels = Levels::default();
+    for voice in [VOICE, "A", "Ab"] {
+        levels.set(voice, level("Hello there."));
+    }
+    levels.set("Woman (Test)", level(LONGER));
+    levels
 }
 
 /// The service with the fake model, given it from the start if `ready`, as the service is once
-/// its model has loaded.
-fn serve_fake(fake: Fake, limits: Limits, loudness: Loudness, ready: bool) -> Harness {
+/// its model has loaded, and the voices' levels `voice_levels`.
+fn serve_fake(
+    fake: Fake,
+    limits: Limits,
+    loudness: Loudness,
+    voice_levels: Levels,
+    ready: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (voices, assets) = (dir.path().join("voices"), dir.path().join("assets"));
     write_voices(&voices);
@@ -256,6 +322,7 @@ fn serve_fake(fake: Fake, limits: Limits, loudness: Loudness, ready: bool) -> Ha
             set.lock().unwrap().push(level);
         }),
         loudness,
+        levels: voice_levels,
         limits,
         blip_seed: Some(BLIP_SEED),
     });
@@ -351,7 +418,7 @@ fn serves_what_the_game_asks_for_at_startup() {
 
 #[test]
 fn answers_503_for_speech_and_health_until_the_model_is_ready() {
-    let h = serve_fake(Fake::default(), limits(), LOUDNESS, false);
+    let h = serve_fake(Fake::default(), limits(), LOUDNESS, levels(), false);
     let health = || call(&format!("{}/health-check", h.base), None, "");
     let loading = health();
     assert_eq!(
@@ -1093,4 +1160,350 @@ fn records_metrics_without_the_text() {
             }
         }
     }
+}
+
+/// A job's id and its streams' paths by route, from what `POST /stream` answered.
+fn job(reply: &Reply) -> (String, BTreeMap<String, String>) {
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let job: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    let streams = job["streams"].as_object().unwrap();
+    let streams = (streams.iter())
+        .map(|(route, path)| (route.clone(), path.as_str().unwrap().to_owned()))
+        .collect();
+    (job["job"].as_str().unwrap().to_owned(), streams)
+}
+
+/// What `GET /stream/{job}` says, waiting up to `wait` seconds.
+fn status(h: &Harness, job: &str, wait: f64) -> serde_json::Value {
+    let reply = h.get(&format!("/stream/{job}?wait={wait}"), "");
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+/// A stream played as a player plays it, without the token.
+fn play(h: &Harness, path: &str) -> Reply {
+    call(&format!("{}{path}", h.base), None, "")
+}
+
+/// The variants of a message for everyone, as routes.
+const ALL: [&str; 5] = [
+    "tts",
+    "tts-blips",
+    "tts-radio",
+    "tts-blips-radio",
+    "tts-radio-gibberish",
+];
+
+#[test]
+fn streams_each_version_a_job_asks_for() {
+    let h = harness(Fake::default(), limits());
+    let message = Message::default();
+    let (id, streams) = job(&h.post("/stream", &message.job(&ALL)));
+    assert_eq!(streams.keys().map(String::as_str).collect::<Vec<_>>(), {
+        let mut all = ALL.to_vec();
+        all.sort_unstable();
+        all
+    });
+    let distinct: std::collections::BTreeSet<&String> = streams.values().collect();
+    assert_eq!(distinct.len(), 5, "{streams:?}");
+    for path in streams.values() {
+        assert!(path.starts_with("/s/") && path.len() == 3 + 32, "{path}");
+    }
+    let done = status(&h, &id, 30.0);
+    assert_eq!(done["done"], true, "{done}");
+
+    let played: BTreeMap<&str, Reply> = (streams.iter())
+        .map(|(route, path)| (route.as_str(), play(&h, path)))
+        .collect();
+    let whole = message.blips(&h);
+    let speech = 12 * FRAMES_PER_CHAR + TAIL;
+    let blips = whole.frames(48000);
+    let frames = [
+        ("tts", speech),
+        ("tts-blips", blips),
+        ("tts-radio", radio_frames(speech)),
+        ("tts-blips-radio", radio_frames(blips)),
+        ("tts-radio-gibberish", radio_frames(speech)),
+    ];
+    for (route, frames) in frames {
+        let reply = &played[route];
+        assert_eq!(reply.status, 200, "{route}");
+        assert_eq!(
+            reply.content_type.as_deref(),
+            Some("audio/ogg; codecs=opus")
+        );
+        assert_eq!(reply.allow_origin.as_deref(), Some("*"));
+        let decoded = tgtts::opus::decode(&reply.body).unwrap();
+        assert_eq!(
+            (decoded.channels, decoded.samples.len()),
+            (1, frames),
+            "{route}"
+        );
+        assert_eq!(
+            common::decode(&reply.body).samples.len(),
+            frames,
+            "{route}, by ffmpeg"
+        );
+        let seconds = done["variants"][route]["seconds"].as_f64().unwrap();
+        assert_eq!(done["variants"][route]["state"], "done");
+        assert!(
+            (seconds * 48000.0 - frames as f64).abs() < 0.5,
+            "{route}: {seconds} s"
+        );
+    }
+    // The gibberish radio is the plain radio's stream.
+    assert_eq!(played["tts-radio-gibberish"].body, played["tts-radio"].body);
+    assert_eq!(h.fake.texts(), ["Hello there."]);
+    assert_eq!(h.fake.streamed.load(Ordering::SeqCst), 1);
+    let routes: Vec<(String, u16)> = h
+        .rows()
+        .into_iter()
+        .filter(|row| row.identifier == message.identifier)
+        .map(|row| (row.route, row.status))
+        .collect();
+    assert_eq!(routes.len(), 6, "{routes:?}");
+    assert!(routes.iter().all(|(_, status)| *status == 200));
+}
+
+/// The fake's tone has the loudness its voice's level says, so the streamed speech comes out at
+/// the service's loudness as the whole-file route's does, shifted or not.
+#[test]
+fn streamed_speech_is_as_long_and_as_loud_as_the_whole_files() {
+    let h = harness(Fake::default(), limits());
+    for message in [
+        Message::default(),
+        Message {
+            speaker: "Woman (Test)",
+            pitch: "-6",
+            text: LONGER,
+            ..Message::default()
+        },
+    ] {
+        let whole = message.speech(&h);
+        let (id, streams) = job(&h.post("/stream", &message.job(&["tts"])));
+        assert_eq!(status(&h, &id, 30.0)["done"], true);
+        let streamed = play(&h, &streams["tts"]);
+        let decoded = tgtts::opus::decode(&streamed.body).unwrap().samples;
+        assert_eq!(decoded.len(), whole.frames(48000));
+        let streamed: Vec<f64> = decoded.iter().map(|&s| f64::from(s)).collect();
+        let streamed = dsp::loudness::integrated(&streamed, 48000);
+        let whole = loudness(&whole);
+        assert!(
+            (streamed - whole).abs() < 0.3,
+            "{streamed:.2} LUFS streamed, {whole:.2} whole"
+        );
+    }
+}
+
+#[test]
+fn streams_speech_as_the_model_makes_it() {
+    let (fake, entries, release) = Fake::paused();
+    let h = harness(fake, limits());
+    let message = Message::default();
+    let (id, streams) = job(&h.post("/stream", &message.job(&["tts", "tts-radio"])));
+    assert_eq!(entries.recv().unwrap(), "Hello there.");
+    // The model has made a patch and is held: that patch is playing, the radio, which takes
+    // all of the speech, is not.
+    let url = format!("{}{}", h.base, streams["tts"]);
+    let mut reader = ureq::get(&url).call().unwrap().into_reader();
+    let (mut read, mut buffer) = (Vec::new(), [0; 4096]);
+    let audio = loop {
+        let n = std::io::Read::read(&mut reader, &mut buffer).unwrap();
+        assert!(n > 0, "the stream ended before any audio");
+        read.extend_from_slice(&buffer[..n]);
+        if let Ok(pages) = tgtts::ogg::pages(&read)
+            && let Some(granule) = pages.iter().filter_map(|p| p.granule).max()
+            && granule > 0
+        {
+            break granule;
+        }
+    };
+    assert!(
+        audio <= PATCH as u64,
+        "{audio} samples before the second patch"
+    );
+    let now = status(&h, &id, 0.0);
+    assert_eq!(now["done"], false);
+    assert_eq!(now["variants"]["tts"]["state"], "streaming");
+    assert_eq!(now["variants"]["tts-radio"]["state"], "pending");
+    release.send(()).unwrap();
+    std::io::Read::read_to_end(&mut reader, &mut read).unwrap();
+    let decoded = tgtts::opus::decode(&read).unwrap();
+    assert_eq!(decoded.samples.len(), 12 * FRAMES_PER_CHAR + TAIL);
+    assert_eq!(status(&h, &id, 30.0)["done"], true);
+    // Read again from the start, the stream is the same.
+    assert_eq!(play(&h, &streams["tts"]).body, read);
+}
+
+/// Speech from the cache, through an ffmpeg filter graph or in a voice with no level is made
+/// whole first, as the whole-file route makes it, and streamed at once.
+#[test]
+fn serves_whole_what_cannot_stream() {
+    let h = harness(Fake::default(), limits());
+    let filtered = Message {
+        filter: "volume=0.5",
+        ..Message::default()
+    };
+    let (id, streams) = job(&h.post("/stream", &filtered.job(&["tts"])));
+    assert_eq!(status(&h, &id, 30.0)["done"], true);
+    let decoded = tgtts::opus::decode(&play(&h, &streams["tts"]).body).unwrap();
+    assert_eq!(decoded.samples.len(), 12 * FRAMES_PER_CHAR + TAIL);
+    assert_eq!(h.fake.streamed.load(Ordering::SeqCst), 0);
+
+    let silent = Message {
+        text: "...",
+        ..Message::default()
+    };
+    let (id, streams) = job(&h.post("/stream", &silent.job(&["tts", "tts-radio"])));
+    assert_eq!(status(&h, &id, 30.0)["done"], true);
+    let decoded = tgtts::opus::decode(&play(&h, &streams["tts"]).body).unwrap();
+    assert_eq!(decoded.samples.len(), TAIL);
+    assert_eq!(h.fake.texts(), ["Hello there."]);
+
+    let levelless = serve_fake(Fake::default(), limits(), LOUDNESS, Levels::default(), true);
+    let (id, _) = job(&levelless.post("/stream", &Message::default().job(&["tts"])));
+    assert_eq!(status(&levelless, &id, 30.0)["done"], true);
+    assert_eq!(levelless.fake.texts(), ["Hello there."]);
+    assert_eq!(levelless.fake.streamed.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_job_that_fails_says_so_for_each_version_it_takes_down() {
+    let h = harness(Fake::default(), limits());
+    let message = Message {
+        text: "Fail now.",
+        ..Message::default()
+    };
+    let (id, streams) = job(&h.post("/stream", &message.job(&["tts", "tts-radio", "tts-blips"])));
+    let done = status(&h, &id, 30.0);
+    assert_eq!(done["done"], true);
+    for route in ["tts", "tts-radio"] {
+        let failed = &done["variants"][route];
+        assert_eq!(
+            (&failed["state"], &failed["status"]),
+            (&"failed".into(), &500.into())
+        );
+        // The stream ends with its headers alone.
+        let pages = tgtts::ogg::pages(&play(&h, &streams[route]).body).unwrap();
+        assert!(pages.iter().all(|p| p.granule.unwrap_or(0) == 0), "{route}");
+    }
+    assert_eq!(done["variants"]["tts-blips"]["state"], "done");
+}
+
+#[test]
+fn refuses_a_job_it_cannot_do_and_streams_nobody_has() {
+    let h = harness(Fake::default(), limits());
+    let message = Message::default();
+    let refused = |body: &str| h.post("/stream", body);
+    for (body, reason) in [
+        (message.job(&[]), "no variants"),
+        (
+            message.job(&["tts", "tts-whisper"]),
+            "no variant \"tts-whisper\"",
+        ),
+        (
+            Message {
+                speaker: "Nobody",
+                ..Message::default()
+            }
+            .job(&["tts"]),
+            "no voice \"Nobody\"",
+        ),
+        (
+            Message {
+                pitch: "49",
+                ..Message::default()
+            }
+            .job(&["tts"]),
+            "pitch 49",
+        ),
+        (
+            "{".to_owned(),
+            "body: EOF while parsing an object at line 1 column 1",
+        ),
+    ] {
+        let reply = refused(&body);
+        assert_eq!((reply.status, reply.text()), (400, reason));
+    }
+    let effects = Message {
+        effects: r#"[{"effect": "warp"}]"#,
+        ..Message::default()
+    };
+    assert_eq!(refused(&effects.job(&["tts"])).status, 400);
+    assert_eq!(h.fake.texts(), Vec::<String>::new());
+
+    let unauthorized = |path: &str| {
+        let url = format!("{}{path}", h.base);
+        let post = ureq::post(&url).send_bytes(message.job(&["tts"]).as_bytes());
+        let status = |r: Result<ureq::Response, ureq::Error>| match r {
+            Ok(r) | Err(ureq::Error::Status(_, r)) => r.status(),
+            Err(e) => panic!("{e}"),
+        };
+        (status(post), status(ureq::get(&url).call()))
+    };
+    assert_eq!(unauthorized("/stream").0, 401);
+    assert_eq!(unauthorized("/stream/0123").1, 401);
+    assert_eq!(h.get("/stream/0123", "").status, 404);
+    assert_eq!(play(&h, "/s/00000000000000000000000000000000").status, 404);
+}
+
+/// Streamed, speech goes through the effects, the silicon effect and the clicks as it does
+/// whole: as long as the whole-file route's, and as loud. Each line is new, so that none comes
+/// from the cache.
+#[test]
+fn streams_the_effects_and_the_clicks() {
+    let h = harness(Fake::default(), limits());
+    let speech = 12 * FRAMES_PER_CHAR + TAIL;
+    let lines: Vec<String> = (0..8).map(|i| format!("Hello {i:05}.")).collect();
+    let streamed = |message: &Message| {
+        let (id, streams) = job(&h.post("/stream", &message.job(&["tts"])));
+        assert_eq!(status(&h, &id, 30.0)["done"], true);
+        let body = play(&h, &streams["tts"]).body;
+        tgtts::opus::decode(&body).unwrap().samples
+    };
+    let integrated = |samples: &[f32]| {
+        let samples: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
+        dsp::loudness::integrated(&samples, 48000)
+    };
+    for (effects, text) in [
+        r#"[[{"effect": "lowpass", "frequency_hz": 750}, {"effect": "gain", "gain_db": -6}]]"#,
+        r#"[[{"effect": "tempo", "ratio": 2}]]"#,
+    ]
+    .into_iter()
+    .zip(&lines)
+    {
+        let message = Message {
+            effects,
+            text,
+            ..Message::default()
+        };
+        let whole = message.speech(&h);
+        let decoded = streamed(&message);
+        assert_eq!(decoded.len(), whole.frames(48000), "{effects}");
+        let (streamed, whole) = (integrated(&decoded), loudness(&whole));
+        assert!(
+            (streamed - whole).abs() < 0.3,
+            "{effects}: {streamed:.2} and {whole:.2} LUFS"
+        );
+    }
+    let silicon = Message {
+        special_filters: "silicon",
+        text: &lines[2],
+        ..Message::default()
+    };
+    assert_eq!(streamed(&silicon).len(), speech + 69);
+    let (starts, ends) = ([1200, 2400], [240, 480, 720, 960]);
+    for text in &lines[3..7] {
+        let radio = Message {
+            special_filters: "radio",
+            text,
+            ..Message::default()
+        };
+        let clicks = streamed(&radio).len() - speech;
+        assert!(
+            starts.iter().any(|s| ends.iter().any(|e| s + e == clicks)),
+            "{clicks} frames of clicks"
+        );
+    }
+    assert_eq!(h.fake.streamed.load(Ordering::SeqCst), 7);
 }

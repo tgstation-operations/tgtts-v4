@@ -6,6 +6,8 @@
 //! if any of them fails, so the gibberish radio, with no aligner to time the lost words by,
 //! serves the plain radio rather than fail.
 
+mod stream;
+
 use std::{
     fmt, fs, io,
     path::Path,
@@ -20,7 +22,7 @@ use axum::{
     http::{HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use dsp::{loudness::Normalized, radio, resample::resample, segment::Segment};
 use effects::{
@@ -35,10 +37,12 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, level_filters::LevelFilter, warn};
 use voices::Voices;
 
+use self::stream::{Chain, Jobs};
 use crate::{
     cache::Cache,
     ffmpeg::{self, Ffmpeg},
     handoff::{Handoff, Missing, Source},
+    levels::Levels,
     metrics::{Leveling, Metrics, Row, Timings},
     synth::{self, Start, Synthesizer},
     vorbis,
@@ -102,6 +106,19 @@ impl Route {
         }
     }
 
+    /// The route of `name`, as [`name`](Self::name) gives it.
+    pub fn named(name: &str) -> Option<Self> {
+        [
+            Self::Speech,
+            Self::Blips,
+            Self::Radio,
+            Self::RadioGibberish,
+            Self::BlipsRadio,
+        ]
+        .into_iter()
+        .find(|route| route.name() == name)
+    }
+
     /// What it hands over to a radio route.
     fn makes(self) -> Option<Source> {
         match self {
@@ -152,6 +169,9 @@ pub struct Setup {
     pub metrics: Option<Metrics>,
     pub logging: Logging,
     pub loudness: Loudness,
+    /// How loud each voice comes out of the model, which streamed speech is leveled by: speech
+    /// in no voice's level, where no voice has one, is not streamed but served whole.
+    pub levels: Levels,
     pub limits: Limits,
     /// The seed of every request's blips, which are drawn from a seed of their own each time
     /// where there is none.
@@ -169,7 +189,9 @@ pub struct Service {
     metrics: Option<Metrics>,
     logging: Logging,
     loudness: Loudness,
+    levels: Levels,
     handoff: Handoff,
+    jobs: Jobs,
     model: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
     queue_timeout: Duration,
@@ -188,7 +210,9 @@ impl Service {
             metrics: setup.metrics,
             logging: setup.logging,
             loudness: setup.loudness,
+            levels: setup.levels,
             handoff: Handoff::new(setup.limits.radio_wait, setup.limits.radio_wait_ceiling),
+            jobs: Jobs::default(),
             model: Arc::new(Semaphore::new(setup.limits.synthesis)),
             cpu: Arc::new(Semaphore::new(setup.limits.cpu)),
             queue_timeout: setup.limits.queue_timeout,
@@ -223,8 +247,11 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/tts-voices", get(voices))
         .route("/pitch-available", get(pitch_available))
         .route("/toggle-logging", get(toggle_logging))
+        .route("/stream", post(stream::create))
+        .route("/stream/{job}", get(stream::status))
         .route_layer(middleware::from_fn_with_state(service.clone(), authorize))
         .route("/health-check", get(health_check))
+        .route("/s/{token}", get(stream::play))
         .with_state(service)
 }
 
@@ -374,7 +401,7 @@ struct Served {
 }
 
 /// What a request did, for its metrics and log line.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Trace {
     timings: Timings,
     cache_hit: Option<bool>,
@@ -565,6 +592,17 @@ impl Service {
             None => Segment::new(dsp::RATE, Vec::new()),
             Some(text) => self.spoken(voice, text, trace).await?,
         };
+        self.finish(spoken, pitch, trace).await
+    }
+
+    /// What the model said, finished as the old frontend finished it and brought to the
+    /// service's loudness.
+    async fn finish(
+        &self,
+        spoken: Segment,
+        pitch: i32,
+        trace: &mut Trace,
+    ) -> Result<Segment, Failure> {
         let loudness = self.loudness;
         let normalized = self
             .cpu(trace, move || {
@@ -583,25 +621,47 @@ impl Service {
         text: String,
         trace: &mut Trace,
     ) -> Result<Segment, Failure> {
+        if let Some(speech) = self.cached(voice, &text, trace).await? {
+            return Ok(speech);
+        }
+        let (speech, _) = self.synthesized(voice, text, None, trace).await?;
+        Ok(speech)
+    }
+
+    /// A take of `text` in `voice` from the cache, once it holds enough of them.
+    async fn cached(
+        self: &Arc<Self>,
+        voice: &str,
+        text: &str,
+        trace: &mut Trace,
+    ) -> Result<Option<Segment>, Failure> {
         let service = self.clone();
-        let (voice, lookup) = (voice.to_owned(), text.clone());
-        let cached = blocking(move || {
-            let cached = service.cache.lookup(&voice, &lookup, &mut rand::rng());
-            (voice, cached)
-        })
-        .await?;
-        let (voice, cached) = cached;
+        let (voice, text) = (voice.to_owned(), text.to_owned());
+        let cached =
+            blocking(move || service.cache.lookup(&voice, &text, &mut rand::rng())).await?;
         match cached {
             Ok(lookup) => {
                 trace.cache_takes = Some(lookup.takes);
                 if let Some(speech) = lookup.take {
                     trace.cache_hit = Some(true);
-                    return Ok(speech);
+                    return Ok(Some(speech));
                 }
             }
             Err(e) => warn!("reading the cache, speaking anew: {e}"),
         }
         trace.cache_hit = Some(false);
+        Ok(None)
+    }
+
+    /// What the model says for `text` in `voice` anew, leveled and cached; streamed through
+    /// `chain` as it is made where there is one, which comes back with it.
+    async fn synthesized(
+        self: &Arc<Self>,
+        voice: &str,
+        text: String,
+        chain: Option<Chain>,
+        trace: &mut Trace,
+    ) -> Result<(Segment, Option<Chain>), Failure> {
         let Some(synthesizer) = self.synthesizer.get().cloned() else {
             return Err(Failure::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -624,14 +684,21 @@ impl Service {
 
         let seed = rand::rng().random();
         debug!(voice, seed, "synthesizing");
-        let service = self.clone();
+        let (service, voice) = (self.clone(), voice.to_owned());
         let started = Instant::now();
         let spoken = blocking(move || {
             let _permit = permit;
             let latent = service.voices.latent(&voice).map_err(Failure::internal)?;
-            let speech = synthesizer
-                .synthesize(&text, &latent, seed)
-                .map_err(|e| Failure::internal(format!("synthesis: {e}")))?;
+            let (speech, chain) = match chain {
+                Some(mut chain) => {
+                    let speech = synthesizer.stream(&text, &latent, seed, &mut |run| {
+                        chain.push(run);
+                    });
+                    (speech, Some(chain))
+                }
+                None => (synthesizer.synthesize(&text, &latent, seed), None),
+            };
+            let speech = speech.map_err(|e| Failure::internal(format!("synthesis: {e}")))?;
             let leveled = synth::level(&synth::to_segment(&speech.samples));
             if let Err(e) = service
                 .cache
@@ -639,14 +706,14 @@ impl Service {
             {
                 warn!("caching: {e}");
             }
-            Ok((leveled, speech.patches, speech.start))
+            Ok((leveled, speech.patches, speech.start, chain))
         })
         .await?;
         trace.timings.synthesis += started.elapsed();
-        let (speech, patches, start) = spoken?;
+        let (speech, patches, start, chain) = spoken?;
         trace.patches = Some(patches);
         trace.start = start;
-        Ok(speech)
+        Ok((speech, chain))
     }
 
     /// The blips of `text` in the request's voice, `pitch` quarter tones up, as the old frontend
@@ -719,6 +786,25 @@ impl Service {
         treatment: Treatment,
         trace: &mut Trace,
     ) -> Result<Served, Failure> {
+        let audio = Arc::new(self.treat(params, audio, treatment, trace).await?);
+        self.handoff
+            .publish(source, &params.identifier, Ok(audio.clone()));
+        let ogg = self.encode(trace, audio.clone()).await?;
+        Ok(Served {
+            ogg,
+            seconds: audio.seconds(),
+        })
+    }
+
+    /// `audio` through `treatment` and the request's special filters: what the game plays, but
+    /// for the encoding.
+    async fn treat(
+        self: &Arc<Self>,
+        params: &Params,
+        audio: Segment,
+        treatment: Treatment,
+        trace: &mut Trace,
+    ) -> Result<Audio, Failure> {
         let specials: Vec<&str> = params.special_filters.split('|').collect();
         let wav = || wav::write_pcm16(audio.rate, 1, &audio.samples);
         let mut audio = match treatment {
@@ -764,14 +850,7 @@ impl Service {
                 })
                 .await?;
         }
-        let audio = Arc::new(audio);
-        self.handoff
-            .publish(source, &params.identifier, Ok(audio.clone()));
-        let ogg = self.encode(trace, audio.clone()).await?;
-        Ok(Served {
-            ogg,
-            seconds: audio.seconds(),
-        })
+        Ok(audio)
     }
 
     /// `audio` as the Ogg Vorbis the game plays, made at a turn on the CPU.
@@ -970,25 +1049,31 @@ impl Sounds {
     /// special filter put them around the Ogg it had encoded, here around the audio before it is
     /// encoded, the clicks matched to its rate and channels.
     fn clicked(&self, audio: &Audio, rng: &mut impl Rng) -> Audio {
+        let (start, end) = self.clicks(audio.rate, audio.channels, rng);
+        let mut samples = start;
+        samples.extend_from_slice(&audio.samples);
+        samples.extend(end);
+        Audio { samples, ..*audio }
+    }
+
+    /// A start and an end click drawn from `rng`, at `rate` and in `channels` channels.
+    fn clicks(&self, rate: u32, channels: u16, rng: &mut impl Rng) -> (Vec<f32>, Vec<f32>) {
         let start = &self.starts[rng.random_range(0..self.starts.len())];
         let end = &self.ends[rng.random_range(0..self.ends.len())];
-        let mut samples = matched(start, audio);
-        samples.extend_from_slice(&audio.samples);
-        samples.extend(matched(end, audio));
-        Audio { samples, ..*audio }
+        (matched(start, rate, channels), matched(end, rate, channels))
     }
 }
 
-/// `click`'s samples at `audio`'s rate and in as many channels.
-fn matched(click: &Audio, audio: &Audio) -> Vec<f32> {
-    let channels = usize::from(click.channels.max(1));
+/// `click`'s samples at `rate` and in `channels` channels.
+fn matched(click: &Audio, rate: u32, channels: u16) -> Vec<f32> {
+    let from = usize::from(click.channels.max(1));
     let mono: Vec<f32> = click
         .samples
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .chunks(from)
+        .map(|frame| frame.iter().sum::<f32>() / from as f32)
         .collect();
-    let mono = resample(&mono, f64::from(click.rate), f64::from(audio.rate));
-    let channels = usize::from(audio.channels.max(1));
+    let mono = resample(&mono, f64::from(click.rate), f64::from(rate));
+    let channels = usize::from(channels.max(1));
     mono.iter()
         .flat_map(|&s| std::iter::repeat_n(s, channels))
         .collect()

@@ -11,6 +11,7 @@ use std::{
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
+    levels::Levels,
     model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES},
     service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::Synthesizer,
@@ -75,6 +76,7 @@ pub fn serves_a_message<S: Synthesizer>(model: S, prepare: impl FnOnce(&S, &Voic
             target: -16.0,
             ceiling: dsp::loudness::CEILING,
         },
+        levels: Levels::default(),
         limits: Limits {
             synthesis: 1,
             cpu: 4,

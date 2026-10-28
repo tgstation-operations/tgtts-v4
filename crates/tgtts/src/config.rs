@@ -42,6 +42,9 @@
 //!   game's filters, -16 by default.
 //! - `loudness_ceiling_dbtp`: the true peak they are held under, at most 0, EBU R128's -1 by
 //!   default.
+//! - `voice_levels_file`: how loud each voice comes out of the model, as `tgtts-gains` writes
+//!   it, by which `POST /stream` streams speech as it is made; without it, that speech is made
+//!   whole first.
 //! - `log_level`: `DEBUG`, `INFO`, `WARNING` or `ERROR`, `INFO` by default, of the service's own
 //!   events; the crates it uses log at it but never finer than `WARN`, but for the kernels
 //!   autotune tunes, at `INFO`.
@@ -66,7 +69,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 30] = [
+const KEYS: [&str; 31] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -96,6 +99,7 @@ const KEYS: [&str; 30] = [
     "radio_wait_ceiling_seconds",
     "loudness_target_lufs",
     "loudness_ceiling_dbtp",
+    "voice_levels_file",
     "log_level",
 ];
 
@@ -127,6 +131,7 @@ pub struct Config {
     pub radio_wait: Duration,
     pub radio_wait_ceiling: Duration,
     pub loudness: Loudness,
+    pub voice_levels_file: Option<PathBuf>,
     pub log_level: LevelFilter,
 }
 
@@ -248,6 +253,7 @@ impl Config {
                     ceiling => ceiling.unwrap_or(dsp::loudness::CEILING),
                 },
             },
+            voice_levels_file: settings.parse("voice_levels_file")?,
             log_level: match settings.0.get("log_level") {
                 None => LevelFilter::INFO,
                 Some(name) => parse_level(&name.to_uppercase())
@@ -407,6 +413,7 @@ mod tests {
                     target: -16.0,
                     ceiling: -1.0,
                 },
+                voice_levels_file: None,
                 log_level: LevelFilter::INFO,
             }
         );
@@ -432,6 +439,7 @@ mod tests {
             radio_wait_ceiling_seconds = 45
             loudness_target_lufs = -18
             loudness_ceiling_dbtp = -1.5
+            voice_levels_file = \"/var/lib/tgtts/levels.json\"
             log_level = \"debug\"
             device = \"vulkan\"
             local_dit_dtype = \"bf16\"
@@ -455,6 +463,10 @@ mod tests {
             Some(Path::new("/var/lib/tgtts/metrics.sqlite"))
         );
         assert_eq!(config.ffmpeg, Path::new("/usr/bin/ffmpeg"));
+        assert_eq!(
+            config.voice_levels_file.as_deref(),
+            Some(Path::new("/var/lib/tgtts/levels.json"))
+        );
         assert_eq!((config.synthesis_limit, config.cpu_limit), (4, 8));
         assert_eq!(config.batch_window, Duration::from_millis(50));
         assert!(!config.step_graphs);

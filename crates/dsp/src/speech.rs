@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// The silence after the speech, in ms.
-const TAIL: u32 = 250;
+pub const TAIL: u32 = 250;
 
 /// `speech` with 250 ms of silence after it, then, unless `pitch` is 0, all of it shifted by
 /// `pitch` quarter tones, as the old frontend finished the model's speech.

@@ -12,6 +12,7 @@ use tgtts::{
     config::{self, Config},
     device,
     ffmpeg::Ffmpeg,
+    levels::Levels,
     metrics::Metrics,
     model::{Batching, VoxCpm},
     service::{self, Limits, Logging, Service, Setup, Sounds},
@@ -72,6 +73,14 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
     let voices = Voices::open(&config.voices_dir)?;
     let sounds = Sounds::open(&config.assets_dir)?;
     let cache = Cache::open(&config.cache_dir)?;
+    let levels = match &config.voice_levels_file {
+        Some(path) => {
+            let levels = Levels::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            info!(voices = levels.len(), "read the voices' levels");
+            levels
+        }
+        None => Levels::default(),
+    };
     let metrics = match &config.metrics_db {
         Some(path) => Some(Metrics::open(path, METRICS_QUEUE)?),
         None => None,
@@ -88,6 +97,7 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         metrics,
         logging,
         loudness: config.loudness,
+        levels,
         limits: Limits {
             synthesis: config.synthesis_limit,
             cpu: config.cpu_limit,

@@ -55,6 +55,15 @@ impl Server {
     pub fn get(&self, path: &str, body: &str) -> Reply {
         call(&format!("{}{path}", self.base), Some(TOKEN), body)
     }
+
+    /// A POST with the token, its body JSON.
+    pub fn post(&self, path: &str, body: &str) -> Reply {
+        let request = ureq::post(&format!("{}{path}", self.base))
+            .set("Authorization", TOKEN)
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(60));
+        reply(request.send_bytes(body.as_bytes()), path)
+    }
 }
 
 #[derive(Debug)]
@@ -62,6 +71,8 @@ pub struct Reply {
     pub status: u16,
     pub content_type: Option<String>,
     pub disposition: Option<String>,
+    /// The CORS header that lets a page of any origin read it.
+    pub allow_origin: Option<String>,
     pub length: Option<String>,
     pub body: Vec<u8>,
 }
@@ -109,12 +120,17 @@ pub fn call(url: &str, token: Option<&str>, body: &str) -> Reply {
     if let Some(token) = token {
         request = request.set("Authorization", token);
     }
-    let response = match request.send_bytes(body.as_bytes()) {
+    reply(request.send_bytes(body.as_bytes()), url)
+}
+
+fn reply(response: Result<ureq::Response, ureq::Error>, url: &str) -> Reply {
+    let response = match response {
         Ok(response) | Err(ureq::Error::Status(_, response)) => response,
         Err(e) => panic!("{url}: {e}"),
     };
     let header = |name| response.header(name).map(str::to_owned);
     let (content_type, disposition) = (header("content-type"), header("content-disposition"));
+    let allow_origin = header("access-control-allow-origin");
     let (status, length) = (response.status(), header("audio-length"));
     let mut body = Vec::new();
     std::io::Read::read_to_end(&mut response.into_reader(), &mut body).unwrap();
@@ -122,6 +138,7 @@ pub fn call(url: &str, token: Option<&str>, body: &str) -> Reply {
         status,
         content_type,
         disposition,
+        allow_origin,
         length,
         body,
     }
@@ -192,6 +209,25 @@ impl Message<'_> {
 
     pub fn body(&self) -> String {
         self.with_effects(serde_json::json!({ "text": self.text }))
+    }
+
+    /// The body of `POST /stream` for the routes `variants`.
+    pub fn job(&self, variants: &[&str]) -> String {
+        let mut body = serde_json::json!({
+            "voice": self.speaker,
+            "identifier": self.identifier,
+            "text": self.text,
+            "pitch": self.pitch.parse::<i32>().unwrap(),
+            "filter": self.filter,
+            "special_filters": self.special_filters,
+            "blip_base": self.blip_base,
+            "blip_number": self.blip_number,
+            "variants": variants,
+        });
+        if !self.effects.is_empty() {
+            body["effects"] = serde_json::from_str(self.effects).unwrap();
+        }
+        body.to_string()
     }
 
     /// The gibberish request's body, which the game sends with the same text twice.

@@ -20,6 +20,7 @@ blake3.workspace = true
 burn = { workspace = true, features = ["flex"] }
 dsp = { path = "../dsp" }
 effects = { path = "../effects" }
+futures-util.workspace = true
 gpu = { path = "../gpu", optional = true }
 graph = { path = "../graph", optional = true }
 rand = { workspace = true, features = ["thread_rng"] }

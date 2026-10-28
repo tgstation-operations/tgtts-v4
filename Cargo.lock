@@ -6052,6 +6052,7 @@ dependencies = [
  "burn",
  "dsp",
  "effects",
+ "futures-util",
  "gpu",
  "graph",
  "pkg-config",
