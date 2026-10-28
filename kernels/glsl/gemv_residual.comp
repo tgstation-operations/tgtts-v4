@@ -1,19 +1,28 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// out = residual + W x: o_proj and down_proj with the residual add after them. W is N x K,
-// ROWS rows to a subgroup.
+// out = residual + W x for each of BATCH rows: o_proj and down_proj with the residual add after
+// them. W is N x K, ROWS rows to a subgroup.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint K = 2048;
 layout(constant_id = 3) const uint ROWS = 2;
 layout(constant_id = 4) const uint AHEAD = 0;
+layout(constant_id = 5) const uint N = 2048;
+layout(constant_id = 6) const uint BATCH = 1;
+layout(constant_id = 7) const uint SPAN = 0;
 
+// [BATCH][K]
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
+// [BATCH][N], both.
 layout(std430, binding = 2) readonly buffer Residual { float16_t residual[]; };
 layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
 
 #include "gemv.glsl"
+
+uvec4 x_at(uint b, uint v) {
+    return x[b * (K / 8) + v];
+}
 
 void main() {
     uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * ROWS;
@@ -22,12 +31,14 @@ void main() {
         rows[r] = first + r;
     }
     prefetch(rows);
-    load_plain();
-    float sums[ROWS];
+    float sums[SUMS];
     dot_rows(rows, sums);
     if (gl_SubgroupInvocationID == 0) {
-        [[unroll]] for (uint r = 0; r < ROWS; r++) {
-            out_[rows[r]] = float16_t(float(residual[rows[r]]) + sums[r]);
+        [[unroll]] for (uint b = 0; b < BATCH; b++) {
+            [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                uint at = b * N + rows[r];
+                out_[at] = float16_t(float(residual[at]) + sums[b * ROWS + r]);
+            }
         }
     }
 }

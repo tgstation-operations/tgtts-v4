@@ -1,7 +1,9 @@
 //! The decode step on the GPU against minicpm4's stack on burn's CPU backend, on VoxCPM2's real
 //! base LM over a real prompt: a prefill on the CPU and one position at a time on the GPU, then
 //! decode steps on both. Built with the `device` feature, and run with `VOXCPM2_DIR` naming the
-//! checkpoint and `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests` sets it.
+//! checkpoint and `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests` sets it. The
+//! GPU also runs the prompt as several requests at once, a row each, each row at its own position
+//! in its own slot of the cache.
 //!
 //! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
 //! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
@@ -12,7 +14,7 @@ use std::{fs, time::Instant};
 use burn::tensor::{FloatDType, Int, Tensor, TensorData};
 use graph::{
     checkpoint::Checkpoint,
-    decode::{Decoder, LmConfig, SUBGROUPS, Shape, Tuning},
+    decode::{Batch, Decoder, LmConfig, Row, SUBGROUPS, Shape, Tuning},
     kernels::Kernels,
 };
 use half::f16;
@@ -197,6 +199,20 @@ fn compute_oracle(stack: Stack, layers: usize, prefill: usize) -> Oracle {
 /// a time, each at its position plus `shift` in the cache, with the kernels at `subgroup` (the
 /// device's default when `None`).
 fn gpu(stack: Stack, layers: usize, x: &[u16], shift: usize, subgroup: Option<u32>) -> Vec<f32> {
+    gpu_rows(stack, layers, x, shift, subgroup, 1).remove(0)
+}
+
+/// [`gpu`]'s outputs for each of `rows` requests run at once: request r from step 2 r on, in slot
+/// `rows - 1 - r` of the cache, in a row that changes from step to step, the rows without one
+/// spare.
+fn gpu_rows(
+    stack: Stack,
+    layers: usize,
+    x: &[u16],
+    shift: usize,
+    subgroup: Option<u32>,
+    rows: usize,
+) -> Vec<Vec<f32>> {
     let json = config();
     let hidden = json["lm_config"]["hidden_size"].as_u64().unwrap() as usize;
     let len = x.len() / hidden;
@@ -212,26 +228,47 @@ fn gpu(stack: Stack, layers: usize, x: &[u16], shift: usize, subgroup: Option<u3
         Some(s) => Tuning::for_subgroup(s),
         None => Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}")),
     };
-    let mut decoder =
-        Decoder::new(&ctx, &mut kernels, &shape, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
+    let batch = Batch { rows, slots: rows };
+    let mut decoder = Decoder::with_batch(&ctx, &mut kernels, &shape, &tuning, batch, false)
+        .unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     decoder
         .load(&checkpoint, stack.prefix())
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "{layers} layers recorded and loaded on the GPU at {tuning:?}: {:.1} s, {} dispatches, \
-         {} barriers, {} pipelines, an arena of {} KiB",
+        "{layers} layers in {rows} rows recorded and loaded on the GPU at {tuning:?}: {:.1} s, \
+         {} dispatches, {} barriers, {} pipelines, an arena of {} KiB",
         start.elapsed().as_secs_f64(),
         decoder.graph_step().dispatches(),
         decoder.graph_step().barriers(),
         kernels.len(),
         decoder.graph_step().arena_bytes() / 1024
     );
-    let mut got = Vec::with_capacity(len * hidden);
-    for (t, x) in x.chunks(hidden).enumerate() {
-        let out = decoder.step(t + shift, x).unwrap_or_else(|e| panic!("{e}"));
-        got.extend(out.iter().map(|&h| f16::from_bits(h).to_f32()));
+    let mut got = vec![Vec::with_capacity(len * hidden); rows];
+    for t in 0..len + 2 * (rows - 1) {
+        let mut placed = vec![None; rows];
+        let mut input = vec![0u16; rows * hidden];
+        for r in 0..rows {
+            let Some(i) = t.checked_sub(2 * r).filter(|&i| i < len) else {
+                continue;
+            };
+            let row = (r + t) % rows;
+            placed[row] = Some(Row {
+                position: i + shift,
+                slot: rows - 1 - r,
+            });
+            input[row * hidden..(row + 1) * hidden]
+                .copy_from_slice(&x[i * hidden..(i + 1) * hidden]);
+        }
+        let out = decoder
+            .step_rows(&placed, &input)
+            .unwrap_or_else(|e| panic!("{e}"));
+        for r in (0..rows).filter(|r| (2 * r..2 * r + len).contains(&t)) {
+            let row = (r + t) % rows;
+            let out = &out[row * hidden..(row + 1) * hidden];
+            got[r].extend(out.iter().map(|&h| f16::from_bits(h).to_f32()));
+        }
     }
     assert_no_validation_messages(&ctx);
     got
@@ -324,6 +361,14 @@ fn one_layer_decodes_as_minicpm4_does_on_the_cpu() {
         assert!(within(margin), "wave{subgroup}: {margin:?}");
         // One layer is well inside the served tolerance, which was set for eight.
         assert!(ours.worst <= 1.0, "wave{subgroup}: {ours:?}");
+        // Three requests at once, each at its own position: each as it is alone.
+        let rows = gpu_rows(Stack::Base, 1, &oracle.x, 0, Some(subgroup), 3);
+        for (r, row) in rows.iter().enumerate() {
+            assert!(
+                row == &got,
+                "wave{subgroup}: row {r} of 3 is not as it is alone"
+            );
+        }
     }
     // Defect: every position one slot on in the cache, so rotated by the next position's angle.
     let shifted = gpu(Stack::Base, 1, &oracle.x, 1, None);
@@ -365,9 +410,16 @@ fn one_layer_recorded_again_with_its_rows_cut_otherwise_decodes_the_same() {
             .collect()
     };
     let want = run(&mut decoder);
-    // Rows to a subgroup and loads ahead decide where and when each row is summed, not in what
-    // order; the workgroup width, which orders the norm's sum, stays.
+    // Rows to a subgroup, loads ahead and the workgroup width decide where and when each row is
+    // summed, not in what order: the norms are summed in the order of the default's workgroup.
     let cuts = [
+        (
+            Tuning {
+                workgroup: 4 * base.workgroup,
+                ..base
+            },
+            false,
+        ),
         (
             Tuning {
                 qkv_pairs: 2,
@@ -404,6 +456,11 @@ fn the_base_lm_decodes_as_minicpm4_does_on_the_cpu() {
     let got = gpu(Stack::Base, 28, &oracle.x, 0, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
     assert!(within(margin), "{margin:?}");
+    // Sixteen requests at once, each at its own position: each as it is alone.
+    let rows = gpu_rows(Stack::Base, 28, &oracle.x, 0, None, 16);
+    for (r, row) in rows.iter().enumerate() {
+        assert!(row == &got, "row {r} of 16 is not as it is alone");
+    }
 }
 
 #[test]
@@ -413,6 +470,10 @@ fn the_residual_lm_decodes_without_rope_as_minicpm4_does_on_the_cpu() {
     let got = gpu(Stack::Residual, 8, &oracle.x, 0, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &got, 70);
     assert!(within(margin), "{margin:?}");
+    let rows = gpu_rows(Stack::Residual, 8, &oracle.x, 0, None, 4);
+    for (r, row) in rows.iter().enumerate() {
+        assert!(row == &got, "row {r} of 4 is not as it is alone");
+    }
     // Defect: the residual LM rotated by RoPE.
     let rotated = gpu(Stack::RotatedResidual, 8, &oracle.x, 0, None);
     let (_, margin) = check(&oracle.f32, &oracle.f16, &rotated, 70);

@@ -1,6 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// out = RMSNorm(x) with gain g, by one workgroup.
+// out = RMSNorm(x) with gain g for each row of x, a workgroup to a row.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint K = 2048;
@@ -13,8 +13,9 @@ layout(std430, binding = 2) writeonly buffer Out { uvec4 out_[]; };
 #include "norm.glsl"
 
 void main() {
-    float scale = rms_scale(EPS);
+    uint b = gl_WorkGroupID.x;
+    float scale = rms_scale(b, EPS);
     for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
-        out_[v] = normed8(v, scale);
+        out_[b * (K / 8) + v] = normed8(b, v, scale);
     }
 }

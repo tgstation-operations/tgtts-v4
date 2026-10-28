@@ -1,17 +1,31 @@
-// The matrix-vector product shared by the GEMV kernels: a row-major f16 weight `w` of K
-// columns against the f16 vector in `xs`, both eight to a uvec4. A subgroup takes ROWS rows at
-// once, each lane reading 16 contiguous bytes of each row per step, and sums in f32.
+// The matrix-vector products shared by the GEMV kernels: a row-major f16 weight `w` of K
+// columns against BATCH f16 vectors, both eight to a uvec4. A subgroup takes ROWS rows at
+// once, each lane reading 16 contiguous bytes of each row per step, and sums each row with
+// every vector in f32, so that a weight is read once for all of them. A vector's sums are taken
+// in the same order whatever BATCH is: it comes out as it does alone.
 //
-// A lane may load its first AHEAD steps of its rows before the kernel's prologue fills xs
-// (`prefetch`), so that they are in flight while the prologue runs rather than issued after its
-// barrier. When a weight is loaded does not change what is summed, or in what order.
+// The vectors are staged in `xs` COLS columns at a time: all K of them unless SPAN says
+// otherwise, which the host sets to a divisor of K when BATCH vectors of K do not fit.
 //
-// The including kernel declares the `w` buffer, K, ROWS and AHEAD, then includes this.
+// A lane may load its first AHEAD steps of its rows before the kernel's prologue (`prefetch`),
+// so that they are in flight while the prologue runs rather than issued after its barrier; the
+// steps of a later chunk are loaded before the chunk is staged. When a weight is loaded does not
+// change what is summed, or in what order.
+//
+// The including kernel declares the `w` buffer, K, ROWS, AHEAD, BATCH and SPAN, then includes
+// this and defines `x_at`.
 
-shared uvec4 xs[K / 8];
-
+const uint COLS = SPAN == 0 ? K : SPAN;
+const uint CHUNKS = K / COLS;
 const uint STEPS = K / 8 / SUBGROUP;
+const uint CHUNK_STEPS = COLS / 8 / SUBGROUP;
 const uint EARLY = AHEAD < STEPS ? AHEAD : STEPS;
+// Sizes named once: glslang tells apart arrays sized by two spellings of the same expression.
+const uint STAGED = BATCH * (COLS / 8);
+const uint SUMS = BATCH * ROWS;
+
+shared uvec4 xs[STAGED];
+
 // One entry at least, as an array must have.
 uvec4 early[EARLY > 0 ? EARLY : 1][ROWS];
 
@@ -25,38 +39,62 @@ void prefetch(uint rows[ROWS]) {
     }
 }
 
-// Sums of the rows `rows` of w with xs, each in every lane of the subgroup.
-void dot_rows(uint rows[ROWS], out float sums[ROWS]) {
-    float acc[ROWS];
-    [[unroll]] for (uint r = 0; r < ROWS; r++) {
-        acc[r] = 0.0;
-    }
-    uint lane = gl_SubgroupInvocationID;
-    [[unroll]] for (uint s = 0; s < STEPS; s++) {
-        uint i = s * SUBGROUP + lane;
-        vec4 lo, hi;
-        unpack8(xs[i], lo, hi);
-        [[unroll]] for (uint r = 0; r < ROWS; r++) {
-            uvec4 q;
-            if (s < EARLY) {
-                q = early[s][r];
-            } else {
-                q = w[rows[r] * (K / 8) + i];
-            }
-            vec4 wlo, whi;
-            unpack8(q, wlo, whi);
-            acc[r] += dot(wlo, lo) + dot(whi, hi);
-        }
-    }
-    [[unroll]] for (uint r = 0; r < ROWS; r++) {
-        sums[r] = subgroupAdd(acc[r]);
+// The uvec4 `v` of vector `b` as xs takes it, `v` counted along the whole of K.
+uvec4 x_at(uint b, uint v);
+
+// Writes chunk `chunk` of every vector into xs, `[BATCH][COLS / 8]`.
+void stage(uint chunk) {
+    for (uint i = gl_LocalInvocationID.x; i < STAGED; i += WORKGROUP) {
+        xs[i] = x_at(i / (COLS / 8), chunk * (COLS / 8) + i % (COLS / 8));
     }
 }
 
-// xs = x, a uvec4 view of the input vector.
-void load_plain() {
-    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
-        xs[v] = x[v];
+// Sums of the rows `rows` of w with every vector, each in every lane of the subgroup:
+// `sums[b * ROWS + r]` is row r's with vector b. Stages the vectors, so every invocation of the
+// workgroup calls it.
+void dot_rows(uint rows[ROWS], out float sums[SUMS]) {
+    float acc[SUMS];
+    [[unroll]] for (uint j = 0; j < SUMS; j++) {
+        acc[j] = 0.0;
     }
-    barrier();
+    uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint c = 0; c < CHUNKS; c++) {
+        uvec4 ws[CHUNK_STEPS][ROWS];
+        [[unroll]] for (uint t = 0; t < CHUNK_STEPS; t++) {
+            uint s = c * CHUNK_STEPS + t;
+            [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                if (s < EARLY) {
+                    ws[t][r] = early[s][r];
+                } else if (c > 0) {
+                    ws[t][r] = w[rows[r] * (K / 8) + s * SUBGROUP + lane];
+                }
+            }
+        }
+        if (c > 0) {
+            barrier();
+        }
+        stage(c);
+        barrier();
+        [[unroll]] for (uint t = 0; t < CHUNK_STEPS; t++) {
+            uint s = c * CHUNK_STEPS + t;
+            vec4 wlo[ROWS], whi[ROWS];
+            [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                uvec4 q = ws[t][r];
+                if (c == 0 && s >= EARLY) {
+                    q = w[rows[r] * (K / 8) + s * SUBGROUP + lane];
+                }
+                unpack8(q, wlo[r], whi[r]);
+            }
+            [[unroll]] for (uint b = 0; b < BATCH; b++) {
+                vec4 lo, hi;
+                unpack8(xs[b * (COLS / 8) + t * SUBGROUP + lane], lo, hi);
+                [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                    acc[b * ROWS + r] += dot(wlo[r], lo) + dot(whi[r], hi);
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0; j < SUMS; j++) {
+        sums[j] = subgroupAdd(acc[j]);
+    }
 }

@@ -1,9 +1,14 @@
-//! One decode step of a MiniCPM-4 stack at batch 1, as VoxCPM2's base LM runs it: per layer,
-//! the input norm, q/k/v projection, RoPE and the cache write in one dispatch, attention over the
-//! cache split along it and joined, the output projection with the residual, the post-attention
-//! norm with the gate/up projection and SiLU, and the down projection with the residual; then the
+//! One decode step of a MiniCPM-4 stack, as VoxCPM2's base LM runs it: per layer, the input
+//! norm, q/k/v projection, RoPE and the cache write in one dispatch, attention over the cache
+//! split along it and joined, the output projection with the residual, the post-attention norm
+//! with the gate/up projection and SiLU, and the down projection with the residual; then the
 //! final norm. Six dispatches a layer and one more, recorded once for a cache capacity and
 //! submitted at every position, which is read from a buffer the host writes before each.
+//!
+//! A step runs a [`Batch`] of rows, each a request at its own position in its own slot of the
+//! cache: the projections read each weight once for all of them, so that a step of several rows
+//! takes about as long as a step of one. A row's sums are taken in the same order whatever the
+//! batch and however the kernels are cut, so that it comes out bit for bit as it does alone.
 
 use serde::Deserialize;
 use vulkan::{Context, DeviceReport, SpecValue, Submission, Timing};
@@ -162,9 +167,76 @@ impl Shape {
     }
 }
 
+/// How many requests a step runs at once, each a row of its tensors, and the slots of the KV
+/// cache they are kept in. Where each row runs is written before each run ([`Batch::placement`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Batch {
+    pub rows: usize,
+    /// At least `rows`.
+    pub slots: usize,
+}
+
+impl Batch {
+    /// One request in a cache of one slot: the step at batch 1.
+    pub const ONE: Batch = Batch { rows: 1, slots: 1 };
+
+    /// The u32 that say where the rows run: each row's position, then each row's slot when there
+    /// is more than one.
+    pub fn words(&self) -> usize {
+        if self.slots > 1 {
+            2 * self.rows
+        } else {
+            self.rows
+        }
+    }
+
+    /// The words for `rows`, one to a row of the batch, in caches of `capacity` positions: where
+    /// each runs, or none for a spare row, which is put past every position so that it writes
+    /// into no cache and attends to nothing. Refuses two rows in one slot, whose writes into it
+    /// would race.
+    pub fn placement(&self, rows: &[Option<Row>], capacity: usize) -> Result<Vec<u32>, Error> {
+        if rows.len() != self.rows {
+            return Err(Error::Shape(format!(
+                "{} rows for a batch of {}",
+                rows.len(),
+                self.rows
+            )));
+        }
+        let mut words = vec![u32::MAX; self.words()];
+        let mut taken = vec![false; self.slots];
+        for (b, row) in rows.iter().enumerate() {
+            let Some(Row { position, slot }) = *row else {
+                continue;
+            };
+            if position >= capacity || slot >= self.slots || taken[slot] {
+                return Err(Error::Shape(format!(
+                    "row {b} at position {position} of {capacity} in slot {slot} of {}, \
+                     taken: {}",
+                    self.slots,
+                    taken.get(slot).copied().unwrap_or(false)
+                )));
+            }
+            taken[slot] = true;
+            words[b] = position as u32;
+            if self.slots > 1 {
+                words[self.rows + b] = slot as u32;
+            }
+        }
+        Ok(words)
+    }
+}
+
+/// Where a row of a batch runs: at a position of the cache slot its request is kept in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub position: usize,
+    pub slot: usize,
+}
+
 /// How the kernels' work is cut: the subgroup size every kernel runs at (32 or 64 on RADV,
-/// 32 on NVIDIA), the GEMVs' workgroup width, the rows each of their subgroups takes, and how
-/// many of a lane's loads they issue before their prologue.
+/// 32 on NVIDIA), the GEMVs' workgroup width, the rows each of their subgroups takes, how
+/// many of a lane's loads they issue before their prologue, and how much of the vectors they
+/// stage at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub subgroup: u32,
@@ -178,6 +250,9 @@ pub struct Tuning {
     /// copy of x into shared memory, so that they are in flight while it runs; all of them when
     /// a lane has no more steps than this.
     pub ahead: u32,
+    /// The bytes of shared memory a GEMV takes at most, most of them for its vectors, a batch's
+    /// rows of them: when they are longer, a part of each at a time.
+    pub stage: u32,
 }
 
 impl Tuning {
@@ -201,7 +276,39 @@ impl Tuning {
             gate_up_pairs: 1,
             residual_rows: 1,
             ahead: 0,
+            stage: 32 << 10,
         }
+    }
+
+    /// The width of the workgroup whose order every norm is summed in, however wide the GEMVs'
+    /// are: [`for_subgroup`](Self::for_subgroup)'s, as at batch 1.
+    pub fn norm_width(&self) -> u32 {
+        Self::for_subgroup(self.subgroup).workgroup
+    }
+
+    /// The columns of each of `rows` vectors of `k` a GEMV stages at once, as its SPAN constant:
+    /// 0 when all of them fit in [`stage`](Self::stage) beside the rest of its shared memory, and
+    /// otherwise the most that do in whole steps of its subgroups that divide `k`.
+    pub(crate) fn span(&self, k: usize, rows: usize) -> Result<u32, Error> {
+        // The norm's partial sum of each subgroup and each row's scale, a float each.
+        let others = 4 * ((self.workgroup / self.subgroup) as usize + rows);
+        let stage = (self.stage as usize).saturating_sub(others);
+        if rows * k * 2 <= stage {
+            return Ok(0);
+        }
+        let step = 8 * self.subgroup as usize;
+        let steps = k / step;
+        (1..=steps)
+            .rev()
+            .filter(|m| steps.is_multiple_of(*m))
+            .map(|m| m * step)
+            .find(|&columns| rows * columns * 2 <= stage)
+            .map(|columns| columns as u32)
+            .ok_or_else(|| {
+                Error::Shape(format!(
+                    "{rows} rows of {step} columns in {stage} bytes of shared memory"
+                ))
+            })
     }
 
     /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for,
@@ -252,17 +359,23 @@ impl LayerTensors {
     }
 }
 
-/// The step's graph and the tensors the host writes and reads.
+/// The step's graph and the tensors the host writes and reads, a row of each for every row of
+/// the batch.
 #[derive(Clone, Debug)]
 pub struct DecodeGraph {
     pub graph: Graph,
     pub shape: Shape,
+    pub batch: Batch,
+    /// The rows' hidden states, `[rows][hidden]` f16.
     pub x: TensorId,
+    /// Where the rows run, [`Batch::words`] u32: at batch 1, the one position.
     pub position: TensorId,
     pub cos: TensorId,
     pub sin: TensorId,
     pub norm: TensorId,
+    /// The rows' outputs after the final norm, `[rows][hidden]` f16.
     pub out: TensorId,
+    /// Their caches hold `[slots][kv_heads][capacity][head_dim]`.
     pub layers: Vec<LayerTensors>,
 }
 
@@ -281,8 +394,17 @@ fn groups(what: &str, total: usize, per_group: usize) -> Result<u32, Error> {
     u32::try_from(total / per_group).map_err(|_| Error::Shape(format!("{what}: {total}")))
 }
 
-/// The decode step of `shape` cut as `tuning` says.
+/// The decode step of `shape` at batch 1 cut as `tuning` says.
 pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error> {
+    decode_batch_graph(shape, tuning, Batch::ONE)
+}
+
+/// The decode step of `shape` for `batch` cut as `tuning` says.
+pub fn decode_batch_graph(
+    shape: &Shape,
+    tuning: &Tuning,
+    batch: Batch,
+) -> Result<DecodeGraph, Error> {
     let s = shape;
     let Tuning {
         subgroup,
@@ -308,6 +430,11 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
         s.heads.is_multiple_of(s.kv_heads) && s.head_dim.is_multiple_of(8),
         format!("{} heads over {} of {}", s.heads, s.kv_heads, s.head_dim),
     )?;
+    let Batch { rows, slots } = batch;
+    check(
+        rows > 0 && rows <= slots,
+        format!("{rows} rows in {slots} slots"),
+    )?;
     let group = s.heads / s.kv_heads;
     let subgroups = (workgroup / subgroup) as usize;
     let sub = Some(subgroup);
@@ -321,6 +448,8 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
         subgroup_size,
     };
     let eps = SpecValue::F32(s.eps);
+    let norm_width = SpecValue::U32(tuning.norm_width());
+    let span = |k: usize| tuning.span(k, rows).map(SpecValue::U32);
     let qkv_pipeline = pipeline(
         &GEMV_QKV_ROPE,
         &[
@@ -333,6 +462,10 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (8, SpecValue::U32(tuning.qkv_pairs)),
             (9, SpecValue::U32(tuning.ahead)),
             (10, SpecValue::Bool(s.rope)),
+            (11, u(rows)),
+            (12, u(slots)),
+            (13, span(s.hidden)?),
+            (14, norm_width),
         ],
         sub,
     );
@@ -351,6 +484,8 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (4, u(s.head_dim)),
             (5, u(s.capacity)),
             (6, SpecValue::F32(1.0 / (s.head_dim as f32).sqrt())),
+            (7, u(rows)),
+            (8, u(slots)),
         ],
         subgroup_size: sub,
     };
@@ -364,20 +499,27 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (2, u(s.heads)),
             (3, u(s.head_dim)),
             (4, u(s.capacity)),
+            (5, u(rows)),
+            (6, u(slots)),
         ],
         subgroup_size: None,
     };
-    let residual = |k: usize| {
-        pipeline(
+    let residual = |k: usize| -> Result<Pipeline, Error> {
+        Ok(pipeline(
             &GEMV_RESIDUAL,
             &[
                 (2, u(k)),
                 (3, SpecValue::U32(tuning.residual_rows)),
                 (4, SpecValue::U32(tuning.ahead)),
+                (5, u(s.hidden)),
+                (6, u(rows)),
+                (7, span(k)?),
             ],
             sub,
-        )
+        ))
     };
+    let o_pipeline = residual(s.heads * s.head_dim)?;
+    let down_pipeline = residual(s.inner)?;
     let residual_groups = groups(
         "residual rows",
         s.hidden,
@@ -391,6 +533,9 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             (4, eps),
             (5, SpecValue::U32(tuning.gate_up_pairs)),
             (6, SpecValue::U32(tuning.ahead)),
+            (7, u(rows)),
+            (8, span(s.hidden)?),
+            (9, norm_width),
         ],
         sub,
     );
@@ -399,48 +544,59 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
         s.inner,
         subgroups * tuning.gate_up_pairs as usize,
     )?;
-    let norm_pipeline = pipeline(&RMSNORM, &[(2, u(s.hidden)), (3, eps)], sub);
+    // A workgroup to a row, summing in the order batch 1's does.
+    let norm_pipeline = Pipeline {
+        kernel: &RMSNORM,
+        constants: vec![
+            (0, SpecValue::U32(subgroup)),
+            (1, norm_width),
+            (2, u(s.hidden)),
+            (3, eps),
+        ],
+        subgroup_size: sub,
+    };
 
     let mut g = Graph::default();
     let half = 2u64;
-    let vector = |n: usize| n as u64 * half;
+    let vector = |n: usize| (rows * n) as u64 * half;
     let x = g.tensor("x", vector(s.hidden), Kind::Input);
-    let position = g.tensor("position", 4, Kind::Param);
+    let position = g.tensor("position", 4 * batch.words() as u64, Kind::Param);
     let table = (s.capacity * s.head_dim / 2 * 4) as u64;
     let cos = g.tensor("rope.cos", table, Kind::Constant);
     let sin = g.tensor("rope.sin", table, Kind::Constant);
     let chunks = s.capacity / CHUNK;
-    let cache = vector(s.kv_heads * s.capacity * s.head_dim);
+    let weight = |n: usize| n as u64 * half;
+    let cache = weight(slots * s.kv_heads * s.capacity * s.head_dim);
     let qkv_rows = (s.heads + 2 * s.kv_heads) * s.head_dim;
     let mut layers = Vec::with_capacity(s.layers);
     let mut input = x;
     for l in 0..s.layers {
         let name = |what: &str| format!("layers.{l}.{what}");
         let t = LayerTensors {
-            input_norm: g.tensor(name("input_layernorm"), vector(s.hidden), Kind::Constant),
+            input_norm: g.tensor(name("input_layernorm"), weight(s.hidden), Kind::Constant),
             qkv: g.tensor(
                 name("qkv_proj"),
-                vector(qkv_rows * s.hidden),
+                weight(qkv_rows * s.hidden),
                 Kind::Constant,
             ),
             o: g.tensor(
                 name("o_proj"),
-                vector(s.hidden * s.heads * s.head_dim),
+                weight(s.hidden * s.heads * s.head_dim),
                 Kind::Constant,
             ),
             post_norm: g.tensor(
                 name("post_attention_layernorm"),
-                vector(s.hidden),
+                weight(s.hidden),
                 Kind::Constant,
             ),
             gate_up: g.tensor(
                 name("gate_up_proj"),
-                vector(2 * s.inner * s.hidden),
+                weight(2 * s.inner * s.hidden),
                 Kind::Constant,
             ),
             down: g.tensor(
                 name("down_proj"),
-                vector(s.hidden * s.inner),
+                weight(s.hidden * s.inner),
                 Kind::Constant,
             ),
             k_cache: g.tensor(name("k_cache"), cache, Kind::State),
@@ -449,12 +605,12 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
         let q = g.tensor(name("q"), vector(s.heads * s.head_dim), Kind::Intermediate);
         let partial_o = g.tensor(
             name("partial_o"),
-            (s.heads * chunks * s.head_dim * 4) as u64,
+            (rows * s.heads * chunks * s.head_dim * 4) as u64,
             Kind::Intermediate,
         );
         let partial_ml = g.tensor(
             name("partial_ml"),
-            (s.heads * chunks * 8) as u64,
+            (rows * s.heads * chunks * 8) as u64,
             Kind::Intermediate,
         );
         let attended = g.tensor(
@@ -485,17 +641,17 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
             "attention_split",
             split_pipeline.clone(),
             &[q, t.k_cache, t.v_cache, position, partial_o, partial_ml],
-            [chunks as u32, s.kv_heads as u32, 1],
+            [chunks as u32, s.kv_heads as u32, rows as u32],
         );
         g.op(
             "attention_combine",
             combine_pipeline.clone(),
             &[position, partial_o, partial_ml, attended],
-            [s.heads as u32, 1, 1],
+            [s.heads as u32, rows as u32, 1],
         );
         g.op(
             "o_proj",
-            residual(s.heads * s.head_dim),
+            o_pipeline.clone(),
             &[attended, t.o, input, mid],
             [residual_groups, 1, 1],
         );
@@ -507,19 +663,25 @@ pub fn decode_graph(shape: &Shape, tuning: &Tuning) -> Result<DecodeGraph, Error
         );
         g.op(
             "down_proj",
-            residual(s.inner),
+            down_pipeline.clone(),
             &[mlp, t.down, mid, output],
             [residual_groups, 1, 1],
         );
         layers.push(t);
         input = output;
     }
-    let norm = g.tensor("norm", vector(s.hidden), Kind::Constant);
+    let norm = g.tensor("norm", weight(s.hidden), Kind::Constant);
     let out = g.tensor("out", vector(s.hidden), Kind::Output);
-    g.op("final_norm", norm_pipeline, &[input, norm, out], [1, 1, 1]);
+    g.op(
+        "final_norm",
+        norm_pipeline,
+        &[input, norm, out],
+        [rows as u32, 1, 1],
+    );
     Ok(DecodeGraph {
         graph: g,
         shape: shape.clone(),
+        batch,
         x,
         position,
         cos,
@@ -578,8 +740,8 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Records the step of `shape`, with its rotation tables written and every weight zero
-    /// until [`load`](Self::load).
+    /// Records the step of `shape` at batch 1, with its rotation tables written and every weight
+    /// zero until [`load`](Self::load).
     pub fn new(
         ctx: &Context,
         kernels: &mut Kernels,
@@ -587,7 +749,19 @@ impl Decoder {
         tuning: &Tuning,
         timed: bool,
     ) -> Result<Self, Error> {
-        let tensors = decode_graph(shape, tuning)?;
+        Self::with_batch(ctx, kernels, shape, tuning, Batch::ONE, timed)
+    }
+
+    /// Records the step of `shape` for `batch`, as [`new`](Self::new) records it for one row.
+    pub fn with_batch(
+        ctx: &Context,
+        kernels: &mut Kernels,
+        shape: &Shape,
+        tuning: &Tuning,
+        batch: Batch,
+        timed: bool,
+    ) -> Result<Self, Error> {
+        let tensors = decode_batch_graph(shape, tuning, batch)?;
         let mut step = Step::new(ctx, kernels, &tensors.graph, timed)?;
         let (cos, sin) = shape.rope_tables();
         step.write(tensors.cos, &cos)?;
@@ -619,17 +793,29 @@ impl Decoder {
         self.output()
     }
 
-    /// Writes the input of the next run: `x`, the hidden state of `position` as f16 bits, and the
-    /// position.
+    /// Writes the input of the next run at batch 1: `x`, the hidden state of `position` as f16
+    /// bits, and the position.
     pub fn set_input(&mut self, position: usize, x: &[u16]) -> Result<(), Error> {
-        let capacity = self.tensors.shape.capacity;
-        if position >= capacity {
-            return Err(Error::Shape(format!(
-                "position {position} in a cache of {capacity}"
-            )));
-        }
-        self.step.write(self.tensors.x, x)?;
-        self.step.write(self.tensors.position, &[position as u32])
+        self.set_rows(&[Some(Row { position, slot: 0 })], x)
+    }
+
+    /// Runs the stack over `x`, the hidden states `[rows][hidden]` of the batch's rows as f16
+    /// bits, each where `rows` says or spare: writes each row's keys and values into its slot of
+    /// the cache at its position and attends over the slot up to it. Returns the outputs after
+    /// the final norm, `[rows][hidden]` as f16 bits, a spare row's meaningless.
+    pub fn step_rows(&mut self, rows: &[Option<Row>], x: &[u16]) -> Result<Vec<u16>, Error> {
+        self.set_rows(rows, x)?;
+        self.start()?.wait()?;
+        self.output()
+    }
+
+    /// Writes the input of the next run: `x`, the rows' hidden states as f16 bits, and where
+    /// each runs, as [`step_rows`](Self::step_rows) takes them.
+    pub fn set_rows(&mut self, rows: &[Option<Row>], x: &[u16]) -> Result<(), Error> {
+        let t = &self.tensors;
+        let words = t.batch.placement(rows, t.shape.capacity)?;
+        self.step.write(t.x, x)?;
+        self.step.write(t.position, &words)
     }
 
     /// Starts a run over the input last written, and returns without waiting for it.
@@ -637,7 +823,7 @@ impl Decoder {
         self.step.start()
     }
 
-    /// The output of the last run, after the final norm, as f16 bits.
+    /// The output of the last run, after the final norm, as f16 bits: `[rows][hidden]`.
     pub fn output(&self) -> Result<Vec<u16>, Error> {
         self.step.read(self.tensors.out)
     }
@@ -651,7 +837,7 @@ impl Decoder {
         tuning: &Tuning,
         timed: bool,
     ) -> Result<Self, Error> {
-        let tensors = decode_graph(&self.tensors.shape, tuning)?;
+        let tensors = decode_batch_graph(&self.tensors.shape, tuning, self.tensors.batch)?;
         let step = self
             .step
             .recorded_again(ctx, kernels, &tensors.graph, timed)?;
@@ -665,6 +851,10 @@ impl Decoder {
 
     pub fn shape(&self) -> &Shape {
         &self.tensors.shape
+    }
+
+    pub fn batch(&self) -> Batch {
+        self.tensors.batch
     }
 
     /// The recorded step's dispatches, barriers and arena.
@@ -835,6 +1025,85 @@ mod tests {
         };
         assert_eq!(rope(&s), vec![SpecValue::Bool(false); 8]);
         assert_eq!(rope(&shape(2)), vec![SpecValue::Bool(true); 2]);
+    }
+
+    #[test]
+    fn spare_rows_are_placed_past_every_position_and_a_slot_is_taken_once() {
+        let batch = Batch { rows: 3, slots: 4 };
+        let at = |position, slot| Some(Row { position, slot });
+        let words = batch.placement(&[at(5, 2), None, at(0, 0)], 64).unwrap();
+        assert_eq!(words, [5, u32::MAX, 0, 2, u32::MAX, 0]);
+        // One slot: the position alone, as at batch 1.
+        assert_eq!(Batch::ONE.placement(&[at(7, 0)], 64).unwrap(), [7]);
+        for rows in [
+            [at(5, 2), at(9, 2), None],
+            [at(64, 0), None, None],
+            [at(1, 4), None, None],
+        ] {
+            assert!(
+                matches!(batch.placement(&rows, 64), Err(Error::Shape(_))),
+                "{rows:?}"
+            );
+        }
+        assert!(batch.placement(&[None, None], 64).is_err());
+    }
+
+    #[test]
+    fn a_batch_scales_its_rows_tensors_and_grids_and_not_the_weights() {
+        let s = shape(2);
+        let tuning = Tuning::for_subgroup(32);
+        let one = decode_graph(&s, &tuning).unwrap();
+        let batch = Batch { rows: 4, slots: 6 };
+        let four = decode_batch_graph(&s, &tuning, batch).unwrap();
+        let bytes = |g: &DecodeGraph, t: TensorId| g.graph.tensors[t.0].bytes;
+        assert_eq!(bytes(&four, four.x), 4 * bytes(&one, one.x));
+        assert_eq!(bytes(&four, four.out), 4 * bytes(&one, one.out));
+        assert_eq!(bytes(&four, four.position), 4 * 2 * 4);
+        for (l, w) in one.layers.iter().zip(&four.layers) {
+            assert_eq!(bytes(&four, w.k_cache), 6 * bytes(&one, l.k_cache));
+            assert_eq!(bytes(&four, w.qkv), bytes(&one, l.qkv));
+            assert_eq!(bytes(&four, w.down), bytes(&one, l.down));
+        }
+        let norm_width = (0, SpecValue::U32(tuning.norm_width()));
+        for (a, b) in one.graph.ops.iter().zip(&four.graph.ops) {
+            let want = match b.label.as_str() {
+                "attention_split" => [a.groups[0], a.groups[1], 4],
+                "attention_combine" => [a.groups[0], 4, 1],
+                "final_norm" => [4, 1, 1],
+                _ => a.groups,
+            };
+            assert_eq!(b.groups, want, "{}", b.label);
+            let constant = |id| b.pipeline.constants.iter().find(|c| c.0 == id).copied();
+            if b.pipeline.kernel.name == "rmsnorm" {
+                assert_eq!(constant(1), Some((1, norm_width.1)));
+            }
+        }
+        assert!(matches!(
+            decode_batch_graph(&s, &tuning, Batch { rows: 3, slots: 2 }),
+            Err(Error::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn vectors_are_staged_whole_unless_a_batch_of_them_does_not_fit() {
+        let tuning = Tuning::for_subgroup(64);
+        assert_eq!(tuning.span(6144, 1).unwrap(), 0);
+        assert_eq!(tuning.span(2048, 4).unwrap(), 0);
+        assert_eq!(tuning.span(6144, 4).unwrap(), 3072);
+        // Rows of 32 KiB in all leave no room in 32 KiB for the norm's floats beside them.
+        assert_eq!(tuning.span(2048, 8).unwrap(), 1024);
+        assert_eq!(tuning.span(2048, 16).unwrap(), 512);
+        let wider = Tuning {
+            stage: 48 << 10,
+            ..tuning
+        };
+        assert_eq!(wider.span(2048, 16).unwrap(), 1024);
+        assert_eq!(wider.span(6144, 16).unwrap(), 1024);
+        let small = Tuning {
+            stage: 1024,
+            ..tuning
+        };
+        assert!(matches!(small.span(2048, 16), Err(Error::Shape(_))));
     }
 
     #[test]

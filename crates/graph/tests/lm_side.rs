@@ -7,6 +7,10 @@
 //! with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS`
 //! the compiled kernels, as `nix run .#device-tests` sets the last.
 //!
+//! The LM side runs several requests at once too, a row each, each at its own position in its own
+//! slot of the caches: a row comes out bit for bit as it does alone, which a few layers are held
+//! to over inputs made up for each request, and as voxcpm's on the oracle's patches.
+//!
 //! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
 //! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
 #![cfg(feature = "device")]
@@ -16,9 +20,11 @@ use std::{fs, time::Instant};
 use burn::tensor::{FloatDType, Tensor, TensorData};
 use graph::{
     checkpoint::Checkpoint,
-    decode::{SUBGROUPS, Tuning},
+    decode::{Batch, Row, SUBGROUPS, Tuning},
+    graph::{Kind, TensorId},
     kernels::Kernels,
-    lm_side::{self, LmSide, LmSideShape},
+    lm_side::{self, Conditioning, LmSide, LmSideShape, lm_side_batch_graph, load_lm_side},
+    step::Step,
 };
 use half::f16;
 use serde::{Deserialize, Serialize};
@@ -180,15 +186,84 @@ fn compute_oracle(config: &Config) -> Oracle {
     }
 }
 
+/// A request a batch runs: from step `start` on, positions 0 to `len - 1`, a position a step, in
+/// slot `slot` of the caches.
+#[derive(Clone, Copy, Debug)]
+struct Request {
+    start: usize,
+    len: usize,
+    slot: usize,
+}
+
+/// Runs `requests` through a batch of `rows`, step by step: those running at a step in rows that
+/// rotate from step to step, so that a request is seldom in the same row twice running, and the
+/// other rows spare. `step` takes where each row runs and which request runs there, and gives
+/// what each row gives, none for a spare row; returns what each request was given at each of its
+/// positions.
+fn run_batch<T>(
+    requests: &[Request],
+    rows: usize,
+    mut step: impl FnMut(&[Option<Row>], &[Option<usize>]) -> Vec<Option<T>>,
+) -> Vec<Vec<T>> {
+    let steps = requests.iter().map(|r| r.start + r.len).max().unwrap_or(0);
+    let mut got: Vec<Vec<T>> = requests.iter().map(|_| Vec::new()).collect();
+    for t in 0..steps {
+        let running: Vec<usize> = (0..requests.len())
+            .filter(|&i| (requests[i].start..requests[i].start + requests[i].len).contains(&t))
+            .collect();
+        assert!(
+            running.len() <= rows,
+            "{running:?} at step {t} in {rows} rows"
+        );
+        let mut placed = vec![None; rows];
+        let mut which = vec![None; rows];
+        for (k, &i) in running.iter().enumerate() {
+            let row = (k + t) % rows;
+            let Request { start, slot, .. } = requests[i];
+            placed[row] = Some(Row {
+                position: t - start,
+                slot,
+            });
+            which[row] = Some(i);
+        }
+        let mut out = step(&placed, &which);
+        for (k, &i) in running.iter().enumerate() {
+            let row = (k + t) % rows;
+            got[i].push(out[row].take().expect("a row that runs gives something"));
+        }
+    }
+    got
+}
+
+/// Each row's input, `[rows][width]`: of the request that runs there, at its position, from
+/// `inputs`, the inputs of every request at every position; zero in a spare row.
+fn row_inputs(
+    placed: &[Option<Row>],
+    which: &[Option<usize>],
+    inputs: &[&[u16]],
+    width: usize,
+) -> Vec<u16> {
+    let mut x = vec![0u16; placed.len() * width];
+    for (b, (row, request)) in placed.iter().zip(which).enumerate() {
+        if let (Some(row), Some(i)) = (row, request) {
+            let at = row.position * width;
+            x[b * width..(b + 1) * width].copy_from_slice(&inputs[*i][at..at + width]);
+        }
+    }
+    x
+}
+
 /// The GPU's conditions and stop logits for the oracle's patches, from the prompt's last on, with
 /// the kernels at `subgroup` (the device's default when `None`), the residual LM rotated by RoPE
-/// as `shape` says unless `residual_rope` says otherwise.
+/// as `shape` says unless `residual_rope` says otherwise; for each of `rows` requests run at
+/// once, request r from step 2 r on in slot `rows - 1 - r` of the caches.
 fn gpu(
     config: &lm_side::Config,
     oracle: &Oracle,
     subgroup: Option<u32>,
     residual_rope: Option<bool>,
-) -> (Vec<f32>, Vec<f32>) {
+    rows: usize,
+) -> Vec<(Vec<f32>, Vec<f32>)> {
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     let positions = oracle.enc.len() / config.encoder_config.hidden_dim;
@@ -201,15 +276,16 @@ fn gpu(
         None => Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}")),
     };
     let start = Instant::now();
-    let mut side =
-        LmSide::new(&ctx, &mut kernels, &shape, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
+    let batch = Batch { rows, slots: rows };
+    let mut side = LmSide::with_batch(&ctx, &mut kernels, &shape, &tuning, batch, false)
+        .unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     side.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
     let step = side.graph_step();
     eprintln!(
-        "{} and {} layers recorded and loaded on the GPU at {tuning:?}: {:.1} s, {} dispatches, {} \
-         barriers, {} pipelines, an arena of {} KiB",
+        "{} and {} layers in {rows} rows recorded and loaded on the GPU at {tuning:?}: {:.1} s, {} \
+         dispatches, {} barriers, {} pipelines, an arena of {} KiB",
         shape.base.layers,
         shape.residual.layers,
         start.elapsed().as_secs_f64(),
@@ -218,16 +294,31 @@ fn gpu(
         kernels.len(),
         step.arena_bytes() / 1024
     );
-    let (mut mu, mut stop) = (vec![], vec![]);
-    for (t, enc) in oracle.enc.chunks(shape.encoder).enumerate() {
-        let out = side.step(t, enc).unwrap_or_else(|e| panic!("{e}"));
-        if t + 1 >= oracle.prompt {
-            mu.extend(out.mu.iter().map(|&h| f16::from_bits(h).to_f32()));
-            stop.extend(out.stop_logits);
-        }
-    }
+    let requests: Vec<Request> = (0..rows)
+        .map(|r| Request {
+            start: 2 * r,
+            len: positions,
+            slot: rows - 1 - r,
+        })
+        .collect();
+    let width = shape.encoder;
+    let inputs = vec![oracle.enc.as_slice(); rows];
+    let got = run_batch(&requests, rows, |placed, which| {
+        let enc = row_inputs(placed, which, &inputs, width);
+        side.step_rows(placed, &enc)
+            .unwrap_or_else(|e| panic!("{e}"))
+    });
     assert_no_validation_messages(&ctx);
-    (mu, stop)
+    got.into_iter()
+        .map(|patches| {
+            let (mut mu, mut stop) = (vec![], vec![]);
+            for out in &patches[oracle.prompt - 1..] {
+                mu.extend(out.mu.iter().map(|&h| f16::from_bits(h).to_f32()));
+                stop.extend(out.stop_logits);
+            }
+            (mu, stop)
+        })
+        .collect()
 }
 
 /// How far one run's outputs are from another's.
@@ -316,6 +407,16 @@ fn decides_alike(oracle: &Oracle, stop: &[f32]) -> bool {
     })
 }
 
+/// The full stacks' layer counts, from the checkpoint's config.
+fn full() -> (usize, usize) {
+    let json = fs::read_to_string(checkpoint_dir().join("config.json")).unwrap();
+    let full: lm_side::Config = serde_json::from_str(&json).unwrap();
+    (
+        full.lm_config.num_hidden_layers,
+        full.residual_lm_num_layers,
+    )
+}
+
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
             ORACLE_DIR a directory to keep the oracles in"]
@@ -340,13 +441,21 @@ fn a_few_layers_condition_as_voxcpm_does_on_the_cpu() {
         .into_iter()
         .filter(|&s| report.can_require_subgroup_size(s))
     {
-        let got = gpu(&ours, &oracle, Some(subgroup), None);
+        let got = gpu(&ours, &oracle, Some(subgroup), None, 1).remove(0);
         let margin = check(&oracle, &got);
         assert!(within(margin), "wave{subgroup}: {margin:?}");
         assert!(decides_alike(&oracle, &got.1), "wave{subgroup}");
+        // Three requests at once, each at its own position: each as it is alone.
+        let rows = gpu(&ours, &oracle, Some(subgroup), None, 3);
+        for (r, row) in rows.iter().enumerate() {
+            assert!(
+                row == &got,
+                "wave{subgroup}: row {r} of 3 is not as it is alone"
+            );
+        }
     }
     // Defect: the residual LM rotated by RoPE, as the base LM is.
-    let rotated = gpu(&ours, &oracle, None, Some(true));
+    let rotated = gpu(&ours, &oracle, None, Some(true), 1).remove(0);
     let margin = check(&oracle, &rotated);
     assert!(
         !within(margin),
@@ -354,18 +463,228 @@ fn a_few_layers_condition_as_voxcpm_does_on_the_cpu() {
     );
 }
 
+/// Requests in four rows over six slots: four at once for a while, mostly three and so a spare
+/// row, each at its own position; the last in a slot the first has left.
+const REQUESTS: [Request; 6] = [
+    Request {
+        start: 0,
+        len: 40,
+        slot: 5,
+    },
+    Request {
+        start: 3,
+        len: 30,
+        slot: 0,
+    },
+    Request {
+        start: 10,
+        len: 25,
+        slot: 2,
+    },
+    Request {
+        start: 12,
+        len: 8,
+        slot: 3,
+    },
+    Request {
+        start: 34,
+        len: 20,
+        slot: 1,
+    },
+    Request {
+        start: 41,
+        len: 10,
+        slot: 5,
+    },
+];
+
+/// Local encoder outputs of about the real ones' scale, `[len][width]` as f16 bits, from a
+/// fixed xorshift sequence for each seed.
+fn made_up(len: usize, width: usize, seed: u32) -> Vec<u16> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9) | 1;
+    (0..len * width)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            f16::from_f64(f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0).to_bits()
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn rows_condition_bit_for_bit_as_they_do_alone() {
+    let (_, config) = configs(2, 1);
+    let ctx = context();
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let shape = LmSideShape::new(&config, 64).unwrap();
+    let width = shape.encoder;
+    let encs: Vec<Vec<u16>> = (0..REQUESTS.len())
+        .map(|i| made_up(REQUESTS[i].len, width, i as u32 + 1))
+        .collect();
+    let inputs: Vec<&[u16]> = encs.iter().map(Vec::as_slice).collect();
+    let batch = Batch { rows: 4, slots: 6 };
+    let report = ctx.report().clone();
+    for subgroup in SUBGROUPS
+        .into_iter()
+        .filter(|&s| report.can_require_subgroup_size(s))
+    {
+        let base = Tuning::for_subgroup(subgroup);
+        let side = |tuning: &Tuning, batch: Batch, kernels: &mut Kernels| {
+            let mut side = LmSide::with_batch(&ctx, kernels, &shape, tuning, batch, false)
+                .unwrap_or_else(|e| panic!("{e}"));
+            side.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
+            side
+        };
+        // Alone: each request at batch 1, one after another in the one slot.
+        let mut one = side(&base, Batch::ONE, &mut kernels);
+        let alone: Vec<Vec<Conditioning>> = encs
+            .iter()
+            .map(|enc| {
+                let steps = enc.chunks(width).enumerate();
+                steps
+                    .map(|(t, e)| one.step(t, e).unwrap_or_else(|e| panic!("{e}")))
+                    .collect()
+            })
+            .collect();
+        drop(one);
+        let first_apart = |got: &[Vec<Conditioning>]| -> Vec<Option<usize>> {
+            got.iter()
+                .zip(&alone)
+                .map(|(g, w)| (0..w.len()).find(|&t| g.get(t) != Some(&w[t])))
+                .collect()
+        };
+        // Cuts that change where and when a row is summed, never in what order: the workgroup
+        // and the rows to a subgroup, loads ahead, and the vectors staged a step at a time, in
+        // a stage short of two.
+        let cuts = [
+            base,
+            Tuning {
+                workgroup: 256,
+                qkv_pairs: 2,
+                gate_up_pairs: 2,
+                residual_rows: 2,
+                ahead: 2,
+                ..base
+            },
+            Tuning {
+                workgroup: 2 * subgroup,
+                stage: (2 * batch.rows * 8 * subgroup as usize * 2 - 1) as u32,
+                ..base
+            },
+        ];
+        for tuning in cuts {
+            let mut rows = side(&tuning, batch, &mut kernels);
+            let got = run_batch(&REQUESTS, batch.rows, |placed, which| {
+                let enc = row_inputs(placed, which, &inputs, width);
+                rows.step_rows(placed, &enc)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            });
+            let apart = first_apart(&got);
+            assert!(
+                apart.iter().all(Option::is_none),
+                "wave{subgroup}, {tuning:?}: the first position of each request apart from it \
+                 alone, {apart:?}"
+            );
+        }
+        // One row over three slots, a request in each in turn.
+        let mut row = side(&base, Batch { rows: 1, slots: 3 }, &mut kernels);
+        let (d, f) = (REQUESTS[3], REQUESTS[5]);
+        let turns = [
+            Request {
+                start: 0,
+                len: d.len,
+                slot: 2,
+            },
+            Request {
+                start: d.len,
+                len: f.len,
+                slot: 1,
+            },
+        ];
+        let got = run_batch(&turns, 1, |placed, which| {
+            let enc = row_inputs(placed, which, &[inputs[3], inputs[5]], width);
+            row.step_rows(placed, &enc)
+                .unwrap_or_else(|e| panic!("{e}"))
+        });
+        assert!(
+            got[0] == alone[3] && got[1] == alone[5],
+            "wave{subgroup}: one row over three slots"
+        );
+        drop(row);
+
+        // Defect: request 0's attention reads request 2's slot and the reverse wherever both run,
+        // while their keys and values go to their own. Only those two may come out otherwise.
+        let mut tensors =
+            lm_side_batch_graph(&shape, &base, batch).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = tensors.graph.tensors[tensors.position.0].bytes;
+        let wrong = tensors.graph.tensor("wrong_position", bytes, Kind::Param);
+        for op in &mut tensors.graph.ops {
+            if op.label.ends_with("attention_split") {
+                op.bindings[3] = wrong;
+            }
+        }
+        let mut step =
+            Step::new(&ctx, &mut kernels, &tensors.graph, false).unwrap_or_else(|e| panic!("{e}"));
+        let (cos, sin) = shape.base.rope_tables();
+        step.write(tensors.cos, &cos).unwrap();
+        step.write(tensors.sin, &sin).unwrap();
+        let ids: Vec<TensorId> = (0..tensors.graph.tensors.len()).map(TensorId).collect();
+        load_lm_side(&mut step, &tensors.graph, &tensors, &ids, &checkpoint)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let got = run_batch(&REQUESTS, batch.rows, |placed, which| {
+            let words = batch.placement(placed, shape.base.capacity).unwrap();
+            let mut swapped = words.clone();
+            let row_of = |i| which.iter().position(|&w| w == Some(i));
+            if let (Some(a), Some(c)) = (row_of(0), row_of(2)) {
+                swapped.swap(batch.rows + a, batch.rows + c);
+            }
+            step.write(tensors.enc, &row_inputs(placed, which, &inputs, width))
+                .unwrap();
+            step.write(tensors.position, &words).unwrap();
+            step.write(wrong, &swapped).unwrap();
+            step.submit().unwrap();
+            let mu: Vec<u16> = step.read(tensors.mu).unwrap();
+            let logits: Vec<u16> = step.read(tensors.stop_logits).unwrap();
+            let logit = |i: usize| f16::from_bits(logits[i]).to_f32();
+            let condition = mu.len() / batch.rows;
+            let rows = placed.iter().enumerate();
+            rows.map(|(b, row)| {
+                row.map(|_| Conditioning {
+                    mu: mu[b * condition..(b + 1) * condition].to_vec(),
+                    stop_logits: [logit(2 * b), logit(2 * b + 1)],
+                })
+            })
+            .collect()
+        });
+        let apart = first_apart(&got);
+        eprintln!("wave{subgroup}: with the slots read crossed, first apart at {apart:?}");
+        let crossed: Vec<bool> = apart.iter().map(Option::is_some).collect();
+        assert_eq!(
+            crossed,
+            [true, false, true, false, false, false],
+            "wave{subgroup}: {apart:?}"
+        );
+    }
+    assert_no_validation_messages(&ctx);
+}
+
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
 fn the_lm_side_conditions_as_voxcpm_does_on_the_cpu() {
-    let json = fs::read_to_string(checkpoint_dir().join("config.json")).unwrap();
-    let full: lm_side::Config = serde_json::from_str(&json).unwrap();
-    let (config, ours) = configs(
-        full.lm_config.num_hidden_layers,
-        full.residual_lm_num_layers,
-    );
+    let (layers, residual_layers) = full();
+    let (config, ours) = configs(layers, residual_layers);
     let oracle = oracle(&config);
-    let got = gpu(&ours, &oracle, None, None);
+    let got = gpu(&ours, &oracle, None, None, 1).remove(0);
     let margin = check(&oracle, &got);
     assert!(within(margin), "{margin:?}");
     assert!(decides_alike(&oracle, &got.1));
+    // Sixteen requests at once, each at its own position: each as it is alone.
+    let rows = gpu(&ours, &oracle, None, None, 16);
+    for (r, row) in rows.iter().enumerate() {
+        assert!(row == &got, "row {r} of 16 is not as it is alone");
+    }
 }

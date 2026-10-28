@@ -1,14 +1,14 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// The attention's input side for one position: q, k and v = W RMSNorm(x), q and k rotated by
-// RoPE at the position, k and v written into the cache there. W is upstream's q_proj, k_proj
-// and v_proj joined along their outputs: HEADS + 2 KV_HEADS heads of HEAD_DIM rows. A subgroup
-// takes PAIRS pairs of rows i and i + HEAD_DIM / 2 of one head, the pairs RoPE rotates
-// together, so the rotation needs nothing from another subgroup.
+// The attention's input side for each of BATCH rows: q, k and v = W RMSNorm(x), q and k
+// rotated by RoPE at the row's position, k and v written into the row's cache slot there. W is
+// upstream's q_proj, k_proj and v_proj joined along their outputs: HEADS + 2 KV_HEADS heads of
+// HEAD_DIM rows. A subgroup takes PAIRS pairs of rows i and i + HEAD_DIM / 2 of one head, the
+// pairs RoPE rotates together, so the rotation needs nothing from another subgroup.
 //
-// The position is read from `position` on every run, so a recording of this dispatch serves
-// every position. The rotation's cosines and sines are tables of HEAD_DIM / 2 per position,
-// computed by the host as upstream's LongRoPE computes them.
+// The positions and slots are read from `at` on every run (batch.glsl). The rotation's cosines
+// and sines are tables of HEAD_DIM / 2 per position, computed by the host as upstream's
+// LongRoPE computes them.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint K = 2048;
@@ -21,23 +21,31 @@ layout(constant_id = 8) const uint PAIRS = 1;
 layout(constant_id = 9) const uint AHEAD = 0;
 // Whether q and k are rotated: VoxCPM2's residual LM attends without RoPE.
 layout(constant_id = 10) const bool ROPE = true;
+layout(constant_id = 11) const uint BATCH = 1;
+layout(constant_id = 12) const uint SLOTS = 1;
+layout(constant_id = 13) const uint SPAN = 0;
+layout(constant_id = 14) const uint NORM_WIDTH = 64;
 
 const uint ROWS = 2 * PAIRS;
 const uint HALF = HEAD_DIM / 2;
 
+// [BATCH][K]
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
 layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 3) readonly buffer Cos { float cos_[]; };
 layout(std430, binding = 4) readonly buffer Sin { float sin_[]; };
-layout(std430, binding = 5) readonly buffer Position { uint position; };
+layout(std430, binding = 5) readonly buffer At { uint at_[]; };
+// [BATCH][HEADS][HEAD_DIM]
 layout(std430, binding = 6) writeonly buffer Q { float16_t q[]; };
-// [KV_HEADS][CAPACITY][HEAD_DIM]
+// [SLOTS][KV_HEADS][CAPACITY][HEAD_DIM]
 layout(std430, binding = 7) writeonly buffer KCache { float16_t k_cache[]; };
 layout(std430, binding = 8) writeonly buffer VCache { float16_t v_cache[]; };
 
+#include "batch.glsl"
 #include "gemv.glsl"
 #include "norm.glsl"
+#include "gemv_norm.glsl"
 
 void main() {
     uint first = (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * PAIRS;
@@ -49,46 +57,49 @@ void main() {
         rows[2 * p + 1] = row + HALF;
     }
     prefetch(rows);
-    float scale = rms_scale(EPS);
-    for (uint v = gl_LocalInvocationID.x; v < K / 8; v += WORKGROUP) {
-        xs[v] = normed8(v, scale);
-    }
-    barrier();
-    float sums[ROWS];
+    norm_scales(EPS);
+    float sums[SUMS];
     dot_rows(rows, sums);
-    uint pos = position;
-    if (gl_SubgroupInvocationID != 0 || pos >= CAPACITY) {
+    if (gl_SubgroupInvocationID != 0) {
         return;
     }
-    [[unroll]] for (uint p = 0; p < PAIRS; p++) {
-        uint pair = first + p;
-        uint head = pair / HALF;
-        uint i = pair % HALF;
-        float a = sums[2 * p];
-        float b = sums[2 * p + 1];
-        if (head >= HEADS + KV_HEADS) {
-            uint at = ((head - HEADS - KV_HEADS) * CAPACITY + pos) * HEAD_DIM + i;
-            v_cache[at] = float16_t(a);
-            v_cache[at + HALF] = float16_t(b);
+    [[unroll]] for (uint b = 0; b < BATCH; b++) {
+        uint pos, slot;
+        if (!placed(b, pos, slot)) {
             continue;
         }
-        float ra = a;
-        float rb = b;
-        if (ROPE) {
-            // As upstream: x cos + rotate_half(x) sin.
-            float c = cos_[pos * HALF + i];
-            float s = sin_[pos * HALF + i];
-            ra = a * c - b * s;
-            rb = b * c + a * s;
-        }
-        if (head < HEADS) {
-            uint at = head * HEAD_DIM + i;
-            q[at] = float16_t(ra);
-            q[at + HALF] = float16_t(rb);
-        } else {
-            uint at = ((head - HEADS) * CAPACITY + pos) * HEAD_DIM + i;
-            k_cache[at] = float16_t(ra);
-            k_cache[at + HALF] = float16_t(rb);
+        [[unroll]] for (uint p = 0; p < PAIRS; p++) {
+            uint pair = first + p;
+            uint head = pair / HALF;
+            uint i = pair % HALF;
+            float a = sums[b * ROWS + 2 * p];
+            float c = sums[b * ROWS + 2 * p + 1];
+            if (head >= HEADS + KV_HEADS) {
+                uint kv = head - HEADS - KV_HEADS;
+                uint at = ((slot * KV_HEADS + kv) * CAPACITY + pos) * HEAD_DIM + i;
+                v_cache[at] = float16_t(a);
+                v_cache[at + HALF] = float16_t(c);
+                continue;
+            }
+            float ra = a;
+            float rc = c;
+            if (ROPE) {
+                // As upstream: x cos + rotate_half(x) sin.
+                float co = cos_[pos * HALF + i];
+                float si = sin_[pos * HALF + i];
+                ra = a * co - c * si;
+                rc = c * co + a * si;
+            }
+            if (head < HEADS) {
+                uint at = (b * HEADS + head) * HEAD_DIM + i;
+                q[at] = float16_t(ra);
+                q[at + HALF] = float16_t(rc);
+            } else {
+                uint kv = head - HEADS;
+                uint at = ((slot * KV_HEADS + kv) * CAPACITY + pos) * HEAD_DIM + i;
+                k_cache[at] = float16_t(ra);
+                k_cache[at + HALF] = float16_t(rc);
+            }
         }
     }
 }

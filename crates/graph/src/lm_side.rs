@@ -1,11 +1,13 @@
-//! VoxCPM2's LM side of a patch at batch 1, as one recorded step: from the local encoder's output
-//! for the last patch to what the next is sampled with, as upstream's `VoxCPM2Model` computes it.
+//! VoxCPM2's LM side of a patch, as one recorded step: from the local encoder's output for the
+//! last patch to what the next is sampled with, as upstream's `VoxCPM2Model` computes it.
 //! enc_to_lm_proj embeds the patch for the base LM, whose output the scalar quantizer rounds;
 //! fusion_concat_proj joins that with the embedding for the residual LM, which goes without RoPE;
 //! the DiT's condition is lm_to_dit_proj of the quantized output beside res_to_dit_proj of the
 //! residual LM's, and the stop logits stop_head of SiLU(stop_proj) of the quantized output. Both
-//! stacks are [`decode`](crate::decode)'s step, their caches written at the one position the
-//! host gives.
+//! stacks are [`decode`](crate::decode)'s step, their caches written at the position the host
+//! gives. A step runs a [`Batch`] of rows, each a request at its own position in its own slot of
+//! both caches, every layer reading its weights once for all of them; a row comes out bit for bit
+//! as it does alone.
 
 use serde::Deserialize;
 use vulkan::{Context, SpecValue, Timing};
@@ -13,7 +15,10 @@ use vulkan::{Context, SpecValue, Timing};
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    decode::{DecodeGraph, LayerTensors, LmConfig, Shape, Tuning, decode_graph, load_stack},
+    decode::{
+        Batch, DecodeGraph, LayerTensors, LmConfig, Row, Shape, Tuning, decode_batch_graph,
+        load_stack,
+    },
     graph::{Graph, Kind, Pipeline, TensorId},
     kernels::{
         Access::{Read, Write},
@@ -127,14 +132,17 @@ pub struct Stack {
     pub norm: TensorId,
 }
 
-/// The LM side's graph, and the tensors the host writes and reads.
+/// The LM side's graph, and the tensors the host writes and reads, a row of each for every row of
+/// the batch.
 #[derive(Clone, Debug)]
 pub struct LmSideGraph {
     pub graph: Graph,
     pub shape: LmSideShape,
+    pub batch: Batch,
     /// The local encoder's output for the last patch, `[encoder]` f16: the step's input.
     pub enc: TensorId,
-    /// The position the patch goes to in both LMs' caches, a u32.
+    /// Where the patch goes in both LMs' caches, [`Batch::words`] u32: at batch 1, the one
+    /// position.
     pub position: TensorId,
     /// The DiT's condition for the next patch, `[2 * dit]` f16: lm_to_dit_proj's output, then
     /// res_to_dit_proj's.
@@ -231,9 +239,25 @@ pub(crate) fn append_linear(
     layer: Linear,
     x: &[TensorId],
     act: Act,
+    out: (TensorId, usize),
+    tuning: &Tuning,
+    levels: u32,
+) -> Result<(), Error> {
+    append_batch_linear(g, label, layer, x, act, out, tuning, levels, 1)
+}
+
+/// [`append_linear`] over `rows` rows of each input, written into as many rows of `out`.
+#[allow(clippy::too_many_arguments)]
+fn append_batch_linear(
+    g: &mut Graph,
+    label: &str,
+    layer: Linear,
+    x: &[TensorId],
+    act: Act,
     (out, offset): (TensorId, usize),
     tuning: &Tuning,
     levels: u32,
+    rows: usize,
 ) -> Result<(), Error> {
     let Tuning {
         subgroup,
@@ -241,7 +265,7 @@ pub(crate) fn append_linear(
         ..
     } = *tuning;
     let subgroups = (workgroup / subgroup) as usize;
-    let len = |t: TensorId| g.tensors[t.0].bytes as usize / 2;
+    let len = |t: TensorId| g.tensors[t.0].bytes as usize / 2 / rows;
     let (x0, x1) = (x[0], x[x.len() - 1]);
     let (k0, k1) = (len(x0), if x.len() > 1 { len(x1) } else { 0 });
     for k in [k0, k1] {
@@ -252,7 +276,7 @@ pub(crate) fn append_linear(
             )));
         }
     }
-    let n = len(layer.bias);
+    let n = g.tensors[layer.bias.0].bytes as usize / 2;
     let pipeline = Pipeline {
         kernel: &GEMV_LINEAR,
         constants: vec![
@@ -264,6 +288,9 @@ pub(crate) fn append_linear(
             (5, SpecValue::U32(offset as u32)),
             (6, SpecValue::U32(act as u32)),
             (7, SpecValue::F32(levels as f32)),
+            (8, SpecValue::U32(rows as u32)),
+            (9, SpecValue::U32(tuning.span(k0 + k1, rows)?)),
+            (10, SpecValue::U32(len(out) as u32)),
         ],
         subgroup_size: Some(subgroup),
     };
@@ -273,8 +300,17 @@ pub(crate) fn append_linear(
     Ok(())
 }
 
-/// The LM side of `shape` cut as `tuning` says.
+/// The LM side of `shape` at batch 1 cut as `tuning` says.
 pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph, Error> {
+    lm_side_batch_graph(shape, tuning, Batch::ONE)
+}
+
+/// The LM side of `shape` for `batch` cut as `tuning` says.
+pub fn lm_side_batch_graph(
+    shape: &LmSideShape,
+    tuning: &Tuning,
+    batch: Batch,
+) -> Result<LmSideGraph, Error> {
     let s = shape;
     let (b, r) = (&s.base, &s.residual);
     if (r.hidden, r.capacity, r.head_dim) != (b.hidden, b.capacity, b.head_dim) {
@@ -283,14 +319,16 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
             r.hidden, r.capacity, r.head_dim, b.hidden, b.capacity, b.head_dim
         )));
     }
-    let base = decode_graph(b, tuning)?;
-    let residual = decode_graph(r, tuning)?;
+    let base = decode_batch_graph(b, tuning, batch)?;
+    let residual = decode_batch_graph(r, tuning, batch)?;
     let hidden = b.hidden;
 
     let mut g = Graph::default();
-    let vector = |n: usize| n as u64 * 2;
+    let rows = batch.rows;
+    let vector = |n: usize| (rows * n) as u64 * 2;
+    let weight = |n: usize| n as u64 * 2;
     let enc = g.tensor("enc", vector(s.encoder), Kind::Input);
-    let position = g.tensor("position", 4, Kind::Param);
+    let position = g.tensor("position", 4 * batch.words() as u64, Kind::Param);
     let table = base.graph.tensors[base.cos.0].bytes;
     let cos = g.tensor("rope.cos", table, Kind::Constant);
     let sin = g.tensor("rope.sin", table, Kind::Constant);
@@ -299,10 +337,10 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
     let mut linear = |name: &str, rows: usize, columns: usize| Linear {
         weight: g.tensor(
             format!("{name}.weight"),
-            vector(rows * columns),
+            weight(rows * columns),
             Kind::Constant,
         ),
-        bias: g.tensor(format!("{name}.bias"), vector(rows), Kind::Constant),
+        bias: g.tensor(format!("{name}.bias"), weight(rows), Kind::Constant),
     };
     let heads = Heads {
         enc_to_lm_proj: linear("enc_to_lm_proj", hidden, s.encoder),
@@ -329,7 +367,7 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
                  x: &[TensorId],
                  act: Act,
                  out: (TensorId, usize)| {
-        append_linear(g, label, layer, x, act, out, tuning, s.levels)
+        append_batch_linear(g, label, layer, x, act, out, tuning, s.levels, rows)
     };
     let h = &heads;
     apply(
@@ -405,6 +443,7 @@ pub fn lm_side_graph(shape: &LmSideShape, tuning: &Tuning) -> Result<LmSideGraph
     Ok(LmSideGraph {
         graph: g,
         shape: shape.clone(),
+        batch,
         enc,
         position,
         mu,
@@ -471,8 +510,8 @@ pub struct LmSide {
 }
 
 impl LmSide {
-    /// Records the LM side of `shape`, with its rotation tables written and every weight zero
-    /// until [`load`](Self::load).
+    /// Records the LM side of `shape` at batch 1, with its rotation tables written and every
+    /// weight zero until [`load`](Self::load).
     pub fn new(
         ctx: &Context,
         kernels: &mut Kernels,
@@ -480,7 +519,19 @@ impl LmSide {
         tuning: &Tuning,
         timed: bool,
     ) -> Result<Self, Error> {
-        let tensors = lm_side_graph(shape, tuning)?;
+        Self::with_batch(ctx, kernels, shape, tuning, Batch::ONE, timed)
+    }
+
+    /// Records the LM side of `shape` for `batch`, as [`new`](Self::new) records it for one row.
+    pub fn with_batch(
+        ctx: &Context,
+        kernels: &mut Kernels,
+        shape: &LmSideShape,
+        tuning: &Tuning,
+        batch: Batch,
+        timed: bool,
+    ) -> Result<Self, Error> {
+        let tensors = lm_side_batch_graph(shape, tuning, batch)?;
         let mut step = Step::new(ctx, kernels, &tensors.graph, timed)?;
         let (cos, sin) = shape.base.rope_tables();
         step.write(tensors.cos, &cos)?;
@@ -494,25 +545,42 @@ impl LmSide {
         load_lm_side(&mut self.step, &t.graph, t, &identity(&t.graph), checkpoint)
     }
 
-    /// Runs the LM side over `enc`, the local encoder's output for the patch at `position` as f16
-    /// bits, writing both LMs' keys and values into their caches there; returns what the next
-    /// patch is sampled with.
+    /// Runs the LM side at batch 1 over `enc`, the local encoder's output for the patch at
+    /// `position` as f16 bits, writing both LMs' keys and values into their caches there;
+    /// returns what the next patch is sampled with.
     pub fn step(&mut self, position: usize, enc: &[u16]) -> Result<Conditioning, Error> {
-        let capacity = self.tensors.shape.base.capacity;
-        if position >= capacity {
-            return Err(Error::Shape(format!(
-                "position {position} in a cache of {capacity}"
-            )));
-        }
-        self.step.write(self.tensors.enc, enc)?;
-        self.step.write(self.tensors.position, &[position as u32])?;
+        let mut rows = self.step_rows(&[Some(Row { position, slot: 0 })], enc)?;
+        Ok(rows.remove(0).expect("a row that runs"))
+    }
+
+    /// Runs the LM side over `enc`, the local encoder's outputs `[rows][encoder]` for the
+    /// batch's rows as f16 bits, each where `rows` says or spare: writes each row's keys and
+    /// values into its slot of both LMs' caches at its position. Returns what each row's next
+    /// patch is sampled with, none for a spare row.
+    pub fn step_rows(
+        &mut self,
+        rows: &[Option<Row>],
+        enc: &[u16],
+    ) -> Result<Vec<Option<Conditioning>>, Error> {
+        let t = &self.tensors;
+        let words = t.batch.placement(rows, t.shape.base.capacity)?;
+        self.step.write(t.enc, enc)?;
+        self.step.write(t.position, &words)?;
         self.step.submit()?;
-        let logits: Vec<u16> = self.step.read(self.tensors.stop_logits)?;
+        let logits: Vec<u16> = self.step.read(t.stop_logits)?;
+        let mu: Vec<u16> = self.step.read(t.mu)?;
+        let width = mu.len() / rows.len();
         let logit = |i: usize| half::f16::from_bits(logits[i]).to_f32();
-        Ok(Conditioning {
-            mu: self.step.read(self.tensors.mu)?,
-            stop_logits: [logit(0), logit(1)],
-        })
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(b, row)| {
+                row.map(|_| Conditioning {
+                    mu: mu[b * width..(b + 1) * width].to_vec(),
+                    stop_logits: [logit(2 * b), logit(2 * b + 1)],
+                })
+            })
+            .collect())
     }
 
     /// Each dispatch's label and GPU time in the last step, when recorded timed.
@@ -524,6 +592,10 @@ impl LmSide {
         &self.tensors.shape
     }
 
+    pub fn batch(&self) -> Batch {
+        self.tensors.batch
+    }
+
     /// The recorded step's dispatches, barriers and arena.
     pub fn graph_step(&self) -> &Step {
         &self.step
@@ -533,7 +605,7 @@ impl LmSide {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::SUBGROUPS;
+    use crate::decode::{SUBGROUPS, decode_graph};
 
     fn stack(layers: usize, rope: bool) -> Shape {
         Shape {
@@ -633,6 +705,35 @@ mod tests {
             let h = s.base.hidden;
             assert_eq!(covered, h + s.latent + h + h + 2 * s.dit + h + 2);
         }
+    }
+
+    #[test]
+    fn a_batch_writes_each_linear_layer_into_its_rows_of_the_output() {
+        let s = shape();
+        let batch = Batch { rows: 4, slots: 4 };
+        let g = lm_side_batch_graph(&s, &Tuning::for_subgroup(64), batch).unwrap();
+        let constant =
+            |op: &crate::graph::Op, id| match op.pipeline.constants.iter().find(|c| c.0 == id) {
+                Some(&(_, SpecValue::U32(v))) => v as u64,
+                other => panic!("{}: constant {id} is {other:?}", op.label),
+            };
+        let mut layers = 0;
+        for op in g
+            .graph
+            .ops
+            .iter()
+            .filter(|op| op.pipeline.kernel.name == GEMV_LINEAR.name)
+        {
+            let out = g.graph.tensors[op.bindings[4].0].bytes;
+            let (n, offset, stride) = (constant(op, 4), constant(op, 5), constant(op, 10));
+            assert_eq!(constant(op, 8), 4, "{}", op.label);
+            assert_eq!(4 * stride * 2, out, "{}", op.label);
+            assert!(offset + n <= stride, "{}", op.label);
+            layers += 1;
+        }
+        assert_eq!(layers, 8);
+        assert_eq!(g.graph.tensors[g.mu.0].bytes, 4 * 2 * s.dit as u64 * 2);
+        assert_eq!(g.graph.tensors[g.stop_logits.0].bytes, 4 * 2 * 2);
     }
 
     #[test]

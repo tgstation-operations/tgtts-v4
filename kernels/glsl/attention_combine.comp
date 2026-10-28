@@ -1,28 +1,34 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Joins attention_split's chunks up to the position into each query head's output: workgroup h
-// rescales each chunk's sum to the largest maximum among them and divides by the total.
+// Joins attention_split's chunks up to the row's position into each query head's output:
+// workgroup (h, b) rescales each chunk's sum for head h of row b to the largest maximum among
+// them and divides by the total. A spare row's output is left as it was.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint HEADS = 16;
 layout(constant_id = 3) const uint HEAD_DIM = 128;
 layout(constant_id = 4) const uint CAPACITY = 1024;
+layout(constant_id = 5) const uint BATCH = 1;
+layout(constant_id = 6) const uint SLOTS = 1;
 
 // As attention_split's.
 const uint CHUNK = 32;
 const uint CHUNKS = CAPACITY / CHUNK;
 const uint ROW = HEAD_DIM / 4;
 
-layout(std430, binding = 0) readonly buffer Position { uint position; };
+layout(std430, binding = 0) readonly buffer At { uint at_[]; };
 layout(std430, binding = 1) readonly buffer PartialO { vec4 partial_o[]; };
 layout(std430, binding = 2) readonly buffer PartialMl { vec2 partial_ml[]; };
-// [HEADS * HEAD_DIM]
+// [BATCH][HEADS * HEAD_DIM]
 layout(std430, binding = 3) writeonly buffer Out { float16_t out_[]; };
 
+#include "batch.glsl"
+
 void main() {
-    uint head = gl_WorkGroupID.x;
-    uint pos = position;
-    if (pos >= CAPACITY) {
+    uint b = gl_WorkGroupID.y;
+    uint head = b * HEADS + gl_WorkGroupID.x;
+    uint pos, slot;
+    if (!placed(b, pos, slot)) {
         return;
     }
     uint chunks = pos / CHUNK + 1;
