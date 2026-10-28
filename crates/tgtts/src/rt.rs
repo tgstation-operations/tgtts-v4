@@ -52,6 +52,10 @@ const CAPACITY: usize = 2048;
 #[cfg(feature = "rt")]
 const MAX_ROWS: usize = 512;
 
+/// The requests the generator generates at once.
+#[cfg(feature = "rt")]
+const SLOTS: usize = 1;
+
 /// A request as the thread that generates takes it.
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -297,6 +301,7 @@ impl Rt {
             timed: false,
             prompt_cache_bytes,
             subgroup: None,
+            slots: SLOTS,
         };
         let sampling = params.sampling.clone();
         let patch = config.patch_size * config.feat_dim;
@@ -319,10 +324,10 @@ impl Rt {
             let generator = Generator::new(&ctx, &mut kernels, &dir, &settings, parameter)?;
             Ok(Box::new(Generating {
                 ctx,
+                noise: (0..generator.slots()).map(|_| None).collect(),
                 generator,
                 sampling,
                 patch,
-                noise: SeededNoise::new(0),
             }))
         })
     }
@@ -385,7 +390,7 @@ impl Rt {
     }
 }
 
-/// The generator, one request at a time.
+/// The generator, with the noise of the request in each of its slots.
 #[cfg(feature = "rt")]
 struct Generating {
     ctx: vulkan::Context,
@@ -393,18 +398,17 @@ struct Generating {
     sampling: Sampling,
     /// The values of a patch, and so of its noise.
     patch: usize,
-    /// The request's noise.
-    noise: SeededNoise,
+    /// The noise of each slot's request, none in a free slot.
+    noise: Vec<Option<SeededNoise>>,
 }
 
 #[cfg(feature = "rt")]
 impl Engine for Generating {
     fn slots(&self) -> usize {
-        1
+        self.generator.slots()
     }
 
-    fn start(&mut self, _: usize, request: &Request) -> Result<usize, synth::Error> {
-        self.noise = SeededNoise::new(request.seed);
+    fn start(&mut self, slot: usize, request: &Request) -> Result<usize, synth::Error> {
         let prompt = &request.prompt;
         let positions = graph::prompt::Prompt {
             tokens: &prompt.tokens,
@@ -412,12 +416,14 @@ impl Engine for Generating {
             audio: &prompt.audio,
         };
         let prefilled = self.generator.start(
+            slot,
             positions,
             &request.voice,
             request.max_patches,
             self.sampling.temperature,
             self.sampling.cfg_value,
         )?;
+        self.noise[slot] = Some(SeededNoise::new(request.seed));
         let cache = self.generator.prompt_cache();
         debug!(
             prompt = prompt.len(),
@@ -430,20 +436,43 @@ impl Engine for Generating {
     }
 
     fn step(&mut self) -> Vec<(usize, Result<Stepped, synth::Error>)> {
-        let noise = self.noise.next(self.patch);
-        let stepped = match self.generator.next_patch(&noise) {
-            Ok(patch) => Ok(Stepped {
-                audio: self.generator.take_audio(),
-                last: patch.is_none_or(|patch| patch.last),
-            }),
-            Err(e) => Err(e.into()),
+        let Generating {
+            generator,
+            noise,
+            patch,
+            ..
+        } = self;
+        let drawn = |slot: usize| {
+            let noise = noise[slot].as_mut().expect("a request under way");
+            noise.next(*patch)
         };
-        vec![(0, stepped)]
+        match generator.step(drawn) {
+            Ok(patches) => patches
+                .into_iter()
+                .map(|(slot, patch)| {
+                    let stepped = patch.map(|patch| Stepped {
+                        audio: generator.take_audio(slot),
+                        last: patch.last,
+                    });
+                    (slot, stepped.map_err(Into::into))
+                })
+                .collect(),
+            // The submission failed, and every request under way with it.
+            Err(e) => {
+                let held = noise
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, noise)| noise.is_some());
+                held.map(|(slot, _)| (slot, Err(e.to_string().into())))
+                    .collect()
+            }
+        }
     }
 
     /// Fails the request once the validation layer, where it is on, has reported anything.
-    fn finish(&mut self, _: usize) -> Result<Vec<f32>, synth::Error> {
-        let audio = self.generator.finish()?;
+    fn finish(&mut self, slot: usize) -> Result<Vec<f32>, synth::Error> {
+        self.noise[slot] = None;
+        let audio = self.generator.finish(slot)?;
         validated(&self.ctx)?;
         Ok(audio)
     }

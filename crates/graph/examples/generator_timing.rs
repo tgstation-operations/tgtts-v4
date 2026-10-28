@@ -97,6 +97,7 @@ fn request(generator: &mut Generator, prompt: &Prompt, voice: &[f32], patches: u
     let begun = Instant::now();
     generator
         .start(
+            0,
             positions,
             voice,
             patches,
@@ -115,13 +116,15 @@ fn request(generator: &mut Generator, prompt: &Prompt, voice: &[f32], patches: u
     };
     loop {
         let at = Instant::now();
-        let patch = generator.next_patch(&noise.next(256));
+        let stepped = generator.step(|_| noise.next(256));
         let host = at.elapsed().as_secs_f64() * 1e3;
-        let Some(patch) = patch.unwrap_or_else(|e| panic!("{e}")) else {
+        let stepped = stepped.unwrap_or_else(|e| panic!("{e}"));
+        let Some((_, patch)) = stepped.into_iter().next() else {
             break;
         };
+        let patch = patch.unwrap_or_else(|e| panic!("{e}"));
         let gpu = gpu_ms(generator.timings().unwrap());
-        let audio = generator.take_audio();
+        let audio = generator.take_audio(0);
         let chunk = (!audio.is_empty()).then(|| gpu_ms(generator.audio_timings().unwrap()));
         if out.patches.is_empty() {
             out.first = begun.elapsed().as_secs_f64() * 1e3;
@@ -132,7 +135,7 @@ fn request(generator: &mut Generator, prompt: &Prompt, voice: &[f32], patches: u
             break;
         }
     }
-    generator.finish().unwrap_or_else(|e| panic!("{e}"));
+    generator.finish(0).unwrap_or_else(|e| panic!("{e}"));
     out
 }
 
@@ -175,6 +178,7 @@ fn main() {
         timed: true,
         prompt_cache_bytes: 0,
         subgroup: None,
+        slots: 1,
     };
     let loaded = Instant::now();
     let parameter = |name: &str| {

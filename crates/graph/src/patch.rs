@@ -263,6 +263,8 @@ pub struct PatchStep {
     step: Step,
     /// Fewest rows first, each graph over every tensor the step holds.
     programs: Vec<(Program, PatchGraph)>,
+    /// The program [`run_rows`](Self::run_rows) ran last.
+    last: usize,
     capacity: usize,
 }
 
@@ -319,6 +321,7 @@ impl PatchStep {
             capacity: base.capacity,
             step,
             programs,
+            last: 0,
         })
     }
 
@@ -362,10 +365,10 @@ impl PatchStep {
         &mut self,
         rows: &[Option<PatchRow<'_>>],
     ) -> Result<Vec<Option<Sampled>>, Error> {
-        let Some((program, t)) = self
+        let Some(index) = self
             .programs
             .iter()
-            .find(|(_, t)| t.batch().rows >= rows.len())
+            .position(|(_, t)| t.batch().rows >= rows.len())
         else {
             return Err(Error::Shape(format!(
                 "{} rows, of at most {}",
@@ -373,6 +376,7 @@ impl PatchStep {
                 self.rows().last().copied().unwrap_or(0)
             )));
         };
+        let (program, t) = &self.programs[index];
         let batch = t.batch();
         let len = t.sampler.feat_dim * t.sampler.patch_size;
         let mut placed = vec![None; batch.rows];
@@ -401,6 +405,7 @@ impl PatchStep {
         self.step.write(t.position, &words)?;
         self.step.write(t.sampling, &sampling)?;
         self.step.run(*program)?;
+        self.last = index;
         let logits: Vec<u16> = self.step.read(t.stop_logits)?;
         let patches: Vec<f32> = self.step.read(t.patch)?;
         let logit = |i: usize| half::f16::from_bits(logits[i]).to_f32();
@@ -429,6 +434,12 @@ impl PatchStep {
     /// The numbers of rows it has a program for, fewest first.
     pub fn rows(&self) -> Vec<usize> {
         self.programs.iter().map(|(_, t)| t.batch().rows).collect()
+    }
+
+    /// The tensors of the program [`run_rows`](Self::run_rows) ran last, over every tensor of the
+    /// step.
+    pub fn last_run(&self) -> &PatchGraph {
+        &self.programs[self.last].1
     }
 
     /// The tensors of the program of the fewest rows, over every tensor of the step, and the

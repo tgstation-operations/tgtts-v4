@@ -813,6 +813,7 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize, subgroup: u3
         timed: false,
         prompt_cache_bytes: 0,
         subgroup: Some(subgroup),
+        slots: 1,
     };
     let start = Instant::now();
     let parameter = |name: &str| {
@@ -859,6 +860,7 @@ fn speak(
     let start = Instant::now();
     generator
         .start(
+            0,
             prompt,
             voice.frames.as_flattened(),
             Params::default().max_patches,
@@ -870,15 +872,16 @@ fn speak(
     for (i, noise) in noise.iter().enumerate() {
         if let Some(before) = stale.and_then(|stale| i.checked_sub(stale)) {
             generator
-                .sample_after(&oracle.patches[0][before])
+                .sample_after(0, &oracle.patches[0][before])
                 .unwrap_or_else(|e| panic!("{e}"));
         }
-        let Some(patch) = generator
-            .next_patch(noise)
-            .unwrap_or_else(|e| panic!("{e}"))
-        else {
+        let stepped = generator
+            .step(|_| noise.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let Some((_, patch)) = stepped.into_iter().next() else {
             break;
         };
+        let patch = patch.unwrap_or_else(|e| panic!("{e}"));
         if i == 0 {
             eprintln!(
                 "the first patch {:.1} ms after the request (smoke, not a measurement)",
@@ -887,15 +890,17 @@ fn speak(
         }
         patches.push(patch.frames);
         if early.contains(&patches.len()) {
-            generator.decode_waiting().unwrap_or_else(|e| panic!("{e}"));
+            generator
+                .decode_waiting(0)
+                .unwrap_or_else(|e| panic!("{e}"));
         }
-        levels.push(generator.levels().unwrap_or_else(|e| panic!("{e}")));
-        audio.extend(generator.take_audio());
+        levels.push(generator.levels(0).unwrap_or_else(|e| panic!("{e}")));
+        audio.extend(generator.take_audio(0));
         if patch.last {
             break;
         }
     }
-    audio.extend(generator.finish().unwrap_or_else(|e| panic!("{e}")));
+    audio.extend(generator.finish(0).unwrap_or_else(|e| panic!("{e}")));
     eprintln!(
         "{} patches and {} samples in {:.2} s (smoke, not a measurement)",
         patches.len(),

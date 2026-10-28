@@ -1,28 +1,30 @@
-//! VoxCPM2's text-to-speech at batch 1 on the GPU, from a prompt to audio, one request at a time:
-//! the prompt run into the patch step's caches ([`prompt`](crate::prompt)) from what a prompt
-//! cache keeps of its voice ([`PromptCache`]), patches sampled a submission each
-//! ([`patch`](crate::patch)) until the stop head says to stop after one or the request's most are
-//! sampled, as the service stops, and their latent frames decoded by the audio VAE
-//! ([`vae`](crate::vae)) after the voice's last frames, as the service primes its decoder, in
-//! chunks of a fixed number of frames as they come.
+//! VoxCPM2's text-to-speech on the GPU, from a prompt to audio, several requests at once, each in
+//! a slot of its own. A request is admitted between two steps: its prompt run into its slot of the
+//! patch step's caches ([`prompt`](crate::prompt)) from what a prompt cache keeps of its voice
+//! ([`PromptCache`]). Each step samples a patch of every request under way in one submission
+//! ([`patch`](crate::patch)), on the program of the fewest rows that holds them, until the stop
+//! head says to stop after one or the request's most are sampled, as the service stops. A
+//! request's latent frames are decoded by the audio VAE ([`vae`](crate::vae)) in a stream of its
+//! own after the voice's last frames, as the service primes its decoder, in chunks of a fixed
+//! number of frames as they come. A request comes out bit for bit as it does alone, whatever
+//! runs beside it.
 
-use std::{fs, mem, path::Path};
+use std::{fs, iter, mem, path::Path};
 
 use half::f16;
 use serde::Deserialize;
-use vulkan::{Buffer, Context, Residence, Timing};
+use vulkan::{Context, Timing};
 
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    decode,
-    graph::{Kind, TensorId},
+    decode::{self, Batch, Row},
+    graph::Kind,
     kernels::Kernels,
     lm_side,
     local::{self, PatchConfig},
-    patch::{PatchStep, patch_graph, transposed},
+    patch::{PatchRow, PatchStep, Sampled, patch_batch_graph, transposed},
     prompt::{Prompt, PromptCache, Prompter},
-    step::Region,
     vae::{Parameter, VaeConfig, VaeDecoder, VaeShape},
 };
 
@@ -33,7 +35,8 @@ const CONTEXT_FRAMES: usize = 12;
 /// What the generator is recorded for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// The positions the LMs' caches hold, a multiple of 32: a request's prompt and its patches.
+    /// The positions each slot of the LMs' caches holds, a multiple of 32: a request's prompt and
+    /// its patches.
     pub capacity: usize,
     /// The most positions of a prompt one submission runs, a multiple of 128.
     pub max_rows: usize,
@@ -49,6 +52,8 @@ pub struct Settings {
     /// The subgroup size the kernels run at, the device's widest they are written for when
     /// `None`.
     pub subgroup: Option<u32>,
+    /// The requests it generates at once.
+    pub slots: usize,
 }
 
 /// The parts of VoxCPM2's `config.json` the generator reads.
@@ -67,6 +72,9 @@ pub struct Patch {
     /// Whether it is the request's last.
     pub last: bool,
 }
+
+/// What a step gave a request: its patch, or why it has none, after which it has ended.
+pub type Outcome = Result<Patch, Error>;
 
 /// A request under way.
 #[derive(Debug)]
@@ -88,7 +96,7 @@ struct Request {
     audio: Vec<f32>,
 }
 
-/// VoxCPM2 on the GPU, loaded once and generating one request at a time.
+/// VoxCPM2 on the GPU, loaded once and generating requests in its slots.
 #[derive(Debug)]
 pub struct Generator {
     step: PatchStep,
@@ -97,12 +105,22 @@ pub struct Generator {
     vae: VaeDecoder,
     checkpoint: Checkpoint,
     settings: Settings,
-    /// The scalar quantizer's levels in the patch step, the buffer [`levels`](Self::levels)
-    /// copies them out into, and the levels to a unit they are multiples of.
-    levels: (TensorId, Buffer, u32),
     patch_size: usize,
     feat_dim: usize,
-    request: Option<Request>,
+    /// The request in each slot.
+    requests: Vec<Option<Request>>,
+    /// The row each slot's request ran in at the last step, none for one that did not run there.
+    rows: Vec<Option<usize>>,
+}
+
+/// The rows of the patch step's programs for `slots` slots: each power of two below it, then
+/// `slots`.
+fn program_rows(slots: usize) -> Vec<usize> {
+    let powers = iter::successors(Some(1), |rows| Some(rows * 2));
+    powers
+        .take_while(|&rows| rows < slots)
+        .chain([slots])
+        .collect()
 }
 
 impl Generator {
@@ -132,12 +150,21 @@ impl Generator {
         let lm = decode::Tuning::for_subgroup(subgroup);
         let local = local::Tuning::for_subgroup(subgroup).fit(report)?;
         let shape = lm_side::LmSideShape::new(&side_config, settings.capacity)?;
-        let mut graph = patch_graph(&shape, &config, settings.timesteps, &lm, &local)?;
-        let levels = graph.side_ids[graph.side.levels.0];
-        // Out of the arena, whose later ops would reuse its bytes before they are copied out.
-        graph.graph.tensors[levels.0].kind = Kind::State;
-        let out = ctx.buffer_in(graph.graph.tensors[levels.0].bytes, Residence::Readback)?;
-        let mut step = PatchStep::new(ctx, kernels, graph, settings.timed)?;
+        let slots = settings.slots;
+        let graphs = program_rows(slots)
+            .into_iter()
+            .map(|rows| {
+                let lm = decode::Tuning::for_batch(subgroup, rows);
+                let batch = Batch { rows, slots };
+                let mut graph =
+                    patch_batch_graph(&shape, &config, settings.timesteps, &lm, &local, batch)?;
+                // For the host to read, out of the arena, whose later ops would reuse its bytes.
+                let levels = graph.side_ids[graph.side.levels.0];
+                graph.graph.tensors[levels.0].kind = Kind::Output;
+                Ok(graph)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut step = PatchStep::with_rows(ctx, kernels, graphs, settings.timed)?;
         let checkpoint = Checkpoint::open(dir.join("model.safetensors"))?;
         step.load(&checkpoint)?;
         let prompter = Prompter::new(
@@ -148,7 +175,7 @@ impl Generator {
             &lm,
             settings.timed,
         )?;
-        let vae_shape = VaeShape::new(&audio_vae_config, settings.chunk_frames, 1)?;
+        let vae_shape = VaeShape::new(&audio_vae_config, settings.chunk_frames, slots)?;
         let mut vae = VaeDecoder::new(ctx, kernels, &vae_shape, settings.timed)?;
         vae.load(parameter)?;
         Ok(Generator {
@@ -158,27 +185,38 @@ impl Generator {
             vae,
             checkpoint,
             settings: settings.clone(),
-            levels: (levels, out, shape.levels),
             patch_size: config.patch_size,
             feat_dim: config.feat_dim,
-            request: None,
+            requests: (0..slots).map(|_| None).collect(),
+            rows: vec![None; slots],
         })
     }
 
-    /// Starts a request, ending any under way: runs `prompt`, which ends in audio, into the
-    /// caches, to sample up to `max_patches` patches after it at `temperature` and guidance
-    /// scale `cfg`, whose audio goes on from `voice`, the voice's latent frames. Gives the
-    /// positions of the prompt that run through the LMs, the rest coming from what the prompt
-    /// cache keeps of the voice.
+    /// The requests it generates at once.
+    pub fn slots(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// Starts a request in slot `slot`, ending any under way there: runs `prompt`, which ends in
+    /// audio, into the slot of the caches, to sample up to `max_patches` patches after it at
+    /// `temperature` and guidance scale `cfg`, whose audio goes on from `voice`, the voice's
+    /// latent frames. The request's first patch is sampled at the next [`step`](Self::step).
+    /// Gives the positions of the prompt that run through the LMs, the rest coming from what the
+    /// prompt cache keeps of the voice.
     pub fn start(
         &mut self,
+        slot: usize,
         prompt: Prompt<'_>,
         voice: &[f32],
         max_patches: usize,
         temperature: f32,
         cfg: f32,
     ) -> Result<usize, Error> {
-        self.request = None;
+        let held = self
+            .requests
+            .get_mut(slot)
+            .ok_or_else(|| Error::Shape(format!("slot {slot} of {}", self.settings.slots)))?;
+        *held = None;
         let (len, capacity) = (prompt.len(), self.settings.capacity);
         let patch = self.patch_size * self.feat_dim;
         if len == 0 || max_patches == 0 || len - 1 + max_patches > capacity {
@@ -197,16 +235,17 @@ impl Generator {
         }
         let prefilled = self.prompter.run_cached(
             &mut self.step,
-            0,
+            slot,
             &self.checkpoint,
             prompt,
             voice,
             &mut self.cache,
         )?;
-        self.vae.reset(0)?;
+        self.vae.reset(slot)?;
+        self.rows[slot] = None;
         let context = (voice.len() / self.feat_dim).min(CONTEXT_FRAMES);
         let last = &prompt.patches[(len - 1) * patch..];
-        self.request = Some(Request {
+        self.requests[slot] = Some(Request {
             position: len - 1,
             before: transposed(last, self.patch_size),
             left: max_patches,
@@ -220,84 +259,109 @@ impl Generator {
         Ok(prefilled)
     }
 
-    /// Has the next patch sampled after `frames`, `[patch_size][feat_dim]`, rather than the
-    /// patch sampled last: for checking a generation against another's, each patch sampled
-    /// after the other's patch before, as teacher forcing does.
-    pub fn sample_after(&mut self, frames: &[f32]) -> Result<(), Error> {
-        let request = self.request.as_mut().ok_or_else(no_request)?;
+    /// The request in `slot`.
+    fn request(&mut self, slot: usize) -> Result<&mut Request, Error> {
+        let request = self.requests.get_mut(slot).and_then(Option::as_mut);
+        request.ok_or_else(|| no_request(slot))
+    }
+
+    /// Has the next patch of the request in `slot` sampled after `frames`,
+    /// `[patch_size][feat_dim]`, rather than the patch sampled last: for checking a generation
+    /// against another's, each patch sampled after the other's patch before, as teacher forcing
+    /// does.
+    pub fn sample_after(&mut self, slot: usize, frames: &[f32]) -> Result<(), Error> {
+        let patch_size = self.patch_size;
+        let request = self.request(slot)?;
         if frames.len() != request.before.len() {
             return Err(Error::Shape(format!("a patch of {} values", frames.len())));
         }
-        request.before = transposed(frames, self.patch_size);
+        request.before = transposed(frames, patch_size);
         Ok(())
     }
 
-    /// Samples the request's next patch from `noise`, standard normal values
-    /// `[feat_dim][patch_size]`, and decodes the frames waiting while a chunk's worth of them
-    /// waits; none once the request has ended.
-    pub fn next_patch(&mut self, noise: &[f32]) -> Result<Option<Patch>, Error> {
-        let request = self.request.as_mut().ok_or_else(no_request)?;
-        if request.left == 0 {
-            return Ok(None);
+    /// Samples the next patch of each request under way, all in one submission, each from the
+    /// noise `noise` gives for its slot, standard normal values `[feat_dim][patch_size]`; and
+    /// decodes each one's frames waiting while a chunk's worth of them waits. Gives what it gave
+    /// each, by its slot. A request whose last patch has been sampled is no longer under way, and
+    /// waits in its slot to be [`finish`](Self::finish)ed.
+    pub fn step(
+        &mut self,
+        mut noise: impl FnMut(usize) -> Vec<f32>,
+    ) -> Result<Vec<(usize, Outcome)>, Error> {
+        let under_way: Vec<usize> = (0..self.requests.len())
+            .filter(|&slot| self.requests[slot].as_ref().is_some_and(|r| r.left > 0))
+            .collect();
+        if under_way.is_empty() {
+            return Ok(Vec::new());
         }
-        if noise.len() != request.before.len() {
-            return Err(Error::Shape(format!("noise of {} values", noise.len())));
+        let noises: Vec<Vec<f32>> = under_way.iter().map(|&slot| noise(slot)).collect();
+        let rows: Vec<Option<PatchRow<'_>>> = under_way
+            .iter()
+            .zip(&noises)
+            .map(|(&slot, noise)| {
+                let request = self.requests[slot].as_ref().expect("under way");
+                Some(PatchRow {
+                    at: Row {
+                        position: request.position,
+                        slot,
+                    },
+                    cond: &request.before,
+                    noise,
+                    temperature: request.temperature,
+                    cfg: request.cfg,
+                })
+            })
+            .collect();
+        let sampled = self.step.run_rows(&rows)?;
+        self.rows.fill(None);
+        for (row, &slot) in under_way.iter().enumerate() {
+            self.rows[slot] = Some(row);
         }
-        let sampled = self.step.run(
-            request.position,
-            &request.before,
-            noise,
-            request.temperature,
-            request.cfg,
-        )?;
-        let finite = |v: &[f32]| v.iter().all(|v| v.is_finite());
-        if !finite(&sampled.patch) || !finite(&sampled.stop_logits) {
-            request.left = 0;
-            return Err(Error::NotFinite(request.sampled));
-        }
-        request.sampled += 1;
-        request.left = if sampled.stops() { 0 } else { request.left - 1 };
-        request.position += 1;
-        let frames = transposed(&sampled.patch, self.feat_dim);
-        request.frames.extend_from_slice(&frames);
-        request.before = sampled.patch;
         let chunk = self.settings.chunk_frames * self.feat_dim;
-        while request.frames.len() >= chunk {
-            let rest = request.frames.split_off(chunk);
-            let frames = mem::replace(&mut request.frames, rest);
-            decode(&mut self.vae, request, &frames)?;
+        let mut patches = Vec::with_capacity(under_way.len());
+        for (slot, sampled) in under_way.into_iter().zip(sampled) {
+            let request = self.requests[slot].as_mut().expect("under way");
+            let sampled = sampled.expect("a row that runs");
+            let patch = advance(&mut self.vae, slot, request, sampled, self.feat_dim, chunk);
+            if patch.is_err() {
+                request.left = 0;
+            }
+            patches.push((slot, patch));
         }
-        Ok(Some(Patch {
-            frames,
-            stop_logits: sampled.stop_logits,
-            last: request.left == 0,
-        }))
+        Ok(patches)
     }
 
-    /// Decodes the frames waiting now rather than once a chunk's worth of them waits: the audio
-    /// sooner, for a submission of the audio VAE on fewer frames than it could take.
-    pub fn decode_waiting(&mut self) -> Result<(), Error> {
-        let request = self.request.as_mut().ok_or_else(no_request)?;
+    /// Decodes the frames waiting of the request in `slot` now rather than once a chunk's worth
+    /// of them waits: the audio sooner, for a submission of the audio VAE on fewer frames than
+    /// it could take.
+    pub fn decode_waiting(&mut self, slot: usize) -> Result<(), Error> {
+        let request = self.requests.get_mut(slot).and_then(Option::as_mut);
+        let request = request.ok_or_else(|| no_request(slot))?;
         let frames = mem::take(&mut request.frames);
-        decode(&mut self.vae, request, &frames)
+        decode(&mut self.vae, slot, request, &frames)
     }
 
-    /// The scalar quantizer's levels the last patch was sampled after, integers: for checking a
-    /// generation against another's, as [`sample_after`](Self::sample_after) is. Generating reads
-    /// them nowhere else, and each call copies them out of the GPU's memory.
-    pub fn levels(&mut self) -> Result<Vec<f32>, Error> {
-        let (tensor, out, unit) = &mut self.levels;
-        let bytes = out.size();
-        let region = Region {
-            tensor: *tensor,
-            offset: 0,
-            other: 0,
-            bytes,
-        };
-        self.step.parts_mut().1.copy_out(&[region], out)?;
-        let halves: Vec<u16> = out.read_at(0, bytes as usize / 2)?;
-        let level = |h: &u16| (f16::from_bits(*h).to_f32() * *unit as f32).round();
-        Ok(halves.iter().map(level).collect())
+    /// The scalar quantizer's levels the last patch of the request in `slot` was sampled after,
+    /// integers: for checking a generation against another's, as
+    /// [`sample_after`](Self::sample_after) is. Generating reads them nowhere else, yet each step
+    /// writes them into memory the host maps and reads them back from there, 1 KiB a row: they
+    /// are an output of each program of the patch step, as a program's state would be the
+    /// others' too.
+    pub fn levels(&self, slot: usize) -> Result<Vec<f32>, Error> {
+        let ran = self.requests.get(slot).and_then(Option::as_ref);
+        let row = ran
+            .and_then(|_| self.rows[slot])
+            .ok_or_else(|| no_request(slot))?;
+        let graph = self.step.last_run();
+        let tensor = graph.side_ids[graph.side.levels.0];
+        let halves: Vec<u16> = self.step.graph_step().read(tensor)?;
+        let shape = &graph.side.shape;
+        let unit = shape.levels as f32;
+        let row = &halves[row * shape.latent..(row + 1) * shape.latent];
+        Ok(row
+            .iter()
+            .map(|&h| (f16::from_bits(h).to_f32() * unit).round())
+            .collect())
     }
 
     /// What the generator keeps of the voices.
@@ -305,16 +369,16 @@ impl Generator {
         &self.cache
     }
 
-    /// The audio decoded since it was last taken, mono samples at the audio VAE's rate.
-    pub fn take_audio(&mut self) -> Vec<f32> {
-        self.request
-            .as_mut()
-            .map_or_else(Vec::new, |request| mem::take(&mut request.audio))
+    /// The audio of the request in `slot` decoded since it was last taken, mono samples at the
+    /// audio VAE's rate.
+    pub fn take_audio(&mut self, slot: usize) -> Vec<f32> {
+        let request = self.requests.get_mut(slot).and_then(Option::as_mut);
+        request.map_or_else(Vec::new, |request| mem::take(&mut request.audio))
     }
 
     /// Each dispatch's label and GPU time in the last run over the LMs' caches, when recorded
     /// timed: the prompt's last run after [`start`](Self::start), the patch step's after
-    /// [`next_patch`](Self::next_patch).
+    /// [`step`](Self::step).
     pub fn timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
         self.step.timings()
     }
@@ -324,30 +388,82 @@ impl Generator {
         self.vae.timings()
     }
 
-    /// Ends the request, decoding the frames still waiting, and gives the audio not yet taken.
-    pub fn finish(&mut self) -> Result<Vec<f32>, Error> {
-        let mut request = self.request.take().ok_or_else(no_request)?;
+    /// Ends the request in `slot`, decoding the frames still waiting, and gives the audio not yet
+    /// taken.
+    pub fn finish(&mut self, slot: usize) -> Result<Vec<f32>, Error> {
+        let request = self.requests.get_mut(slot).and_then(Option::take);
+        let mut request = request.ok_or_else(|| no_request(slot))?;
         let frames = mem::take(&mut request.frames);
-        decode(&mut self.vae, &mut request, &frames)?;
+        decode(&mut self.vae, slot, &mut request, &frames)?;
         Ok(request.audio)
     }
 }
 
-fn no_request() -> Error {
-    Error::Shape("no request under way".into())
+fn no_request(slot: usize) -> Error {
+    Error::Shape(format!("no request under way in slot {slot}"))
 }
 
-/// `frames`, `[frames][feat_dim]`, through `vae`'s stream into `request`'s audio, the voice's
-/// frames' audio left out.
-fn decode(vae: &mut VaeDecoder, request: &mut Request, frames: &[f32]) -> Result<(), Error> {
+/// Takes `sampled`, the patch step's for the request in `slot`, as the request's next patch,
+/// and decodes its frames waiting while a chunk's worth of them, `chunk` values, waits.
+fn advance(
+    vae: &mut VaeDecoder,
+    slot: usize,
+    request: &mut Request,
+    sampled: Sampled,
+    feat_dim: usize,
+    chunk: usize,
+) -> Result<Patch, Error> {
+    let finite = |v: &[f32]| v.iter().all(|v| v.is_finite());
+    if !finite(&sampled.patch) || !finite(&sampled.stop_logits) {
+        return Err(Error::NotFinite(request.sampled));
+    }
+    request.sampled += 1;
+    request.left = if sampled.stops() { 0 } else { request.left - 1 };
+    request.position += 1;
+    let frames = transposed(&sampled.patch, feat_dim);
+    request.frames.extend_from_slice(&frames);
+    request.before = sampled.patch;
+    while request.frames.len() >= chunk {
+        let rest = request.frames.split_off(chunk);
+        let frames = mem::replace(&mut request.frames, rest);
+        decode(vae, slot, request, &frames)?;
+    }
+    Ok(Patch {
+        frames,
+        stop_logits: sampled.stop_logits,
+        last: request.left == 0,
+    })
+}
+
+/// `frames`, `[frames][feat_dim]`, through `vae`'s stream `slot` into `request`'s audio, the
+/// voice's frames' audio left out.
+fn decode(
+    vae: &mut VaeDecoder,
+    slot: usize,
+    request: &mut Request,
+    frames: &[f32],
+) -> Result<(), Error> {
     if frames.is_empty() {
         return Ok(());
     }
-    let audio = vae.push(0, frames)?;
+    let audio = vae.push(slot, frames)?;
     let voice = request.context.min(frames.len() / vae.shape().latent);
     request.context -= voice;
     request
         .audio
         .extend_from_slice(&audio[voice * vae.shape().hop()..]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_programs_are_the_powers_of_two_below_the_slots_and_the_slots() {
+        assert_eq!(program_rows(1), [1]);
+        assert_eq!(program_rows(2), [1, 2]);
+        assert_eq!(program_rows(12), [1, 2, 4, 8, 12]);
+        assert_eq!(program_rows(16), [1, 2, 4, 8, 16]);
+    }
 }
