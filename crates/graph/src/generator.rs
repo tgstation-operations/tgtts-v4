@@ -383,6 +383,12 @@ impl Generator {
         self.step.timings()
     }
 
+    /// The GPU time of the last run over the LMs' caches, as [`timings`](Self::timings) says
+    /// which, from before its first dispatch to after its last.
+    pub fn elapsed(&self) -> Result<Timing, Error> {
+        self.step.graph_step().elapsed()
+    }
+
     /// Each dispatch's label and GPU time in the audio VAE's last chunk, when recorded timed.
     pub fn audio_timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
         self.vae.timings()

@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --release -p graph --example generator_timing -- [--voice-patches 70]
-//!     [--patches 32] [--runs 3]
+//!     [--patches 32] [--runs 3] [--slots 1]
 //! ```
 //!
 //! `VOXCPM2_DIR` names the checkpoint, `VOICES_DIR` a voices directory, and `GLSL_KERNELS` and
@@ -13,6 +13,12 @@
 //! directory, its prompt timed whole and with its voice cut to its first `--voice-patches`
 //! patches. Each prompt is generated from once to warm up, then `--runs` times, each request
 //! `--patches` patches long.
+//!
+//! With `--slots` above 1, the generator holds that many requests at once, recorded untimed, and
+//! each number of them under way from one to its slots is timed instead: the prompt with its
+//! voice cut started that many times, each from a seed of its own, then their steps until they
+//! end, each from the call to its return on the host, with the patch step's GPU time and the
+//! chunks of audio decoded in it.
 
 use std::{path::PathBuf, time::Instant};
 
@@ -139,10 +145,82 @@ fn request(generator: &mut Generator, prompt: &Prompt, voice: &[f32], patches: u
     out
 }
 
+/// Each number of requests under way from one to `generator`'s slots, as the module's
+/// documentation says: `prompt` in `voice`, up to `patches` patches each.
+fn batched(generator: &mut Generator, prompt: &Prompt, voice: &[f32], patches: usize) {
+    let sampling = Sampling::default();
+    let positions = Positions {
+        tokens: &prompt.tokens,
+        patches: &prompt.patches,
+        audio: &prompt.audio,
+    };
+    let ms = |since: Instant| since.elapsed().as_secs_f64() * 1e3;
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    for under_way in 1..=generator.slots() {
+        let begun = Instant::now();
+        for slot in 0..under_way {
+            generator
+                .start(
+                    slot,
+                    positions,
+                    voice,
+                    patches,
+                    sampling.temperature,
+                    sampling.cfg_value,
+                )
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let started = ms(begun);
+        let mut noise: Vec<SeededNoise> = (0..under_way as u64).map(SeededNoise::new).collect();
+        let (mut host, mut quiet, mut gpu, mut chunks) = (vec![], vec![], vec![], 0);
+        loop {
+            let at = Instant::now();
+            let stepped = generator
+                .step(|slot| noise[slot].next(256))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let took = ms(at);
+            if stepped.is_empty() {
+                break;
+            }
+            let decoded = stepped
+                .iter()
+                .filter(|(slot, _)| !generator.take_audio(*slot).is_empty())
+                .count();
+            if stepped.len() == under_way {
+                host.push(took);
+                gpu.push(generator.elapsed().unwrap().nanoseconds / 1e6);
+                chunks += decoded;
+                if decoded == 0 {
+                    quiet.push(took);
+                }
+            }
+            for (slot, patch) in stepped {
+                if patch.unwrap_or_else(|e| panic!("{e}")).last {
+                    generator.finish(slot).unwrap_or_else(|e| panic!("{e}"));
+                }
+            }
+        }
+        let step = mean(&host);
+        println!(
+            "{under_way} under way: {} steps with all of them, each {step:.1} ms on the host, \
+             {:.1} without a chunk of audio, the patch step {:.1} ms on the GPU; {:.2} chunks a \
+             step; {:.1} steps and {:.1} patches a second; the prompts {:.0} ms each",
+            host.len(),
+            median(quiet),
+            median(gpu),
+            chunks as f64 / host.len().max(1) as f64,
+            1e3 / step,
+            under_way as f64 * 1e3 / step,
+            started / under_way as f64,
+        );
+    }
+}
+
 fn main() {
     let patches = arg("--patches", 32);
     let runs = arg("--runs", 3);
     let voice_patches = arg("--voice-patches", 70);
+    let slots = arg("--slots", 1);
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let voices = PathBuf::from(std::env::var_os("VOICES_DIR").expect("VOICES_DIR"));
     let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json")).unwrap())
@@ -175,10 +253,10 @@ fn main() {
         max_rows: longest.next_multiple_of(graph::prefill::TILE),
         timesteps: Sampling::default().timesteps,
         chunk_frames: Params::default().decode_chunk_frames.get(),
-        timed: true,
+        timed: slots == 1,
         prompt_cache_bytes: 0,
         subgroup: None,
-        slots: 1,
+        slots,
     };
     let loaded = Instant::now();
     let parameter = |name: &str| {
@@ -192,6 +270,10 @@ fn main() {
         "recorded and loaded in {:.1} s, {settings:?}",
         loaded.elapsed().as_secs_f64()
     );
+    if slots > 1 {
+        batched(&mut generator, &prompts[0], cut, patches);
+        return;
+    }
 
     for (prompt, voice) in prompts.iter().zip([cut, frames]) {
         request(&mut generator, prompt, voice, patches);
