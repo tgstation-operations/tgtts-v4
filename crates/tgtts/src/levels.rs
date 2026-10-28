@@ -199,8 +199,9 @@ impl Measure<'_> {
     /// A voice's lines are measured as the model says them, then once it has said them all,
     /// brought to the service's loudness by its level, as they stream, and put on the radio, at
     /// the medians of their peaks, as the radio streams; each line then goes to `log` as a line
-    /// of JSON: its loudness, and how far the streamed radio of it is from today's, in loudness
-    /// and in how hard it is driven.
+    /// of JSON: its loudness, how loud it streams, where the whole-file path brings each line to
+    /// the target, and how far the streamed radio of it is from today's, in loudness and in how
+    /// hard it is driven.
     ///
     /// # Errors
     ///
@@ -364,6 +365,7 @@ impl Measure<'_> {
                 "loudness_lufs": m.loudness,
                 "seconds": m.samples.len() as f64 / f64::from(dsp::RATE),
                 "patches": m.patches,
+                "streamed_lufs": pcm_lufs(pcm),
                 "radio_level_db": pcm_lufs(&out) - m.radio_lufs,
                 "radio_drive_db": 20.0 * (f64::from(peaks.narrowed) / radio.narrowed).log10(),
                 "radio_clipped": out.iter().filter(|&&s| s == i16::MAX || s <= -i16::MAX).count(),
@@ -539,6 +541,13 @@ mod tests {
             .collect();
         assert_eq!(median(&loudness), Some(loud.loudness_lufs));
         assert!(logged.iter().all(|line| line["radio_level_db"].is_f64()));
+        // Under the limiter, a line streams as loud as it is plus its voice's gain, so the
+        // median line at the target.
+        let streamed: Vec<f64> = (logged.iter())
+            .map(|line| line["streamed_lufs"].as_f64().unwrap())
+            .collect();
+        let streamed = median(&streamed).unwrap();
+        assert!((streamed + 16.0).abs() < 0.01, "{streamed} LUFS");
         let kept = crate::wav::read(&fs::read(keep.join("Loud.wav")).unwrap()).unwrap();
         assert_eq!(kept.frames(), 480 * synth::prepare(LINES[0]).unwrap().len());
 
