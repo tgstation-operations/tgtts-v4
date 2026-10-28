@@ -20,7 +20,7 @@ use vulkan::{DeviceReport, SpecValue};
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    decode::{self, LmConfig, Shape},
+    decode::{LmConfig, SUBGROUPS, Shape},
     graph::{Graph, Kind, Pipeline, TensorId},
     kernels::{Access, KernelInfo},
     step::Step,
@@ -197,11 +197,22 @@ impl Tuning {
         }
     }
 
-    /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for
-    /// that the device can require, [`fit`](Self::fit) to it.
+    /// [`for_subgroup`](Self::for_subgroup) at the narrowest subgroup the kernels are written
+    /// for that the device can require, [`fit`](Self::fit) to it. On the Radeon 8060S the
+    /// sampler's ten steps took 74 to 77 ms on the GPU for 16 requests at 32 and 97 to 99 at
+    /// 64, 32 and 36 ms for 4, and 21 to 23 for one at either.
     pub fn for_device(report: &DeviceReport) -> Result<Self, Error> {
-        let base = decode::Tuning::for_device(report)?;
-        Tuning::for_subgroup(base.subgroup).fit(report)
+        let subgroup = SUBGROUPS
+            .into_iter()
+            .rev()
+            .find(|&s| report.can_require_subgroup_size(s))
+            .ok_or_else(|| {
+                Error::Shape(format!(
+                    "{} requires subgroups of {} to {}, none of {SUBGROUPS:?}",
+                    report.name, report.min_subgroup_size, report.max_subgroup_size
+                ))
+            })?;
+        Tuning::for_subgroup(subgroup).fit(report)
     }
 
     /// This tuning staging fewer columns, down to 256, and then fewer tokens at once, until it
