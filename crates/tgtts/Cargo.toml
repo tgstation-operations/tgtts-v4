@@ -11,10 +11,9 @@ vulkan = ["burn/persistence", "dep:gpu", "gpu/vulkan"]
 # The model on an NVIDIA GPU through CUDA, likewise.
 cuda = ["burn/persistence", "dep:gpu", "gpu/cuda"]
 # The model on tts-rs's own runtime on a Vulkan GPU, rather than on burn.
-rt = ["dep:audiovae", "dep:graph", "dep:vulkan"]
+rt = ["dep:graph", "dep:vulkan"]
 
 [dependencies]
-audiovae = { path = "../audiovae", optional = true }
 axum = { workspace = true, features = ["http1", "query", "tokio"] }
 blake3.workspace = true
 burn = { workspace = true, features = ["flex"] }
