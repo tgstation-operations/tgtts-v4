@@ -1,7 +1,7 @@
-//! `tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR] [--seconds S]`: measures how loud each
-//! voice comes out of the model, as [`tgtts::levels`] has it, for the service's
-//! `voice_levels_file`, on the model the service loads from the TOML file `CONFIG` and the
-//! environment.
+//! `tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR] [--seconds S]`, or `tgtts-gains --report
+//! LEVELS`: measures how loud each voice comes out of the model, as [`tgtts::levels`] has it, for
+//! the service's `voice_levels_file`, on the model the service loads from the TOML file `CONFIG`
+//! and the environment.
 //!
 //! It reads the radio's clicks and static from the configuration's assets too, for the peaks the
 //! radio scales each voice's streamed speech by. Up to `N` lines are asked for at once, the
@@ -12,7 +12,8 @@
 //! on a stream of it is from today's. With `--keep DIR`, each voice's first line is kept there as
 //! 16-bit WAV, as the model said it. With `--seconds S` it asks for no more lines after S
 //! seconds, measures those it asked for, and shuts the model down, leaving the voices it did not
-//! finish to the next run.
+//! finish to the next run. With `--report` it loads no model, and prints what `LEVELS.lines` says,
+//! as [`tgtts::levels::report`] has it.
 
 use std::{
     env,
@@ -36,10 +37,14 @@ use voices::Voices;
 
 fn main() -> ExitCode {
     let usage = || {
-        eprintln!("usage: tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR] [--seconds S]");
+        eprintln!(
+            "usage: tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR] [--seconds S]\n       \
+             tgtts-gains --report LEVELS"
+        );
         ExitCode::from(2)
     };
     let (mut positional, mut requests, mut keep, mut until) = (Vec::new(), None, None, None);
+    let mut report = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,6 +56,7 @@ fn main() -> ExitCode {
                 Some(dir) => keep = Some(PathBuf::from(dir)),
                 None => return usage(),
             },
+            "--report" => report = true,
             "--seconds" => match args.next().and_then(|s| s.parse::<f64>().ok()) {
                 Some(s) if s >= 0.0 && s.is_finite() => {
                     until = Some(Instant::now() + Duration::from_secs_f64(s));
@@ -59,6 +65,26 @@ fn main() -> ExitCode {
             },
             _ => positional.push(PathBuf::from(arg)),
         }
+    }
+    if report {
+        let [levels] = &positional[..] else {
+            return usage();
+        };
+        let mut lines = levels.as_os_str().to_owned();
+        lines.push(".lines");
+        let reported = fs::read_to_string(&lines)
+            .map_err(|e| e.to_string())
+            .and_then(|log| levels::report(&log).map_err(|e| e.to_string()));
+        return match reported {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("tgtts-gains: {}: {e}", PathBuf::from(lines).display());
+                ExitCode::FAILURE
+            }
+        };
     }
     let [config, levels] = &positional[..] else {
         return usage();

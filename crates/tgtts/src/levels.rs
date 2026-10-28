@@ -168,6 +168,71 @@ pub fn median(values: &[f64]) -> Option<f64> {
     }
 }
 
+/// The `q`th quantile of `values`, interpolated linearly between the two nearest of them in order,
+/// as numpy's `quantile` has it by default, or none of none.
+pub fn quantile(values: &[f64], q: f64) -> Option<f64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let last = sorted.len().checked_sub(1)?;
+    let at = q.clamp(0.0, 1.0) * last as f64;
+    let (below, above) = (at.floor() as usize, at.ceil() as usize);
+    Some(sorted[below] + (sorted[above] - sorted[below]) * (at - below as f64))
+}
+
+/// What the lines [`Measure::run`] logs say, for reading: of each measure, its median, its 10th
+/// and 90th percentiles, and its least and most, over the lines that have it.
+///
+/// # Errors
+///
+/// If a line is not JSON.
+pub fn report(log: &str) -> Result<String, serde_json::Error> {
+    let lines: Vec<serde_json::Value> = (log.lines())
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let of = |field: &str| -> Vec<f64> {
+        lines
+            .iter()
+            .filter_map(|line| line[field].as_f64())
+            .collect()
+    };
+    let mut report = String::new();
+    for (field, what) in [
+        ("loudness_lufs", "the model's loudness, LUFS"),
+        ("streamed_lufs", "the speech as it streams, LUFS"),
+        (
+            "radio_level_db",
+            "the streamed radio's loudness less today's, dB",
+        ),
+        (
+            "radio_drive_db",
+            "the streamed radio's drive less today's, dB",
+        ),
+        ("seconds", "the model's speech, seconds"),
+        ("patches", "its patches"),
+    ] {
+        let values = of(field);
+        let at = |q: f64| quantile(&values, q).map_or("-".to_owned(), |v| format!("{v:.2}"));
+        report += &format!(
+            "{what} over {} lines: median {}, p10 {}, p90 {}, min {}, max {}\n",
+            values.len(),
+            at(0.5),
+            at(0.1),
+            at(0.9),
+            at(0.0),
+            at(1.0)
+        );
+    }
+    let clipped = of("radio_clipped");
+    let most = clipped.iter().copied().fold(0.0, f64::max);
+    report += &format!(
+        "streamed radio lines with a clipped sample: {} of {}, at most {most} samples\n",
+        clipped.iter().filter(|&&n| n > 0.0).count(),
+        clipped.len()
+    );
+    Ok(report)
+}
+
 /// A line measured: the model's samples and their loudness with the silence after them, or none
 /// for silence; and the loudness of today's radio of it, as the whole-file path makes it.
 struct Measured {
@@ -579,6 +644,35 @@ mod tests {
             .unwrap();
         assert_eq!(tone.asked.load(Ordering::SeqCst), 2 * LINES.len());
         assert_eq!(resumed, levels);
+    }
+
+    /// The quantiles of a known distribution, 1 to 101 dB down in steps of 1 dB and out of
+    /// order, with as many digits as text sorts apart from numbers.
+    #[test]
+    fn reports_the_quantiles_of_the_lines() {
+        assert_eq!(quantile(&[], 0.5), None);
+        assert_eq!(quantile(&[3.0, 1.0, 2.0, 4.0], 0.5), Some(2.5));
+        assert_eq!(quantile(&[3.0, 1.0, 2.0, 4.0], 0.1), Some(1.3));
+        let log: String = (0..101)
+            .map(|i| (i * 37) % 101 + 1)
+            .map(|db| {
+                let line = serde_json::json!({
+                    "loudness_lufs": -f64::from(db),
+                    "radio_clipped": usize::from(db % 25 == 0) * 7,
+                });
+                format!("{line}\n")
+            })
+            .collect();
+        let report = report(&log).unwrap();
+        let first = report.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "the model's loudness, LUFS over 101 lines: median -51.00, p10 -91.00, p90 -11.00, \
+             min -101.00, max -1.00"
+        );
+        assert!(report.contains("the model's speech, seconds over 0 lines: median -,"));
+        assert!(report.ends_with("a clipped sample: 4 of 101, at most 7 samples\n"));
+        assert!(super::report("not JSON").is_err());
     }
 
     #[test]
