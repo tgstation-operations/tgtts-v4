@@ -20,6 +20,10 @@ const WIDTH: u32 = 0;
 const A: u32 = 1;
 const B: u32 = 2;
 
+/// Workgroup memory of 16 floats, a flag, and 2 `rows` (SpecId 1) vec4s (source and build
+/// command in `kernels/shared.spvasm`).
+const SHARED: &[u8] = include_bytes!("kernels/shared.spv");
+
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     if !ctx.validating() {
@@ -347,6 +351,31 @@ fn a_subgroup_size_the_device_cannot_require_is_refused() {
             "size {size}"
         );
     }
+    assert_no_validation_messages(&ctx);
+}
+
+#[test]
+fn workgroup_memory_past_the_devices_is_refused_before_the_driver_sees_it() {
+    let ctx = context();
+    let max = u64::from(ctx.report().max_shared_memory);
+    // 80 bytes of floats, the flag and padding, before the tiles.
+    let rows = |bytes: u64| (bytes - 80) / 32;
+    let kernel = |rows: u64| {
+        let constants = [(1, SpecValue::U32(rows as u32))];
+        let desc = KernelDesc {
+            constants: &constants,
+            ..KernelDesc::default()
+        };
+        ctx.kernel(SHARED, &desc)
+    };
+    let fits = kernel(rows(max)).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(fits.workgroup_memory(), 80 + 32 * rows(max));
+    drop(fits);
+    let past = kernel(rows(max) + 1);
+    assert!(
+        matches!(&past, Err(Error::Unsupported(why)) if why.contains("workgroup memory")),
+        "{past:?}"
+    );
     assert_no_validation_messages(&ctx);
 }
 

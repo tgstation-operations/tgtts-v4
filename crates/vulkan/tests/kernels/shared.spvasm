@@ -1,0 +1,68 @@
+; shared: workgroup memory sized by specialization constants, which a pipeline must not take
+; past the device's limit. It holds `len` floats (SpecId 0), a flag, and 2 rows (SpecId 1)
+; vec4 tiles when `wide` (SpecId 2) and one otherwise: the lengths come through
+; OpSpecConstantOp as glslang's do. One invocation writes each of them once, so that each is
+; one the entry point uses; the kernel computes nothing else.
+;
+; Assembled and validated, from crates/vulkan, with
+;   spirv-as --target-env vulkan1.3 tests/kernels/shared.spvasm -o tests/kernels/shared.spv
+;   spirv-val --target-env vulkan1.3 tests/kernels/shared.spv
+; and `nix run .#device-tests` checks that the committed blob is what this file assembles to.
+
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %partial %flag %tiles
+               OpExecutionMode %main LocalSize 1 1 1
+
+               OpName %main "main"
+               OpName %partial "partial"
+               OpName %flag "flag"
+               OpName %tiles "tiles"
+               OpName %len "len"
+               OpName %rows "rows"
+               OpName %wide "wide"
+
+               OpDecorate %len SpecId 0
+               OpDecorate %rows SpecId 1
+               OpDecorate %wide SpecId 2
+
+       %void = OpTypeVoid
+    %void_fn = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+      %float = OpTypeFloat 32
+     %float4 = OpTypeVector %float 4
+
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+    %float_1 = OpConstant %float 1
+   %float4_1 = OpConstantComposite %float4 %float_1 %float_1 %float_1 %float_1
+       %true = OpConstantTrue %bool
+        %len = OpSpecConstant %uint 16
+       %rows = OpSpecConstant %uint 8
+       %wide = OpSpecConstantTrue %bool
+  %all_tiles = OpSpecConstantOp %uint IMul %rows %uint_2
+      %count = OpSpecConstantOp %uint Select %wide %all_tiles %uint_1
+
+     %floats = OpTypeArray %float %len
+    %float4s = OpTypeArray %float4 %count
+ %floats_ptr = OpTypePointer Workgroup %floats
+%float4s_ptr = OpTypePointer Workgroup %float4s
+   %bool_ptr = OpTypePointer Workgroup %bool
+  %float_ptr = OpTypePointer Workgroup %float
+ %float4_ptr = OpTypePointer Workgroup %float4
+
+    %partial = OpVariable %floats_ptr Workgroup
+       %flag = OpVariable %bool_ptr Workgroup
+      %tiles = OpVariable %float4s_ptr Workgroup
+
+       %main = OpFunction %void None %void_fn
+      %entry = OpLabel
+      %first = OpAccessChain %float_ptr %partial %uint_0
+               OpStore %first %float_1
+               OpStore %flag %true
+       %tile = OpAccessChain %float4_ptr %tiles %uint_0
+               OpStore %tile %float4_1
+               OpReturn
+               OpFunctionEnd

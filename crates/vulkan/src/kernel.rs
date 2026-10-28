@@ -1,5 +1,6 @@
 //! A compute pipeline from a SPIR-V blob: its storage-buffer bindings, its
-//! specialization constants, and the subgroup size it is compiled for.
+//! specialization constants, and the subgroup size it is compiled for. One whose workgroup
+//! memory would pass the device's limit is refused before the driver sees it.
 //!
 //! The subgroup size is the caller's to state. Left unstated, RADV picks one per shader (wave64, or
 //! wave32 for a workgroup of 32 or fewer invocations when the module is SPIR-V 1.6), and a kernel
@@ -78,6 +79,19 @@ pub fn required_subgroup_size_allowed(
         && (range.0..=range.1).contains(&size)
 }
 
+/// The bytes of workgroup memory the entry point of the module `words` takes specialized as
+/// `desc` says ([`spirv::workgroup_memory`]), refused past `max`, the device's
+/// `maxComputeSharedMemorySize`.
+pub fn checked_workgroup_memory(words: &[u32], desc: &KernelDesc<'_>, max: u32) -> Result<u64> {
+    let bytes = spirv::workgroup_memory(words, desc.entry, desc.constants)?;
+    if bytes > u64::from(max) {
+        return Err(Error::Unsupported(format!(
+            "{bytes} bytes of workgroup memory, past the {max} a workgroup has"
+        )));
+    }
+    Ok(bytes)
+}
+
 /// How to build a [`Kernel`] from a SPIR-V module.
 #[derive(Clone, Debug)]
 pub struct KernelDesc<'a> {
@@ -115,6 +129,7 @@ pub struct Kernel {
     pub(crate) set_layout: vk::DescriptorSetLayout,
     pub(crate) storage_buffers: u32,
     subgroup_size: Option<u32>,
+    workgroup_memory: u64,
     spirv: spirv::Header,
 }
 
@@ -123,6 +138,7 @@ impl std::fmt::Debug for Kernel {
         f.debug_struct("Kernel")
             .field("storage_buffers", &self.storage_buffers)
             .field("subgroup_size", &self.subgroup_size)
+            .field("workgroup_memory", &self.workgroup_memory)
             .field("spirv", &self.spirv)
             .finish_non_exhaustive()
     }
@@ -142,6 +158,7 @@ impl Kernel {
             )));
         }
         let (words, header) = spirv::words(spirv)?;
+        let workgroup_memory = checked_workgroup_memory(&words, desc, report.max_shared_memory)?;
         let (entries, data) = pack_specialization(desc.constants)?;
         let device = &ctx.device;
 
@@ -154,6 +171,7 @@ impl Kernel {
             set_layout: vk::DescriptorSetLayout::null(),
             storage_buffers: desc.storage_buffers,
             subgroup_size: desc.subgroup_size,
+            workgroup_memory,
             spirv: header,
         };
         let bindings: Vec<_> = (0..desc.storage_buffers)
@@ -230,6 +248,11 @@ impl Kernel {
     /// The subgroup size the pipeline was required to run at, if any.
     pub fn subgroup_size(&self) -> Option<u32> {
         self.subgroup_size
+    }
+
+    /// The bytes of workgroup memory the pipeline takes, at most ([`spirv::workgroup_memory`]).
+    pub fn workgroup_memory(&self) -> u64 {
+        self.workgroup_memory
     }
 
     /// The module's SPIR-V header.
@@ -341,6 +364,36 @@ impl Drop for Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workgroup_memory_past_the_devices_is_refused() {
+        let words = spirv::words(include_bytes!("../tests/kernels/shared.spv"))
+            .unwrap()
+            .0;
+        let desc = |constants| KernelDesc {
+            constants,
+            ..KernelDesc::default()
+        };
+        // 16 floats and a flag, then 2 rows vec4 tiles: 336 bytes at 8 rows.
+        assert_eq!(
+            checked_workgroup_memory(&words, &desc(&[]), 336).unwrap(),
+            336
+        );
+        assert!(matches!(
+            checked_workgroup_memory(&words, &desc(&[]), 335),
+            Err(Error::Unsupported(why)) if why.contains("workgroup memory")
+        ));
+        let past = [(1, SpecValue::U32(2048))];
+        assert!(matches!(
+            checked_workgroup_memory(&words, &desc(&past), 65536),
+            Err(Error::Unsupported(_))
+        ));
+        let fits = [(1, SpecValue::U32(2043))];
+        assert_eq!(
+            checked_workgroup_memory(&words, &desc(&fits), 65536).unwrap(),
+            80 + 4086 * 16
+        );
+    }
 
     #[test]
     fn constants_pack_back_to_back_in_the_order_given() {

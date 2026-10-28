@@ -14,7 +14,8 @@
 //!   to write or read in place ([`memory`] says which memory and why); [`Context::buffer`] is
 //!   the mapped kind the host writes.
 //! - [`Context::kernel`] builds a compute pipeline from a SPIR-V blob with an explicit subgroup
-//!   size and specialization constants ([`kernel`]).
+//!   size and specialization constants ([`kernel`]), refusing one whose workgroup memory would
+//!   pass the device's limit ([`spirv::workgroup_memory`]).
 //! - [`Context::dispatch`] runs it, waits, and returns the GPU time from timestamps.
 //! - [`Context::record`] records a chain of dispatches with the barriers between them into one
 //!   command buffer, which [`Recording::submit`] runs as often as needed ([`recording`]), timing
