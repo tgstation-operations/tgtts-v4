@@ -67,7 +67,7 @@ use voxcpm_core::{Dtype, Dtypes};
 
 use crate::{
     device::{self, Kind},
-    model,
+    load,
     service::{Loudness, parse_level},
 };
 
@@ -127,7 +127,7 @@ pub struct Config {
     pub step_graphs: bool,
     pub prefill_positions: usize,
     pub prefill_graphs: Vec<(usize, usize)>,
-    pub prefill_batch: usize,
+    pub prefill_batch: Option<usize>,
     pub prompt_cache_bytes: usize,
     pub cpu_limit: usize,
     pub queue_timeout: Duration,
@@ -229,19 +229,17 @@ impl Config {
             step_graphs: settings.parse("step_graphs")?.unwrap_or(true),
             prefill_positions: settings
                 .limit("prefill_positions")?
-                .unwrap_or(model::PREFILL_POSITIONS),
+                .unwrap_or(load::PREFILL_POSITIONS),
             prefill_graphs: match settings.0.get("prefill_graphs") {
                 Some(value) => parse_runs(value).ok_or_else(|| {
                     Error(format!("prefill_graphs: {value:?} is not rows x runs"))
                 })?,
-                None => model::PREFILL_GRAPHS.to_vec(),
+                None => load::PREFILL_GRAPHS.to_vec(),
             },
-            prefill_batch: settings
-                .limit("prefill_batch")?
-                .unwrap_or(voxcpm::PREFILL_BATCH),
+            prefill_batch: settings.limit("prefill_batch")?,
             prompt_cache_bytes: settings
                 .parse("prompt_cache_bytes")?
-                .unwrap_or(model::PROMPT_CACHE_BYTES),
+                .unwrap_or(load::PROMPT_CACHE_BYTES),
             cpu_limit: settings.limit("cpu_limit")?.unwrap_or(cpus),
             queue_timeout: settings
                 .seconds("queue_timeout_seconds")?
@@ -412,8 +410,8 @@ mod tests {
                 batch_window: Duration::from_millis(100),
                 step_graphs: true,
                 prefill_positions: 128,
-                prefill_graphs: model::PREFILL_GRAPHS.to_vec(),
-                prefill_batch: 4096,
+                prefill_graphs: load::PREFILL_GRAPHS.to_vec(),
+                prefill_batch: None,
                 prompt_cache_bytes: 1 << 29,
                 cpu_limit: cpus,
                 queue_timeout: Duration::from_secs(5),
@@ -484,7 +482,7 @@ mod tests {
         assert_eq!(config.prefill_positions, 512);
         assert_eq!(
             (config.prefill_batch, config.prompt_cache_bytes),
-            (2048, 1 << 29)
+            (Some(2048), 1 << 29)
         );
         assert_eq!(config.prefill_graphs, [(1, 64), (4, 32)]);
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));

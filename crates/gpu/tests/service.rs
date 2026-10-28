@@ -13,7 +13,8 @@ use std::{
 use service::real;
 use tgtts::{
     device::Kind,
-    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES, VoxCpm},
+    load::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES},
+    model::VoxCpm,
     synth::Synthesizer,
 };
 use voices::Voices;
@@ -67,9 +68,8 @@ fn holds_the_memory_it_warmed_up_with(graphs: bool) {
                 tgtts::config::parse_runs(&runs).unwrap()
             }),
         prefill_batch: std::env::var("TGTTS_PREFILL_BATCH")
-            .map_or(voxcpm::PREFILL_BATCH, |positions| {
-                positions.parse().unwrap()
-            }),
+            .ok()
+            .map(|positions| positions.parse().unwrap()),
         prompt_cache_bytes: std::env::var("TGTTS_PROMPT_CACHE_BYTES")
             .map_or(PROMPT_CACHE_BYTES, |bytes| bytes.parse().unwrap()),
     };

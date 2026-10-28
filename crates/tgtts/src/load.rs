@@ -3,7 +3,11 @@
 
 #[cfg(feature = "rt")]
 use std::path::PathBuf;
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{
+    error::Error,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use burn::tensor::Device;
 use tracing::info;
@@ -13,9 +17,46 @@ use voxcpm::Params;
 use crate::{
     config::Config,
     device::{self, Opened},
-    model::{Batching, VoxCpm},
+    model::VoxCpm,
     synth::Synthesizer,
 };
+
+/// The bytes on the device the prompt cache keeps of the voices unless the configuration says
+/// otherwise: on a GPU in f16 a median voice takes about 11 MB, so about 45 of them. On real
+/// rounds twice as much made no difference to how long requests took.
+pub const PROMPT_CACHE_BYTES: usize = 1 << 29;
+
+/// The positions of waiting prompts run between two patches while other requests generate,
+/// unless the configuration says otherwise, past which only the first runs.
+pub const PREFILL_POSITIONS: usize = 128;
+
+/// The runs of prompts joining together replayed from graphs unless the configuration says
+/// otherwise, as rows and positions run: on real rounds nine in ten of those that join between
+/// two patches are one prompt, of 100 to 600 positions. Each graph holds pages of the GPU's
+/// memory of its own, and graphs of two prompts too took the service past 15 GB of a 16 GB card.
+pub const PREFILL_GRAPHS: [(usize, usize); 2] = [(1, 256), (1, 512)];
+
+/// How requests are batched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Batching {
+    /// How long the first request to an idle model waits for others to start with it.
+    pub window: Duration,
+    /// The most requests at once, which stop the wait.
+    pub requests: usize,
+    /// Whether a batch steps by replaying graphs of its step where the device records them.
+    pub graphs: bool,
+    /// The positions of prompts run between two patches while other requests generate.
+    pub prefill_positions: usize,
+    /// The most positions of prompts run together, rows and longest rounded up to powers of
+    /// two: voxcpm's own `PREFILL_BATCH` where it is `None`, which a build without burn cannot
+    /// name.
+    pub prefill_batch: Option<usize>,
+    /// The bytes on the device the prompt cache keeps of the voices.
+    pub prompt_cache_bytes: usize,
+    /// The rows and positions run of the runs of prompts that join together replayed from
+    /// graphs, where the step is.
+    pub prefill_graphs: Vec<(usize, usize)>,
+}
 
 /// VoxCPM2 as `config` asks for it, on the device it opened, `device`, warmed up.
 ///

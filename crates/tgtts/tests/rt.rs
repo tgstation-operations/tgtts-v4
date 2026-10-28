@@ -28,7 +28,8 @@ use common::real;
 use serde::{Deserialize, Serialize};
 use tgtts::{
     device::Kind,
-    model::{PROMPT_CACHE_BYTES, VoxCpm},
+    load::PROMPT_CACHE_BYTES,
+    model::VoxCpm,
     rt::Rt,
     synth::{Speech, Synthesizer},
 };

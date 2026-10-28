@@ -12,7 +12,7 @@ use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
     levels::Levels,
-    model::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES},
+    load::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES},
     service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::Synthesizer,
     wav,
@@ -45,7 +45,7 @@ pub fn batching() -> Batching {
         graphs: true,
         prefill_positions: PREFILL_POSITIONS,
         prefill_graphs: PREFILL_GRAPHS.to_vec(),
-        prefill_batch: voxcpm::PREFILL_BATCH,
+        prefill_batch: None,
         prompt_cache_bytes: PROMPT_CACHE_BYTES,
     }
 }

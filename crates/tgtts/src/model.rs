@@ -24,6 +24,7 @@ use voxcpm_core::Dtypes;
 
 use crate::{
     device,
+    load::Batching,
     synth::{self, Speech, Start, Synthesizer},
 };
 
@@ -35,42 +36,6 @@ const WARM_UP_LINE: &str = "Hello there, could someone please come to medbay? I 
 /// KV length goes past that power of two, where a GPU takes other kernels, and on to the
 /// alignments past it.
 const WARM_UP_PATCHES: usize = 9;
-
-/// The bytes on the device the prompt cache keeps of the voices unless the configuration says
-/// otherwise: on a GPU in f16 a median voice takes about 11 MB, so about 45 of them. On real
-/// rounds twice as much made no difference to how long requests took.
-pub const PROMPT_CACHE_BYTES: usize = 1 << 29;
-
-/// The positions of waiting prompts run between two patches while other requests generate,
-/// unless the configuration says otherwise, past which only the first runs.
-pub const PREFILL_POSITIONS: usize = 128;
-
-/// The runs of prompts joining together replayed from graphs unless the configuration says
-/// otherwise, as rows and positions run: on real rounds nine in ten of those that join between
-/// two patches are one prompt, of 100 to 600 positions. Each graph holds pages of the GPU's
-/// memory of its own, and graphs of two prompts too took the service past 15 GB of a 16 GB card.
-pub const PREFILL_GRAPHS: [(usize, usize); 2] = [(1, 256), (1, 512)];
-
-/// How requests are batched.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Batching {
-    /// How long the first request to an idle model waits for others to start with it.
-    pub window: Duration,
-    /// The most requests at once, which stop the wait.
-    pub requests: usize,
-    /// Whether a batch steps by replaying graphs of its step where the device records them.
-    pub graphs: bool,
-    /// The positions of prompts run between two patches while other requests generate.
-    pub prefill_positions: usize,
-    /// The most positions of prompts run together, rows and longest rounded up to powers of
-    /// two.
-    pub prefill_batch: usize,
-    /// The bytes on the device the prompt cache keeps of the voices.
-    pub prompt_cache_bytes: usize,
-    /// The rows and positions run of the runs of prompts that join together replayed from
-    /// graphs, where the step is.
-    pub prefill_graphs: Vec<(usize, usize)>,
-}
 
 /// VoxCPM2, synthesizing with the same parameters for every request: the requests generate
 /// together, in a batch a thread of its own runs, which loads the model and decodes their
@@ -167,7 +132,7 @@ impl VoxCpm {
                     params: model_params,
                     device: on,
                     prefill_positions: batching.prefill_positions,
-                    prefill_batch: batching.prefill_batch,
+                    prefill_batch: batching.prefill_batch.unwrap_or(voxcpm::PREFILL_BATCH),
                     prompt_cache_bytes: batching.prompt_cache_bytes,
                 };
                 generate(&generating, &model_batching, &received);
@@ -695,6 +660,7 @@ mod tests {
     use voxcpm_core::Dtype;
 
     use super::*;
+    use crate::load::{PREFILL_POSITIONS, PROMPT_CACHE_BYTES};
 
     /// voxcpm's tiny config, at `rate`, as the checkpoint `dir` holds it, with nothing else.
     fn checkpoint(dir: &Path, rate: u32) {
@@ -718,7 +684,7 @@ mod tests {
             graphs: true,
             prefill_positions: PREFILL_POSITIONS,
             prefill_graphs: vec![],
-            prefill_batch: voxcpm::PREFILL_BATCH,
+            prefill_batch: None,
             prompt_cache_bytes: PROMPT_CACHE_BYTES,
         };
         VoxCpm::load(dir, &dtypes, &Device::flex(), Params::default(), batching).unwrap_err()
