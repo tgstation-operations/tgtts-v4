@@ -9,12 +9,12 @@
 
 use std::{collections::VecDeque, fs, time::Instant};
 
-use audiovae::Weights;
 use graph::{
     generator::{Generator, Settings},
     kernels::Kernels,
     prefill::TILE,
     prompt::Prompt as Positions,
+    pth::Pth,
 };
 use testkit::checkpoint_dir;
 use voices::Voices;
@@ -111,7 +111,7 @@ fn prompts() -> Vec<(Prompt, Vec<f32>)> {
 fn generator(prompts: &[(Prompt, Vec<f32>)]) -> (Context, Generator) {
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let weights = Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap();
+    let weights = Pth::open(checkpoint_dir().join("audiovae.pth")).unwrap();
     let most = REQUESTS.iter().map(|r| r.max_patches).max().unwrap();
     let longest = prompts.iter().map(|(p, _)| p.len()).max().unwrap();
     let settings = Settings {
@@ -125,11 +125,7 @@ fn generator(prompts: &[(Prompt, Vec<f32>)]) -> (Context, Generator) {
         slots: SLOTS,
     };
     let start = Instant::now();
-    let parameter = |name: &str| {
-        weights
-            .floats(&format!("decoder.{name}"))
-            .map_err(|e| graph::Error::Checkpoint(e.to_string()))
-    };
+    let parameter = |name: &str| weights.floats(&format!("decoder.{name}"));
     let generator = Generator::new(&ctx, &mut kernels, &checkpoint_dir(), &settings, parameter)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(

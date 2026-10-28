@@ -625,8 +625,8 @@ impl VaeDecoder {
     }
 
     /// Writes the weights, `parameter` giving each by its name under the decoder (upstream's
-    /// state_dict names less `decoder.`), weight norm folded, as the `audiovae` crate's
-    /// `Weights::floats` gives them.
+    /// state_dict names less `decoder.`), weight norm folded, as
+    /// [`Pth::floats`](crate::pth::Pth::floats) gives them.
     pub fn load(
         &mut self,
         mut parameter: impl FnMut(&str) -> Result<Parameter, Error>,

@@ -10,10 +10,10 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
-use audiovae::Weights;
 use graph::{
     graph::Kind,
     kernels::Kernels,
+    pth::Pth,
     vae::{VaeConfig, VaeDecoder, VaeShape, vae_graph},
 };
 use voices::Voices;
@@ -45,7 +45,7 @@ fn main() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let config: VaeConfig = serde_json::from_value(json["audio_vae_config"].clone()).unwrap();
     let shape = VaeShape::new(&config, chunk, 1).unwrap_or_else(|e| panic!("{e}"));
-    let weights = Weights::open(dir.join("audiovae.pth")).unwrap_or_else(|e| panic!("{e}"));
+    let weights = Pth::open(dir.join("audiovae.pth")).unwrap_or_else(|e| panic!("{e}"));
     let voices = Voices::open(std::env::var_os("VOICES_DIR").expect("VOICES_DIR"))
         .unwrap_or_else(|e| panic!("{e}"));
     let voice = voices.names().next().expect("a voice").to_owned();
@@ -74,11 +74,7 @@ fn main() {
         let mut decoder =
             VaeDecoder::new(&ctx, &mut kernels, &shape, timed).unwrap_or_else(|e| panic!("{e}"));
         decoder
-            .load(|name| {
-                weights
-                    .floats(&format!("decoder.{name}"))
-                    .map_err(|e| graph::Error::Checkpoint(e.to_string()))
-            })
+            .load(|name| weights.floats(&format!("decoder.{name}")))
             .unwrap_or_else(|e| panic!("{e}"));
         eprintln!(
             "{} recording: {} dispatches, {} barriers, arena {} KiB; built and loaded in {:.1} s",

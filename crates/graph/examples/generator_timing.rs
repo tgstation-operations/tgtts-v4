@@ -26,6 +26,7 @@ use graph::{
     generator::{Generator, Settings},
     kernels::Kernels,
     prompt::Prompt as Positions,
+    pth::Pth,
 };
 use voices::Latent;
 use voxcpm::{Config, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer};
@@ -247,7 +248,7 @@ fn main() {
         tokens.len(),
     );
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let weights = audiovae::Weights::open(dir.join("audiovae.pth")).unwrap();
+    let weights = Pth::open(dir.join("audiovae.pth")).unwrap();
     let settings = Settings {
         capacity: (longest + patches).next_multiple_of(32),
         max_rows: longest.next_multiple_of(graph::prefill::TILE),
@@ -259,11 +260,7 @@ fn main() {
         slots,
     };
     let loaded = Instant::now();
-    let parameter = |name: &str| {
-        weights
-            .floats(&format!("decoder.{name}"))
-            .map_err(|e| graph::Error::Checkpoint(e.to_string()))
-    };
+    let parameter = |name: &str| weights.floats(&format!("decoder.{name}"));
     let mut generator = Generator::new(&ctx, &mut kernels, &dir, &settings, parameter)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(

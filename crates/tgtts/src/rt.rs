@@ -29,6 +29,7 @@ use dsp::RATE;
 use graph::{
     generator::{Generator, Settings},
     kernels::Kernels,
+    pth::Pth,
 };
 use tracing::{debug, error, info};
 use voices::{Latent, Voices};
@@ -338,12 +339,8 @@ impl Rt {
             let report = ctx.report();
             info!(gpu = %report.name, driver = %report.driver_info, "opened the GPU");
             let mut kernels = Kernels::new(&ctx, glsl_kernels).with_mlir(mlir_kernels);
-            let weights = audiovae::Weights::open(dir.join("audiovae.pth"))?;
-            let parameter = |name: &str| {
-                weights
-                    .floats(&format!("decoder.{name}"))
-                    .map_err(|e| graph::Error::Checkpoint(e.to_string()))
-            };
+            let weights = Pth::open(dir.join("audiovae.pth"))?;
+            let parameter = |name: &str| weights.floats(&format!("decoder.{name}"));
             let generator = Generator::new(&ctx, &mut kernels, &dir, &settings, parameter)?;
             Ok(Box::new(Generating {
                 ctx,

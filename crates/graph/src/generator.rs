@@ -127,7 +127,7 @@ impl Generator {
     /// Records the generator `settings` describe for the checkpoint in `dir`, its kernels cut as
     /// the device suits, and loads the weights: the model's from its `model.safetensors`, the
     /// audio VAE decoder's as `parameter` gives each by its name under the decoder, weight norm
-    /// folded, as the `audiovae` crate's `Weights::floats` reads them from its `audiovae.pth`.
+    /// folded, as [`Pth::floats`](crate::pth::Pth::floats) reads them from its `audiovae.pth`.
     pub fn new(
         ctx: &Context,
         kernels: &mut Kernels,

@@ -14,6 +14,7 @@ use audiovae::{AudioVaeConfig, Decoder, Weights};
 use burn::tensor::{FloatDType, Tensor, TensorData};
 use graph::{
     kernels::Kernels,
+    pth::Pth,
     vae::{VaeConfig, VaeDecoder, VaeShape},
 };
 use testkit::{checkpoint_dir, device, kept, oracle_dir};
@@ -106,13 +107,10 @@ fn gpu(ctx: &Context, chunk: usize, streams: usize, timed: bool) -> VaeDecoder {
     let shape = VaeShape::new(&config, chunk, streams).unwrap_or_else(|e| panic!("{e}"));
     let mut decoder =
         VaeDecoder::new(ctx, &mut kernels, &shape, timed).unwrap_or_else(|e| panic!("{e}"));
-    let weights = weights();
+    let weights =
+        Pth::open(checkpoint_dir().join("audiovae.pth")).unwrap_or_else(|e| panic!("{e}"));
     decoder
-        .load(|name| {
-            weights
-                .floats(&format!("decoder.{name}"))
-                .map_err(|e| graph::Error::Checkpoint(e.to_string()))
-        })
+        .load(|name| weights.floats(&format!("decoder.{name}")))
         .unwrap_or_else(|e| panic!("{e}"));
     let step = decoder.graph_step();
     eprintln!(

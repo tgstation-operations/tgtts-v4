@@ -62,6 +62,7 @@ use graph::{
     patch::{PatchStep, patch_graph},
     prefill::TILE,
     prompt::Prompter,
+    pth::Pth,
 };
 use half::f16;
 use serde::{Deserialize, Serialize};
@@ -804,7 +805,7 @@ fn cpu_speech(decoder: &audiovae::Decoder, voice: &[f32], patches: &[Vec<f32>]) 
 /// The generator for the checkpoint, as the service would run it, with caches for `capacity`
 /// positions, its kernels at `subgroup`.
 fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize, subgroup: u32) -> Generator {
-    let weights = Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap();
+    let weights = Pth::open(checkpoint_dir().join("audiovae.pth")).unwrap();
     let settings = Settings {
         capacity,
         max_rows: 2 * TILE,
@@ -816,12 +817,7 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize, subgroup: u3
         slots: 1,
     };
     let start = Instant::now();
-    let parameter = |name: &str| {
-        let name = format!("decoder.{name}");
-        weights
-            .floats(&name)
-            .map_err(|e| graph::Error::Checkpoint(e.to_string()))
-    };
+    let parameter = |name: &str| weights.floats(&format!("decoder.{name}"));
     let generator = Generator::new(ctx, kernels, &checkpoint_dir(), &settings, parameter)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
