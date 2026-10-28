@@ -6,6 +6,7 @@ pub mod device;
 pub mod ffmpeg;
 pub mod handoff;
 pub mod levels;
+pub mod load;
 pub mod metrics;
 pub mod model;
 pub mod ogg;

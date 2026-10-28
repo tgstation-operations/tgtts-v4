@@ -1,22 +1,17 @@
 //! `tgtts [CONFIG]`: serves the game's TTS routes, configured by the TOML file `CONFIG` and the
 //! environment, as the `config` module describes.
 
-use std::{
-    env, error::Error, future::IntoFuture, path::PathBuf, process::ExitCode, sync::Arc, thread,
-    time::Instant,
-};
+use std::{env, error::Error, future::IntoFuture, path::PathBuf, process::ExitCode, thread};
 
-use burn::tensor::Device;
 use tgtts::{
     cache::Cache,
     config::{self, Config},
     device,
     ffmpeg::Ffmpeg,
     levels::Levels,
+    load,
     metrics::Metrics,
-    model::{Batching, VoxCpm},
     service::{self, Limits, Logging, Service, Setup, Sounds},
-    synth::Synthesizer,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -25,7 +20,6 @@ use tokio::{
 use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 use voices::Voices;
-use voxcpm::Params;
 
 /// How many metrics rows may wait to be written before more are dropped.
 const METRICS_QUEUE: usize = 1024;
@@ -116,11 +110,7 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         // A thread of its own, which shutting down does not wait for as it would for the
         // runtime's blocking pool.
         thread::spawn(move || {
-            let model = match &device {
-                device::Opened::Burn(device) => load(&config, device),
-                #[cfg(feature = "rt")]
-                device::Opened::Rt => load_rt(&config),
-            };
+            let model = load::synthesizer(&config, &device);
             let _ = loaded.send(model.map(|model| ready.ready(model)));
         });
         let serve = axum::serve(listener, service::router(service))
@@ -134,69 +124,6 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         serve.await?;
         Ok(())
     })
-}
-
-/// VoxCPM2 as `config` asks for it, on `device`, warmed up where its kernels are chosen as each
-/// shape first runs.
-fn load(
-    config: &Config,
-    device: &Device,
-) -> Result<Arc<dyn Synthesizer>, Box<dyn Error + Send + Sync>> {
-    info!(
-        checkpoint = %config.checkpoint_dir.display(),
-        device = %config.device,
-        dtypes = ?config.dtypes,
-        "loading VoxCPM2"
-    );
-    let started = Instant::now();
-    let batching = Batching {
-        window: config.batch_window,
-        requests: config.synthesis_limit,
-        // Replayed on Vulkan, 16 requests' first patches came out NaN, and replays saved nothing
-        // on the Radeon they were measured on.
-        graphs: config.step_graphs && config.device == device::Kind::Cuda,
-        prefill_positions: config.prefill_positions,
-        prefill_graphs: config.prefill_graphs.clone(),
-        prefill_batch: config.prefill_batch,
-        prompt_cache_bytes: config.prompt_cache_bytes,
-    };
-    let model = VoxCpm::load(
-        &config.checkpoint_dir,
-        &config.dtypes,
-        device,
-        Params::default(),
-        batching,
-    )?;
-    info!(seconds = started.elapsed().as_secs_f64(), "loaded VoxCPM2");
-    if config.device.autotunes() {
-        let voices = Voices::open(&config.voices_dir)?;
-        model.warm_up(&voices)?;
-    }
-    info!("ready");
-    Ok(Arc::new(model))
-}
-
-/// VoxCPM2 on the rt device as `config` asks for it, warmed up.
-#[cfg(feature = "rt")]
-fn load_rt(config: &Config) -> Result<Arc<dyn Synthesizer>, Box<dyn Error + Send + Sync>> {
-    info!(
-        checkpoint = %config.checkpoint_dir.display(),
-        device = %config.device,
-        "loading VoxCPM2"
-    );
-    let started = Instant::now();
-    let kernels = |dir: &Option<PathBuf>| dir.clone().expect("the config requires it for rt");
-    let model = tgtts::rt::Rt::load(
-        &config.checkpoint_dir,
-        &kernels(&config.glsl_kernels_dir),
-        &kernels(&config.mlir_kernels_dir),
-        &Params::default(),
-        config.prompt_cache_bytes,
-    )?;
-    info!(seconds = started.elapsed().as_secs_f64(), "loaded VoxCPM2");
-    model.warm_up(&Voices::open(&config.voices_dir)?)?;
-    info!("ready");
-    Ok(Arc::new(model))
 }
 
 async fn shutdown() {

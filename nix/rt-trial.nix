@@ -5,12 +5,12 @@
   gpuKernels,
   glslKernels,
 }:
-# tgtts built with the rt device, and its test of that device on the real model as test-rt, built
-# release for a first run on an NVIDIA host. Each program loads the Vulkan loader from the store,
-# which finds the host driver's ICD under /run/opengl-driver, as NixOS puts it, and runs ffmpeg
-# from the store. Both run the store's kernels unless the environment names others: tgtts's
-# TGTTS_GLSL_KERNELS_DIR and TGTTS_MLIR_KERNELS_DIR, which override its configuration file, and
-# the test's GLSL_KERNELS and VULKAN_KERNELS.
+# tgtts and tgtts-gains built with the rt device, and the test of that device on the real model as
+# test-rt, built release for a first run on an NVIDIA host. Each program loads the Vulkan loader
+# from the store, which finds the host driver's ICD under /run/opengl-driver, as NixOS puts it,
+# and runs ffmpeg from the store. Each runs the store's kernels unless the environment names
+# others: TGTTS_GLSL_KERNELS_DIR and TGTTS_MLIR_KERNELS_DIR, which override the configuration
+# file tgtts and tgtts-gains read, and the test's GLSL_KERNELS and VULKAN_KERNELS.
 # VULKAN_VALIDATION=1 attaches the validation layer, which VK_LAYER_PATH names.
 let
   inherit (pkgs) lib;
@@ -61,7 +61,7 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin $out/libexec
-    cp target/release/tgtts $out/libexec/
+    cp target/release/tgtts target/release/tgtts-gains $out/libexec/
     cp "$(cat $NIX_BUILD_TOP/tests)" $out/libexec/test-rt
     # Panic locations in the standard library name the toolchain's sources.
     remove-references-to -t ${rustToolchain} $out/libexec/*
