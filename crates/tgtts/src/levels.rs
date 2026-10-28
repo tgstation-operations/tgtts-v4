@@ -190,6 +190,9 @@ pub struct Measure<'a> {
     pub radio: &'a radio::Assets,
     /// Where each voice's first line is kept as 16-bit WAV, named by the voice, if anywhere.
     pub keep: Option<&'a Path>,
+    /// When to stop asking for lines, if ever: the lines asked for are measured, and a voice
+    /// left short is measured again by the next run.
+    pub until: Option<Instant>,
 }
 
 impl Measure<'_> {
@@ -229,6 +232,9 @@ impl Measure<'_> {
                 let (work, measured, names) = (&work, measured.clone(), &names);
                 scope.spawn(move || {
                     loop {
+                        if self.until.is_some_and(|until| Instant::now() >= until) {
+                            return;
+                        }
                         let next = work.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
                         let Some((voice, line)) = next else {
                             return;
@@ -499,6 +505,7 @@ mod tests {
             },
             radio: &radio,
             keep: Some(&keep),
+            until: None,
         };
         measure(&tone).run(&mut levels, &path, &mut log).unwrap();
         assert_eq!(tone.asked.load(Ordering::SeqCst), 3 * LINES.len());
@@ -550,6 +557,18 @@ mod tests {
         assert!((streamed + 16.0).abs() < 0.01, "{streamed} LUFS");
         let kept = crate::wav::read(&fs::read(keep.join("Loud.wav")).unwrap()).unwrap();
         assert_eq!(kept.frames(), 480 * synth::prepare(LINES[0]).unwrap().len());
+
+        // A run out of time asks for nothing more, and sets no level of a voice left short.
+        let tone = Tone::default();
+        let mut late = Levels::default();
+        let out_of_time = Measure {
+            until: Some(Instant::now()),
+            ..measure(&tone)
+        };
+        out_of_time
+            .run(&mut late, &dir.path().join("late.json"), &mut Vec::new())
+            .unwrap();
+        assert_eq!((tone.asked.load(Ordering::SeqCst), late.len()), (0, 0));
 
         // A run that finds a table goes on with the voices it does not have.
         let mut resumed = Levels::default();

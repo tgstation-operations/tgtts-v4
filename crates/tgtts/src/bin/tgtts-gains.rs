@@ -1,6 +1,7 @@
-//! `tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR]`: measures how loud each voice comes
-//! out of the model, as [`tgtts::levels`] has it, for the service's `voice_levels_file`, on the
-//! model the service loads from the TOML file `CONFIG` and the environment.
+//! `tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR] [--seconds S]`: measures how loud each
+//! voice comes out of the model, as [`tgtts::levels`] has it, for the service's
+//! `voice_levels_file`, on the model the service loads from the TOML file `CONFIG` and the
+//! environment.
 //!
 //! It reads the radio's clicks and static from the configuration's assets too, for the peaks the
 //! radio scales each voice's streamed speech by. Up to `N` lines are asked for at once, the
@@ -9,7 +10,9 @@
 //! goes on with the voices it does not have; a voice cut short is spoken again. Each line goes to
 //! `LEVELS.lines` as a line of JSON once its voice is done: its loudness, and how far the radio
 //! on a stream of it is from today's. With `--keep DIR`, each voice's first line is kept there as
-//! 16-bit WAV, as the model said it.
+//! 16-bit WAV, as the model said it. With `--seconds S` it asks for no more lines after S
+//! seconds, measures those it asked for, and shuts the model down, leaving the voices it did not
+//! finish to the next run.
 
 use std::{
     env,
@@ -17,6 +20,7 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::ExitCode,
+    time::{Duration, Instant},
 };
 
 use tgtts::{
@@ -32,10 +36,10 @@ use voices::Voices;
 
 fn main() -> ExitCode {
     let usage = || {
-        eprintln!("usage: tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR]");
+        eprintln!("usage: tgtts-gains CONFIG LEVELS [--requests N] [--keep DIR] [--seconds S]");
         ExitCode::from(2)
     };
-    let (mut positional, mut requests, mut keep) = (Vec::new(), None, None);
+    let (mut positional, mut requests, mut keep, mut until) = (Vec::new(), None, None, None);
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -46,6 +50,12 @@ fn main() -> ExitCode {
             "--keep" => match args.next() {
                 Some(dir) => keep = Some(PathBuf::from(dir)),
                 None => return usage(),
+            },
+            "--seconds" => match args.next().and_then(|s| s.parse::<f64>().ok()) {
+                Some(s) if s >= 0.0 && s.is_finite() => {
+                    until = Some(Instant::now() + Duration::from_secs_f64(s));
+                }
+                _ => return usage(),
             },
             _ => positional.push(PathBuf::from(arg)),
         }
@@ -65,7 +75,7 @@ fn main() -> ExitCode {
         .with(tracing_subscriber::fmt::layer())
         .init();
     let requests = requests.unwrap_or(config.synthesis_limit);
-    match run(&config, levels, requests, keep.as_deref()) {
+    match run(&config, levels, requests, keep.as_deref(), until) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
@@ -79,6 +89,7 @@ fn run(
     path: &Path,
     requests: usize,
     keep: Option<&Path>,
+    until: Option<Instant>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let voices = Voices::open(&config.voices_dir)?;
     let mut levels = match fs::exists(path)? {
@@ -105,6 +116,7 @@ fn run(
         loudness: config.loudness,
         radio: sounds.radio(),
         keep,
+        until,
     };
     measure.run(&mut levels, path, &mut log)?;
     Ok(())
