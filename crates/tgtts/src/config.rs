@@ -7,7 +7,8 @@
 //! - `assets_dir`: the radio's clicks and static and the silicon effect's impulse responses.
 //! - `checkpoint_dir`: the VoxCPM2 checkpoint.
 //! - `device`: what the model runs on, `cpu` by default, `vulkan`, `cuda` or `rt`, tts-rs's own
-//!   runtime on a Vulkan GPU, which need a build with the feature of the same name.
+//!   runtime on a Vulkan GPU, which need a build with the feature of the same name; the first
+//!   three run on burn, which the default feature `burn` builds in, as `vulkan` and `cuda` do.
 //! - `lm_dtype`, `local_encoder_dtype`, `local_dit_dtype`, `audio_decoder_dtype`: what each part
 //!   of the model computes in, `f32`, `f16` or `bf16`; f32 throughout by default on the CPU, f16
 //!   but for the audio decoder's f32 on a GPU.

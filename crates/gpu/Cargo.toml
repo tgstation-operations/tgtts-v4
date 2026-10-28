@@ -42,3 +42,5 @@ tracing.workspace = true
 ureq.workspace = true
 voices = { path = "../voices" }
 voxcpm = { path = "../voxcpm" }
+# For the service's test helpers, which tgtts builds without voxcpm too.
+voxcpm-core = { path = "../voxcpm-core" }

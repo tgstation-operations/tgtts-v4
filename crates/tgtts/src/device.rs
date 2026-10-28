@@ -7,6 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "burn")]
 use burn::tensor::{Device, FloatDType};
 use tracing::{
     Event, Subscriber,
@@ -143,6 +144,7 @@ pub fn parse_dtype(name: &str) -> Result<Dtype, String> {
 }
 
 /// `dtype` as burn names it.
+#[cfg(feature = "burn")]
 pub fn float_dtype(dtype: Dtype) -> FloatDType {
     match dtype {
         Dtype::F32 => FloatDType::F32,
@@ -155,6 +157,7 @@ pub fn float_dtype(dtype: Dtype) -> FloatDType {
 #[derive(Debug)]
 pub enum Opened {
     /// burn's device.
+    #[cfg(feature = "burn")]
     Burn(Device),
     /// tts-rs's own runtime, which opens its GPU as the model loads.
     #[cfg(feature = "rt")]
@@ -169,11 +172,19 @@ pub enum Opened {
 /// If the build cannot open such a device, it is not what it should be, or it does not compute
 /// in one of the dtypes.
 pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<Opened, String> {
+    match kind {
+        Kind::Cpu | Kind::Vulkan | Kind::Cuda => burn(kind, dtypes, autotune_dir),
+        Kind::Rt => rt(dtypes),
+    }
+}
+
+#[cfg(feature = "burn")]
+fn burn(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<Opened, String> {
     let device = match kind {
         Kind::Cpu => Device::flex(),
         Kind::Vulkan => vulkan(autotune_dir)?,
         Kind::Cuda => cuda(autotune_dir)?,
-        Kind::Rt => return rt(dtypes),
+        Kind::Rt => unreachable!("rt is not burn's"),
     };
     let parts = [
         ("lm_dtype", dtypes.lm),
@@ -191,6 +202,18 @@ pub fn open(kind: Kind, dtypes: &Dtypes, autotune_dir: Option<&Path>) -> Result<
     Ok(Opened::Burn(device))
 }
 
+#[cfg(not(feature = "burn"))]
+fn burn(kind: Kind, _: &Dtypes, _: Option<&Path>) -> Result<Opened, String> {
+    // The GPUs' features are named for their devices, and build burn in.
+    let feature = match kind {
+        Kind::Cpu => "burn".to_owned(),
+        gpu => gpu.to_string(),
+    };
+    Err(format!(
+        "device {kind}: this build has no burn; build tgtts with --features {feature}"
+    ))
+}
+
 #[cfg(feature = "vulkan")]
 fn vulkan(autotune_dir: Option<&Path>) -> Result<Device, String> {
     if let Some(dir) = autotune_dir {
@@ -199,7 +222,7 @@ fn vulkan(autotune_dir: Option<&Path>) -> Result<Device, String> {
     gpu::vulkan().map_err(|e| e.to_string())
 }
 
-#[cfg(not(feature = "vulkan"))]
+#[cfg(all(feature = "burn", not(feature = "vulkan")))]
 fn vulkan(_: Option<&Path>) -> Result<Device, String> {
     Err("device vulkan: this build has no Vulkan; build tgtts with --features vulkan".to_owned())
 }
@@ -212,7 +235,7 @@ fn cuda(autotune_dir: Option<&Path>) -> Result<Device, String> {
     gpu::cuda().map_err(|e| e.to_string())
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(all(feature = "burn", not(feature = "cuda")))]
 fn cuda(_: Option<&Path>) -> Result<Device, String> {
     Err("device cuda: this build has no CUDA; build tgtts with --features cuda".to_owned())
 }
@@ -281,6 +304,7 @@ mod tests {
         assert!(parse_dtype("f64").is_err());
     }
 
+    #[cfg(feature = "burn")]
     #[test]
     fn opens_the_cpu_in_every_dtype() {
         let bf16 = Dtypes {
@@ -304,6 +328,13 @@ mod tests {
         ));
         let error = open(Kind::Rt, &Kind::Cpu.dtypes(), None).unwrap_err();
         assert!(error.contains("its own dtypes"), "{error}");
+    }
+
+    #[cfg(not(feature = "burn"))]
+    #[test]
+    fn refuses_the_cpu_in_a_build_without_burn() {
+        let error = open(Kind::Cpu, &Kind::Cpu.dtypes(), None);
+        assert!(error.unwrap_err().contains("--features burn"));
     }
 
     #[cfg(not(feature = "rt"))]

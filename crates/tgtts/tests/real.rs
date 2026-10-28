@@ -1,5 +1,6 @@
 //! The service end to end on the real model, voices and assets: a message for everyone, as the
 //! game asks for it.
+#![cfg(feature = "burn")]
 
 mod common;
 

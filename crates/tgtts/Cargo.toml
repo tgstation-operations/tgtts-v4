@@ -6,17 +6,20 @@ version.workspace = true
 publish = false
 
 [features]
+default = ["burn"]
+# The model on burn: on the CPU, and on the GPUs of the two features below.
+burn = ["dep:burn", "dep:voxcpm"]
 # The model on a Vulkan GPU, with what autotune chose there kept for the next start.
-vulkan = ["burn/persistence", "dep:gpu", "gpu/vulkan"]
+vulkan = ["burn", "burn/persistence", "dep:gpu", "gpu/vulkan"]
 # The model on an NVIDIA GPU through CUDA, likewise.
-cuda = ["burn/persistence", "dep:gpu", "gpu/cuda"]
+cuda = ["burn", "burn/persistence", "dep:gpu", "gpu/cuda"]
 # The model on tts-rs's own runtime on a Vulkan GPU, rather than on burn.
 rt = ["dep:graph", "dep:vulkan"]
 
 [dependencies]
 axum = { workspace = true, features = ["http1", "query", "tokio"] }
 blake3.workspace = true
-burn = { workspace = true, features = ["flex"] }
+burn = { workspace = true, features = ["flex"], optional = true }
 dsp = { path = "../dsp" }
 effects = { path = "../effects" }
 futures-util.workspace = true
@@ -44,7 +47,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "std", "tracing-log"] }
 vorbis_rs.workspace = true
 voices = { path = "../voices" }
-voxcpm = { path = "../voxcpm" }
+voxcpm = { path = "../voxcpm", optional = true }
 voxcpm-core = { path = "../voxcpm-core" }
 vulkan = { path = "../vulkan", optional = true }
 

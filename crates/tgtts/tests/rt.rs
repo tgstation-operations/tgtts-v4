@@ -5,14 +5,14 @@
 //! asked for at once, which come out as each does alone, streamed or not, a streamed one's first
 //! audio its first patch's; and voxcpm's golden line in its voice spoken from a seed as the burn
 //! CPU device speaks it from that seed, held to burn's own f16 there. Built with the `rt`
-//! feature, and run with `VOXCPM2_DIR`, `VOICES_DIR` and `ASSETS_DIR` set and `GLSL_KERNELS` and
-//! `VULKAN_KERNELS` naming the compiled kernels, as `nix run .#device-tests` sets them, one test
-//! at a time; under the validation layer, as it runs, a request fails on anything the layer
-//! reports.
+//! feature, and `burn` for that CPU device, and run with `VOXCPM2_DIR`, `VOICES_DIR` and
+//! `ASSETS_DIR` set and `GLSL_KERNELS` and `VULKAN_KERNELS` naming the compiled kernels, as
+//! `nix run .#device-tests` sets them, one test at a time; under the validation layer, as it
+//! runs, a request fails on anything the layer reports.
 //!
 //! The CPU's speech is kept as JSON under the directory `ORACLE_DIR` names, when it is set, and
 //! read from there by later runs: `keeps_the_cpu_speech` makes it alone, touching no GPU.
-#![cfg(feature = "rt")]
+#![cfg(all(feature = "rt", feature = "burn"))]
 
 mod common;
 

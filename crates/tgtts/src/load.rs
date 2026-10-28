@@ -9,17 +9,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "burn")]
 use burn::tensor::Device;
 use tracing::info;
 use voices::Voices;
-use voxcpm::Params;
+use voxcpm_core::Params;
 
-use crate::{
-    config::Config,
-    device::{self, Opened},
-    model::VoxCpm,
-    synth::Synthesizer,
-};
+use crate::{config::Config, device::Opened, synth::Synthesizer};
+#[cfg(feature = "burn")]
+use crate::{device, model::VoxCpm};
 
 /// The bytes on the device the prompt cache keeps of the voices unless the configuration says
 /// otherwise: on a GPU in f16 a median voice takes about 11 MB, so about 45 of them. On real
@@ -68,6 +66,7 @@ pub fn synthesizer(
     device: &Opened,
 ) -> Result<Arc<dyn Synthesizer>, Box<dyn Error + Send + Sync>> {
     match device {
+        #[cfg(feature = "burn")]
         Opened::Burn(device) => burn(config, device),
         #[cfg(feature = "rt")]
         Opened::Rt => rt(config),
@@ -76,6 +75,7 @@ pub fn synthesizer(
 
 /// VoxCPM2 as `config` asks for it, on `device`, warmed up where its kernels are chosen as each
 /// shape first runs.
+#[cfg(feature = "burn")]
 fn burn(
     config: &Config,
     device: &Device,

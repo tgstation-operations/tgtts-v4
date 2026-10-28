@@ -19,7 +19,7 @@ use tgtts::{
 };
 use tracing::level_filters::LevelFilter;
 use voices::Voices;
-use voxcpm::Params;
+use voxcpm_core::Params;
 
 use super::{Message, call};
 
