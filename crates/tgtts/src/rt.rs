@@ -168,9 +168,11 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
-/// Generates the requests `jobs` brings on `engine` until every sender of them is gone: those
-/// that come while its slots are full wait in the order they came, each starting as a slot
-/// frees, between two steps of those under way.
+/// Generates the requests `jobs` brings on `engine` until every sender of them is gone, starting
+/// them in the order they came, as slots free, one between two steps: a prompt runs in
+/// submissions of its own, and each started holds up the steps of those under way and the starts
+/// of those behind it, so that sixteen at once would hold the first patch of each back by the
+/// time of all their prompts rather than of its own.
 fn serve(engine: &mut dyn Engine, jobs: &Receiver<Job>) {
     let mut slots: Vec<Option<Generation>> = (0..engine.slots()).map(|_| None).collect();
     let mut waiting = VecDeque::new();
@@ -182,16 +184,12 @@ fn serve(engine: &mut dyn Engine, jobs: &Receiver<Job>) {
             waiting.push_back(job);
         }
         waiting.extend(jobs.try_iter());
-        for (slot, held) in slots.iter_mut().enumerate() {
-            if held.is_some() {
-                continue;
-            }
-            let Some(job) = waiting.pop_front() else {
-                break;
-            };
+        if let Some(slot) = slots.iter().position(Option::is_none)
+            && let Some(job) = waiting.pop_front()
+        {
             match engine.start(slot, &job.request) {
                 Ok(prefilled) => {
-                    *held = Some(Generation {
+                    slots[slot] = Some(Generation {
                         job,
                         prefilled,
                         start: None,
@@ -611,8 +609,14 @@ mod tests {
     struct Fake {
         slots: usize,
         under_way: HashMap<usize, (u64, usize)>,
-        /// Each step's slots under way, in order.
-        steps: Vec<Vec<usize>>,
+        /// Each request started, by its seed, and each step's slots under way, in order.
+        events: Vec<Event>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Event {
+        Start(u64),
+        Step(Vec<usize>),
     }
 
     impl Engine for Fake {
@@ -626,13 +630,14 @@ mod tests {
                 return Err("no such request".into());
             }
             self.under_way.insert(slot, (request.seed, 0));
+            self.events.push(Event::Start(request.seed));
             Ok(request.prompt.len() - 1)
         }
 
         fn step(&mut self) -> Vec<(usize, Result<Stepped, synth::Error>)> {
             let mut slots: Vec<usize> = self.under_way.keys().copied().collect();
             slots.sort_unstable();
-            self.steps.push(slots.clone());
+            self.events.push(Event::Step(slots.clone()));
             slots
                 .into_iter()
                 .map(|slot| {
@@ -773,19 +778,29 @@ mod tests {
         }
     }
 
-    /// Serves what `send` sends on an engine of `slots` slots, and gives the steps it took.
-    fn served(slots: usize, send: impl FnOnce(&Sender<Job>)) -> Vec<Vec<usize>> {
+    /// Serves what `send` sends on an engine of `slots` slots, and gives what the engine did.
+    fn served_events(slots: usize, send: impl FnOnce(&Sender<Job>)) -> Vec<Event> {
         let (jobs, received) = mpsc::channel();
         send(&jobs);
         drop(jobs);
         let mut engine = Fake {
             slots,
             under_way: HashMap::new(),
-            steps: Vec::new(),
+            events: Vec::new(),
         };
         serve(&mut engine, &received);
         assert!(engine.under_way.is_empty(), "requests left under way");
-        engine.steps
+        engine.events
+    }
+
+    /// Serves what `send` sends on an engine of `slots` slots, and gives the steps it took.
+    fn served(slots: usize, send: impl FnOnce(&Sender<Job>)) -> Vec<Vec<usize>> {
+        (served_events(slots, send).into_iter())
+            .filter_map(|event| match event {
+                Event::Step(slots) => Some(slots),
+                Event::Start(_) => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -821,8 +836,9 @@ mod tests {
             .map(|r| replied(r).1.unwrap().patches)
             .collect();
         assert_eq!(patches, [2, 4, 1]);
-        // The third starts in the first's slot once the first has its last patch.
-        assert_eq!(steps, [vec![0, 1], vec![0, 1], vec![0, 1], vec![1]]);
+        // The second starts a step after the first, the third in the first's slot once the first
+        // has its last patch.
+        assert_eq!(steps, [vec![0], vec![0, 1], vec![0, 1], vec![1], vec![1]]);
     }
 
     #[test]
@@ -864,5 +880,35 @@ mod tests {
         let (runs, speech) = replied(&replies[2]);
         assert_eq!(runs, [vec![99.0, 1.0]]);
         assert_eq!(speech.unwrap_err().to_string(), "not finite");
+    }
+
+    /// Requests that come at once start one between two steps, in the order they came: the
+    /// first has its first patch after its own prompt rather than after every one's.
+    #[test]
+    fn requests_that_come_at_once_start_a_step_apart() {
+        let mut replies = vec![];
+        let events = served_events(4, |jobs| {
+            for seed in [3, 4, 5, 6] {
+                replies.push(send(jobs, seed, 1, false));
+            }
+        });
+        use Event::{Start, Step};
+        assert_eq!(
+            events[..8],
+            [
+                Start(3),
+                Step(vec![0]),
+                Start(4),
+                Step(vec![0, 1]),
+                Start(5),
+                Step(vec![0, 1, 2]),
+                // The first has had its last patch, and the fourth takes its slot.
+                Start(6),
+                Step(vec![0, 1, 2]),
+            ]
+        );
+        for (reply, seed) in replies.iter().zip([3, 4, 5, 6]) {
+            assert_eq!(replied(reply).1.unwrap().patches, seed);
+        }
     }
 }
