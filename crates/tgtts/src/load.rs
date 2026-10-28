@@ -83,13 +83,14 @@ fn rt(config: &Config) -> Result<Arc<dyn Synthesizer>, Box<dyn Error + Send + Sy
     );
     let started = Instant::now();
     let kernels = |dir: &Option<PathBuf>| dir.clone().expect("the config requires it for rt");
-    let model = crate::rt::Rt::load(
+    let mut model = crate::rt::Rt::load(
         &config.checkpoint_dir,
         &kernels(&config.glsl_kernels_dir),
         &kernels(&config.mlir_kernels_dir),
         &Params::default(),
         config.prompt_cache_bytes,
     )?;
+    model.set_babble_cap(config.babble_cap);
     info!(seconds = started.elapsed().as_secs_f64(), "loaded VoxCPM2");
     model.warm_up(&Voices::open(&config.voices_dir)?)?;
     info!("ready");

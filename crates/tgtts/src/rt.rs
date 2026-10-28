@@ -45,6 +45,14 @@ const WARM_UP_LINE: &str = "Hello there, could someone please come to medbay? I 
 /// The patches the warm-up generates: past the audio decoder's first chunk.
 const WARM_UP_PATCHES: usize = 9;
 
+/// The longest the babble cap lets a request's speech run, in ms: this, and
+/// [`BABBLE_MS_PER_CHAR`] for each character of its text. VoxCPM2 now and then talks on past its
+/// text to the last patch it may have; this is about nine times as long as it says a line of
+/// that length at the median, where in a gains run all but 2 of the 7191 lines it ended itself
+/// came within seven times.
+const BABBLE_MS: usize = 3000;
+const BABBLE_MS_PER_CHAR: usize = 500;
+
 /// The patches after which a streamed request's frames waiting are decoded at once, rather than
 /// once a chunk's worth waits: its first audio after its first patch, then as much again each
 /// time, so that what it has given stays ahead of what a player has played of it while the
@@ -246,6 +254,7 @@ pub struct Rt {
     tokenizer: Tokenizer,
     config: Config,
     max_patches: usize,
+    babble_cap: bool,
     jobs: Sender<Job>,
     thread: Option<JoinHandle<Result<(), synth::Error>>>,
 }
@@ -285,9 +294,27 @@ impl Rt {
             tokenizer,
             config,
             max_patches,
+            babble_cap: false,
             jobs,
             thread: Some(thread),
         })
+    }
+
+    /// Whether each request's patches are capped by its text, at 3 s and 0.5 s for each
+    /// character, as well as by the most any request may have.
+    pub fn set_babble_cap(&mut self, capped: bool) {
+        self.babble_cap = capped;
+    }
+
+    /// The most patches the speech of `text` may have.
+    fn patches_for(&self, text: &str) -> usize {
+        if !self.babble_cap {
+            return self.max_patches;
+        }
+        let vae = self.config.audio_vae();
+        let hop: usize = vae.decoder_rates.iter().product();
+        let cap = babble_cap(text, self.config.patch_size * hop, vae.out_sample_rate);
+        cap.min(self.max_patches)
     }
 
     /// Loads the VoxCPM2 checkpoint in `dir` onto the GPU the `vulkan` crate chooses, with the
@@ -574,7 +601,7 @@ impl Drop for Rt {
 
 impl Synthesizer for Rt {
     fn synthesize(&self, text: &str, voice: &Latent, seed: u64) -> Result<Speech, synth::Error> {
-        self.generate(text, voice, seed, self.max_patches, None)
+        self.generate(text, voice, seed, self.patches_for(text), None)
     }
 
     fn stream(
@@ -584,8 +611,15 @@ impl Synthesizer for Rt {
         seed: u64,
         audio: &mut Sink<'_>,
     ) -> Result<Speech, synth::Error> {
-        self.generate(text, voice, seed, self.max_patches, Some(audio))
+        self.generate(text, voice, seed, self.patches_for(text), Some(audio))
     }
+}
+
+/// The patches of `samples_per_patch` at `rate` Hz that the babble cap lets the speech of `text`
+/// run to.
+fn babble_cap(text: &str, samples_per_patch: usize, rate: u32) -> usize {
+    let ms = BABBLE_MS + BABBLE_MS_PER_CHAR * text.chars().count();
+    (ms * rate as usize / 1000).div_ceil(samples_per_patch)
 }
 
 #[cfg(test)]
@@ -593,7 +627,7 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, Ordering},
         },
     };
@@ -738,6 +772,64 @@ mod tests {
 
     fn config() -> Config {
         Config::from_json(include_str!("../../voxcpm/tests/fixtures/voxcpm.json")).unwrap()
+    }
+
+    /// An engine of a slot that says how many patches each request may have, each a patch long.
+    struct Asked(Arc<Mutex<Vec<usize>>>);
+
+    impl Engine for Asked {
+        fn slots(&self) -> usize {
+            1
+        }
+
+        fn start(&mut self, _: usize, request: &Request) -> Result<usize, synth::Error> {
+            self.0.lock().unwrap().push(request.max_patches);
+            Ok(0)
+        }
+
+        fn step(&mut self) -> Vec<(usize, Result<Stepped, synth::Error>)> {
+            let stepped = Stepped {
+                audio: vec![],
+                last: true,
+            };
+            vec![(0, Ok(stepped))]
+        }
+
+        fn finish(&mut self, _: usize) -> Result<Vec<f32>, synth::Error> {
+            Ok(vec![])
+        }
+
+        fn close(self: Box<Self>) -> Result<(), synth::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn caps_a_requests_patches_by_its_text_where_asked() {
+        // At the real model's patch of 160 ms: 5 s, 34 s and 3 s.
+        assert_eq!(babble_cap("Yes.", 7680, 48000), 32);
+        let line = "Hello there, could someone please come to medbay? I need help.";
+        assert_eq!(babble_cap(line, 7680, 48000), 213);
+        assert_eq!(babble_cap("", 7680, 48000), 19);
+
+        // The tiny config's patches are 24 samples at 48 kHz, so "Yes." is capped at 10000, and
+        // a longer text at the most any request may have.
+        let tokenizer = include_str!("../../voxcpm/tests/fixtures/voxcpm_tokenizer.json");
+        let tokenizer = Tokenizer::from_json(tokenizer).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let engine = Asked(asked.clone());
+        let mut rt = Rt::spawn(tokenizer, config(), 20000, move || Ok(Box::new(engine))).unwrap();
+        let voice = Latent {
+            frames: vec![[0.5; voices::LATENT_DIM]; 4],
+            text: "Hello.".to_owned(),
+        };
+        rt.synthesize("Yes.", &voice, 1).unwrap();
+        rt.set_babble_cap(true);
+        rt.synthesize("Yes.", &voice, 1).unwrap();
+        rt.stream("Yes.", &voice, 1, &mut |_| {}).unwrap();
+        rt.synthesize(line, &voice, 1).unwrap();
+        rt.shut_down().unwrap();
+        assert_eq!(*asked.lock().unwrap(), [20000, 10000, 10000, 20000]);
     }
 
     /// Sends a request of `seed` to `jobs`, its prompt of `text` tokens, streamed if `streamed`,

@@ -45,6 +45,9 @@
 //! - `voice_levels_file`: how loud each voice comes out of the model, as `tgtts-gains` writes
 //!   it, by which `POST /stream` streams speech as it is made; without it, that speech is made
 //!   whole first.
+//! - `babble_cap`: whether a request's speech is cut at 3 s and 0.5 s for each character of its
+//!   text, where the model talks on past its text, rather than at its 256th patch, 41 s in;
+//!   `false` by default. Only the rt device caps it.
 //! - `log_level`: `DEBUG`, `INFO`, `WARNING` or `ERROR`, `INFO` by default, of the service's own
 //!   events; the crates it uses log at it but never finer than `WARN`, but for the kernels
 //!   autotune tunes, at `INFO`.
@@ -69,7 +72,7 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 31] = [
+const KEYS: [&str; 32] = [
     "listen",
     "token_file",
     "voices_dir",
@@ -100,6 +103,7 @@ const KEYS: [&str; 31] = [
     "loudness_target_lufs",
     "loudness_ceiling_dbtp",
     "voice_levels_file",
+    "babble_cap",
     "log_level",
 ];
 
@@ -132,6 +136,7 @@ pub struct Config {
     pub radio_wait_ceiling: Duration,
     pub loudness: Loudness,
     pub voice_levels_file: Option<PathBuf>,
+    pub babble_cap: bool,
     pub log_level: LevelFilter,
 }
 
@@ -176,6 +181,11 @@ impl Config {
         }
         let glsl_kernels_dir = settings.parse("glsl_kernels_dir")?;
         let mlir_kernels_dir = settings.parse("mlir_kernels_dir")?;
+        let babble_cap = settings.parse("babble_cap")?.unwrap_or(false);
+        if babble_cap && device != Kind::Rt {
+            let reason = format!("babble_cap: the {device} device cannot cap a request's speech");
+            return Err(Error(reason));
+        }
         for (key, dir) in [
             ("glsl_kernels_dir", &glsl_kernels_dir),
             ("mlir_kernels_dir", &mlir_kernels_dir),
@@ -254,6 +264,7 @@ impl Config {
                 },
             },
             voice_levels_file: settings.parse("voice_levels_file")?,
+            babble_cap,
             log_level: match settings.0.get("log_level") {
                 None => LevelFilter::INFO,
                 Some(name) => parse_level(&name.to_uppercase())
@@ -414,6 +425,7 @@ mod tests {
                     ceiling: -1.0,
                 },
                 voice_levels_file: None,
+                babble_cap: false,
                 log_level: LevelFilter::INFO,
             }
         );
@@ -561,6 +573,10 @@ mod tests {
             [config.glsl_kernels_dir, config.mlir_kernels_dir],
             [Some("/k/glsl".into()), Some("/k/mlir".into())]
         );
+        let capped = [rt.as_slice(), &[("TGTTS_BABBLE_CAP", "true")]].concat();
+        assert!(load(REQUIRED, &capped).unwrap().babble_cap);
+        let babble = error(REQUIRED, &[("TGTTS_BABBLE_CAP", "true")]);
+        assert!(babble.starts_with("babble_cap:"), "{babble}");
         for (key, value) in [
             ("TGTTS_LOUDNESS_TARGET_LUFS", "NaN"),
             ("TGTTS_LOUDNESS_TARGET_LUFS", "-inf"),
