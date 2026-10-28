@@ -32,7 +32,7 @@ pkgs.writeShellApplication {
     export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true CARGO_BUILD_FINGERPRINT=content \
       CARGO_UNSTABLE_RUSTDOC_DEPINFO=true
     # The C libraries the devshell's buildInputs give, which a bare `nix run` lacks.
-    export PKG_CONFIG_PATH=${pkgs.lib.getDev pkgs.soxr}/lib/pkgconfig
+    export PKG_CONFIG_PATH=${pkgs.lib.getDev pkgs.libopus}/lib/pkgconfig:${pkgs.lib.getDev pkgs.soxr}/lib/pkgconfig
 
     failed=()
     stage() {

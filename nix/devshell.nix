@@ -24,7 +24,10 @@ pkgs.mkShell {
     pkgs.statix
   ]
   ++ builtins.attrValues scripts;
-  buildInputs = [ pkgs.soxr ];
+  buildInputs = [
+    pkgs.libopus
+    pkgs.soxr
+  ];
 
   shellHook = ''
     # Otherwise coreutils' fmt, the paragraph reflower, can shadow ours and

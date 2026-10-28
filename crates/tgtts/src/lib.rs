@@ -7,6 +7,8 @@ pub mod ffmpeg;
 pub mod handoff;
 pub mod metrics;
 pub mod model;
+pub mod ogg;
+pub mod opus;
 pub mod rt;
 pub mod service;
 pub mod synth;

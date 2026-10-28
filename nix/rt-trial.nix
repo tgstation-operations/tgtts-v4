@@ -43,7 +43,10 @@ pkgs.stdenv.mkDerivation {
     pkgs.pkg-config
     pkgs.removeReferencesTo
   ];
-  buildInputs = [ pkgs.soxr ];
+  buildInputs = [
+    pkgs.libopus
+    pkgs.soxr
+  ];
   dontConfigure = true;
   buildPhase = ''
     runHook preBuild

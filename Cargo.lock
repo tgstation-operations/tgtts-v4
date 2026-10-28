@@ -6054,6 +6054,7 @@ dependencies = [
  "effects",
  "gpu",
  "graph",
+ "pkg-config",
  "rand 0.10.3",
  "rusqlite",
  "serde",

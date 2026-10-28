@@ -61,7 +61,10 @@ let
         pkgs.pkg-config
         pkgs.removeReferencesTo
       ];
-      buildInputs = [ pkgs.soxr ];
+      buildInputs = [
+        pkgs.libopus
+        pkgs.soxr
+      ];
       # cubecl-cuda's LLVM, and the CUDA cudarc binds the driver's functions
       # for, which it would otherwise take from nvcc or its newest.
       XDG_DATA_HOME = tracelLlvm;

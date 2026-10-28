@@ -47,6 +47,9 @@ voices = { path = "../voices" }
 voxcpm = { path = "../voxcpm" }
 vulkan = { path = "../vulkan", optional = true }
 
+[build-dependencies]
+pkg-config.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
