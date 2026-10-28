@@ -4,7 +4,11 @@
 // prologue as the convolution takes them, once it has read the ring: the chunk's rows from
 // rows() - REACH on, those of them there are. One invocation per value kept.
 
-layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 0) readonly buffer Chunk {
+    uint frames_before;
+    uint frames;
+    uint stream;
+};
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) buffer Ring { float ring[]; };
 layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };
@@ -20,5 +24,5 @@ void main() {
         return;
     }
     uint t = total - back;
-    ring[(ring_start() + t) % REACH * C + c] = input_at(int(t), c);
+    ring[ring_at((ring_start() + t) % REACH, c)] = input_at(int(t), c);
 }

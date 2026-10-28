@@ -7,7 +7,11 @@
 // included, through Snake into shared memory once, rather than once for each of the seven
 // samples that read each.
 
-layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 0) readonly buffer Chunk {
+    uint frames_before;
+    uint frames;
+    uint stream;
+};
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) readonly buffer Ring { float ring[]; };
 layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };

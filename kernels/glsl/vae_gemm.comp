@@ -10,14 +10,18 @@
 // A workgroup takes a BM x BN tile of out, each invocation TM x TN of it, rows WORKGROUP / WN
 // apart and columns WN apart; A and W pass through shared memory BK columns at a time.
 
-layout(constant_id = 5) const uint TAPS = 1;
-layout(constant_id = 6) const uint N = 2048;
-layout(constant_id = 7) const bool RESIDUAL = false;
-layout(constant_id = 8) const uint TM = 4;
-layout(constant_id = 9) const uint TN = 4;
-layout(constant_id = 10) const uint WN = 16;
+layout(constant_id = 6) const uint TAPS = 1;
+layout(constant_id = 7) const uint N = 2048;
+layout(constant_id = 8) const bool RESIDUAL = false;
+layout(constant_id = 9) const uint TM = 4;
+layout(constant_id = 10) const uint TN = 4;
+layout(constant_id = 11) const uint WN = 16;
 
-layout(std430, binding = 0) readonly buffer Chunk { uint frames_before; uint frames; };
+layout(std430, binding = 0) readonly buffer Chunk {
+    uint frames_before;
+    uint frames;
+    uint stream;
+};
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) readonly buffer Ring { float ring[]; };
 layout(std430, binding = 3) readonly buffer Prologue { vec4 prologue_[]; };

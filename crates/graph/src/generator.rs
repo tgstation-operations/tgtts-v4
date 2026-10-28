@@ -148,7 +148,7 @@ impl Generator {
             &lm,
             settings.timed,
         )?;
-        let vae_shape = VaeShape::new(&audio_vae_config, settings.chunk_frames)?;
+        let vae_shape = VaeShape::new(&audio_vae_config, settings.chunk_frames, 1)?;
         let mut vae = VaeDecoder::new(ctx, kernels, &vae_shape, settings.timed)?;
         vae.load(parameter)?;
         Ok(Generator {
@@ -203,7 +203,7 @@ impl Generator {
             voice,
             &mut self.cache,
         )?;
-        self.vae.reset()?;
+        self.vae.reset(0)?;
         let context = (voice.len() / self.feat_dim).min(CONTEXT_FRAMES);
         let last = &prompt.patches[(len - 1) * patch..];
         self.request = Some(Request {
@@ -343,7 +343,7 @@ fn decode(vae: &mut VaeDecoder, request: &mut Request, frames: &[f32]) -> Result
     if frames.is_empty() {
         return Ok(());
     }
-    let audio = vae.push(frames)?;
+    let audio = vae.push(0, frames)?;
     let voice = request.context.min(frames.len() / vae.shape().latent);
     request.context -= voice;
     request

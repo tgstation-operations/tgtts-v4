@@ -179,7 +179,7 @@ fn every_kernel_takes_no_more_workgroup_memory_than_the_device_has() {
     let mut graphs = lm_side_cuts(&side);
     let chunk = voxcpm::Params::default().decode_chunk_frames.get();
     graphs.push(
-        vae_graph(&VaeShape::new(&audio_vae_config, chunk).unwrap())
+        vae_graph(&VaeShape::new(&audio_vae_config, chunk, 1).unwrap())
             .unwrap()
             .graph,
     );

@@ -2,13 +2,15 @@
 // a time, its tensors time-major, a row of channels per step, all of it f32.
 //
 // A causal convolution reaches back REACH of its inputs, past the chunk's start into the chunks
-// before. It keeps them in a ring of REACH rows, the input at step g of the stream in row
-// g % REACH, zeros before the stream's start. Those inputs are the convolution's own, after any
-// prologue, so a stream's first chunk sees zeros there as a whole sequence's padding does.
+// before. It keeps them in a ring of REACH rows for each of the STREAMS streams it decodes, the
+// input at step g of a stream in row g % REACH of the stream's, zeros before the stream's start.
+// Those inputs are the convolution's own, after any prologue, so a stream's first chunk sees
+// zeros there as a whole sequence's padding does.
 //
-// The including kernel declares the buffers `chunk` (frames_before, frames), `x` (the chunk's
-// inputs), `ring` and `prologue_` (per channel: scale, bias, Snake's alpha and the reciprocal of
-// alpha + 1e-9), then includes this.
+// The including kernel declares the buffers `chunk` (frames_before, frames, and the stream the
+// chunk is of), `x` (the chunk's inputs), `ring` and `prologue_` (per channel: scale, bias,
+// Snake's alpha and the reciprocal of alpha + 1e-9), then includes this. Its own constants take
+// ids from 6.
 
 layout(constant_id = 0) const uint WORKGROUP = 256;
 layout(local_size_x_id = 0) in;
@@ -17,10 +19,12 @@ layout(constant_id = 1) const uint UP = 1;
 layout(constant_id = 2) const uint C = 64;
 layout(constant_id = 3) const uint REACH = 0;
 layout(constant_id = 4) const bool PROLOGUE = false;
+layout(constant_id = 5) const uint STREAMS = 1;
 
-// The input rows in this chunk.
+// The input rows in this chunk: none for a stream past the rings, so that no kernel reaches past
+// them.
 uint rows() {
-    return frames * UP;
+    return stream < STREAMS ? frames * UP : 0;
 }
 
 // The ring row of the chunk's first input, the rows before it being in the rows before that.
@@ -35,6 +39,11 @@ uint ring_start() {
 uint ring_row(uint back) {
     uint reach = max(REACH, 1u);
     return (ring_start() + reach - back) % reach;
+}
+
+// Where channel c of row `row` of the chunk's stream's ring is.
+uint ring_at(uint row, uint c) {
+    return (stream * REACH + row) * C + c;
 }
 
 // sin(x) within a few ulp for |x| to 1e5, unlike the builtin, whose precision Vulkan bounds
@@ -66,7 +75,7 @@ float affine_snake(float x, vec4 p) {
 // prologue applied to what is not in the ring yet; zero past the chunk's rows.
 float input_at(int r, uint c) {
     if (r < 0) {
-        return ring[ring_row(uint(-r)) * C + c];
+        return ring[ring_at(ring_row(uint(-r)), c)];
     }
     if (uint(r) >= rows()) {
         return 0.0;

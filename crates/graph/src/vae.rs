@@ -12,6 +12,10 @@
 //! GEMMs over the chunk's steps; what a convolution keeps for the next chunk is a ring of its
 //! last inputs, which a dispatch after it writes once it has read them.
 //!
+//! A decoder decodes several streams, a chunk of one of them at a time: each convolution keeps a
+//! ring for each stream, and the host says which stream a chunk is of in the buffer it writes
+//! before each, so that each stream comes out bit for bit as it does alone.
+//!
 //! Everything is stored in f32, as the service runs the `audiovae` crate's decoder: storing
 //! activations and weights in f16 took the audio from 115 dB of the CPU's f32 decode to 59, to
 //! save less than a sixth of a chunk's time.
@@ -19,7 +23,7 @@
 use std::iter;
 
 use serde::Deserialize;
-use vulkan::{Context, SpecValue, Timing};
+use vulkan::{Buffer, Context, Residence, SpecValue, Timing};
 
 use crate::{
     Error,
@@ -28,7 +32,7 @@ use crate::{
         Access::{Read, Write},
         KernelInfo, Kernels,
     },
-    step::Step,
+    step::{Region, Step},
 };
 
 /// `vae_gemm.comp`: chunk, x, ring, prologue, W, bias, residual -> out.
@@ -107,12 +111,14 @@ pub struct VaeShape {
     pub buckets: usize,
     /// The most frames a chunk holds.
     pub chunk: usize,
+    /// The streams it decodes.
+    pub streams: usize,
 }
 
 impl VaeShape {
-    /// The decoder `config` describes, in chunks of at most `chunk` frames. Refuses what VoxCPM2
-    /// does not use, as the `audiovae` crate does.
-    pub fn new(config: &VaeConfig, chunk: usize) -> Result<Self, Error> {
+    /// The decoder `config` describes, of `streams` streams in chunks of at most `chunk` frames.
+    /// Refuses what VoxCPM2 does not use, as the `audiovae` crate does.
+    pub fn new(config: &VaeConfig, chunk: usize, streams: usize) -> Result<Self, Error> {
         let unsupported = |why: String| Err(Error::Shape(why));
         if !config.depthwise
             || config.use_noise_block
@@ -131,8 +137,8 @@ impl VaeShape {
                 config.decoder_dim
             ));
         }
-        if chunk == 0 {
-            return unsupported("chunks of no frames".into());
+        if chunk == 0 || streams == 0 {
+            return unsupported(format!("chunks of {chunk} frames of {streams} streams"));
         }
         Ok(VaeShape {
             latent: config.latent_dim,
@@ -141,6 +147,7 @@ impl VaeShape {
             bucket: boundaries.partition_point(|&b| b < config.out_sample_rate),
             buckets: boundaries.len() + 1,
             chunk,
+            streams,
         })
     }
 
@@ -177,13 +184,14 @@ pub enum Fill {
 pub struct VaeGraph {
     pub graph: Graph,
     pub shape: VaeShape,
-    /// frames_before and frames, as u32.
+    /// frames_before, frames and the stream, as u32.
     pub chunk: TensorId,
     /// `[chunk][latent]`.
     pub latents: TensorId,
     /// `[chunk * hop]` samples, f32.
     pub audio: TensorId,
-    /// Each convolution's ring of its last inputs, and how many rows it holds.
+    /// Each convolution's ring of its last inputs, `[streams][rows][channels]`, and how many rows
+    /// it holds.
     pub rings: Vec<(TensorId, usize)>,
     pub constants: Vec<(TensorId, Fill)>,
 }
@@ -248,9 +256,8 @@ impl Builder {
     }
 
     fn ring(&mut self, name: String, reach: usize, channels: usize) -> TensorId {
-        let id = self
-            .g
-            .tensor(name, (4 * reach * channels) as u64, Kind::State);
+        let bytes = 4 * self.shape.streams * reach * channels;
+        let id = self.g.tensor(name, bytes as u64, Kind::State);
         self.rings.push((id, reach));
         id
     }
@@ -270,6 +277,7 @@ impl Builder {
             (2, u(x.channels)),
             (3, u(reach)),
             (4, SpecValue::Bool(prologue)),
+            (5, u(self.shape.streams)),
         ];
         Pipeline {
             kernel,
@@ -349,7 +357,7 @@ impl Builder {
             x,
             reach,
             prologue.is_some(),
-            &[(5, SpecValue::Bool(epilogue.is_some()))],
+            &[(6, SpecValue::Bool(epilogue.is_some()))],
         );
         let groups = [
             (c / DEPTHWISE_COLUMNS) as u32,
@@ -402,12 +410,12 @@ impl Builder {
             reach,
             prologue.is_some(),
             &[
-                (5, u(taps)),
-                (6, u(n)),
-                (7, SpecValue::Bool(residual.is_some())),
-                (8, u(tm)),
-                (9, u(tn)),
-                (10, u(wn)),
+                (6, u(taps)),
+                (7, u(n)),
+                (8, SpecValue::Bool(residual.is_some())),
+                (9, u(tm)),
+                (10, u(tn)),
+                (11, u(wn)),
             ],
         );
         let bindings = [
@@ -506,7 +514,7 @@ impl Builder {
 /// The decoder's step of `shape`.
 pub fn vae_graph(shape: &VaeShape) -> Result<VaeGraph, Error> {
     let mut g = Graph::default();
-    let chunk = g.tensor("chunk", 8, Kind::Param);
+    let chunk = g.tensor("chunk", 12, Kind::Param);
     let unused = g.tensor("unused", 16, Kind::Constant);
     let latents = g.tensor(
         "latents",
@@ -576,19 +584,21 @@ pub fn vae_graph(shape: &VaeShape) -> Result<VaeGraph, Error> {
 /// A parameter's values in torch's layout, and its shape, by its name under the decoder.
 pub type Parameter = (Vec<usize>, Vec<f32>);
 
-/// The audio VAE's decoder on the GPU, with its weights, and the stream it is decoding.
+/// The audio VAE's decoder on the GPU, with its weights, and the streams it is decoding.
 #[derive(Debug)]
 pub struct VaeDecoder {
     step: Step,
     tensors: VaeGraph,
-    /// The frames the stream has decoded, modulo `period`.
-    frames_before: u32,
+    /// The frames each stream has decoded, modulo `period`.
+    frames_before: Vec<u32>,
     /// A multiple of every ring's length.
     period: u32,
+    /// Zeros, as many as a stream's largest ring holds.
+    zeros: Buffer,
 }
 
 impl VaeDecoder {
-    /// Records the step of `shape`, with every weight zero until [`load`](Self::load) and the
+    /// Records the step of `shape`, with every weight zero until [`load`](Self::load) and every
     /// stream at its start.
     pub fn new(
         ctx: &Context,
@@ -602,11 +612,15 @@ impl VaeDecoder {
             .rings
             .iter()
             .fold(1, |period, &(_, reach)| lcm(period, reach as u32));
+        let ring = |&(t, _): &(TensorId, usize)| tensors.graph.tensors[t.0].bytes;
+        let largest = tensors.rings.iter().map(ring).max().unwrap_or(0);
+        let zeros = ctx.buffer_in(largest / shape.streams as u64, Residence::Device)?;
         Ok(VaeDecoder {
             step,
+            frames_before: vec![0; shape.streams],
             tensors,
-            frames_before: 0,
             period,
+            zeros,
         })
     }
 
@@ -699,13 +713,18 @@ impl VaeDecoder {
         Ok(())
     }
 
-    /// Decodes the stream's next latent frames, `[frames][latent]` flattened, into their audio,
-    /// `hop` samples a frame, as many chunks as it takes.
-    pub fn push(&mut self, latents: &[f32]) -> Result<Vec<f32>, Error> {
-        let VaeShape { latent, chunk, .. } = self.tensors.shape;
-        if !latents.len().is_multiple_of(latent) {
+    /// Decodes stream `stream`'s next latent frames, `[frames][latent]` flattened, into their
+    /// audio, `hop` samples a frame, as many chunks as it takes.
+    pub fn push(&mut self, stream: usize, latents: &[f32]) -> Result<Vec<f32>, Error> {
+        let VaeShape {
+            latent,
+            chunk,
+            streams,
+            ..
+        } = self.tensors.shape;
+        if !latents.len().is_multiple_of(latent) || stream >= streams {
             return Err(Error::Shape(format!(
-                "{} latent values in frames of {latent}",
+                "{} latent values in frames of {latent} of stream {stream} of {streams}",
                 latents.len()
             )));
         }
@@ -717,23 +736,39 @@ impl VaeDecoder {
             padded[..frames.len()].copy_from_slice(frames);
             padded[frames.len()..].fill(0.0);
             self.step.write(self.tensors.latents, &padded)?;
+            let before = &mut self.frames_before[stream];
             self.step
-                .write(self.tensors.chunk, &[self.frames_before, count as u32])?;
+                .write(self.tensors.chunk, &[*before, count as u32, stream as u32])?;
             self.step.submit()?;
             let samples: Vec<f32> = self.step.read(self.tensors.audio)?;
             audio.extend_from_slice(&samples[..count * hop]);
-            self.frames_before = (self.frames_before + count as u32) % self.period;
+            *before = (*before + count as u32) % self.period;
         }
         Ok(audio)
     }
 
-    /// Starts a new stream: every convolution's ring back to zeros.
-    pub fn reset(&mut self) -> Result<(), Error> {
-        for &(ring, _) in &self.tensors.rings {
-            let zeros = vec![0u8; self.tensors.graph.tensors[ring.0].bytes as usize];
-            self.step.write(ring, &zeros)?;
+    /// Starts stream `stream` anew: its ring of every convolution back to zeros.
+    pub fn reset(&mut self, stream: usize) -> Result<(), Error> {
+        let streams = self.tensors.shape.streams;
+        if stream >= streams {
+            return Err(Error::Shape(format!("stream {stream} of {streams}")));
         }
-        self.frames_before = 0;
+        let regions: Vec<Region> = self
+            .tensors
+            .rings
+            .iter()
+            .map(|&(ring, _)| {
+                let bytes = self.tensors.graph.tensors[ring.0].bytes / streams as u64;
+                Region {
+                    tensor: ring,
+                    offset: stream as u64 * bytes,
+                    other: 0,
+                    bytes,
+                }
+            })
+            .collect();
+        self.step.copy_in(&self.zeros, &regions)?;
+        self.frames_before[stream] = 0;
         Ok(())
     }
 
@@ -771,7 +806,7 @@ mod tests {
         kernels::Access,
     };
 
-    fn shape(chunk: usize) -> VaeShape {
+    fn shape(chunk: usize, streams: usize) -> VaeShape {
         let config = serde_json::json!({
             "encoder_dim": 128,
             "encoder_rates": [2, 5, 8, 8],
@@ -782,19 +817,19 @@ mod tests {
             "sample_rate": 16000,
             "out_sample_rate": 48000
         });
-        VaeShape::new(&serde_json::from_value(config).unwrap(), chunk).unwrap()
+        VaeShape::new(&serde_json::from_value(config).unwrap(), chunk, streams).unwrap()
     }
 
     #[test]
     fn voxcpm2s_decoder_writes_1920_samples_a_frame_in_the_top_bucket() {
-        let s = shape(25);
+        let s = shape(25, 1);
         assert_eq!(s.hop(), 1920);
         assert_eq!((s.bucket, s.buckets), (3, 4));
     }
 
     #[test]
     fn each_ring_is_kept_after_its_convolution_has_read_it() {
-        let g = vae_graph(&shape(25)).unwrap();
+        let g = vae_graph(&shape(25, 1)).unwrap();
         let graph = &g.graph;
         let needs_barrier = barriers(graph, &plan(graph));
         for &(ring, _) in &g.rings {
@@ -821,24 +856,33 @@ mod tests {
     }
 
     #[test]
-    fn the_rings_carry_what_the_audiovae_crates_stream_keeps() {
-        let g = vae_graph(&shape(25)).unwrap();
-        // 1 + 6 blocks of a transposed convolution and three residual units + 1.
-        assert_eq!(g.rings.len(), 26);
-        let values: u64 = g
-            .rings
-            .iter()
-            .map(|&(t, _)| g.graph.tensors[t.0].bytes / 4)
-            .sum();
-        // As audiovae's DecodeStream counts what it keeps of a batch item.
-        assert_eq!(values, 161_856);
-        assert_eq!(g.graph.ops.len(), 3 + 6 * 11 + 2);
+    fn the_rings_carry_what_the_audiovae_crates_stream_keeps_for_each_stream() {
+        for streams in [1, 3] {
+            let g = vae_graph(&shape(25, streams)).unwrap();
+            // 1 + 6 blocks of a transposed convolution and three residual units + 1.
+            assert_eq!(g.rings.len(), 26);
+            let values: u64 = g
+                .rings
+                .iter()
+                .map(|&(t, _)| g.graph.tensors[t.0].bytes / 4)
+                .sum();
+            // As audiovae's DecodeStream counts what it keeps of a batch item.
+            assert_eq!(values, streams as u64 * 161_856);
+            assert_eq!(g.graph.ops.len(), 3 + 6 * 11 + 2);
+            let declared = (5, SpecValue::U32(streams as u32));
+            assert!(
+                g.graph
+                    .ops
+                    .iter()
+                    .all(|op| op.pipeline.constants.contains(&declared))
+            );
+        }
     }
 
     #[test]
     fn every_gemm_covers_its_outputs_once() {
         for chunk in [1, 25] {
-            let g = vae_graph(&shape(chunk)).unwrap();
+            let g = vae_graph(&shape(chunk, 1)).unwrap();
             for op in g
                 .graph
                 .ops
@@ -851,10 +895,10 @@ mod tests {
                 };
                 let (up, n, tm, tn, wn) = (
                     constant(1),
-                    constant(6),
-                    constant(8),
+                    constant(7),
                     constant(9),
                     constant(10),
+                    constant(11),
                 );
                 let (bm, bn) = (tm * (WORKGROUP as usize / wn), tn * wn);
                 let rows = chunk * up;
@@ -879,7 +923,7 @@ mod tests {
         let with = |field: &str, value: serde_json::Value| {
             let mut config = base.clone();
             config[field] = value;
-            VaeShape::new(&serde_json::from_value(config).unwrap(), 25)
+            VaeShape::new(&serde_json::from_value(config).unwrap(), 25, 1)
         };
         let refused = [
             ("depthwise", serde_json::json!(false)),
@@ -898,6 +942,11 @@ mod tests {
             );
         }
         assert!(with("cond_type", serde_json::json!("scale_bias_init")).is_ok());
+        let config = serde_json::from_value(base).unwrap();
+        assert!(matches!(
+            VaeShape::new(&config, 25, 0),
+            Err(Error::Shape(_))
+        ));
     }
 
     #[test]

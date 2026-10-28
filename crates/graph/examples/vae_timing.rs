@@ -44,7 +44,7 @@ fn main() {
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let config: VaeConfig = serde_json::from_value(json["audio_vae_config"].clone()).unwrap();
-    let shape = VaeShape::new(&config, chunk).unwrap_or_else(|e| panic!("{e}"));
+    let shape = VaeShape::new(&config, chunk, 1).unwrap_or_else(|e| panic!("{e}"));
     let weights = Weights::open(dir.join("audiovae.pth")).unwrap_or_else(|e| panic!("{e}"));
     let voices = Voices::open(std::env::var_os("VOICES_DIR").expect("VOICES_DIR"))
         .unwrap_or_else(|e| panic!("{e}"));
@@ -99,7 +99,7 @@ fn main() {
                 .collect();
             at = (at + chunk) % latent.frames.len();
             let start = Instant::now();
-            let audio = decoder.push(&latents).unwrap_or_else(|e| panic!("{e}"));
+            let audio = decoder.push(0, &latents).unwrap_or_else(|e| panic!("{e}"));
             let wall = start.elapsed().as_secs_f64() * 1e9;
             assert!(audio.iter().all(|v| v.is_finite()));
             if i < warmup {
