@@ -1,11 +1,12 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 // One Euler step of the sampler from the local DiT's last hidden states after its final norm,
-// by one workgroup: out_proj's velocities from the FRAMES tokens at FIRST of each of the DiT's
-// two sequences, the conditional and the unconditional; and x -= DT times the velocity guided
-// as CFG-Zero* guides it, the unconditional velocity scaled to best match the conditional one
-// and the difference from it scaled by the guidance. A cluster takes ROWS of out_proj's
-// CHANNELS rows. h is `[2][T][K]`; x is `[CHANNELS][FRAMES]`, as the sampler keeps it.
+// for the row of WorkGroupID.y by one workgroup: out_proj's velocities from the FRAMES tokens at
+// FIRST of each of the row's two sequences, the conditional and the unconditional; and x -= DT
+// times the velocity guided as CFG-Zero* guides it, the unconditional velocity scaled to best
+// match the conditional one and the difference from it scaled by the row's guidance. A cluster
+// takes ROWS of out_proj's CHANNELS rows. h is `[rows][2][T][K]`; x is `[rows][CHANNELS][FRAMES]`,
+// as the sampler keeps it.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint K = 1024;
@@ -26,8 +27,8 @@ layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
 // [CHANNELS][K]
 layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 2) readonly buffer Bias { float16_t bias[]; };
-// The temperature, then the guidance scale.
-layout(std430, binding = 3) readonly buffer Sampling { float temperature; float cfg; };
+// Each row's temperature, then its guidance scale.
+layout(std430, binding = 3) readonly buffer Sampling { vec2 sampling[]; };
 layout(std430, binding = 4) buffer State { float state[]; };
 
 #include "gemm.glsl"
@@ -37,15 +38,16 @@ shared float velocity[2 * LEN];
 shared float partial_dot[SUBGROUPS];
 shared float partial_norm[SUBGROUPS];
 
-// Token m of the products is frame m % FRAMES of sequence m / FRAMES.
+// Token m of the products is frame m % FRAMES of the row's sequence m / FRAMES.
 void stage(uint chunk) {
+    uint first = 2 * gl_WorkGroupID.y * T + FIRST;
     uvec4 tokens[STAGED];
     [[unroll]] for (uint i = 0; i < STAGED; i++) {
         uint v = i * WORKGROUP + gl_LocalInvocationID.x;
         if (v < M * (KC / 8)) {
             uint at = staged_at(v, chunk);
             uint m = at / (K / 8);
-            tokens[i] = x[(m / FRAMES * T + FIRST + m % FRAMES) * (K / 8) + at % (K / 8)];
+            tokens[i] = x[(first + m / FRAMES * T + m % FRAMES) * (K / 8) + at % (K / 8)];
         }
     }
     [[unroll]] for (uint i = 0; i < STAGED; i++) {
@@ -99,9 +101,10 @@ void main() {
         norm += partial_norm[s];
     }
     float alpha = dot_ / (norm + 1e-8);
+    float cfg = sampling[gl_WorkGroupID.y].y;
     for (uint i = gl_LocalInvocationID.x; i < LEN; i += WORKGROUP) {
         float scaled = velocity[LEN + i] * alpha;
         float guided = scaled + cfg * (velocity[i] - scaled);
-        state[i] -= guided * DT;
+        state[gl_WorkGroupID.y * LEN + i] -= guided * DT;
     }
 }

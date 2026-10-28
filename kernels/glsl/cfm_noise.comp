@@ -1,17 +1,18 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// x = temperature * noise: where the sampler starts.
+// x = temperature * noise for each of ROWS rows of LEN values: where the sampler starts.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint LEN = 256;
+layout(constant_id = 3) const uint ROWS = 1;
 
 layout(std430, binding = 0) readonly buffer Noise { float noise[]; };
-// The temperature, then the guidance scale.
-layout(std430, binding = 1) readonly buffer Sampling { float temperature; float cfg; };
+// Each row's temperature, then its guidance scale.
+layout(std430, binding = 1) readonly buffer Sampling { vec2 sampling[]; };
 layout(std430, binding = 2) writeonly buffer X { float x[]; };
 
 void main() {
-    for (uint i = gl_GlobalInvocationID.x; i < LEN; i += gl_NumWorkGroups.x * WORKGROUP) {
-        x[i] = temperature * noise[i];
+    for (uint i = gl_GlobalInvocationID.x; i < ROWS * LEN; i += gl_NumWorkGroups.x * WORKGROUP) {
+        x[i] = sampling[i / LEN].x * noise[i];
     }
 }

@@ -1,8 +1,13 @@
 //! The patch sampler and the local encoder on the GPU against voxcpm's on burn's CPU backend,
 //! on VoxCPM2's real weights: each case a patch upstream generated, as the patch before, and the
-//! noise it drew for the next. Built with the `device` feature, and run with `VOXCPM2_DIR`
-//! naming the checkpoint and `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests`
-//! sets it.
+//! noise it drew for the next, sampled at a temperature and a guidance scale of its own. Built
+//! with the `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint and `GLSL_KERNELS`
+//! the compiled kernels, as `nix run .#device-tests` sets it.
+//!
+//! Each case is run alone, and with others as rows of one run, where it must come out bit for
+//! bit as it does alone: what a row's sums come to depends on the tuning alone, never on what
+//! else is in a block of tokens (`local`'s documentation), so that a request's audio does not
+//! depend on the others served beside it. Alone, each is held to burn's f16.
 //!
 //! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
 //! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
@@ -54,11 +59,14 @@ fn weights() -> std::path::PathBuf {
 }
 
 /// What one patch is sampled from: the conditions, the patch before and the noise, each laid
-/// out as the sampler takes it.
+/// out as the sampler takes it, and the temperature and guidance scale; named for what it is.
+#[derive(Clone)]
 struct Case {
+    name: String,
     mu: Vec<f32>,
     cond: Vec<f32>,
     noise: Vec<f32>,
+    sampling: [f32; 2],
 }
 
 /// A uniform sequence in [-scale, scale) from a fixed xorshift sequence.
@@ -101,17 +109,36 @@ fn transposed(patch: &[f32], rows: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Two patches of the golden after the ones before them, with conditions of about the scale of
-/// a hidden state after a norm.
+/// The most rows a case is run among.
+const ROWS: usize = 16;
+
+/// [`ROWS`] patches of the golden after the ones before them, with conditions of about the scale
+/// of a hidden state after a norm, the conditions rounded to f16 as the GPU takes them, so that
+/// the oracles take them so too, the difference of their inputs being none of the GPU's error.
+/// The first two at voxcpm's temperature and guidance scale, the rest each at a pair of its own.
 fn cases(config: &PatchConfig) -> Vec<Case> {
     let (patches, noise) = golden();
     let hidden = config.dit_config.stack.hidden_dim;
+    let default = Sampling::default();
+    let others = (1..).filter(|at| ![3, 12].contains(at)).zip(3..);
     [(3, 1), (12, 2)]
         .into_iter()
-        .map(|(at, seed)| Case {
-            mu: uniform(2 * hidden, seed, 1.7),
-            cond: transposed(&patches[at - 1], config.patch_size),
-            noise: noise[at].clone(),
+        .chain(others)
+        .take(ROWS)
+        .enumerate()
+        .map(|(i, (at, seed))| {
+            let sampling = match i {
+                0 | 1 => [default.temperature, default.cfg_value],
+                _ => [[1.0, 0.8, 1.2][i % 3], [2.0, 1.5, 3.0, 2.5][i % 4]],
+            };
+            let mu = uniform(2 * hidden, seed, 1.7);
+            Case {
+                name: format!("golden{at}-mu{seed}-t{}-cfg{}", sampling[0], sampling[1]),
+                mu: mu.iter().map(|&v| f16::from_f32(v).to_f32()).collect(),
+                cond: transposed(&patches[at - 1], config.patch_size),
+                noise: noise[at].clone(),
+                sampling,
+            }
         })
         .collect()
 }
@@ -170,45 +197,44 @@ fn within(margins: [f64; 2]) -> bool {
     margins.iter().all(|&m| m <= 1.25)
 }
 
-/// [`compute_oracle`]'s, kept by the steps and the dtype alone: every test samples the cases
-/// [`cases`] gives.
-fn oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
-    kept(&format!("local-sampler-{timesteps}-{dtype:?}"), || {
-        compute_oracle(cases, timesteps, dtype)
-    })
-}
-
 /// What voxcpm's sampler gives for each case in `timesteps` steps, its DiT in `dtype`, the
-/// patches `[feat_dim][patch_size]` flattened one after another.
-fn compute_oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
+/// patches `[feat_dim][patch_size]` flattened one after another, each kept by the case's name.
+fn oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
     let config = Config::from_json(&config_json()).unwrap();
     let (feat_dim, patch_size) = (config.feat_dim, config.patch_size);
     let cpu = device();
-    let start = Instant::now();
-    let cfm = Cfm::load(&config, &weights(), dtype, &cpu).unwrap_or_else(|e| panic!("{e}"));
-    let sampling = Sampling {
-        timesteps,
-        ..Sampling::default()
-    };
+    let mut cfm = None;
     let mut out = Vec::new();
     for case in cases {
-        let tensor = |values: &[f32], shape: [usize; 3]| {
-            Tensor::<3>::from_data(TensorData::new(values.to_vec(), shape), &cpu)
-        };
-        let mu = Tensor::<2>::from_data(TensorData::new(case.mu.clone(), [1, case.mu.len()]), &cpu);
-        let patch = cfm.sample(
-            mu,
-            tensor(&case.cond, [1, feat_dim, patch_size]),
-            tensor(&case.noise, [1, feat_dim, patch_size]),
-            &sampling,
-        );
-        out.extend(patch.into_data().iter::<f32>());
+        let name = format!("local-{}-{timesteps}-{dtype:?}", case.name);
+        out.extend(kept::<Vec<f32>>(&name, || {
+            let start = Instant::now();
+            let cfm = cfm.get_or_insert_with(|| {
+                Cfm::load(&config, &weights(), dtype, &cpu).unwrap_or_else(|e| panic!("{e}"))
+            });
+            let sampling = Sampling {
+                timesteps,
+                temperature: case.sampling[0],
+                cfg_value: case.sampling[1],
+            };
+            let tensor = |values: &[f32], shape: [usize; 3]| {
+                Tensor::<3>::from_data(TensorData::new(values.to_vec(), shape), &cpu)
+            };
+            let mu = TensorData::new(case.mu.clone(), [1, case.mu.len()]);
+            let patch = cfm.sample(
+                Tensor::<2>::from_data(mu, &cpu),
+                tensor(&case.cond, [1, feat_dim, patch_size]),
+                tensor(&case.noise, [1, feat_dim, patch_size]),
+                &sampling,
+            );
+            eprintln!(
+                "{} in {timesteps} steps on the CPU, {dtype:?}: {:.1} s",
+                case.name,
+                start.elapsed().as_secs_f64()
+            );
+            patch.into_data().iter::<f32>().collect()
+        }));
     }
-    eprintln!(
-        "{} cases in {timesteps} steps on the CPU, {dtype:?}: {:.1} s",
-        cases.len(),
-        start.elapsed().as_secs_f64()
-    );
     out
 }
 
@@ -216,52 +242,64 @@ fn patch_config() -> PatchConfig {
     serde_json::from_str(&config_json()).unwrap()
 }
 
-/// The GPU's patches for the same cases, the kernels cut as `tuning` says, the conditions
-/// rounded to f16 as the GPU takes them.
-fn gpu(ctx: &Context, cases: &[Case], timesteps: usize, tuning: &Tuning) -> Vec<f32> {
+/// The GPU's patches for the cases, sampled `rows` at a time, the kernels cut as `tuning` says:
+/// the rows of the last run past the cases are the first case again.
+fn gpu(ctx: &Context, cases: &[Case], timesteps: usize, rows: usize, tuning: &Tuning) -> Vec<f32> {
     let config = patch_config();
     let mut kernels = Kernels::from_env(ctx).unwrap_or_else(|e| panic!("{e}"));
     let start = Instant::now();
-    let mut sampler = Sampler::new(ctx, &mut kernels, &config, timesteps, tuning, false)
+    let mut sampler = Sampler::new(ctx, &mut kernels, &config, timesteps, rows, tuning, false)
         .unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(weights()).unwrap_or_else(|e| panic!("{e}"));
     sampler.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "sampler in {timesteps} steps recorded and loaded on the GPU at {tuning:?}: {:.1} s, {} \
-         dispatches, {} barriers, {} pipelines, an arena of {} KiB",
+        "sampler in {timesteps} steps over {rows} rows recorded and loaded on the GPU at \
+         {tuning:?}: {:.1} s, {} dispatches, {} barriers, {} pipelines, an arena of {} KiB",
         start.elapsed().as_secs_f64(),
         sampler.graph_step().dispatches(),
         sampler.graph_step().barriers(),
         kernels.len(),
         sampler.graph_step().arena_bytes() / 1024
     );
-    let sampling = Sampling::default();
+    let len = config.feat_dim * config.patch_size;
     let mut out = Vec::new();
-    for case in cases {
-        let patch = sampler
+    for chunk in cases.chunks(rows) {
+        let mut run = chunk.to_vec();
+        run.resize(rows, cases[0].clone());
+        let all = |part: fn(&Case) -> &[f32]| -> Vec<f32> {
+            run.iter().flat_map(part).copied().collect()
+        };
+        let sampling: Vec<[f32; 2]> = run.iter().map(|case| case.sampling).collect();
+        let patches = sampler
             .sample(
-                &f16_bits(&case.mu),
-                &case.cond,
-                &case.noise,
-                sampling.temperature,
-                sampling.cfg_value,
+                &f16_bits(&all(|case| &case.mu)),
+                &all(|case| &case.cond),
+                &all(|case| &case.noise),
+                &sampling,
             )
             .unwrap_or_else(|e| panic!("{e}"));
-        out.extend(patch);
+        out.extend(&patches[..len * chunk.len()]);
     }
     out
 }
 
-/// The mu that burn's DiT sees, rounded to f16 as the GPU's does: the oracles take it so, the
-/// difference of their inputs being none of the GPU's error.
-fn rounded(cases: Vec<Case>) -> Vec<Case> {
-    cases
-        .into_iter()
-        .map(|case| Case {
-            mu: case.mu.iter().map(|&v| f16::from_f32(v).to_f32()).collect(),
-            ..case
-        })
-        .collect()
+/// Whether `got` is `alone` bit for bit, and if not, where it first differs.
+fn as_alone(got: &[f32], alone: &[f32], len: usize) -> Result<(), String> {
+    assert_eq!(got.len(), alone.len());
+    match got
+        .iter()
+        .zip(alone)
+        .position(|(a, b)| a.to_bits() != b.to_bits())
+    {
+        None => Ok(()),
+        Some(at) => Err(format!(
+            "case {} differs from alone at {}: {} for {}",
+            at / len,
+            at % len,
+            got[at],
+            alone[at]
+        )),
+    }
 }
 
 /// The tunings each kernel is checked at, at either subgroup size: one tile or pair of tiles to
@@ -330,7 +368,7 @@ fn keeps_the_oracles() {
         return;
     }
     let config = patch_config();
-    let cases = rounded(cases(&config));
+    let cases = cases(&config);
     let patches = encoder_patches(&config);
     for dtype in [FloatDType::F32, FloatDType::F16] {
         oracle(&cases, 2, dtype);
@@ -343,26 +381,30 @@ fn keeps_the_oracles() {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn one_euler_step_samples_as_voxcpm_does_on_the_cpu() {
     let config = patch_config();
+    let len = config.feat_dim * config.patch_size;
     // Two steps, the first of which stays where it starts: one run of the DiT.
-    let cases = rounded(cases(&config));
+    let cases = cases(&config);
     let want = oracle(&cases, 2, FloatDType::F32);
     let burn_f16 = oracle(&cases, 2, FloatDType::F16);
     let ctx = context();
     for tuning in tunings(&ctx) {
-        let got = gpu(&ctx, &cases, 2, &tuning);
-        let margins = margins_of(&got, &want, &burn_f16);
+        let alone = gpu(&ctx, &cases, 2, 1, &tuning);
+        let margins = margins_of(&alone, &want, &burn_f16);
         assert!(within(margins), "{tuning:?}: {margins:.2?}");
+        for rows in [3, ROWS] {
+            let got = gpu(&ctx, &cases, 2, rows, &tuning);
+            as_alone(&got, &alone, len).unwrap_or_else(|e| panic!("{rows} rows, {tuning:?}: {e}"));
+        }
     }
     // Defect: the conditions left out, so the unconditional velocity alone.
     let unguided: Vec<Case> = cases
         .iter()
         .map(|case| Case {
             mu: vec![0.0; case.mu.len()],
-            cond: case.cond.clone(),
-            noise: case.noise.clone(),
+            ..case.clone()
         })
         .collect();
-    let got = gpu(&ctx, &unguided, 2, &Tuning::for_subgroup(64));
+    let got = gpu(&ctx, &unguided, 2, ROWS, &Tuning::for_subgroup(64));
     let margins = margins_of(&got, &want, &burn_f16);
     assert!(!within(margins), "without mu: {margins:.2?}");
     assert_no_validation_messages(&ctx);
@@ -372,17 +414,32 @@ fn one_euler_step_samples_as_voxcpm_does_on_the_cpu() {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
     let config = patch_config();
-    let cases = rounded(cases(&config));
+    let len = config.feat_dim * config.patch_size;
+    let cases = cases(&config);
     let timesteps = Sampling::default().timesteps;
     let want = oracle(&cases, timesteps, FloatDType::F32);
     let burn_f16 = oracle(&cases, timesteps, FloatDType::F16);
     let ctx = context();
-    let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
-    let got = gpu(&ctx, &cases, timesteps, &tuning);
-    let margins = margins_of(&got, &want, &burn_f16);
-    assert!(within(margins), "{margins:.2?}");
+    let report = ctx.report();
+    for subgroup in [64, 32]
+        .into_iter()
+        .filter(|&s| report.can_require_subgroup_size(s))
+    {
+        let tuning = Tuning {
+            subgroup,
+            ..Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let alone = gpu(&ctx, &cases, timesteps, 1, &tuning);
+        let margins = margins_of(&alone, &want, &burn_f16);
+        assert!(within(margins), "{tuning:?}: {margins:.2?}");
+        for rows in [5, ROWS] {
+            let got = gpu(&ctx, &cases, timesteps, rows, &tuning);
+            as_alone(&got, &alone, len).unwrap_or_else(|e| panic!("{rows} rows, {tuning:?}: {e}"));
+        }
+    }
     // Defect: a step short, the last step's velocity left out.
-    let short = gpu(&ctx, &cases, timesteps - 1, &tuning);
+    let tuning = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
+    let short = gpu(&ctx, &cases, timesteps - 1, ROWS, &tuning);
     let margins = margins_of(&short, &want, &burn_f16);
     assert!(!within(margins), "a step short: {margins:.2?}");
     assert_no_validation_messages(&ctx);
@@ -435,45 +492,75 @@ fn encoder_patches(config: &PatchConfig) -> Vec<Vec<f32>> {
     patches
 }
 
+/// The GPU's embedding of each patch `[patch_size][feat_dim]`, `rows` at a time, the kernels cut
+/// as `tuning` says: the rows of the last run past the patches are the first patch again.
+fn embed(
+    ctx: &Context,
+    checkpoint: &Checkpoint,
+    patches: &[Vec<f32>],
+    rows: usize,
+    tuning: &Tuning,
+) -> Vec<f32> {
+    let config = patch_config();
+    let mut kernels = Kernels::from_env(ctx).unwrap_or_else(|e| panic!("{e}"));
+    let mut encoder = Encoder::new(ctx, &mut kernels, &config, rows, tuning, false)
+        .unwrap_or_else(|e| panic!("{e}"));
+    encoder.load(checkpoint).unwrap_or_else(|e| panic!("{e}"));
+    let hidden = config.encoder_config.hidden_dim;
+    let mut got = Vec::new();
+    for chunk in patches.chunks(rows) {
+        let mut run = chunk.to_vec();
+        run.resize(rows, patches[0].clone());
+        let laid_out: Vec<f32> = run
+            .iter()
+            .flat_map(|patch| transposed(patch, config.patch_size))
+            .collect();
+        let out = encoder.encode(&laid_out).unwrap_or_else(|e| panic!("{e}"));
+        got.extend(
+            out[..hidden * chunk.len()]
+                .iter()
+                .map(|&h| f16::from_bits(h).to_f32()),
+        );
+    }
+    got
+}
+
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
 fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
     let config = patch_config();
+    let hidden = config.encoder_config.hidden_dim;
     let patches = encoder_patches(&config);
     let want = encoder_oracle(&patches, FloatDType::F32);
     let burn_f16 = encoder_oracle(&patches, FloatDType::F16);
     let ctx = context();
     let checkpoint = Checkpoint::open(weights()).unwrap_or_else(|e| panic!("{e}"));
     for tuning in tunings(&ctx) {
-        let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-        let mut encoder = Encoder::new(&ctx, &mut kernels, &config, &tuning, false)
-            .unwrap_or_else(|e| panic!("{e}"));
-        encoder.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
-        let mut got = Vec::new();
-        for patch in &patches {
-            let out = encoder
-                .encode(&transposed(patch, config.patch_size))
-                .unwrap_or_else(|e| panic!("{e}"));
-            got.extend(out.iter().map(|&h| f16::from_bits(h).to_f32()));
-        }
-        let margins = margins_of(&got, &want, &burn_f16);
+        let alone = embed(&ctx, &checkpoint, &patches, 1, &tuning);
+        let margins = margins_of(&alone, &want, &burn_f16);
         assert!(within(margins), "{tuning:?}: {margins:.2?}");
+        for rows in [7, ROWS] {
+            let got = embed(&ctx, &checkpoint, &patches, rows, &tuning);
+            as_alone(&got, &alone, hidden)
+                .unwrap_or_else(|e| panic!("{rows} rows, {tuning:?}: {e}"));
+        }
     }
     // Defect: the patches' frames in another order, which only RoPE tells apart.
-    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let tuning = Tuning::for_subgroup(64);
-    let mut encoder =
-        Encoder::new(&ctx, &mut kernels, &config, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
-    encoder.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
-    let mut got = Vec::new();
-    for patch in &patches {
-        let mut frames: Vec<&[f32]> = patch.chunks(config.feat_dim).collect();
-        frames.reverse();
-        let out = encoder
-            .encode(&transposed(&frames.concat(), config.patch_size))
-            .unwrap_or_else(|e| panic!("{e}"));
-        got.extend(out.iter().map(|&h| f16::from_bits(h).to_f32()));
-    }
+    let reversed: Vec<Vec<f32>> = patches
+        .iter()
+        .map(|patch| {
+            let mut frames: Vec<&[f32]> = patch.chunks(config.feat_dim).collect();
+            frames.reverse();
+            frames.concat()
+        })
+        .collect();
+    let got = embed(
+        &ctx,
+        &checkpoint,
+        &reversed,
+        ROWS,
+        &Tuning::for_subgroup(64),
+    );
     let margins = margins_of(&got, &want, &burn_f16);
     assert!(!within(margins), "frames reversed: {margins:.2?}");
     assert_no_validation_messages(&ctx);
@@ -483,46 +570,49 @@ fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     let config = patch_config();
-    let case = rounded(cases(&config)).swap_remove(0);
-    let patch = transposed(&golden().0[3], config.patch_size);
+    let rows = 2;
+    let cases = &cases(&config)[..rows];
+    let patches = &golden().0[3..3 + rows];
     let ctx = context();
     let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(weights()).unwrap_or_else(|e| panic!("{e}"));
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let alone = gpu(&ctx, std::slice::from_ref(&case), 2, &tuning);
-    let mut encoder =
-        Encoder::new(&ctx, &mut kernels, &config, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
-    encoder.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
-    let embedded = encoder.encode(&patch).unwrap_or_else(|e| panic!("{e}"));
+    let alone = gpu(&ctx, cases, 2, rows, &tuning);
+    let embedded = embed(&ctx, &checkpoint, patches, rows, &tuning);
 
     // A tensor of another graph's first, so that each of theirs is somewhere else: loading
     // them where they were would write the wrong tensors.
     let mut g = Graph::default();
     g.tensor("before", 256, Kind::Constant);
-    let sampler = sampler_graph(&config, 2, &tuning).unwrap_or_else(|e| panic!("{e}"));
+    let sampler = sampler_graph(&config, 2, rows, &tuning).unwrap_or_else(|e| panic!("{e}"));
     let dit = splice(&mut g, &sampler.graph, "dit.", &[]);
-    let enc = encoder_graph(&config, &tuning).unwrap_or_else(|e| panic!("{e}"));
+    let enc = encoder_graph(&config, rows, &tuning).unwrap_or_else(|e| panic!("{e}"));
     let local = splice(&mut g, &enc.graph, "encoder.", &[]);
     let mut step = Step::new(&ctx, &mut kernels, &g, false).unwrap_or_else(|e| panic!("{e}"));
     load_sampler(&mut step, &g, &sampler, &dit, &checkpoint).unwrap_or_else(|e| panic!("{e}"));
     load_encoder(&mut step, &g, &enc, &local, &checkpoint).unwrap_or_else(|e| panic!("{e}"));
     let at = |ids: &[TensorId], t: TensorId| ids[t.0];
-    let sampling = Sampling::default();
-    step.write(at(&dit, sampler.mu), &f16_bits(&case.mu))
+    let all =
+        |part: fn(&Case) -> &[f32]| -> Vec<f32> { cases.iter().flat_map(part).copied().collect() };
+    step.write(at(&dit, sampler.mu), &f16_bits(&all(|case| &case.mu)))
         .unwrap();
-    step.write(at(&dit, sampler.cond), &case.cond).unwrap();
-    step.write(at(&dit, sampler.noise), &case.noise).unwrap();
-    step.write(
-        at(&dit, sampler.sampling),
-        &[sampling.temperature, sampling.cfg_value],
-    )
-    .unwrap();
-    step.write(at(&local, enc.patch), &patch).unwrap();
+    step.write(at(&dit, sampler.cond), &all(|case| &case.cond))
+        .unwrap();
+    step.write(at(&dit, sampler.noise), &all(|case| &case.noise))
+        .unwrap();
+    let sampling: Vec<f32> = cases.iter().flat_map(|case| case.sampling).collect();
+    step.write(at(&dit, sampler.sampling), &sampling).unwrap();
+    let laid_out: Vec<f32> = patches
+        .iter()
+        .flat_map(|patch| transposed(patch, config.patch_size))
+        .collect();
+    step.write(at(&local, enc.patch), &laid_out).unwrap();
     step.submit().unwrap_or_else(|e| panic!("{e}"));
     let got: Vec<f32> = step.read(at(&dit, sampler.patch)).unwrap();
-    assert_eq!(got, alone, "the spliced sampler's patch");
+    assert_eq!(got, alone, "the spliced sampler's patches");
     let got: Vec<u16> = step.read(at(&local, enc.out)).unwrap();
-    assert_eq!(got, embedded, "the spliced encoder's embedding");
+    let got: Vec<f32> = got.iter().map(|&h| f16::from_bits(h).to_f32()).collect();
+    assert_eq!(got, embedded, "the spliced encoder's embeddings");
     assert_no_validation_messages(&ctx);
 }
 
@@ -567,7 +657,7 @@ fn the_projections_compile_to_matrix_products_over_wide_loads() {
         .filter(|&s| report.can_require_subgroup_size(s))
     {
         let tuning = Tuning::for_subgroup(subgroup);
-        let sampler = sampler_graph(&config, 2, &tuning).unwrap_or_else(|e| panic!("{e}"));
+        let sampler = sampler_graph(&config, 2, 1, &tuning).unwrap_or_else(|e| panic!("{e}"));
         let mut seen = std::collections::BTreeSet::new();
         for op in &sampler.graph.ops {
             let name = op.pipeline.kernel.name;

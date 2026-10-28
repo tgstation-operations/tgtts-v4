@@ -1,11 +1,13 @@
-//! VoxCPM2's patch sampler at batch 1, as voxcpm's `Cfm::sample` computes it: Euler steps
-//! along the flow the local DiT predicts, from noise at time 1 to a patch at time 0, with
-//! classifier-free guidance as CFG-Zero* has it. Every step runs the DiT once over two
-//! sequences, the conditional and the unconditional, so that its weights are read once for
-//! both; the whole sample is one submission.
+//! VoxCPM2's patch sampler, as voxcpm's `Cfm::sample` computes it: Euler steps along the flow
+//! the local DiT predicts, from noise at time 1 to a patch at time 0, with classifier-free
+//! guidance as CFG-Zero* has it. It samples a patch for each of several rows, requests apart
+//! from each other, at once: every step runs the DiT once over each row's two sequences, the
+//! conditional and the unconditional, so that its weights are read once for them all; the whole
+//! sample is one submission.
 //!
 //! The DiT's sequence is [`MU_TOKENS`] condition tokens, the time, the patch before and the
-//! noisy patch. What the LM side hands the sampler, as [`Sampler::sample`] takes it:
+//! noisy patch. What the LM side hands the sampler for each row, as [`Sampler::sample`] takes
+//! it, each row's after the one before:
 //!
 //! - `mu`, `[MU_TOKENS][hidden]` in f16: `lm_to_dit_proj` of the base LM's last hidden state,
 //!   then `res_to_dit_proj` of the residual LM's, as voxcpm's model joins them;
@@ -13,8 +15,8 @@
 //! - `noise`, `[feat_dim][patch_size]` in f32: standard normal, as voxcpm's `Noise` draws it;
 //! - the temperature and the guidance scale.
 //!
-//! It hands back the patch, `[feat_dim][patch_size]` in f32, the layout voxcpm's sampler gives
-//! and the local encoder ([`super::encoder`]) takes; voxcpm's model hands its LMs the patch
+//! It hands back each row's patch, `[feat_dim][patch_size]` in f32, the layout voxcpm's sampler
+//! gives and the local encoder ([`super::encoder`]) takes; voxcpm's model hands its LMs the patch
 //! transposed.
 
 use vulkan::{Context, SpecValue, Timing};
@@ -77,11 +79,12 @@ pub fn euler_steps(timesteps: usize) -> Vec<(f32, f32)> {
     steps
 }
 
-/// The sampler's graph and the tensors the host writes and reads.
+/// The sampler's graph and the tensors the host writes and reads, each a row after a row.
 #[derive(Clone, Debug)]
 pub struct SamplerGraph {
     pub graph: Graph,
     pub stack: Stack,
+    pub rows: usize,
     pub feat_dim: usize,
     pub patch_size: usize,
     /// The time and step length of each step the DiT runs at.
@@ -89,9 +92,9 @@ pub struct SamplerGraph {
     pub mu: TensorId,
     pub cond: TensorId,
     pub noise: TensorId,
-    /// The temperature, then the guidance scale, in f32.
+    /// Each row's temperature, then its guidance scale, in f32.
     pub sampling: TensorId,
-    /// The patch, written in place by each step.
+    /// Each row's patch, written in place by each step.
     pub patch: TensorId,
     pub in_proj: (TensorId, TensorId),
     pub cond_proj: (TensorId, TensorId),
@@ -104,10 +107,12 @@ fn u(v: usize) -> SpecValue {
     SpecValue::U32(v as u32)
 }
 
-/// The sampler of `config`'s local DiT in `timesteps` steps, its kernels cut as `tuning` says.
+/// The sampler of `config`'s local DiT in `timesteps` steps over `rows` rows, its kernels cut as
+/// `tuning` says.
 pub fn sampler_graph(
     config: &PatchConfig,
     timesteps: usize,
+    rows: usize,
     tuning: &Tuning,
 ) -> Result<SamplerGraph, Error> {
     let dit = &config.dit_config;
@@ -119,7 +124,10 @@ pub fn sampler_graph(
     let shape = config.stack(&dit.stack, tokens)?;
     let hidden = shape.hidden;
     let mut g = Graph::default();
-    let stack = Stack::new(&mut g, "dit", &shape, 2, tuning)?;
+    if rows == 0 {
+        return Err(Error::Shape("no rows".into()));
+    }
+    let stack = Stack::new(&mut g, "dit", &shape, 2 * rows, tuning)?;
     let x_at = COND_AT + patch_size;
     let Tuning {
         subgroup,
@@ -135,7 +143,8 @@ pub fn sampler_graph(
         constants: common.iter().chain(constants).copied().collect(),
         subgroup_size: Some(subgroup),
     };
-    let embed = |first: usize, at: usize, copied: usize, guided: bool| {
+    // The tokens copied are mu, a row's own, or the time, the same for every row.
+    let embed = |first: usize, at: usize, copied: usize, guided: bool, shared: bool| {
         pipeline(
             &LOCAL_EMBED,
             &[
@@ -148,6 +157,7 @@ pub fn sampler_graph(
                 (8, u(at)),
                 (9, u(copied)),
                 (10, SpecValue::Bool(guided)),
+                (11, SpecValue::Bool(shared)),
             ],
         )
     };
@@ -179,11 +189,11 @@ pub fn sampler_graph(
 
     let half = |n: usize| 2 * n as u64;
     let float = |n: usize| 4 * n as u64;
-    let mu = g.tensor("mu", half(MU_TOKENS * hidden), Kind::Input);
-    let cond = g.tensor("cond", float(len), Kind::Input);
-    let noise = g.tensor("noise", float(len), Kind::Input);
-    let sampling = g.tensor("sampling", float(2), Kind::Param);
-    let patch = g.tensor("patch", float(len), Kind::Output);
+    let mu = g.tensor("mu", half(rows * MU_TOKENS * hidden), Kind::Input);
+    let cond = g.tensor("cond", float(rows * len), Kind::Input);
+    let noise = g.tensor("noise", float(rows * len), Kind::Input);
+    let sampling = g.tensor("sampling", float(rows * 2), Kind::Param);
+    let patch = g.tensor("patch", float(rows * len), Kind::Output);
     let mut linear = |name: &str, n: usize, k: usize| {
         (
             g.tensor(format!("{name}.weight"), half(n * k), Kind::Constant),
@@ -197,38 +207,40 @@ pub fn sampler_graph(
     let times: Vec<TensorId> = (0..steps.len())
         .map(|s| g.tensor(format!("time.{s}"), half(hidden), Kind::Constant))
         .collect();
-    let x = g.tensor("dit.x", half(2 * tokens * hidden), Kind::Intermediate);
+    let x = g.tensor("dit.x", half(stack.tokens() * hidden), Kind::Intermediate);
 
+    let each_row = u32::try_from(rows).map_err(|_| Error::Shape(format!("{rows} rows")))?;
     g.op(
         "noise",
-        pipeline(&CFM_NOISE, &[(2, u(len))]),
+        pipeline(&CFM_NOISE, &[(2, u(len)), (3, u(rows))]),
         &[noise, sampling, patch],
         [1, 1, 1],
     );
     g.op(
         "cond_proj",
-        embed(COND_AT, 0, MU_TOKENS, true),
+        embed(COND_AT, 0, MU_TOKENS, true, false),
         &[cond, cond_proj.0, cond_proj.1, mu, x],
-        [embed_groups, 1, 1],
+        [embed_groups, each_row, 1],
     );
     for (s, &(_, dt)) in steps.iter().enumerate() {
         g.op(
             format!("step.{s}.in_proj"),
-            embed(x_at, TIME_AT, 1, false),
+            embed(x_at, TIME_AT, 1, false, true),
             &[patch, in_proj.0, in_proj.1, times[s], x],
-            [embed_groups, 1, 1],
+            [embed_groups, each_row, 1],
         );
         let out = stack.layers(&mut g, &format!("step.{s}.dit"), x);
         g.op(
             format!("step.{s}.euler"),
             euler(dt),
             &[out, out_proj.0, out_proj.1, sampling, patch],
-            [1, 1, 1],
+            [1, each_row, 1],
         );
     }
     Ok(SamplerGraph {
         graph: g,
         stack,
+        rows,
         feat_dim,
         patch_size,
         steps,
@@ -252,17 +264,18 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Records the sampler of `config` in `timesteps` steps, every weight zero until
-    /// [`load`](Self::load).
+    /// Records the sampler of `config` in `timesteps` steps over `rows` rows, every weight zero
+    /// until [`load`](Self::load).
     pub fn new(
         ctx: &Context,
         kernels: &mut Kernels,
         config: &PatchConfig,
         timesteps: usize,
+        rows: usize,
         tuning: &Tuning,
         timed: bool,
     ) -> Result<Self, Error> {
-        let tensors = sampler_graph(config, timesteps, tuning)?;
+        let tensors = sampler_graph(config, timesteps, rows, tuning)?;
         let step = Step::new(ctx, kernels, &tensors.graph, timed)?;
         Ok(Sampler { step, tensors })
     }
@@ -274,22 +287,21 @@ impl Sampler {
         load_sampler(&mut self.step, &t.graph, t, &identity(&t.graph), checkpoint)
     }
 
-    /// Samples a patch from `noise`, given the conditions `mu` and the patch before, `cond`,
-    /// at `temperature` and guidance scale `cfg`, each as the module's documentation lays it
-    /// out.
+    /// Samples each row's patch from its `noise`, given its conditions `mu` and its patch
+    /// before, `cond`, at its temperature and guidance scale in `sampling`, each as the module's
+    /// documentation lays it out.
     pub fn sample(
         &mut self,
         mu: &[u16],
         cond: &[f32],
         noise: &[f32],
-        temperature: f32,
-        cfg: f32,
+        sampling: &[[f32; 2]],
     ) -> Result<Vec<f32>, Error> {
         let t = &self.tensors;
         self.step.write(t.mu, mu)?;
         self.step.write(t.cond, cond)?;
         self.step.write(t.noise, noise)?;
-        self.step.write(t.sampling, &[temperature, cfg])?;
+        self.step.write(t.sampling, sampling.as_flattened())?;
         self.step.submit()?;
         self.step.read(t.patch)
     }

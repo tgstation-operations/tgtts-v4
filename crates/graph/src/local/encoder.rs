@@ -1,9 +1,10 @@
-//! VoxCPM2's local encoder at batch 1, as voxcpm's `LocalEncoder` computes it for one patch:
-//! the patch's frames projected, after a learned token, through a bidirectional stack whose
-//! output at that token, after the final norm, is the patch's embedding.
+//! VoxCPM2's local encoder, as voxcpm's `LocalEncoder` computes it for one patch: the patch's
+//! frames projected, after a learned token, through a bidirectional stack whose output at that
+//! token, after the final norm, is the patch's embedding. It embeds a patch for each of several
+//! rows at once, a sequence to each.
 //!
-//! It takes the patch as the sampler ([`super::dit`]) gives it, `[feat_dim][patch_size]` in
-//! f32, and gives the embedding, `[hidden]` in f16, which the LM side projects with
+//! It takes each row's patch as the sampler ([`super::dit`]) gives it, `[feat_dim][patch_size]`
+//! in f32, and gives each row's embedding, `[hidden]` in f16, which the LM side projects with
 //! `enc_to_lm_proj`.
 
 use vulkan::{Context, SpecValue, Timing};
@@ -17,11 +18,12 @@ use crate::{
     step::Step,
 };
 
-/// The encoder's graph and the tensors the host writes and reads.
+/// The encoder's graph and the tensors the host writes and reads, each a row after a row.
 #[derive(Clone, Debug)]
 pub struct EncoderGraph {
     pub graph: Graph,
     pub stack: Stack,
+    pub rows: usize,
     pub patch: TensorId,
     /// The learned token that leads the frames.
     pub special: TensorId,
@@ -33,14 +35,21 @@ fn u(v: usize) -> SpecValue {
     SpecValue::U32(v as u32)
 }
 
-/// The local encoder of `config`, its kernels cut as `tuning` says.
-pub fn encoder_graph(config: &PatchConfig, tuning: &Tuning) -> Result<EncoderGraph, Error> {
+/// The local encoder of `config` over `rows` rows, its kernels cut as `tuning` says.
+pub fn encoder_graph(
+    config: &PatchConfig,
+    rows: usize,
+    tuning: &Tuning,
+) -> Result<EncoderGraph, Error> {
     let (feat_dim, patch_size) = (config.feat_dim, config.patch_size);
     let tokens = 1 + patch_size;
     let shape = config.stack(&config.encoder_config, tokens)?;
     let hidden = shape.hidden;
     let mut g = Graph::default();
-    let stack = Stack::new(&mut g, "encoder", &shape, 1, tuning)?;
+    if rows == 0 {
+        return Err(Error::Shape("no rows".into()));
+    }
+    let stack = Stack::new(&mut g, "encoder", &shape, rows, tuning)?;
     let Tuning {
         subgroup,
         workgroup,
@@ -73,35 +82,46 @@ pub fn encoder_graph(config: &PatchConfig, tuning: &Tuning) -> Result<EncoderGra
             (8, u(0)),
             (9, u(1)),
             (10, SpecValue::Bool(false)),
+            (11, SpecValue::Bool(true)),
         ],
     );
     let first = pipeline(&LOCAL_ROWS, &[(2, u(hidden)), (3, u(tokens))]);
 
     let half = |n: usize| 2 * n as u64;
-    let patch = g.tensor("patch", 4 * (feat_dim * patch_size) as u64, Kind::Input);
+    let patch = g.tensor(
+        "patch",
+        4 * (rows * feat_dim * patch_size) as u64,
+        Kind::Input,
+    );
     let special = g.tensor("special_token", half(hidden), Kind::Constant);
     let in_proj = (
         g.tensor("in_proj.weight", half(hidden * feat_dim), Kind::Constant),
         g.tensor("in_proj.bias", half(hidden), Kind::Constant),
     );
-    let x = g.tensor("encoder.x", half(tokens * hidden), Kind::Intermediate);
-    let out = g.tensor("out", half(hidden), Kind::Output);
+    let x = g.tensor(
+        "encoder.x",
+        half(rows * tokens * hidden),
+        Kind::Intermediate,
+    );
+    let out = g.tensor("out", half(rows * hidden), Kind::Output);
+    let each_row = u32::try_from(rows).map_err(|_| Error::Shape(format!("{rows} rows")))?;
     g.op(
         "in_proj",
         embed,
         &[patch, in_proj.0, in_proj.1, special, x],
         [
             groups("embedded columns", hidden, workgroup as usize)?,
-            1,
+            each_row,
             1,
         ],
     );
     let last = stack.layers(&mut g, "encoder", x);
     // The special token's output is the first of each sequence.
-    g.op("first", first, &[last, out], [1, 1, 1]);
+    g.op("first", first, &[last, out], [each_row, 1, 1]);
     Ok(EncoderGraph {
         graph: g,
         stack,
+        rows,
         patch,
         special,
         in_proj,
@@ -156,15 +176,17 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Records the encoder of `config`, every weight zero until [`load`](Self::load).
+    /// Records the encoder of `config` over `rows` rows, every weight zero until
+    /// [`load`](Self::load).
     pub fn new(
         ctx: &Context,
         kernels: &mut Kernels,
         config: &PatchConfig,
+        rows: usize,
         tuning: &Tuning,
         timed: bool,
     ) -> Result<Self, Error> {
-        let tensors = encoder_graph(config, tuning)?;
+        let tensors = encoder_graph(config, rows, tuning)?;
         let step = Step::new(ctx, kernels, &tensors.graph, timed)?;
         Ok(Encoder { step, tensors })
     }
@@ -176,9 +198,10 @@ impl Encoder {
         load_encoder(&mut self.step, &t.graph, t, &identity(&t.graph), checkpoint)
     }
 
-    /// The embedding of `patch`, laid out as the module's documentation says, as f16 bits.
-    pub fn encode(&mut self, patch: &[f32]) -> Result<Vec<u16>, Error> {
-        self.step.write(self.tensors.patch, patch)?;
+    /// The embedding of each row's patch of `patches`, laid out as the module's documentation
+    /// says, as f16 bits.
+    pub fn encode(&mut self, patches: &[f32]) -> Result<Vec<u16>, Error> {
+        self.step.write(self.tensors.patch, patches)?;
         self.step.submit()?;
         self.step.read(self.tensors.out)
     }

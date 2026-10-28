@@ -1,10 +1,10 @@
-//! Times the patch sampler and the local encoder on the GPU at batch 1: per dispatch from GPU
-//! timestamps, summed by kernel, and whole samples from submission to fence, against the bytes
-//! of weights they read and against the floor a streaming read of device memory sets.
+//! Times the patch sampler and the local encoder on the GPU over `--rows` rows: per dispatch from
+//! GPU timestamps, summed by kernel, and whole samples from submission to fence, against the
+//! bytes of weights they read and against the floor a streaming read of device memory sets.
 //!
 //! ```text
-//! cargo run --release -p graph --example local_timing -- [--timesteps 10] [--runs 20]
-//!     [--subgroup S] [--workgroup W] [--qkv-pairs P] [--gate-up-pairs P] [--o-tiles T]
+//! cargo run --release -p graph --example local_timing -- [--rows 1] [--timesteps 10]
+//!     [--runs 20] [--subgroup S] [--workgroup W] [--qkv-pairs P] [--gate-up-pairs P] [--o-tiles T]
 //!     [--down-tiles T] [--o-parts P] [--down-parts P] [--chunk C] [--block B] [--depth D]
 //!     [--groups G] [--warmup-ms 2000] [--floor-mib 512]
 //! ```
@@ -190,6 +190,7 @@ fn report(
 }
 
 fn main() {
+    let rows = arg("--rows", 1);
     let timesteps = arg("--timesteps", 10);
     let runs = arg("--runs", 20);
     let floor_mib = arg("--floor-mib", 512) as u64;
@@ -228,7 +229,7 @@ fn main() {
     };
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "{} ({}), validation {}; {timesteps} timesteps, {tuning:?}",
+        "{} ({}), validation {}; {rows} rows, {timesteps} timesteps, {tuning:?}",
         device_report.name,
         device_report.driver_info,
         if ctx.validating() { "on" } else { "off" },
@@ -241,19 +242,21 @@ fn main() {
 
     let hidden = config.dit_config.stack.hidden_dim;
     let len = config.feat_dim * config.patch_size;
-    let mu: Vec<u16> = uniform(2 * hidden, 1, 1.7)
+    let mu: Vec<u16> = uniform(rows * 2 * hidden, 1, 1.7)
         .iter()
         .map(|&v| half::f16::from_f32(v).to_bits())
         .collect();
-    let cond = uniform(len, 2, 1.0);
+    let cond = uniform(rows * len, 2, 1.0);
+    let sampling = vec![[1.0, 2.0]; rows];
     let mut per_kernel: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let (mut gpu, mut walls) = (Vec::new(), Vec::new());
     let mut steps = 0;
     let mut stack_bytes = BTreeMap::new();
     for timed in [true, false] {
         let start = Instant::now();
-        let mut sampler = Sampler::new(&ctx, &mut kernels, &config, timesteps, &tuning, timed)
-            .unwrap_or_else(|e| panic!("{e}"));
+        let mut sampler =
+            Sampler::new(&ctx, &mut kernels, &config, timesteps, rows, &tuning, timed)
+                .unwrap_or_else(|e| panic!("{e}"));
         sampler.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
         let t = sampler.tensors();
         steps = t.steps.len();
@@ -269,17 +272,17 @@ fn main() {
         let warming = Instant::now();
         let mut i = 0;
         while warming.elapsed() < warmup {
-            let noise = uniform(len, 10 + i, 1.7);
+            let noise = uniform(rows * len, 10 + i, 1.7);
             sampler
-                .sample(&mu, &cond, &noise, 1.0, 2.0)
+                .sample(&mu, &cond, &noise, &sampling)
                 .unwrap_or_else(|e| panic!("{e}"));
             i += 1;
         }
         for i in 0..runs {
-            let noise = uniform(len, 10 + i as u32, 1.7);
+            let noise = uniform(rows * len, 10 + i as u32, 1.7);
             let start = Instant::now();
             let patch = sampler
-                .sample(&mu, &cond, &noise, 1.0, 2.0)
+                .sample(&mu, &cond, &noise, &sampling)
                 .unwrap_or_else(|e| panic!("{e}"));
             let wall = start.elapsed().as_secs_f64() * 1e9;
             assert!(patch.iter().all(|v| v.is_finite()));
@@ -314,7 +317,7 @@ fn main() {
     let (mut gpu, mut walls) = (Vec::new(), Vec::new());
     let mut bytes = BTreeMap::new();
     for timed in [true, false] {
-        let mut encoder = Encoder::new(&ctx, &mut kernels, &config, &tuning, timed)
+        let mut encoder = Encoder::new(&ctx, &mut kernels, &config, rows, &tuning, timed)
             .unwrap_or_else(|e| panic!("{e}"));
         encoder.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
         bytes = layer_bytes(&encoder.tensors().stack.shape, 1);
@@ -322,11 +325,11 @@ fn main() {
         let warming = Instant::now();
         while warming.elapsed() < warmup {
             encoder
-                .encode(&uniform(len, 99, 1.0))
+                .encode(&uniform(rows * len, 99, 1.0))
                 .unwrap_or_else(|e| panic!("{e}"));
         }
         for i in 0..runs {
-            let patch = uniform(len, 100 + i as u32, 1.0);
+            let patch = uniform(rows * len, 100 + i as u32, 1.0);
             let start = Instant::now();
             encoder.encode(&patch).unwrap_or_else(|e| panic!("{e}"));
             let wall = start.elapsed().as_secs_f64() * 1e9;

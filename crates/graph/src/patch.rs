@@ -60,9 +60,9 @@ pub fn patch_graph(
     lm: &decode::Tuning,
     local: &local::Tuning,
 ) -> Result<PatchGraph, Error> {
-    let encoder = encoder_graph(config, local)?;
+    let encoder = encoder_graph(config, 1, local)?;
     let side = lm_side_graph(side, lm)?;
-    let sampler = sampler_graph(config, timesteps, local)?;
+    let sampler = sampler_graph(config, timesteps, 1, local)?;
     let mut g = Graph::default();
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
     let cond = g.tensor("cond", bytes(&sampler.graph, sampler.cond), Kind::Input);

@@ -1,9 +1,10 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// The tokens a local stack starts from, in SEQS sequences of T tokens of N: at FIRST of each,
-// FRAMES tokens W f16(src) + b projected from the frames of a patch, `src` `[IN][FRAMES]` in
-// f32 as the sampler keeps it; and at AT, COPIED tokens of `tokens`, `[COPIED][N]`, the same in
-// every sequence unless GUIDED, which zeroes them in all but the first, as the sampler's
+// The tokens a local stack starts from, for each row of WorkGroupID.y SEQS sequences of T tokens
+// of N: at FIRST of each, FRAMES tokens W f16(src) + b projected from the frames of the row's
+// patch, `src` `[rows][IN][FRAMES]` in f32 as the sampler keeps it; and at AT, COPIED tokens of
+// `tokens`, `[COPIED][N]` for every row when SHARED and `[rows][COPIED][N]` else, the same in each
+// of the row's sequences unless GUIDED, which zeroes them in all but the first, as the sampler's
 // unconditional sequence has them. The other tokens are left as they are. An invocation takes
 // one of the N outputs.
 #include "common.glsl"
@@ -17,13 +18,14 @@ layout(constant_id = 7) const uint FIRST = 7;
 layout(constant_id = 8) const uint AT = 2;
 layout(constant_id = 9) const uint COPIED = 1;
 layout(constant_id = 10) const bool GUIDED = false;
+layout(constant_id = 11) const bool SHARED = true;
 
 layout(std430, binding = 0) readonly buffer Src { float src[]; };
 // [N][IN]
 layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
 layout(std430, binding = 2) readonly buffer Bias { float16_t bias[]; };
 layout(std430, binding = 3) readonly buffer Tokens { float16_t tokens[]; };
-// [SEQS][T][N]
+// [rows][SEQS][T][N]
 layout(std430, binding = 4) writeonly buffer H { float16_t h[]; };
 
 // The frames rounded to f16, as the stack takes them, `[FRAMES][IN]`: stored as f16, so that
@@ -31,10 +33,11 @@ layout(std430, binding = 4) writeonly buffer H { float16_t h[]; };
 shared float16_t frames[FRAMES * IN];
 
 void main() {
+    uint row = gl_WorkGroupID.y;
     for (uint i = gl_LocalInvocationID.x; i < FRAMES * IN; i += WORKGROUP) {
         uint f = i / IN;
         uint c = i % IN;
-        frames[i] = float16_t(src[c * FRAMES + f]);
+        frames[i] = float16_t(src[(row * IN + c) * FRAMES + f]);
     }
     barrier();
     uint n = gl_GlobalInvocationID.x;
@@ -52,13 +55,15 @@ void main() {
             acc[f] += dot(lo, flo) + dot(hi, fhi);
         }
     }
+    uint copied = SHARED ? 0 : row * COPIED;
     for (uint s = 0; s < SEQS; s++) {
+        uint first = (row * SEQS + s) * T;
         [[unroll]] for (uint f = 0; f < FRAMES; f++) {
-            h[((s * T) + FIRST + f) * N + n] = float16_t(acc[f]);
+            h[(first + FIRST + f) * N + n] = float16_t(acc[f]);
         }
         for (uint t = 0; t < COPIED; t++) {
-            float16_t value = GUIDED && s > 0 ? float16_t(0.0) : tokens[t * N + n];
-            h[((s * T) + AT + t) * N + n] = value;
+            float16_t value = GUIDED && s > 0 ? float16_t(0.0) : tokens[(copied + t) * N + n];
+            h[(first + AT + t) * N + n] = value;
         }
     }
 }
