@@ -9,10 +9,28 @@ use voices::Latent;
 /// An error from a synthesizer, which the service reports and fails the request on.
 pub type Error = Box<dyn error::Error + Send + Sync>;
 
+/// Where a stream's audio goes, a run of samples at a time.
+pub type Sink<'a> = dyn FnMut(&[f32]) + 'a;
+
 /// A text-to-speech model, speaking at the service's rate.
 pub trait Synthesizer: Send + Sync + 'static {
     /// `text` spoken in `voice`, drawn from `seed`.
     fn synthesize(&self, text: &str, voice: &Latent, seed: u64) -> Result<Speech, Error>;
+
+    /// The same speech, its samples given to `audio` as they are made, a run at a time, in
+    /// order, all of them before it comes back whole. A model that cannot give them sooner
+    /// gives them all at the end.
+    fn stream(
+        &self,
+        text: &str,
+        voice: &Latent,
+        seed: u64,
+        audio: &mut Sink<'_>,
+    ) -> Result<Speech, Error> {
+        let speech = self.synthesize(text, voice, seed)?;
+        audio(&speech.samples);
+        Ok(speech)
+    }
 }
 
 /// What a synthesizer said.

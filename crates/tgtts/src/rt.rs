@@ -4,8 +4,9 @@
 //! than on burn. A thread of its own owns the GPU and generates there on an [`Engine`], the
 //! requests in the order they come and as many at once as the engine holds, the generator
 //! sixteen. The service talks to it as to the burn devices: the prompt is built on the caller's
-//! thread, and the speech comes back whole. Each patch is sampled from noise drawn from the
-//! request's seed as burn's are, so that a seed gives the same noise on every device.
+//! thread, and the speech comes back whole, or for a stream a run of audio at a time as it is
+//! decoded too. Each patch is sampled from noise drawn from the request's seed as burn's are, so
+//! that a seed gives the same noise on every device.
 //!
 //! The generator keeps what a prompt computes of its voice for the next prompts in it, within
 //! `prompt_cache_bytes`, so that a request in a voice it keeps runs only its own text and the
@@ -35,13 +36,20 @@ use voxcpm::{Config, Prompt, Tokenizer};
 #[cfg(feature = "rt")]
 use voxcpm::{Noise, Params, Sampling, SeededNoise};
 
-use crate::synth::{self, Speech, Start, Synthesizer};
+use crate::synth::{self, Sink, Speech, Start, Synthesizer};
 
 /// The line the warm-up speaks, as long as a median line.
 const WARM_UP_LINE: &str = "Hello there, could someone please come to medbay? I need help.";
 
 /// The patches the warm-up generates: past the audio decoder's first chunk.
 const WARM_UP_PATCHES: usize = 9;
+
+/// The patches after which a streamed request's frames waiting are decoded at once, rather than
+/// once a chunk's worth waits: its first audio after its first patch, then as much again each
+/// time, so that what it has given stays ahead of what a player has played of it while the
+/// chunks grow to their size.
+#[cfg(feature = "rt")]
+const RAMP: [usize; 4] = [1, 2, 4, 8];
 
 /// The positions each slot of the generator's caches holds: a prompt of the longest voice, 188
 /// patches twice, and the longest message the game sends, 1024 characters, with the patches
@@ -67,6 +75,8 @@ pub struct Request {
     pub seed: u64,
     /// The most patches it may have.
     pub max_patches: usize,
+    /// Whether its audio goes out as it is decoded, which it is then sooner.
+    pub streamed: bool,
 }
 
 /// What a step gave a request: the audio decoded, and whether its patch was its last.
@@ -102,7 +112,14 @@ struct Job {
     request: Request,
     /// When it was sent.
     sent: Instant,
-    speech: Sender<Result<Speech, synth::Error>>,
+    replies: Sender<Reply>,
+}
+
+/// What the thread that generates sends back for a request: for a streamed one, its audio a run
+/// at a time as it is decoded, then for every one, its speech whole, or why there is none.
+enum Reply {
+    Audio(Vec<f32>),
+    Speech(Result<Speech, synth::Error>),
 }
 
 /// A request under way.
@@ -125,6 +142,9 @@ impl Generation {
             ..
         } = self;
         let speech = rest.map(|rest| {
+            if job.request.streamed && !rest.is_empty() {
+                let _ = job.replies.send(Reply::Audio(rest.clone()));
+            }
             samples.extend(rest);
             debug!(
                 prompt = start.map(|s| s.prompt),
@@ -140,7 +160,7 @@ impl Generation {
                 start,
             }
         });
-        let _ = job.speech.send(speech);
+        let _ = job.replies.send(Reply::Speech(speech));
     }
 }
 
@@ -180,7 +200,7 @@ fn serve(engine: &mut dyn Engine, jobs: &Receiver<Job>) {
                     });
                 }
                 Err(e) => {
-                    let _ = job.speech.send(Err(e));
+                    let _ = job.replies.send(Reply::Speech(Err(e)));
                 }
             }
         }
@@ -199,6 +219,9 @@ fn serve(engine: &mut dyn Engine, jobs: &Receiver<Job>) {
                         prompt: generation.job.request.prompt.len(),
                         prefilled: generation.prefilled,
                     });
+                    if generation.job.request.streamed && !audio.is_empty() {
+                        let _ = generation.job.replies.send(Reply::Audio(audio.clone()));
+                    }
                     generation.samples.extend(audio);
                     if last {
                         let generation = slots[slot].take().expect("under way");
@@ -327,6 +350,7 @@ impl Rt {
             Ok(Box::new(Generating {
                 ctx,
                 noise: (0..generator.slots()).map(|_| None).collect(),
+                streamed: vec![None; generator.slots()],
                 generator,
                 sampling,
                 patch,
@@ -334,31 +358,43 @@ impl Rt {
         })
     }
 
-    /// `text` in `voice` from `seed`'s noise, up to `max_patches` patches of it.
+    /// `text` in `voice` from `seed`'s noise, up to `max_patches` patches of it, its audio given
+    /// to `audio` as it is decoded where there is one.
     fn generate(
         &self,
         text: &str,
         voice: &Latent,
         seed: u64,
         max_patches: usize,
+        mut audio: Option<&mut Sink<'_>>,
     ) -> Result<Speech, synth::Error> {
         let tokens = self.tokenizer.encode(&format!("{}{text}", voice.text));
         let frames = voice.frames.as_flattened();
         let prompt = Prompt::cloning(&tokens, frames, &self.config)?;
-        let (speech, received) = mpsc::channel();
+        let (replies, received) = mpsc::channel();
         let job = Job {
             request: Request {
                 prompt,
                 voice: frames.to_vec(),
                 seed,
                 max_patches,
+                streamed: audio.is_some(),
             },
             sent: Instant::now(),
-            speech,
+            replies,
         };
         let stopped = "the thread VoxCPM2 generates on has stopped";
         self.jobs.send(job).map_err(|_| stopped)?;
-        received.recv().map_err(|_| stopped)?
+        loop {
+            match received.recv().map_err(|_| stopped)? {
+                Reply::Audio(samples) => {
+                    if let Some(audio) = audio.as_mut() {
+                        audio(&samples);
+                    }
+                }
+                Reply::Speech(speech) => return speech,
+            }
+        }
     }
 
     /// Speaks a line in the voice of `voices` with the most frames, a few patches of it, so that
@@ -381,7 +417,7 @@ impl Rt {
             }
         }
         let voice = longest.ok_or("no voices")?;
-        let speech = self.generate(WARM_UP_LINE, &voice, 0, WARM_UP_PATCHES)?;
+        let speech = self.generate(WARM_UP_LINE, &voice, 0, WARM_UP_PATCHES, None)?;
         info!(
             prompt = speech.start.map(|s| s.prompt),
             patches = speech.patches,
@@ -402,6 +438,8 @@ struct Generating {
     patch: usize,
     /// The noise of each slot's request, none in a free slot.
     noise: Vec<Option<SeededNoise>>,
+    /// The patches of each slot's streamed request so far, none for one not streamed.
+    streamed: Vec<Option<usize>>,
 }
 
 #[cfg(feature = "rt")]
@@ -426,6 +464,7 @@ impl Engine for Generating {
             self.sampling.cfg_value,
         )?;
         self.noise[slot] = Some(SeededNoise::new(request.seed));
+        self.streamed[slot] = request.streamed.then_some(0);
         let cache = self.generator.prompt_cache();
         debug!(
             prompt = prompt.len(),
@@ -442,6 +481,7 @@ impl Engine for Generating {
             generator,
             noise,
             patch,
+            streamed,
             ..
         } = self;
         let drawn = |slot: usize| {
@@ -452,11 +492,19 @@ impl Engine for Generating {
             Ok(patches) => patches
                 .into_iter()
                 .map(|(slot, patch)| {
-                    let stepped = patch.map(|patch| Stepped {
-                        audio: generator.take_audio(slot),
-                        last: patch.last,
+                    let stepped = patch.map_err(synth::Error::from).and_then(|patch| {
+                        if let Some(patches) = &mut streamed[slot] {
+                            *patches += 1;
+                            if RAMP.contains(patches) {
+                                generator.decode_waiting(slot)?;
+                            }
+                        }
+                        Ok(Stepped {
+                            audio: generator.take_audio(slot),
+                            last: patch.last,
+                        })
                     });
-                    (slot, stepped.map_err(Into::into))
+                    (slot, stepped)
                 })
                 .collect(),
             // The submission failed, and every request under way with it.
@@ -474,6 +522,7 @@ impl Engine for Generating {
     /// Fails the request once the validation layer, where it is on, has reported anything.
     fn finish(&mut self, slot: usize) -> Result<Vec<f32>, synth::Error> {
         self.noise[slot] = None;
+        self.streamed[slot] = None;
         let audio = self.generator.finish(slot)?;
         validated(&self.ctx)?;
         Ok(audio)
@@ -530,7 +579,17 @@ impl Drop for Rt {
 
 impl Synthesizer for Rt {
     fn synthesize(&self, text: &str, voice: &Latent, seed: u64) -> Result<Speech, synth::Error> {
-        self.generate(text, voice, seed, self.max_patches)
+        self.generate(text, voice, seed, self.max_patches, None)
+    }
+
+    fn stream(
+        &self,
+        text: &str,
+        voice: &Latent,
+        seed: u64,
+        audio: &mut Sink<'_>,
+    ) -> Result<Speech, synth::Error> {
+        self.generate(text, voice, seed, self.max_patches, Some(audio))
     }
 }
 
@@ -679,27 +738,39 @@ mod tests {
         Config::from_json(include_str!("../../voxcpm/tests/fixtures/voxcpm.json")).unwrap()
     }
 
-    /// Sends a request of `seed` to `jobs`, its prompt of `text` tokens, and gives where its
-    /// speech comes back.
-    fn send(jobs: &Sender<Job>, seed: u64, text: usize) -> Receiver<Result<Speech, synth::Error>> {
+    /// Sends a request of `seed` to `jobs`, its prompt of `text` tokens, streamed if `streamed`,
+    /// and gives where its replies come back.
+    fn send(jobs: &Sender<Job>, seed: u64, text: usize, streamed: bool) -> Receiver<Reply> {
         let config = config();
         let voice = vec![0.5; config.patch_size * config.feat_dim];
         let prompt = Prompt::cloning(&vec![7; text], &voice, &config).unwrap();
-        let (speech, received) = mpsc::channel();
+        let (replies, received) = mpsc::channel();
         let request = Request {
             prompt,
             voice,
             seed,
             max_patches: 16,
+            streamed,
         };
         let sent = Instant::now();
         jobs.send(Job {
             request,
             sent,
-            speech,
+            replies,
         })
         .unwrap();
         received
+    }
+
+    /// The runs of audio `received` brought, then the speech.
+    fn replied(received: &Receiver<Reply>) -> (Vec<Vec<f32>>, Result<Speech, synth::Error>) {
+        let mut runs = vec![];
+        loop {
+            match received.recv().unwrap() {
+                Reply::Audio(run) => runs.push(run),
+                Reply::Speech(speech) => return (runs, speech),
+            }
+        }
     }
 
     /// Serves what `send` sends on an engine of `slots` slots, and gives the steps it took.
@@ -721,10 +792,10 @@ mod tests {
     fn speaks_each_request_whole_one_at_a_time_in_the_order_they_came() {
         let mut replies = vec![];
         let steps = served(1, |jobs| {
-            replies.push(send(jobs, 3, 2));
-            replies.push(send(jobs, 12, 5));
+            replies.push(send(jobs, 3, 2, false));
+            replies.push(send(jobs, 12, 5, false));
         });
-        let speech: Vec<Speech> = replies.iter().map(|r| r.recv().unwrap().unwrap()).collect();
+        let speech: Vec<Speech> = replies.iter().map(|r| replied(r).1.unwrap()).collect();
         assert_eq!(speech[0].samples, [3.0, 1.0, 3.0, 2.0, 3.0, 3.0, -3.0]);
         assert_eq!(speech[0].patches, 3);
         assert_eq!(speech[1].samples, [12.0, 1.0, 12.0, 2.0, -12.0]);
@@ -742,12 +813,12 @@ mod tests {
         let mut replies = vec![];
         let steps = served(2, |jobs| {
             for seed in [2, 4, 1] {
-                replies.push(send(jobs, seed, 1));
+                replies.push(send(jobs, seed, 1, false));
             }
         });
         let patches: Vec<usize> = replies
             .iter()
-            .map(|r| r.recv().unwrap().unwrap().patches)
+            .map(|r| replied(r).1.unwrap().patches)
             .collect();
         assert_eq!(patches, [2, 4, 1]);
         // The third starts in the first's slot once the first has its last patch.
@@ -759,10 +830,10 @@ mod tests {
         let mut replies = vec![];
         let steps = served(1, |jobs| {
             for seed in [0, 99, 1] {
-                replies.push(send(jobs, seed, 1));
+                replies.push(send(jobs, seed, 1, false));
             }
         });
-        let speech: Vec<_> = replies.iter().map(|r| r.recv().unwrap()).collect();
+        let speech: Vec<_> = replies.iter().map(|r| replied(r).1).collect();
         assert_eq!(
             speech[0].as_ref().unwrap_err().to_string(),
             "no such request"
@@ -770,5 +841,28 @@ mod tests {
         assert_eq!(speech[1].as_ref().unwrap_err().to_string(), "not finite");
         assert_eq!(speech[2].as_ref().unwrap().samples, [1.0, 1.0, -1.0]);
         assert_eq!(steps, [[0]; 3]);
+    }
+
+    #[test]
+    fn a_streamed_request_has_its_audio_as_it_is_decoded_and_then_whole() {
+        let mut replies = vec![];
+        served(1, |jobs| {
+            replies.push(send(jobs, 3, 2, true));
+            replies.push(send(jobs, 2, 2, false));
+            replies.push(send(jobs, 99, 2, true));
+        });
+        let (runs, speech) = replied(&replies[0]);
+        assert_eq!(
+            runs,
+            [vec![3.0, 1.0], vec![3.0, 2.0], vec![3.0, 3.0], vec![-3.0]]
+        );
+        assert_eq!(runs.concat(), speech.unwrap().samples);
+        let (runs, speech) = replied(&replies[1]);
+        assert!(runs.is_empty());
+        assert_eq!(speech.unwrap().samples, [2.0, 1.0, 2.0, 2.0, -2.0]);
+        // A stream that fails has what was decoded before it failed, then the failure.
+        let (runs, speech) = replied(&replies[2]);
+        assert_eq!(runs, [vec![99.0, 1.0]]);
+        assert_eq!(speech.unwrap_err().to_string(), "not finite");
     }
 }
