@@ -30,6 +30,7 @@ pub mod local;
 pub mod patch;
 pub mod prefill;
 pub mod prompt;
+pub mod pth;
 pub mod step;
 pub mod vae;
 
