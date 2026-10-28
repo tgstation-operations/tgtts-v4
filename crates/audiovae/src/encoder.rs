@@ -6,6 +6,7 @@ use burn::{
 
 use crate::{
     AudioVaeConfig, Error, Weights,
+    config::Check,
     layers::{Layer, ResidualUnit, Snake1d, causal, sequential},
 };
 

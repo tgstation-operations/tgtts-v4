@@ -1,15 +1,16 @@
-use audiovae::AudioVaeConfig;
-use minicpm4::LocalShape;
 use serde::Deserialize;
 
-use crate::Error;
+use crate::{
+    AudioVaeConfig, Error,
+    minicpm4::{self, LocalShape},
+};
 
 /// A VoxCPM2 checkpoint's `config.json`, in the form of upstream's `VoxCPMConfig`.
 ///
 /// Fields the JSON leaves out take upstream's defaults. A field upstream does not have is
 /// refused rather than ignored, but for the two the checkpoint carries beyond upstream's schema,
-/// `architecture` and `dit_config.mean_mode`. [`from_json`](Self::from_json) refuses what this
-/// crate does not implement.
+/// `architecture` and `dit_config.mean_mode`. [`from_json`](Self::from_json) refuses what the
+/// `voxcpm` crate does not implement.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -174,7 +175,7 @@ mod defaults {
 }
 
 impl Config {
-    /// Parses a `config.json`, refusing what this crate does not implement: another
+    /// Parses a `config.json`, refusing what the `voxcpm` crate does not implement: another
     /// architecture, mean mode, a solver other than Euler, or latent frames other than the
     /// audio VAE's. What the MiniCPM-4 stacks do not implement is refused as they load.
     ///
@@ -187,7 +188,13 @@ impl Config {
         Ok(config)
     }
 
-    pub(crate) fn check(&self) -> Result<(), Error> {
+    /// What [`from_json`](Self::from_json) refuses of a config it has parsed, for a config made
+    /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// If it asks for what the `voxcpm` crate does not implement.
+    pub fn check(&self) -> Result<(), Error> {
         let unsupported = |what: String| Err(Error::Unsupported(what));
         if let Some(architecture) = &self.architecture
             && architecture != "voxcpm2"

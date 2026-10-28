@@ -262,9 +262,9 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "crc32fast",
- "serde",
  "serde_json",
  "testkit",
+ "voxcpm-core",
 ]
 
 [[package]]
@@ -4094,9 +4094,9 @@ dependencies = [
  "burn",
  "crc32fast",
  "regex",
- "serde",
  "serde_json",
  "testkit",
+ "voxcpm-core",
 ]
 
 [[package]]
@@ -6906,14 +6906,22 @@ dependencies = [
  "burn",
  "crc32fast",
  "minicpm4",
- "rand 0.10.3",
- "rand_distr",
  "regex",
  "safetensors 0.8.0",
- "serde",
  "serde_json",
  "testkit",
  "voices",
+ "voxcpm-core",
+]
+
+[[package]]
+name = "voxcpm-core"
+version = "0.1.0"
+dependencies = [
+ "rand 0.10.3",
+ "rand_distr",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

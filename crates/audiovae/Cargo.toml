@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 burn = { workspace = true, features = ["std", "pytorch"] }
-serde.workspace = true
+voxcpm-core = { path = "../voxcpm-core" }
 
 [dev-dependencies]
 burn = { workspace = true, features = ["safetensors"] }

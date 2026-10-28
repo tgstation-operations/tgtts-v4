@@ -8,6 +8,7 @@ use burn::{
 
 use crate::{
     AudioVaeConfig, Error, Weights,
+    config::Check,
     layers::{
         Carry, CausalConvTranspose1d, Layer, ResidualUnit, SampleRateCondition, Snake1d, causal,
         sequential, sequential_push,

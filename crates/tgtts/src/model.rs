@@ -358,7 +358,7 @@ fn lengthened(
         .take(len - 3 - 2 * patches)
         .copied()
         .collect();
-    Prompt::cloning(&tokens, voice, config)
+    Prompt::cloning(&tokens, voice, config).map_err(voxcpm::Error::Core)
 }
 
 /// What the thread that generates holds.

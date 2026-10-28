@@ -7,35 +7,31 @@
 
 mod batch;
 mod cfm;
-mod config;
 mod graph;
 mod local_dit;
 mod local_encoder;
 mod model;
-mod noise;
 mod prefill;
-mod prompt;
 mod speech;
-mod tokenizer;
 mod weights;
 
 use std::{fmt, io, path::PathBuf};
 
 use burn::store::SafetensorsStoreError;
+pub use voxcpm_core::{
+    CfmConfig, Config, DitConfig, EncoderConfig, Noise, Params, Prompt, Sampling, SeededNoise,
+    Tokenizer,
+};
 
 pub use crate::{
     batch::{Batch, PREFILL_BATCH, Patch, RowId, Scheduler, Started, StepReport},
-    cfm::{Cfm, Sampling, schedule},
-    config::{CfmConfig, Config, DitConfig, EncoderConfig},
+    cfm::{Cfm, schedule},
     graph::{GraphCounts, Stepper, Stepping},
     local_dit::LocalDit,
     local_encoder::LocalEncoder,
     model::{Dtypes, Generation, Model, Patches, Step},
-    noise::{Noise, SeededNoise},
     prefill::{PREFILL_KEYS, Prefill, PromptCache},
-    prompt::Prompt,
-    speech::{CHUNK_FRAMES, ChunkDecoder, Params, SpeechChunks, SpeechDecoder, TextToSpeech},
-    tokenizer::Tokenizer,
+    speech::{CHUNK_FRAMES, ChunkDecoder, SpeechChunks, SpeechDecoder, TextToSpeech},
 };
 
 /// Why a model could not be loaded, or a request served.
@@ -43,8 +39,8 @@ pub use crate::{
 pub enum Error {
     /// A file of the checkpoint could not be read.
     Io(PathBuf, io::Error),
-    /// `config.json` is not a config upstream would read.
-    Config(serde_json::Error),
+    /// The config, the tokenizer or a prompt was refused.
+    Core(voxcpm_core::Error),
     /// The config asks for something this crate does not implement.
     Unsupported(String),
     /// A MiniCPM-4 stack could not be loaded.
@@ -53,8 +49,6 @@ pub enum Error {
     Load(SafetensorsStoreError),
     /// The audio VAE could not be loaded.
     AudioVae(audiovae::Error),
-    /// `tokenizer.json` is not one this crate implements.
-    Tokenizer(String),
     /// A request the model cannot serve.
     Request(String),
     /// The patch, by its index, came out NaN or infinite, as an overflow or a kernel that wrote
@@ -69,12 +63,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(path, e) => write!(f, "{}: {e}", path.display()),
-            Self::Config(e) => write!(f, "VoxCPM2 config: {e}"),
+            Self::Core(e) => write!(f, "{e}"),
             Self::Unsupported(what) => write!(f, "unsupported VoxCPM2 config: {what}"),
             Self::Stack(e) => write!(f, "{e}"),
             Self::Load(e) => write!(f, "loading VoxCPM2 weights: {e}"),
             Self::AudioVae(e) => write!(f, "{e}"),
-            Self::Tokenizer(what) => write!(f, "tokenizer.json: {what}"),
             Self::Request(what) => write!(f, "cannot generate from {what}"),
             Self::NotFinite(patch) => write!(f, "patch {patch} came out NaN or infinite"),
             Self::OtherThread => f.write_str(
@@ -85,3 +78,9 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<voxcpm_core::Error> for Error {
+    fn from(e: voxcpm_core::Error) -> Self {
+        Self::Core(e)
+    }
+}

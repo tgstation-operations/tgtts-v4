@@ -4,7 +4,8 @@ use safetensors::SafeTensors;
 use serde_json::{Value, json};
 use testkit::{checkpoint_dir, device, fixture};
 use voices::Latent;
-use voxcpm::{Error, Tokenizer};
+use voxcpm::Tokenizer;
+use voxcpm_core::Error;
 
 fn tiny() -> Value {
     serde_json::from_str(include_str!("fixtures/voxcpm_tokenizer.json")).unwrap()

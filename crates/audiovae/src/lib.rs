@@ -14,8 +14,9 @@ mod weights;
 
 use std::fmt;
 
+pub use voxcpm_core::AudioVaeConfig;
+
 pub use crate::{
-    config::AudioVaeConfig,
     decoder::{DecodeSlots, DecodeStream, Decoder},
     encoder::Encoder,
     weights::Weights,

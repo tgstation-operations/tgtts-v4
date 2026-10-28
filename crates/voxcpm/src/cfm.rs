@@ -2,28 +2,7 @@ use std::{f32::consts::FRAC_PI_2, path::Path};
 
 use burn::tensor::{Device, FloatDType, Tensor};
 
-use crate::{Config, Error, LocalDit};
-
-/// How a patch is sampled. The default is what the Python service asked for.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Sampling {
-    /// Euler steps from noise to the patch, upstream's `inference_timesteps`.
-    pub timesteps: usize,
-    /// The scale of the noise the flow starts from.
-    pub temperature: f32,
-    /// The classifier-free guidance scale.
-    pub cfg_value: f32,
-}
-
-impl Default for Sampling {
-    fn default() -> Self {
-        Self {
-            timesteps: 10,
-            temperature: 1.0,
-            cfg_value: 2.0,
-        }
-    }
-}
+use crate::{Config, Error, LocalDit, Sampling};
 
 /// The sampler of VoxCPM2's patches, upstream's `UnifiedCFM` at inference: Euler steps along
 /// the flow the local DiT predicts, from noise at time 1 to a patch at time 0, with

@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 burn = { workspace = true, features = ["safetensors", "std", "store"] }
 regex.workspace = true
-serde.workspace = true
+voxcpm-core = { path = "../voxcpm-core" }
 
 [dev-dependencies]
 crc32fast.workspace = true

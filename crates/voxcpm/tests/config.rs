@@ -1,7 +1,8 @@
 use audiovae::AudioVaeConfig;
 use serde_json::{Value, json};
 use testkit::checkpoint_dir;
-use voxcpm::{CfmConfig, Config, Error};
+use voxcpm::{CfmConfig, Config};
+use voxcpm_core::Error;
 
 fn tiny() -> Value {
     serde_json::from_str(include_str!("fixtures/voxcpm.json")).unwrap()

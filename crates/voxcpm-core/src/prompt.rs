@@ -69,7 +69,7 @@ impl Prompt {
     /// The positions of the voice as reference audio, and the voice's patches there, if the
     /// prompt is as [`cloning`](Self::cloning) lays it out: the voice spoken again at the end,
     /// after the text and the audio start token.
-    pub(crate) fn voice(&self) -> Option<(Range<usize>, &[f32])> {
+    pub fn voice(&self) -> Option<(Range<usize>, &[f32])> {
         let len = self.len();
         let voice = self.audio.iter().skip(1).take_while(|&&a| a).count();
         let text = len.checked_sub(3 + 2 * voice)?;
@@ -89,7 +89,7 @@ impl Prompt {
 
     /// The positions of the text, between the reference audio and the audio start token, of a
     /// prompt [`voice`](Self::voice) finds laid out.
-    pub(crate) fn text(&self) -> Range<usize> {
+    pub fn text(&self) -> Range<usize> {
         let voice = self.audio.iter().skip(1).take_while(|&&a| a).count();
         2 + voice..self.len() - voice - 1
     }

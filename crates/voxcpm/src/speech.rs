@@ -13,34 +13,11 @@ use burn::tensor::{
 };
 use voices::{LATENT_DIM, Latent};
 
-use crate::{Config, Dtypes, Error, Model, Noise, Prompt, Sampling, Stepping, Tokenizer};
+use crate::{Config, Dtypes, Error, Model, Noise, Params, Prompt, Stepping, Tokenizer};
 
 /// The voice's last frames that nanovllm-voxcpm's streaming decoder is primed with, its
 /// `n_decode_pad_frames`, so that speech starts as if it went on from the voice.
 const DECODE_CONTEXT_FRAMES: usize = 12;
-
-/// What a request asks for beyond its text and voice. The default is what the Python service
-/// asked for, decoded a second at a time.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Params {
-    pub sampling: Sampling,
-    /// The most patches to generate, nanovllm-voxcpm's `max_generate_length`.
-    pub max_patches: usize,
-    /// The most latent frames the audio VAE decodes in one call, so that no call holds a GPU
-    /// long enough for its driver to reset it. The audio is the same, to rounding, however the
-    /// frames are split.
-    pub decode_chunk_frames: NonZeroUsize,
-}
-
-impl Default for Params {
-    fn default() -> Self {
-        Self {
-            sampling: Sampling::default(),
-            max_patches: 256,
-            decode_chunk_frames: NonZeroUsize::new(25).expect("not zero"),
-        }
-    }
-}
 
 /// VoxCPM2 as the Python service ran it: text spoken in a voice, as audio.
 #[derive(Debug)]
@@ -156,7 +133,7 @@ impl TextToSpeech {
     /// If the voice is not a whole number of patches.
     pub fn prompt(&self, text: &str, voice: &Latent) -> Result<Prompt, Error> {
         let tokens = self.tokenizer.encode(&format!("{}{text}", voice.text));
-        Prompt::cloning(&tokens, voice.frames.as_flattened(), &self.config)
+        Prompt::cloning(&tokens, voice.frames.as_flattened(), &self.config).map_err(Error::Core)
     }
 
     /// The model, to generate from a prompt a patch at a time.

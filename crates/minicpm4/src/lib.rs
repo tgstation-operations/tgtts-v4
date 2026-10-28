@@ -22,13 +22,12 @@ use burn::{
     },
     tensor::{Bool, Device, FloatDType, Int, Shape, Tensor, TensorData},
 };
+pub use voxcpm_core::minicpm4::{Config, LocalShape, RopeScaling};
 
-pub use crate::{
-    cache::KvCache,
-    config::{Config, LocalShape, RopeScaling},
-};
+pub use crate::cache::KvCache;
 use crate::{
     cache::{Append, Slots},
+    config::Check,
     layer::{DecoderLayer, RmsNorm},
     rope::Rope,
 };
