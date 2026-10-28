@@ -5,13 +5,17 @@
 //! reports rather than who made it ([`choose_memory_type`]).
 //!
 //! What the GPU reads every step, weights and a model's working memory, is
-//! [`Residence::Device`]: device-local memory, preferring a type the host cannot map, which on a
-//! discrete GPU is its own memory and on an APU is the same system memory as any other. The host
-//! reaches it only through a staging buffer and a copy on the queue, a chunk at a time
-//! ([`STAGING_BYTES`]). What the host writes or reads every step, small inputs and outputs, is
-//! mapped for the buffer's whole life and read and written in place: [`Residence::Upload`] in
-//! device-local memory the host can map where the device has it (an APU's, or a discrete GPU's
-//! through a resizable BAR), [`Residence::Readback`] in host-cached memory where it has that.
+//! [`Residence::Device`]: on a discrete GPU its own memory, preferring a type the host cannot map.
+//! On an integrated GPU it is system memory the host does not cache, where the device offers a
+//! type of it that is not device-local: an APU's device-local memory is the carve-out the firmware
+//! set aside from the same system memory, 512 MiB on the Radeon 8060S here, which RADV fills with
+//! device-local buffers before it places any elsewhere, and in which the display has to pin its
+//! framebuffers. The host reaches it only through a staging buffer and a copy on the queue, a
+//! chunk at a time ([`STAGING_BYTES`]).
+//! What the host writes or reads every step, small inputs and outputs, is mapped for the buffer's
+//! whole life and read and written in place: [`Residence::Upload`] in device-local memory the
+//! host can map where a discrete GPU has it (through a resizable BAR), in memory the host does
+//! not cache otherwise, [`Residence::Readback`] in host-cached memory where the device has that.
 
 use std::{ptr::NonNull, sync::Arc};
 
@@ -49,7 +53,8 @@ pub const STAGING_BYTES: u64 = 64 << 20;
 /// Where a buffer lives, and so how the host reaches it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Residence {
-    /// The GPU's own memory, filled and read through staging copies.
+    /// Memory for the GPU alone, its own on a discrete GPU, filled and read through staging
+    /// copies.
     Device,
     /// Mapped memory the host writes and the GPU reads. It is not host-cached, so the host's
     /// reads of it may be slow.
@@ -59,9 +64,9 @@ pub enum Residence {
 }
 
 impl Residence {
-    /// The (wanted, unwanted) memory properties of this residence's type, most preferred first.
-    /// Every entry also refuses [`AVOID`].
-    pub fn preference(self) -> &'static [(Flags, Flags)] {
+    /// The (wanted, unwanted) memory properties of this residence's type on a device of
+    /// `device_type`, most preferred first. Every entry also refuses [`AVOID`].
+    pub fn preference(self, device_type: vk::PhysicalDeviceType) -> &'static [(Flags, Flags)] {
         const DEVICE: &[(Flags, Flags)] = &[
             (DEVICE_LOCAL, Flags::HOST_VISIBLE),
             (DEVICE_LOCAL, Flags::empty()),
@@ -74,8 +79,23 @@ impl Residence {
             (all(&[MAPPABLE, Flags::HOST_CACHED]), Flags::empty()),
             (MAPPABLE, Flags::empty()),
         ];
+        // Out of the carve-out, and out of memory the GPU would have to snoop the host's caches
+        // for.
+        const INTEGRATED_DEVICE: &[(Flags, Flags)] = &[
+            (Flags::empty(), all(&[DEVICE_LOCAL, Flags::HOST_CACHED])),
+            (DEVICE_LOCAL, Flags::HOST_VISIBLE),
+            (DEVICE_LOCAL, Flags::empty()),
+        ];
+        const INTEGRATED_UPLOAD: &[(Flags, Flags)] = &[
+            (MAPPABLE, all(&[DEVICE_LOCAL, Flags::HOST_CACHED])),
+            (all(&[DEVICE_LOCAL, MAPPABLE]), Flags::empty()),
+            (MAPPABLE, Flags::empty()),
+        ];
+        let integrated = device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
         match self {
+            Residence::Device if integrated => INTEGRATED_DEVICE,
             Residence::Device => DEVICE,
+            Residence::Upload if integrated => INTEGRATED_UPLOAD,
             Residence::Upload => UPLOAD,
             Residence::Readback => READBACK,
         }
@@ -87,20 +107,21 @@ impl Residence {
     }
 }
 
-/// The index of the memory type a buffer of `size` bytes in `residence` is allocated from: for
-/// the first entry of [`Residence::preference`] any type matches, the first type, in the
-/// device's order, that `type_bits` (the buffer's `memoryTypeBits`) allows, has the entry's
-/// wanted properties and none of its unwanted ones nor of [`AVOID`], and sits in a heap at least
-/// `size` large.
+/// The index of the memory type a buffer of `size` bytes in `residence` is allocated from on a
+/// device of `device_type`: for the first entry of [`Residence::preference`] any type matches,
+/// the first type, in the device's order, that `type_bits` (the buffer's `memoryTypeBits`)
+/// allows, has the entry's wanted properties and none of its unwanted ones nor of [`AVOID`], and
+/// sits in a heap at least `size` large.
 pub fn choose_memory_type(
     types: &[MemoryType],
     heaps: &[MemoryHeap],
+    device_type: vk::PhysicalDeviceType,
     type_bits: u32,
     size: u64,
     residence: Residence,
 ) -> Option<u32> {
     residence
-        .preference()
+        .preference(device_type)
         .iter()
         .find_map(|&(wanted, unwanted)| {
             types.iter().enumerate().find_map(|(i, t)| {
@@ -238,6 +259,7 @@ impl Buffer {
         buffer.memory_type = choose_memory_type(
             &report.types,
             &report.heaps,
+            report.device_type,
             needs.memory_type_bits,
             needs.size,
             residence,
@@ -483,9 +505,13 @@ mod tests {
         MemoryType { flags, heap }
     }
 
+    type Table = (Vec<MemoryType>, Vec<MemoryHeap>, vk::PhysicalDeviceType);
+
     /// The table RADV from Mesa 26.1.8 reports for the Radeon 8060S: heap 0 is a third of the
-    /// GPU-addressable system memory, heap 1 the two thirds the driver marks device-local.
-    fn radv_gfx1151() -> (Vec<MemoryType>, Vec<MemoryHeap>) {
+    /// GPU-addressable system memory, heap 1 the two thirds the driver marks device-local. Every
+    /// device-local type allocates from the 512 MiB carve-out first, every other type from system
+    /// memory.
+    fn radv_gfx1151() -> Table {
         let heaps = vec![heap(11_289_620_480), heap(22_579_245_056)];
         let types = vec![
             ty(DL, 1),
@@ -500,13 +526,13 @@ mod tests {
             ty(DL | HV | HC | AMD, 1),
             ty(HV | HC | CACHED | AMD, 0),
         ];
-        (types, heaps)
+        (types, heaps, vk::PhysicalDeviceType::INTEGRATED_GPU)
     }
 
     /// A discrete GPU of 16 GiB laid out as NVIDIA's driver lays one out: heap 0 its own memory,
     /// heap 1 system memory, heap 2 the window the host maps into the GPU's memory, `bar` bytes:
     /// 256 MiB without a resizable BAR, all of it with one.
-    fn discrete(bar: u64) -> (Vec<MemoryType>, Vec<MemoryHeap>) {
+    fn discrete(bar: u64) -> Table {
         let heaps = vec![heap(16 << 30), heap(32 << 30), heap(bar)];
         let types = vec![
             ty(Flags::empty(), 1),
@@ -516,31 +542,46 @@ mod tests {
             ty(HV | HC | CACHED, 1),
             ty(DL | HV | HC, 2),
         ];
-        (types, heaps)
+        (types, heaps, vk::PhysicalDeviceType::DISCRETE_GPU)
     }
 
     fn choose(
-        (types, heaps): &(Vec<MemoryType>, Vec<MemoryHeap>),
+        (types, heaps, device_type): &Table,
         type_bits: u32,
         size: u64,
         residence: Residence,
     ) -> Option<u32> {
-        choose_memory_type(types, heaps, type_bits, size, residence)
+        choose_memory_type(types, heaps, *device_type, type_bits, size, residence)
     }
 
     #[test]
     fn each_residence_takes_its_preferred_type_on_an_apu() {
         let radv = radv_gfx1151();
-        assert_eq!(choose(&radv, u32::MAX, 1 << 20, Residence::Device), Some(0));
-        assert_eq!(choose(&radv, u32::MAX, 1 << 20, Residence::Upload), Some(3));
+        // Write-combined system memory, out of the carve-out, for what the host does not read.
+        assert_eq!(choose(&radv, u32::MAX, 1 << 20, Residence::Device), Some(2));
+        assert_eq!(choose(&radv, u32::MAX, 1 << 20, Residence::Upload), Some(2));
         assert_eq!(
             choose(&radv, u32::MAX, 1 << 20, Residence::Readback),
             Some(5)
         );
-        // The buffer's own allowed types narrow the choice to the second such type.
+        // Where the buffer's own allowed types leave no system memory, the carve-out's, narrowed
+        // to the second such type.
         assert_eq!(
-            choose(&radv, 1 << 4 | 1 << 2, 1 << 20, Residence::Upload),
+            choose(&radv, 1 << 4 | 1 << 1, 1 << 20, Residence::Upload),
             Some(4)
+        );
+    }
+
+    #[test]
+    fn an_apu_takes_the_carve_out_rather_than_memory_the_gpu_snoops() {
+        let radv = radv_gfx1151();
+        assert_eq!(
+            choose(&radv, 1 << 5 | 1 << 1, 64, Residence::Device),
+            Some(1)
+        );
+        assert_eq!(
+            choose(&radv, 1 << 5 | 1 << 3, 64, Residence::Upload),
+            Some(3)
         );
     }
 
@@ -600,6 +641,10 @@ mod tests {
             Some(3)
         );
         assert_eq!(choose(&radv, 1 << 2, 12 << 30, Residence::Upload), None);
+        assert_eq!(
+            choose(&radv, u32::MAX, 12 << 30, Residence::Device),
+            Some(0)
+        );
         assert_eq!(choose(&radv, u32::MAX, 22 << 30, Residence::Device), None);
     }
 }

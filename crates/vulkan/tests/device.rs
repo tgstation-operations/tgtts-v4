@@ -174,13 +174,21 @@ fn the_device_offers_what_the_runtime_relies_on() {
     );
 
     // Each residence's buffers in the memory its preference names, wherever the device
-    // offers it; where it does not, the fallbacks still give the GPU device-local memory and
-    // the host mapped memory.
+    // offers it; where it does not, the fallbacks still give the host mapped memory, and the
+    // GPU device-local memory unless it is integrated.
+    let integrated = r.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
     for residence in [Residence::Device, Residence::Upload, Residence::Readback] {
         let buffer = ctx.buffer_in(1 << 20, residence).unwrap();
         let flags = r.types[buffer.memory_type() as usize].flags;
-        let preferred =
-            choose_memory_type(&r.types, &r.heaps, u32::MAX, 1 << 20, residence).unwrap();
+        let preferred = choose_memory_type(
+            &r.types,
+            &r.heaps,
+            r.device_type,
+            u32::MAX,
+            1 << 20,
+            residence,
+        )
+        .unwrap();
         eprintln!(
             "{residence:?} buffers: memory type {} ({flags:?}); the device's preferred is \
              {preferred}",
@@ -188,6 +196,8 @@ fn the_device_offers_what_the_runtime_relies_on() {
         );
         let needs = if residence.mapped() {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+        } else if integrated {
+            vk::MemoryPropertyFlags::empty()
         } else {
             vk::MemoryPropertyFlags::DEVICE_LOCAL
         };
@@ -248,8 +258,10 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
         device(4 * n as u64),
         device(4 * n as u64),
     );
-    // Where the device has device-local memory the host cannot map, as the Radeon 8060S and a
-    // discrete GPU do, these buffers are in it, and staging is the host's only way in.
+    // Where a discrete GPU has device-local memory the host cannot map, these buffers are in it;
+    // an integrated GPU's stay out of its carve-out where they can, as on the Radeon 8060S.
+    // Either way they are not mapped, and staging is the host's only way in.
+    let integrated = r.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
     let hidden = vk::MemoryPropertyFlags::HOST_VISIBLE;
     let has_hidden = r.types.iter().any(|t| {
         t.flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) && !t.flags.intersects(hidden)
@@ -257,10 +269,13 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
     for b in [&xs, &ys, &ss] {
         let flags = r.types[b.memory_type() as usize].flags;
         assert!(
-            flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+            integrated || flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
             "{flags:?}"
         );
-        assert!(!has_hidden || !flags.intersects(hidden), "{flags:?}");
+        assert!(
+            integrated || !has_hidden || !flags.intersects(hidden),
+            "{flags:?}"
+        );
     }
     assert!(
         ys.read::<u32>().unwrap().iter().all(|&v| v == 0),
@@ -311,6 +326,64 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
         (4 * n) >> 20,
         STAGING_BYTES >> 20,
         ys.memory_type()
+    );
+    assert_no_validation_messages(&ctx);
+}
+
+/// The VRAM this process's amdgpu clients have asked for, in KiB, which the kernel counts by the
+/// domain a buffer prefers rather than where it lies (`amd-requested-vram` in
+/// `/proc/self/fdinfo`); `None` when the process has no amdgpu client.
+fn amdgpu_requested_vram_kib() -> Option<u64> {
+    let mut clients = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir("/proc/self/fdinfo").ok()?.flatten() {
+        let Ok(info) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let field = |key: &str| {
+            info.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(str::trim)
+        };
+        if field("drm-driver:") != Some("amdgpu") {
+            continue;
+        }
+        if let (Some(id), Some(kib)) = (field("drm-client-id:"), field("amd-requested-vram:")) {
+            clients.insert(
+                id.to_string(),
+                kib.strip_suffix(" KiB")?.parse::<u64>().ok()?,
+            );
+        }
+    }
+    (!clients.is_empty()).then(|| clients.values().sum())
+}
+
+#[test]
+fn an_integrated_gpus_buffers_ask_for_none_of_its_carve_out() {
+    let ctx = context();
+    let r = ctx.report();
+    let integrated = r.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+    let Some(before) = amdgpu_requested_vram_kib().filter(|_| integrated) else {
+        eprintln!(
+            "{} is not an integrated GPU on amdgpu; nothing to check",
+            r.name
+        );
+        return;
+    };
+    let size = 64 << 20;
+    let _buffers = [Residence::Device, Residence::Upload, Residence::Readback].map(|residence| {
+        ctx.buffer_in(size, residence)
+            .unwrap_or_else(|e| panic!("{e}"))
+    });
+    let after = amdgpu_requested_vram_kib().unwrap();
+    eprintln!(
+        "VRAM asked for: {before} KiB before a buffer of {} MiB in each residence, {after} KiB \
+         after",
+        size >> 20
+    );
+    assert!(
+        after.saturating_sub(before) < (size >> 10) / 2,
+        "{} KiB more VRAM asked for",
+        after.saturating_sub(before)
     );
     assert_no_validation_messages(&ctx);
 }
