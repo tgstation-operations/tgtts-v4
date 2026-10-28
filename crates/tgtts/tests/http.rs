@@ -21,7 +21,7 @@ use common::{Message, Reply, Server, VOICE, call};
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
-    levels::{Level, Levels},
+    levels::{Level, Levels, RadioPeaks},
     metrics::Metrics,
     service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::{self, Speech, Synthesizer},
@@ -47,6 +47,8 @@ struct Fake {
     texts: Mutex<Vec<String>>,
     gate: Option<Gate>,
     pause: Option<Gate>,
+    /// The patch after which a stream waits, counting from 0.
+    pause_at: usize,
     active: AtomicUsize,
     most: AtomicUsize,
     streamed: AtomicUsize,
@@ -75,9 +77,15 @@ impl Fake {
 
     /// A fake whose streams wait after their first patch, which says so, until released.
     fn paused() -> (Self, mpsc::Receiver<String>, mpsc::Sender<()>) {
+        Self::paused_at(0)
+    }
+
+    /// A fake whose streams wait after patch `at`, counting from 0, likewise.
+    fn paused_at(at: usize) -> (Self, mpsc::Receiver<String>, mpsc::Sender<()>) {
         let (gated, entries, release) = Self::gated();
         let fake = Self {
             pause: gated.gate,
+            pause_at: at,
             ..Self::default()
         };
         (fake, entries, release)
@@ -102,9 +110,10 @@ impl Synthesizer for Fake {
         let speech = self.synthesize(text, voice, seed)?;
         for (i, patch) in speech.samples.chunks(PATCH).enumerate() {
             audio(patch);
-            if let (0, Some(pause)) = (i, &self.pause) {
+            if let (true, Some(pause)) = (i == self.pause_at, &self.pause) {
                 pause.entered.lock().unwrap().send(text.to_owned()).unwrap();
-                pause.release.lock().unwrap().recv().unwrap();
+                let release = pause.release.lock().unwrap();
+                release.recv_timeout(Duration::from_secs(60)).unwrap();
             }
         }
         Ok(speech)
@@ -283,6 +292,7 @@ fn levels() -> Levels {
         Level {
             loudness_lufs: dsp::loudness::integrated(&tone, 48000),
             lines: 1,
+            radio: None,
         }
     };
     let mut levels = Levels::default();
@@ -1506,4 +1516,101 @@ fn streams_the_effects_and_the_clicks() {
         );
     }
     assert_eq!(h.fake.streamed.load(Ordering::SeqCst), 7);
+}
+
+/// `levels` with the peaks the radio scales each voice's line by, as it streams, as
+/// `tgtts-gains` would find them for the fake: the default message's but for "Woman (Test)",
+/// whose are [`LONGER`]'s.
+fn with_radio_peaks(mut levels: Levels, assets: &std::path::Path) -> Levels {
+    let sounds = Sounds::open(assets).unwrap();
+    for (voice, text) in [(VOICE, "Hello there."), ("Woman (Test)", LONGER)] {
+        let level = levels.get(voice).unwrap();
+        let gain = 10f64.powf((LOUDNESS.target - level.loudness_lufs) / 20.0);
+        let mut x: Vec<f64> = said(text).iter().map(|&s| f64::from(s) * gain).collect();
+        x.resize(x.len() + TAIL, 0.0);
+        let limited = dsp::limiter::limit(&x, 48000, LOUDNESS.ceiling).samples;
+        let speech = wav::Audio {
+            rate: 48000,
+            channels: 1,
+            samples: limited.iter().map(|&s| s as f32).collect(),
+        };
+        let peaks = dsp::radio::peaks(&speech.to_pcm(), sounds.radio());
+        let radio = RadioPeaks {
+            narrowed: f64::from(peaks.narrowed),
+            driven: peaks.driven,
+            output: peaks.output,
+        };
+        let level = Level {
+            radio: Some(radio),
+            ..level
+        };
+        levels.set(voice, level);
+    }
+    levels
+}
+
+/// Asked for, the radio streams as the speech does, at its voice's peaks; unasked, or where no
+/// voice has peaks, it waits for the whole. Its resamplings hold back about 0.3 s of speech before
+/// it gives any, so the model is held four patches in.
+#[test]
+fn streams_the_radio_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    write_assets(dir.path());
+    let peaks = with_radio_peaks(levels(), dir.path());
+    let (fake, entries, release) = Fake::paused_at(3);
+    let h = serve_fake(fake, limits(), LOUDNESS, peaks, true);
+    let ask = |h: &Harness, message: &Message, streamed: bool| {
+        let mut body: serde_json::Value =
+            serde_json::from_str(&message.job(&["tts", "tts-radio"])).unwrap();
+        body["streamed_radio"] = streamed.into();
+        job(&h.post("/stream", &body.to_string()))
+    };
+    let message = Message {
+        speaker: "Woman (Test)",
+        text: LONGER,
+        ..Message::default()
+    };
+    let speech = LONGER.len() * FRAMES_PER_CHAR + TAIL;
+    let [_, _, whole, _, _] = message.all(&h);
+
+    let (id, streams) = ask(&h, &message, true);
+    entries.recv().unwrap();
+    let held = status(&h, &id, 0.0);
+    assert_eq!(
+        held["variants"]["tts-radio"]["state"], "streaming",
+        "{held}"
+    );
+    release.send(()).unwrap();
+    assert_eq!(status(&h, &id, 30.0)["done"], true);
+    let streamed = tgtts::opus::decode(&play(&h, &streams["tts-radio"]).body).unwrap();
+    assert_eq!(streamed.samples.len(), radio_frames(speech));
+    let streamed: Vec<f64> = streamed.samples.iter().map(|&s| f64::from(s)).collect();
+    let (streamed, whole) = (
+        dsp::loudness::integrated(&streamed, 48000),
+        loudness(&whole),
+    );
+    assert!(
+        (streamed - whole).abs() < 0.3,
+        "{streamed:.2} LUFS streamed, {whole:.2} whole"
+    );
+
+    let unasked = Message {
+        text: "Hello there, could someone please come to medbay, please?",
+        ..message
+    };
+    let (id, _) = ask(&h, &unasked, false);
+    entries.recv().unwrap();
+    let held = status(&h, &id, 0.0);
+    assert_eq!(held["variants"]["tts-radio"]["state"], "pending", "{held}");
+    release.send(()).unwrap();
+    assert_eq!(status(&h, &id, 30.0)["done"], true);
+
+    let (fake, entries, release) = Fake::paused_at(3);
+    let h = serve_fake(fake, limits(), LOUDNESS, levels(), true);
+    let (id, _) = ask(&h, &message, true);
+    entries.recv().unwrap();
+    let held = status(&h, &id, 0.0);
+    assert_eq!(held["variants"]["tts-radio"]["state"], "pending", "{held}");
+    release.send(()).unwrap();
+    assert_eq!(status(&h, &id, 30.0)["done"], true);
 }

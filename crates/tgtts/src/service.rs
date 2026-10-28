@@ -1045,6 +1045,11 @@ impl Sounds {
         })
     }
 
+    /// The radio's clicks and static.
+    pub fn radio(&self) -> &radio::Assets {
+        &self.radio
+    }
+
     /// `audio` between a start and an end click drawn from `rng`, as the old frontend's "radio"
     /// special filter put them around the Ogg it had encoded, here around the audio before it is
     /// encoded, the clicks matched to its rate and channels.

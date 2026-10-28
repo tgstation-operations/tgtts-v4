@@ -65,6 +65,10 @@ struct Message {
     blip_number: String,
     effects: Option<serde_json::Value>,
     variants: Vec<String>,
+    /// Whether the radio of speech made anew streams as the speech does, scaled by its voice's
+    /// peaks rather than its own, rather than waiting for the whole: the radio comes sooner but
+    /// is not today's radio, as the peaks of a line's speech are not its voice's.
+    streamed_radio: bool,
 }
 
 impl Message {
@@ -178,6 +182,7 @@ struct Out {
     made: Instant,
     first: Option<Duration>,
     samples: usize,
+    energy: f64,
     failed: Option<String>,
 }
 
@@ -185,6 +190,8 @@ struct Out {
 struct Ended {
     seconds: f64,
     first: Option<Duration>,
+    /// The RMS level of its audio, in dBFS.
+    rms_dbfs: f64,
 }
 
 impl Out {
@@ -202,6 +209,7 @@ impl Out {
             Err(e) => self.failed = Some(e.to_string()),
         }
         self.samples += samples.len();
+        self.energy += samples.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
         if self.first.is_none() {
             self.first = Some(self.made.elapsed());
             for &route in &self.routes {
@@ -226,6 +234,7 @@ impl Out {
         Ok(Ended {
             seconds,
             first: self.first,
+            rms_dbfs: 10.0 * (self.energy / self.samples.max(1) as f64).log10(),
         })
     }
 }
@@ -259,8 +268,9 @@ pub(super) struct Chain {
     clicks: Option<(Vec<f32>, Vec<f32>)>,
     started: bool,
     out: Option<Out>,
-    /// All of it, for the radio.
+    /// All of it, for the radio made whole, or the radio on a stream of it.
     kept: Option<Vec<f32>>,
+    radio: Option<(radio::Stream, Out)>,
     /// The energy of what the clicks go around, and its length.
     energy: f64,
     counted: usize,
@@ -270,6 +280,7 @@ pub(super) struct Chain {
 struct Finished {
     out: Option<Out>,
     kept: Option<Vec<f32>>,
+    radio: Option<Out>,
     leveling: Leveling,
     rms_dbfs: f64,
 }
@@ -309,13 +320,14 @@ impl Chain {
         let audio = self.limit(&pitched, true);
         self.emit(audio);
         if let Some((_, end)) = self.clicks.take() {
-            if let Some(out) = &mut self.out {
-                out.push(&end);
-            }
-            if let Some(kept) = &mut self.kept {
-                kept.extend_from_slice(&end);
-            }
+            self.give(&end);
         }
+        let radio = self.radio.take().map(|(stream, mut out)| {
+            let mut radio = Vec::new();
+            stream.finish(&mut radio);
+            out.push(&Audio::from_segment(&Segment::new(dsp::RATE, radio)).samples);
+            out
+        });
         let energy = self.energy / self.counted.max(1) as f64;
         Finished {
             leveling: Leveling {
@@ -326,6 +338,7 @@ impl Chain {
             rms_dbfs: 10.0 * energy.log10(),
             out: self.out.take(),
             kept: self.kept.take(),
+            radio,
         }
     }
 
@@ -363,11 +376,26 @@ impl Chain {
                 audio.splice(0..0, start.iter().copied());
             }
         }
+        self.give(&audio);
+    }
+
+    /// `audio` to the speech's stream, and to the radio's.
+    fn give(&mut self, audio: &[f32]) {
         if let Some(out) = &mut self.out {
-            out.push(&audio);
+            out.push(audio);
         }
         if let Some(kept) = &mut self.kept {
-            kept.extend_from_slice(&audio);
+            kept.extend_from_slice(audio);
+        }
+        if let Some((stream, out)) = &mut self.radio {
+            let speech = Audio {
+                rate: dsp::RATE,
+                channels: 1,
+                samples: audio.to_vec(),
+            };
+            let mut radio = Vec::new();
+            stream.process(&speech.to_pcm().samples, &mut radio);
+            out.push(&Audio::from_segment(&Segment::new(dsp::RATE, radio)).samples);
         }
     }
 }
@@ -458,6 +486,7 @@ pub(super) async fn create(State(service): State<Arc<Service>>, body: Bytes) -> 
             made,
             first: None,
             samples: 0,
+            energy: 0.0,
             failed: None,
         };
         match group[0] {
@@ -621,7 +650,7 @@ impl Service {
         self: &Arc<Self>,
         message: &Message,
         speech: Option<Out>,
-        radio: Option<Out>,
+        mut radio: Option<Out>,
         trace: &mut Trace,
     ) -> Result<Outcomes, Failure> {
         let params = message.params();
@@ -642,20 +671,31 @@ impl Service {
                 treatment @ (Treatment::Effects(_) | Treatment::None),
             ) => {
                 let routes = speech.as_ref().map(|out| out.routes.clone());
-                let chain = self.chain(
-                    &params,
-                    message.pitch,
-                    loudness,
-                    treatment,
-                    speech,
-                    radio.is_some(),
-                );
+                let mut chain = self.chain(&params, message.pitch, loudness, treatment);
+                chain.out = speech;
+                let peaks = self.levels.radio(voice).filter(|_| message.streamed_radio);
+                match (radio.take(), peaks) {
+                    (Some(out), Some(peaks)) => {
+                        let stream = radio::Stream::new(&self.sounds.radio, peaks, dsp::RATE, 1);
+                        chain.radio = Some((stream, out));
+                    }
+                    (whole, _) => {
+                        chain.kept = whole.is_some().then(Vec::new);
+                        radio = whole;
+                    }
+                }
                 let (_, chain) = self.synthesized(voice, text, Some(chain), trace).await?;
                 let chain = chain.expect("a chain given comes back");
                 let finished = blocking(move || chain.finish()).await?;
                 trace.leveling = Some(finished.leveling);
                 if let (Some(routes), Some(out)) = (routes, finished.out) {
                     outcomes.push((routes, out.finish(), Some(finished.rms_dbfs)));
+                }
+                if let Some(out) = finished.radio {
+                    let routes = out.routes.clone();
+                    let ended = out.finish();
+                    let rms = ended.as_ref().ok().map(|ended| ended.rms_dbfs);
+                    outcomes.push((routes, ended, rms));
                 }
                 Audio {
                     rate: dsp::RATE,
@@ -737,16 +777,8 @@ impl Service {
     }
 
     /// The chain speech in a voice of `loudness` streams through, as the request's `params`,
-    /// `pitch` and `treatment` have it, to `out`, kept whole as well if `keep`.
-    fn chain(
-        &self,
-        params: &Params,
-        pitch: i32,
-        loudness: f64,
-        treatment: Treatment,
-        out: Option<Out>,
-        keep: bool,
-    ) -> Chain {
+    /// `pitch` and `treatment` have it, to nowhere yet.
+    fn chain(&self, params: &Params, pitch: i32, loudness: f64, treatment: Treatment) -> Chain {
         let clicked = params.special_filters.split('|').any(|s| s == "radio");
         let effects = match treatment {
             Treatment::Effects(pipeline) => Some(pipeline),
@@ -760,8 +792,9 @@ impl Service {
             effects,
             clicks: clicked.then(|| self.sounds.clicks(dsp::RATE, 1, &mut rand::rng())),
             started: false,
-            out,
-            kept: keep.then(Vec::new),
+            out: None,
+            kept: None,
+            radio: None,
             energy: 0.0,
             counted: 0,
         }
@@ -822,6 +855,7 @@ mod tests {
             started: false,
             out: None,
             kept: Some(Vec::new()),
+            radio: None,
             energy: 0.0,
             counted: 0,
         };

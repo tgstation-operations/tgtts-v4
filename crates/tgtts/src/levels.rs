@@ -5,8 +5,10 @@
 //! A voice's level is the median integrated loudness of the same lines spoken in it, as the
 //! model gave them, before anything levels them, each with the silence the old frontend put
 //! after it, as the whole-file routes measure a line: on a short line that silence moves the
-//! measure by decibels. [`measure`] measures them, a voice at a time, for `tgtts-gains`, which
-//! writes them as JSON: `{"Man (Ace Detective)": {"loudness_lufs": -38.2, "lines": 12}, ...}`.
+//! measure by decibels. [`Measure`] measures them, a voice at a time, for `tgtts-gains`, which
+//! writes them as JSON: `{"Man (Ace Detective)": {"loudness_lufs": -38.2, "lines": 12}, ...}`,
+//! with the peaks the radio scales the voice's lines by as they stream, which a radio on a stream
+//! cannot measure.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -18,14 +20,15 @@ use std::{
     time::Instant,
 };
 
-use dsp::segment::Segment;
+use dsp::{radio, segment::Segment};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use voices::Voices;
 
 use crate::{
+    service::Loudness,
     synth::{self, Synthesizer},
-    wav,
+    wav::{self, Audio},
 };
 
 /// The lines each voice speaks: of the lengths the game's lines run to, from a word to a long
@@ -59,6 +62,19 @@ pub struct Level {
     pub loudness_lufs: f64,
     /// The lines it is the median of.
     pub lines: usize,
+    /// The peaks the radio scales its lines by, as they stream, where they were measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<RadioPeaks>,
+}
+
+/// The medians of the peaks the radio scales a voice's lines by, as [`radio::Peaks`] has them,
+/// of each line brought to the service's loudness by the voice's level, as it streams: what the
+/// radio on a stream scales by, which cannot measure them.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RadioPeaks {
+    pub narrowed: f64,
+    pub driven: f64,
+    pub output: f64,
 }
 
 impl Levels {
@@ -105,6 +121,30 @@ impl Levels {
         median(&all)
     }
 
+    /// The peaks the radio scales `voice`'s streamed speech by, or for a voice without them the
+    /// medians of the voices', or none where no voice has them.
+    pub fn radio(&self, voice: &str) -> Option<radio::Peaks> {
+        let peaks = match self.voices.get(voice).and_then(|l| l.radio) {
+            Some(peaks) => peaks,
+            None => {
+                let all: Vec<RadioPeaks> = self.voices.values().filter_map(|l| l.radio).collect();
+                let of = |peak: fn(&RadioPeaks) -> f64| {
+                    median(&all.iter().map(peak).collect::<Vec<_>>())
+                };
+                RadioPeaks {
+                    narrowed: of(|p| p.narrowed)?,
+                    driven: of(|p| p.driven)?,
+                    output: of(|p| p.output)?,
+                }
+            }
+        };
+        Some(radio::Peaks {
+            narrowed: peaks.narrowed as f32,
+            driven: peaks.driven,
+            output: peaks.output,
+        })
+    }
+
     /// How many voices have a level.
     pub fn len(&self) -> usize {
         self.voices.len()
@@ -128,148 +168,233 @@ pub fn median(values: &[f64]) -> Option<f64> {
     }
 }
 
-/// A line measured.
+/// A line measured: the model's samples and their loudness with the silence after them, or none
+/// for silence; and the loudness of today's radio of it, as the whole-file path makes it.
 struct Measured {
     line: usize,
-    /// Its integrated loudness with the silence after it, or none for silence.
+    samples: Vec<f32>,
     loudness: Option<f64>,
-    seconds: f64,
     patches: usize,
+    radio_lufs: f64,
 }
 
-/// Measures each voice of `voices` that `levels` has no level of on `model`, up to `requests`
-/// lines at once, setting its level and writing the table to `path` as each is done. Each line's
-/// loudness goes to `log` as a line of JSON as it is measured, and each voice's first line to
-/// `keep` as 16-bit WAV, named by the voice, where it is given.
-///
-/// # Errors
-///
-/// If the table or the log cannot be written.
-pub fn measure(
-    model: &dyn Synthesizer,
-    voices: &Voices,
-    levels: &mut Levels,
-    path: &Path,
-    requests: usize,
-    log: &mut dyn Write,
-    keep: Option<&Path>,
-) -> io::Result<()> {
-    let names: Vec<String> = (voices.names())
-        .filter(|name| levels.get(name).is_none())
-        .map(str::to_owned)
-        .collect();
-    info!(
-        voices = names.len(),
-        done = levels.len(),
-        requests,
-        "measuring"
-    );
-    let tail = Segment::silent(dsp::speech::TAIL, dsp::RATE).samples.len();
-    let started = Instant::now();
-    let work: Mutex<VecDeque<(usize, usize)>> = Mutex::new(
-        (0..names.len())
-            .flat_map(|voice| (0..LINES.len()).map(move |line| (voice, line)))
-            .collect(),
-    );
-    let (measured, received) = mpsc::channel();
-    thread::scope(|scope| {
-        for _ in 0..requests {
-            let (work, measured, names) = (&work, measured.clone(), &names);
-            scope.spawn(move || {
-                loop {
-                    let next = work.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-                    let Some((voice, line)) = next else {
-                        return;
-                    };
-                    let name = &names[voice];
-                    let said =
-                        (voices.latent(name).map_err(synth::Error::from)).and_then(|latent| {
-                            let text = synth::prepare(LINES[line]).expect("a line has letters");
-                            model.synthesize(&text, &latent, line as u64)
-                        });
-                    let speech = match said {
-                        Ok(speech) => speech,
-                        Err(e) => {
-                            warn!(voice = %name, line, "{e}");
-                            let _ = measured.send((voice, None));
-                            continue;
-                        }
-                    };
-                    if let (Some(keep), 0) = (keep, line) {
-                        let file = keep.join(format!("{}.wav", file_name(name)));
-                        let pcm = synth::to_segment(&speech.samples);
-                        if let Err(e) =
-                            fs::write(&file, wav::write_pcm16(pcm.rate, 1, &pcm.samples))
-                        {
-                            warn!("{}: {e}", file.display());
-                        }
+/// What [`Measure::run`] measures with.
+pub struct Measure<'a> {
+    pub model: &'a dyn Synthesizer,
+    pub voices: &'a Voices,
+    /// The lines asked for at once.
+    pub requests: usize,
+    /// The loudness the service brings speech to.
+    pub loudness: Loudness,
+    /// The radio's clicks and static.
+    pub radio: &'a radio::Assets,
+    /// Where each voice's first line is kept as 16-bit WAV, named by the voice, if anywhere.
+    pub keep: Option<&'a Path>,
+}
+
+impl Measure<'_> {
+    /// Measures each voice that `levels` has no level of, setting its level and writing the
+    /// table to `path` as each is done.
+    ///
+    /// A voice's lines are measured as the model says them, then once it has said them all,
+    /// brought to the service's loudness by its level, as they stream, and put on the radio, at
+    /// the medians of their peaks, as the radio streams; each line then goes to `log` as a line
+    /// of JSON: its loudness, and how far the streamed radio of it is from today's, in loudness
+    /// and in how hard it is driven.
+    ///
+    /// # Errors
+    ///
+    /// If the table or the log cannot be written.
+    pub fn run(&self, levels: &mut Levels, path: &Path, log: &mut dyn Write) -> io::Result<()> {
+        let names: Vec<String> = (self.voices.names())
+            .filter(|name| levels.get(name).is_none())
+            .map(str::to_owned)
+            .collect();
+        info!(
+            voices = names.len(),
+            done = levels.len(),
+            requests = self.requests,
+            "measuring"
+        );
+        let started = Instant::now();
+        let work: Mutex<VecDeque<(usize, usize)>> = Mutex::new(
+            (0..names.len())
+                .flat_map(|voice| (0..LINES.len()).map(move |line| (voice, line)))
+                .collect(),
+        );
+        let (measured, received) = mpsc::channel();
+        thread::scope(|scope| {
+            for _ in 0..self.requests {
+                let (work, measured, names) = (&work, measured.clone(), &names);
+                scope.spawn(move || {
+                    loop {
+                        let next = work.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                        let Some((voice, line)) = next else {
+                            return;
+                        };
+                        let _ = measured.send((voice, self.line(&names[voice], line)));
                     }
-                    let mut samples: Vec<f64> =
-                        speech.samples.iter().map(|&s| f64::from(s)).collect();
-                    samples.resize(samples.len() + tail, 0.0);
-                    let loudness = dsp::loudness::integrated(&samples, dsp::RATE);
-                    let _ = measured.send((
-                        voice,
-                        Some(Measured {
-                            line,
-                            loudness: loudness.is_finite().then_some(loudness),
-                            seconds: speech.samples.len() as f64 / f64::from(dsp::RATE),
-                            patches: speech.patches,
-                        }),
-                    ));
-                }
-            });
-        }
-        drop(measured);
-        // Each voice's lines as they come, until it has them all.
-        let mut said: BTreeMap<usize, Vec<Option<f64>>> = BTreeMap::new();
-        let mut done = 0;
-        for (voice, measured) in received {
-            let loudness = match measured {
-                Some(m) => {
-                    let line = serde_json::json!({
-                        "voice": names[voice],
-                        "line": m.line,
-                        "loudness_lufs": m.loudness,
-                        "seconds": m.seconds,
-                        "patches": m.patches,
-                    });
-                    writeln!(log, "{line}")?;
-                    m.loudness
-                }
-                None => None,
-            };
-            let lines = said.entry(voice).or_default();
-            lines.push(loudness);
-            if lines.len() < LINES.len() {
-                continue;
+                });
             }
-            let loud: Vec<f64> = lines.iter().flatten().copied().collect();
-            said.remove(&voice);
-            let name = &names[voice];
-            done += 1;
-            let Some(median) = median(&loud) else {
-                warn!(voice = %name, "said nothing to measure");
-                continue;
-            };
-            let level = Level {
-                loudness_lufs: median,
-                lines: loud.len(),
-            };
-            levels.set(name, level);
-            levels.write(path)?;
-            info!(
-                voice = %name,
-                loudness_lufs = median,
-                lines = loud.len(),
-                done,
-                left = names.len() - done,
-                seconds = started.elapsed().as_secs_f64(),
-                "measured"
-            );
+            drop(measured);
+            // Each voice's lines as they come, until it has them all.
+            let mut said: BTreeMap<usize, Vec<Option<Measured>>> = BTreeMap::new();
+            let mut done = 0;
+            for (voice, measured) in received {
+                let lines = said.entry(voice).or_default();
+                lines.push(measured);
+                if lines.len() < LINES.len() {
+                    continue;
+                }
+                let lines = said.remove(&voice).expect("the voice's lines");
+                let name = &names[voice];
+                done += 1;
+                let Some(level) = self.level(name, lines, log)? else {
+                    warn!(voice = %name, "said nothing to measure");
+                    continue;
+                };
+                levels.set(name, level);
+                levels.write(path)?;
+                info!(
+                    voice = %name,
+                    loudness_lufs = level.loudness_lufs,
+                    lines = level.lines,
+                    done,
+                    left = names.len() - done,
+                    seconds = started.elapsed().as_secs_f64(),
+                    "measured"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// Line `line` in `voice`, measured, or none where the model could not say it.
+    fn line(&self, voice: &str, line: usize) -> Option<Measured> {
+        let said = (self.voices.latent(voice).map_err(synth::Error::from)).and_then(|latent| {
+            let text = synth::prepare(LINES[line]).expect("a line has letters");
+            self.model.synthesize(&text, &latent, line as u64)
+        });
+        let speech = match said {
+            Ok(speech) => speech,
+            Err(e) => {
+                warn!(voice, line, "{e}");
+                return None;
+            }
+        };
+        let pcm = synth::to_segment(&speech.samples);
+        if let (Some(keep), 0) = (self.keep, line) {
+            let file = keep.join(format!("{}.wav", file_name(voice)));
+            if let Err(e) = fs::write(&file, wav::write_pcm16(pcm.rate, 1, &pcm.samples)) {
+                warn!("{}: {e}", file.display());
+            }
         }
-        Ok(())
-    })
+        let mut samples: Vec<f64> = speech.samples.iter().map(|&s| f64::from(s)).collect();
+        samples.resize(samples.len() + tail(), 0.0);
+        let loudness = dsp::loudness::integrated(&samples, dsp::RATE);
+        // Today's: the speech leveled, finished and brought to the loudness whole, then put on
+        // the radio whole.
+        let finished = dsp::speech::finish(&synth::level(&pcm), 0);
+        let whole =
+            dsp::loudness::normalize(&finished, self.loudness.target, self.loudness.ceiling);
+        let radio = radio::radio(&mono(&whole.segment.samples), self.radio);
+        Some(Measured {
+            line,
+            samples: speech.samples,
+            loudness: loudness.is_finite().then_some(loudness),
+            patches: speech.patches,
+            radio_lufs: pcm_lufs(&radio.samples),
+        })
+    }
+
+    /// The level of a voice from its `lines`, logged, or none where it said nothing.
+    fn level(
+        &self,
+        voice: &str,
+        lines: Vec<Option<Measured>>,
+        log: &mut dyn Write,
+    ) -> io::Result<Option<Level>> {
+        let mut lines: Vec<Measured> = lines.into_iter().flatten().collect();
+        lines.retain(|m| m.loudness.is_some());
+        lines.sort_by_key(|m| m.line);
+        let loud: Vec<f64> = lines.iter().filter_map(|m| m.loudness).collect();
+        let Some(loudness) = median(&loud) else {
+            return Ok(None);
+        };
+        // Each line as it streams: at the voice's gain and under the limiter.
+        let gain = 10f64.powf((self.loudness.target - loudness) / 20.0);
+        let streamed: Vec<Vec<i16>> = (lines.iter())
+            .map(|m| {
+                let mut x: Vec<f64> = m.samples.iter().map(|&s| f64::from(s) * gain).collect();
+                x.resize(x.len() + tail(), 0.0);
+                let limited = dsp::limiter::limit(&x, dsp::RATE, self.loudness.ceiling).samples;
+                let samples = limited.iter().map(|&s| s as f32).collect();
+                Audio {
+                    rate: dsp::RATE,
+                    channels: 1,
+                    samples,
+                }
+                .to_pcm()
+                .samples
+            })
+            .collect();
+        let peaks: Vec<radio::Peaks> = (streamed.iter())
+            .map(|pcm| radio::peaks(&mono(pcm), self.radio))
+            .collect();
+        let of =
+            |peak: fn(&radio::Peaks) -> f64| median(&peaks.iter().map(peak).collect::<Vec<_>>());
+        let radio = RadioPeaks {
+            narrowed: of(|p| f64::from(p.narrowed)).expect("a line"),
+            driven: of(|p| p.driven).expect("a line"),
+            output: of(|p| p.output).expect("a line"),
+        };
+        let fixed = radio::Peaks {
+            narrowed: radio.narrowed as f32,
+            driven: radio.driven,
+            output: radio.output,
+        };
+        for ((m, pcm), peaks) in lines.iter().zip(&streamed).zip(&peaks) {
+            let mut stream = radio::Stream::new(self.radio, fixed, dsp::RATE, 1);
+            let mut out = Vec::new();
+            stream.process(pcm, &mut out);
+            stream.finish(&mut out);
+            let line = serde_json::json!({
+                "voice": voice,
+                "line": m.line,
+                "loudness_lufs": m.loudness,
+                "seconds": m.samples.len() as f64 / f64::from(dsp::RATE),
+                "patches": m.patches,
+                "radio_level_db": pcm_lufs(&out) - m.radio_lufs,
+                "radio_drive_db": 20.0 * (f64::from(peaks.narrowed) / radio.narrowed).log10(),
+                "radio_clipped": out.iter().filter(|&&s| s == i16::MAX || s <= -i16::MAX).count(),
+            });
+            writeln!(log, "{line}")?;
+        }
+        Ok(Some(Level {
+            loudness_lufs: loudness,
+            lines: loud.len(),
+            radio: Some(radio),
+        }))
+    }
+}
+
+/// The silence the old frontend put after speech, in samples.
+fn tail() -> usize {
+    Segment::silent(dsp::speech::TAIL, dsp::RATE).samples.len()
+}
+
+fn mono(samples: &[i16]) -> radio::Pcm {
+    radio::Pcm {
+        rate: dsp::RATE,
+        channels: 1,
+        samples: samples.to_vec(),
+    }
+}
+
+/// The integrated loudness of 16-bit `samples`.
+fn pcm_lufs(samples: &[i16]) -> f64 {
+    let x: Vec<f64> = samples.iter().map(|&s| f64::from(s) / 32768.0).collect();
+    dsp::loudness::integrated(&x, dsp::RATE)
 }
 
 /// `name` as a file's name: letters, digits, `-` and `_` kept, anything else `_`.
@@ -312,7 +437,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
             self.at_once.fetch_sub(1, Ordering::SeqCst);
             let amplitude: f32 = voice.text.parse()?;
-            let samples = (0..1200 * text.len())
+            let samples = (0..480 * text.len())
                 .map(|i| amplitude * (TAU * 220.0 * i as f32 / 48000.0).sin())
                 .collect();
             Ok(Speech {
@@ -321,6 +446,18 @@ mod tests {
                 start: None,
             })
         }
+    }
+
+    /// Clicks and static at the service's rate.
+    fn radio() -> radio::Assets {
+        let pcm = |frames: usize, amplitude: f64| radio::Pcm {
+            rate: dsp::RATE,
+            channels: 1,
+            samples: (0..frames)
+                .map(|i| ((i as f64 * 0.37).sin() * amplitude * 32767.0) as i16)
+                .collect(),
+        };
+        radio::Assets::new(&pcm(2400, 0.1), &pcm(2400, 0.05), &pcm(48000, 0.4))
     }
 
     /// Voices whose model says tones at `amplitudes`, by name.
@@ -349,7 +486,19 @@ mod tests {
         let (path, keep) = (dir.path().join("levels.json"), dir.path().join("kept"));
         fs::create_dir_all(&keep).unwrap();
         let (tone, mut levels, mut log) = (Tone::default(), Levels::default(), Vec::new());
-        measure(&tone, &voices, &mut levels, &path, 4, &mut log, Some(&keep)).unwrap();
+        let radio = radio();
+        let measure = |model| Measure {
+            model,
+            voices: &voices,
+            requests: 4,
+            loudness: Loudness {
+                target: -16.0,
+                ceiling: dsp::loudness::CEILING,
+            },
+            radio: &radio,
+            keep: Some(&keep),
+        };
+        measure(&tone).run(&mut levels, &path, &mut log).unwrap();
         assert_eq!(tone.asked.load(Ordering::SeqCst), 3 * LINES.len());
         assert!(tone.most.load(Ordering::SeqCst) > 1, "one line at a time");
         let read = Levels::read(&path).unwrap();
@@ -370,33 +519,36 @@ mod tests {
             "{apart} dB apart"
         );
         assert_eq!(levels.get("Broken"), None);
-        // The level is the median of the lines logged.
-        let logged: Vec<f64> = (String::from_utf8(log).unwrap().lines())
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .filter(|line| line["voice"] == "Loud")
+        // Brought to the loudness by their levels, the two voices stream the same speech, which
+        // the radio scales by the same peaks.
+        let (a, b) = (loud.radio.unwrap(), quiet.radio.unwrap());
+        for (a, b) in [
+            (a.narrowed, b.narrowed),
+            (a.driven, b.driven),
+            (a.output, b.output),
+        ] {
+            assert!(a > 0.0 && (a - b).abs() < 1e-6, "{a} and {b}");
+        }
+        // The level is the median of the lines logged, each with its radio's.
+        let logged: Vec<serde_json::Value> = (String::from_utf8(log).unwrap().lines())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|line: &serde_json::Value| line["voice"] == "Loud")
+            .collect();
+        let loudness: Vec<f64> = (logged.iter())
             .map(|line| line["loudness_lufs"].as_f64().unwrap())
             .collect();
-        assert_eq!(median(&logged), Some(loud.loudness_lufs));
+        assert_eq!(median(&loudness), Some(loud.loudness_lufs));
+        assert!(logged.iter().all(|line| line["radio_level_db"].is_f64()));
         let kept = crate::wav::read(&fs::read(keep.join("Loud.wav")).unwrap()).unwrap();
-        assert_eq!(
-            kept.frames(),
-            1200 * synth::prepare(LINES[0]).unwrap().len()
-        );
+        assert_eq!(kept.frames(), 480 * synth::prepare(LINES[0]).unwrap().len());
 
         // A run that finds a table goes on with the voices it does not have.
         let mut resumed = Levels::default();
         resumed.set("Loud", loud);
         let tone = Tone::default();
-        measure(
-            &tone,
-            &voices,
-            &mut resumed,
-            &path,
-            4,
-            &mut Vec::new(),
-            None,
-        )
-        .unwrap();
+        measure(&tone)
+            .run(&mut resumed, &path, &mut Vec::new())
+            .unwrap();
         assert_eq!(tone.asked.load(Ordering::SeqCst), 2 * LINES.len());
         assert_eq!(resumed, levels);
     }
@@ -409,6 +561,7 @@ mod tests {
             let level = Level {
                 loudness_lufs: loudness,
                 lines: 12,
+                radio: None,
             };
             levels.set(voice, level);
         }
@@ -425,6 +578,7 @@ mod tests {
         let level = Level {
             loudness_lufs: -38.25,
             lines: 3,
+            radio: None,
         };
         levels.set("Man (Test)", level);
         levels.write(&path).unwrap();
