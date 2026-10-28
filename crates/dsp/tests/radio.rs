@@ -201,3 +201,55 @@ fn the_real_assets_match_the_old_service() {
         assets,
     );
 }
+
+/// Given the peaks the whole radio scales by, the radio on a stream is the whole radio to the
+/// bit, however the speech comes and at whatever rate, silence and nothing included.
+#[test]
+fn a_stream_at_the_wholes_peaks_is_the_whole() {
+    let fx = Tensors::new(&testkit::fixture!("dsp_radio"));
+    let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
+    let assets = Assets::new(&on, &off, &noise);
+    let mut speeches: Vec<Pcm> = (0..fx.int("cases"))
+        .map(|case| Pcm {
+            rate: fx.int(&format!("{case}/rate")) as u32,
+            channels: fx.int(&format!("{case}/channels")) as u16,
+            samples: fx.pcm(&format!("{case}/input")),
+        })
+        .collect();
+    let voice: Vec<i16> = (0..30000)
+        .map(|i| ((f64::from(i) * 0.031).sin() * (f64::from(i) * 0.0007).sin() * 20000.0) as i16)
+        .collect();
+    for (rate, channels) in [(48000, 1), (44100, 2), (8000, 1)] {
+        let samples = voice
+            .iter()
+            .flat_map(|&s| std::iter::repeat_n(s, channels))
+            .collect();
+        speeches.push(Pcm {
+            rate,
+            channels: channels as u16,
+            samples,
+        });
+    }
+    speeches.push(silence(2400));
+    speeches.push(silence(0));
+    for speech in &speeches {
+        let whole = radio::radio(speech, &assets).samples;
+        let peaks = radio::peaks(speech, &assets);
+        let channels = usize::from(speech.channels);
+        for frames in [1, 480, 7680] {
+            let mut stream = radio::Stream::new(&assets, peaks, speech.rate, speech.channels);
+            let mut streamed = Vec::new();
+            for chunk in speech.samples.chunks(frames * channels) {
+                stream.process(chunk, &mut streamed);
+            }
+            stream.finish(&mut streamed);
+            assert!(
+                streamed == whole,
+                "{} Hz in {} channels, {} frames, in chunks of {frames}",
+                speech.rate,
+                speech.channels,
+                speech.samples.len() / channels
+            );
+        }
+    }
+}
