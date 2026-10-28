@@ -26,7 +26,7 @@ use graph::{
 use half::f16;
 use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
 use voxcpm::{Cfm, Config, LocalEncoder, Sampling};
-use vulkan::Context;
+use vulkan::{Context, executable::count_mnemonics};
 
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
@@ -264,26 +264,35 @@ fn rounded(cases: Vec<Case>) -> Vec<Case> {
         .collect()
 }
 
-/// The tunings each kernel is checked at, at either subgroup size: one row or pair to a cluster
-/// and more, in workgroups of 128 to 1024, one to each block of rows or fewer, which then take
-/// several in turn, the tokens staged in chunks of 1024 columns and fewer, and the output and
-/// down projections cut along their columns or not.
+/// The tunings each kernel is checked at, at either subgroup size: one tile or pair of tiles to
+/// a subgroup and more, in workgroups of 64 to 512, one to each workgroup's worth of tiles or
+/// fewer, which then take several in turn; the tokens staged in chunks of 512 columns and fewer,
+/// at once or chunk by chunk, in blocks of 16 tokens and more; the weights loaded 1 to 8 steps
+/// ahead; and the output and down projections cut into 1 to 8 parts. Each fits the device's
+/// shared memory.
 fn tunings(ctx: &Context) -> Vec<Tuning> {
     let report = ctx.report();
-    [64, 32]
+    let tunings: Vec<Tuning> = [64, 32]
         .into_iter()
         .filter(|&s| report.can_require_subgroup_size(s))
         .flat_map(|s| {
             let base = Tuning::for_subgroup(s);
-            let cut = |workgroup, pairs, o_rows, down_rows, chunk, groups| Tuning {
+            let cut = |workgroup, pairs, tiles, chunk, block, depth, groups| Tuning {
                 workgroup,
                 qkv_pairs: pairs,
                 gate_up_pairs: pairs,
-                o_rows,
-                down_rows,
+                o_tiles: tiles,
+                down_tiles: tiles,
                 chunk,
+                block,
+                depth,
                 groups,
                 ..base
+            };
+            let parts = |o_parts, down_parts, tuning| Tuning {
+                o_parts,
+                down_parts,
+                ..tuning
             };
             [
                 base,
@@ -291,33 +300,25 @@ fn tunings(ctx: &Context) -> Vec<Tuning> {
                     subgroup: s,
                     ..Tuning::for_device(report).unwrap()
                 },
-                cut(128, 2, 2, 4, 512, 0),
-                cut(256, 1, 1, 1, 256, 0),
-                cut(256, 2, 2, 2, 256, 24),
-                cut(128, 1, 1, 1, 256, 40),
-                cut(256, 1, 1, 1, 1024, 40),
-                cut(256, 1, 1, 1, 512, 80),
-                cut(512, 1, 1, 1, 1024, 40),
-                cut(1024, 1, 1, 1, 1024, 0),
-                Tuning {
-                    split: true,
-                    ..cut(256, 1, 1, 1, 1024, 40)
-                },
-                Tuning {
-                    split: true,
-                    ..cut(256, 1, 1, 1, 1024, 24)
-                },
-                Tuning {
-                    split: true,
-                    ..cut(256, 1, 1, 1, 1024, 80)
-                },
-                Tuning {
-                    split: true,
-                    ..cut(128, 1, 2, 2, 512, 0)
-                },
+                cut(64, 1, 1, 256, 32, 4, 0),
+                cut(128, 2, 2, 128, 32, 2, 0),
+                cut(256, 2, 4, 64, 16, 1, 0),
+                cut(256, 1, 1, 512, 16, 8, 40),
+                cut(512, 1, 2, 128, 64, 4, 8),
+                parts(1, 1, cut(256, 1, 1, 512, 32, 4, 0)),
+                parts(4, 8, cut(256, 1, 1, 128, 32, 2, 0)),
+                parts(1, 2, cut(128, 1, 2, 256, 48, 4, 3)),
             ]
         })
-        .collect()
+        .collect();
+    for tuning in &tunings {
+        assert!(
+            tuning.shared_bytes() <= report.max_shared_memory as usize,
+            "{tuning:?} takes {} bytes of shared memory",
+            tuning.shared_bytes()
+        );
+    }
+    tunings
 }
 
 #[test]
@@ -330,8 +331,7 @@ fn keeps_the_oracles() {
     }
     let config = patch_config();
     let cases = rounded(cases(&config));
-    let mut patches = golden().0;
-    patches.extend(voice_patches(&config, 40));
+    let patches = encoder_patches(&config);
     for dtype in [FloatDType::F32, FloatDType::F16] {
         oracle(&cases, 2, dtype);
         oracle(&cases, Sampling::default().timesteps, dtype);
@@ -427,14 +427,19 @@ fn voice_patches(config: &PatchConfig, count: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// The patches the encoder is checked on: over many, since the errors gather in a few outlier
+/// channels, and at any one patch which of two runs rounds those worse is luck.
+fn encoder_patches(config: &PatchConfig) -> Vec<Vec<f32>> {
+    let mut patches = golden().0;
+    patches.extend(voice_patches(config, 40));
+    patches
+}
+
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
 fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
     let config = patch_config();
-    // Over many patches: the errors gather in a few outlier channels, and at any one patch
-    // which of two runs rounds those worse is luck.
-    let mut patches = golden().0;
-    patches.extend(voice_patches(&config, 40));
+    let patches = encoder_patches(&config);
     let want = encoder_oracle(&patches, FloatDType::F32);
     let burn_f16 = encoder_oracle(&patches, FloatDType::F16);
     let ctx = context();
@@ -518,5 +523,100 @@ fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     assert_eq!(got, alone, "the spliced sampler's patch");
     let got: Vec<u16> = step.read(at(&local, enc.out)).unwrap();
     assert_eq!(got, embedded, "the spliced encoder's embedding");
+    assert_no_validation_messages(&ctx);
+}
+
+/// Sub-dword loads among the mnemonics of `assembly` that start with `prefix`.
+fn narrow_loads(assembly: &str, prefix: &str) -> Vec<String> {
+    count_mnemonics(assembly, prefix)
+        .into_keys()
+        .filter(|m| {
+            !["_b32", "_b64", "_b96", "_b128"]
+                .iter()
+                .any(|w| m.ends_with(w))
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
+fn the_projections_compile_to_matrix_products_over_wide_loads() {
+    // What the driver makes of the cooperative-matrix loads decides how fast the weights stream,
+    // which no output can show: on RADV, whose final assembly is read, each projection's weights,
+    // loaded straight from memory, and its tokens, from shared memory, are loaded 8 and 16 bytes
+    // to a lane, never 2, and multiplied by v_wmma in f32, with nothing spilled. Another driver's
+    // statistics are printed.
+    let ctx = context();
+    let radv = ctx.report().driver_name == "radv";
+    if !ctx.captures_executables() {
+        assert!(
+            !radv,
+            "the device does not offer VK_KHR_pipeline_executable_properties"
+        );
+        eprintln!(
+            "{}: no VK_KHR_pipeline_executable_properties",
+            ctx.report().driver_name
+        );
+        return;
+    }
+    let config = patch_config();
+    let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
+    let report = ctx.report();
+    for subgroup in [64, 32]
+        .into_iter()
+        .filter(|&s| report.can_require_subgroup_size(s))
+    {
+        let tuning = Tuning::for_subgroup(subgroup);
+        let sampler = sampler_graph(&config, 2, &tuning).unwrap_or_else(|e| panic!("{e}"));
+        let mut seen = std::collections::BTreeSet::new();
+        for op in &sampler.graph.ops {
+            let name = op.pipeline.kernel.name;
+            if !["local_qkv_rope", "local_gate_up", "local_partial"].contains(&name)
+                || !seen.insert(op.pipeline.key())
+            {
+                continue;
+            }
+            let kernel = kernels.get(&op.pipeline).unwrap_or_else(|e| panic!("{e}"));
+            let executables = kernel.executables().unwrap_or_else(|e| panic!("{e}"));
+            let [e] = executables.as_slice() else {
+                panic!("{name}: {} executables", executables.len());
+            };
+            assert_eq!(e.subgroup_size, subgroup, "{name}");
+            let stats: Vec<String> = e
+                .statistics
+                .iter()
+                .map(|s| format!("{} {}", s.name, s.value.as_f64()))
+                .collect();
+            eprintln!("{name} wave{subgroup}: {stats:?}");
+            if !radv {
+                continue;
+            }
+            let asm = e
+                .representations
+                .iter()
+                .find(|r| r.name.contains("Assembly"))
+                .and_then(|r| r.text.as_deref())
+                .expect("RADV's final assembly");
+            let wmma = count_mnemonics(asm, "v_wmma_");
+            let wide = count_mnemonics(asm, "buffer_load_b128");
+            eprintln!(
+                "  {wmma:?}, {wide:?}, LDS {:?}",
+                count_mnemonics(asm, "ds_load")
+            );
+            assert!(
+                !wmma.is_empty() && wmma.keys().all(|m| m == "v_wmma_f32_16x16x16_f16"),
+                "{name} wave{subgroup}: {wmma:?}"
+            );
+            assert!(!wide.is_empty(), "{name} wave{subgroup}: no 16-byte loads");
+            for prefix in ["buffer_load", "global_load", "ds_load", "ds_read"] {
+                let narrow = narrow_loads(asm, prefix);
+                assert!(narrow.is_empty(), "{name} wave{subgroup}: {narrow:?}");
+            }
+            for stat in ["Spilled VGPRs", "Scratch size"] {
+                let value = e.statistic(stat).map(|v| v.as_f64());
+                assert_eq!(value, Some(0.0), "{name} wave{subgroup}: {stat}");
+            }
+        }
+    }
     assert_no_validation_messages(&ctx);
 }

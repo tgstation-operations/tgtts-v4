@@ -1,0 +1,76 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// sum = residual + the PARTS partial products local_partial wrote, summed in f32 in the order of
+// their parts, and normed = RMSNorm(sum) with gain g: the residual add after o_proj or down_proj
+// and the norm before the projection after it, or the stack's final norm. Workgroup m takes
+// token m. The norm is of the sum as rounded to f16 for `sum`, the tensor the next residual add
+// and upstream's norm see. The residual, sum and normed are `[M][N]`, the partial products
+// `[PARTS][TOKENS][N]`.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint N = 1024;
+layout(constant_id = 3) const uint PARTS = 4;
+layout(constant_id = 4) const uint TOKENS = 32;
+layout(constant_id = 5) const float EPS = 1e-5;
+
+const uint VECTORS = N / 8;
+const uint PER = (VECTORS + WORKGROUP - 1) / WORKGROUP;
+
+layout(std430, binding = 0) readonly buffer Partial { vec4 partial[]; };
+layout(std430, binding = 1) readonly buffer Residual { uvec4 residual[]; };
+layout(std430, binding = 2) readonly buffer G { uvec4 g[]; };
+layout(std430, binding = 3) writeonly buffer Sum { uvec4 sum[]; };
+layout(std430, binding = 4) writeonly buffer Normed { uvec4 normed[]; };
+
+// The token's sum rounded to f16, each read back by the invocation beside the one that wrote it,
+// so that the rounding is not folded away.
+shared uvec4 rounded[VECTORS];
+shared float squares_of[SUBGROUPS];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    [[unroll]] for (uint i = 0; i < PER; i++) {
+        uint v = i * WORKGROUP + gl_LocalInvocationID.x;
+        if (v < VECTORS) {
+            vec4 lo = vec4(0.0), hi = vec4(0.0);
+            [[unroll]] for (uint p = 0; p < PARTS; p++) {
+                uint at = 2 * ((p * TOKENS + m) * VECTORS + v);
+                lo += partial[at];
+                hi += partial[at + 1];
+            }
+            vec4 rlo, rhi;
+            unpack8(residual[m * VECTORS + v], rlo, rhi);
+            uvec4 packed = pack8(rlo + lo, rhi + hi);
+            sum[m * VECTORS + v] = packed;
+            rounded[v] = packed;
+        }
+    }
+    barrier();
+    vec4 lo[PER], hi[PER];
+    float squares = 0.0;
+    [[unroll]] for (uint i = 0; i < PER; i++) {
+        uint v = (i * WORKGROUP + gl_LocalInvocationID.x + 1) % VECTORS;
+        if (i * WORKGROUP + gl_LocalInvocationID.x < VECTORS) {
+            unpack8(rounded[v], lo[i], hi[i]);
+            squares += dot(lo[i], lo[i]) + dot(hi[i], hi[i]);
+        }
+    }
+    squares = subgroupAdd(squares);
+    if (subgroupElect()) {
+        squares_of[gl_SubgroupID] = squares;
+    }
+    barrier();
+    float total = 0.0;
+    for (uint s = 0; s < SUBGROUPS; s++) {
+        total += squares_of[s];
+    }
+    float scale = 1.0 / sqrt(total / float(N) + EPS);
+    [[unroll]] for (uint i = 0; i < PER; i++) {
+        uint v = (i * WORKGROUP + gl_LocalInvocationID.x + 1) % VECTORS;
+        if (i * WORKGROUP + gl_LocalInvocationID.x < VECTORS) {
+            vec4 glo, ghi;
+            unpack8(g[v], glo, ghi);
+            normed[m * VECTORS + v] = pack8(lo[i] * scale * glo, hi[i] * scale * ghi);
+        }
+    }
+}

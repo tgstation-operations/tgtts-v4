@@ -1,11 +1,14 @@
-//! VoxCPM2's local stacks at batch 1, the work around the LMs for each patch: the sampler with
-//! its local DiT ([`dit`]) and the local encoder ([`encoder`]). Each is a bidirectional
-//! MiniCPM-4 stack over the few tokens of one patch, run here in sequences of
-//! [`Shape::capacity`] tokens, the positions RoPE rotates them by. Its kernels read each weight
-//! once for every token, which is what a stack's time goes to: per layer the input norm, q/k/v
-//! projection and RoPE in one dispatch; attention within each sequence; the output projection
-//! with the residual; the post-attention norm with the gate/up projection and SiLU; and the down
-//! projection with the residual.
+//! VoxCPM2's local stacks, the work around the LMs for each patch: the sampler with its local DiT
+//! ([`dit`]) and the local encoder ([`encoder`]). Each is a bidirectional MiniCPM-4 stack over the
+//! few tokens of one patch, run here in sequences of [`Shape::capacity`] tokens, the positions
+//! RoPE rotates them by. Per layer: the q/k/v projection and RoPE; attention within each
+//! sequence; the output projection; the residual add with the post-attention norm; the gate/up
+//! projection and SiLU; the down projection; and the residual add with the next layer's input
+//! norm, or after the last the final norm.
+//!
+//! The projections are products of cooperative matrices, 16 x 16 tiles of f16 summed in f32
+//! (`mma.glsl`): each weight is read once for a block of tokens, and a token's products are the
+//! same whatever else is in its block, so that each sequence comes out as it would alone.
 
 pub mod dit;
 pub mod encoder;
@@ -23,10 +26,16 @@ use crate::{
     step::Step,
 };
 
-/// `local_qkv_rope.comp`: x, gain, W, cos, sin -> q, k, v.
+/// `local_norm.comp`: x, gain -> out.
+pub static LOCAL_NORM: KernelInfo = KernelInfo {
+    name: "local_norm",
+    access: &[Read, Read, Write],
+};
+
+/// `local_qkv_rope.comp`: x, W, cos, sin -> q, k, v.
 pub static LOCAL_QKV_ROPE: KernelInfo = KernelInfo {
     name: "local_qkv_rope",
-    access: &[Read, Read, Read, Read, Read, Write, Write, Write],
+    access: &[Read, Read, Read, Read, Write, Write, Write],
 };
 
 /// `local_attention.comp`: q, k, v -> out.
@@ -35,28 +44,28 @@ pub static LOCAL_ATTENTION: KernelInfo = KernelInfo {
     access: &[Read, Read, Read, Write],
 };
 
-/// `local_residual.comp`: x, W, residual -> out.
-pub static LOCAL_RESIDUAL: KernelInfo = KernelInfo {
-    name: "local_residual",
-    access: &[Read, Read, Read, Write],
-};
-
-/// `local_gate_up.comp`: x, gain, W -> out.
-pub static LOCAL_GATE_UP: KernelInfo = KernelInfo {
-    name: "local_gate_up",
-    access: &[Read, Read, Read, Write],
-};
-
-/// `local_partial.comp`: x, W -> partial products over chunks of the columns.
+/// `local_partial.comp`: x, W -> partial products over parts of the columns.
 pub static LOCAL_PARTIAL: KernelInfo = KernelInfo {
     name: "local_partial",
     access: &[Read, Read, Write],
 };
 
-/// `local_combine.comp`: partial products, residual -> out.
-pub static LOCAL_COMBINE: KernelInfo = KernelInfo {
-    name: "local_combine",
+/// `local_add_norm.comp`: partial products, residual, gain -> sum, normed.
+pub static LOCAL_ADD_NORM: KernelInfo = KernelInfo {
+    name: "local_add_norm",
+    access: &[Read, Read, Read, Write, Write],
+};
+
+/// `local_gate_up.comp`: x, W -> out.
+pub static LOCAL_GATE_UP: KernelInfo = KernelInfo {
+    name: "local_gate_up",
     access: &[Read, Read, Write],
+};
+
+/// `local_rows.comp`: x -> every few of its rows.
+pub static LOCAL_ROWS: KernelInfo = KernelInfo {
+    name: "local_rows",
+    access: &[Read, Write],
 };
 
 /// `local_embed.comp`: frames, W, bias, tokens -> some of a stack's input tokens.
@@ -71,14 +80,18 @@ pub static CFM_NOISE: KernelInfo = KernelInfo {
     access: &[Read, Read, Write],
 };
 
-/// `dit_euler.comp`: hidden states, gain, out_proj, bias, sampling -> x, which it also reads.
+/// `dit_euler.comp`: hidden states after the final norm, out_proj, bias, sampling -> x, which it
+/// also reads.
 pub static DIT_EULER: KernelInfo = KernelInfo {
     name: "dit_euler",
-    access: &[Read, Read, Read, Read, Read, Write],
+    access: &[Read, Read, Read, Read, Write],
 };
 
 /// The tokens gemm.glsl's clusters take a row at a time, fixed in the kernels.
 pub const CLUSTER: usize = 16;
+
+/// The rows and columns of a cooperative matrix's tile, fixed in `mma.glsl`.
+pub const TILE: usize = 16;
 
 /// What a VoxCPM2 `config.json` says of the local stacks; the rest is ignored.
 #[derive(Clone, Debug, Deserialize)]
@@ -133,63 +146,85 @@ impl PatchConfig {
 }
 
 /// How the local stacks' kernels cut their work: the subgroup size every kernel runs at, the
-/// workgroup width, and the rows each cluster of [`CLUSTER`] lanes takes in each projection.
+/// workgroup width, and how the projections share out their tiles of [`TILE`] rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
     pub subgroup: u32,
     pub workgroup: u32,
-    /// Row pairs per cluster of the q/k/v and the gate/up projections.
+    /// Pairs of tiles a subgroup takes at once in the q/k/v and the gate/up projections: of the
+    /// rows RoPE rotates together, and of the gate's rows with up's.
     pub qkv_pairs: u32,
     pub gate_up_pairs: u32,
-    /// Rows per cluster of the output and down projections.
-    pub o_rows: u32,
-    pub down_rows: u32,
-    /// The columns of the tokens each projection stages at once.
+    /// Tiles a subgroup takes at once in the output and down projections.
+    pub o_tiles: u32,
+    pub down_tiles: u32,
+    /// The parts the output and down projections' columns are cut into, each summed by
+    /// workgroups of its own and joined after in their order: the order of the sums, and so what
+    /// a token's products come to, depends on these alone.
+    pub o_parts: u32,
+    pub down_parts: u32,
+    /// The columns of the tokens each projection stages in shared memory at once.
     pub chunk: u32,
-    /// Whether the output and down projections are cut along their columns too, a chunk to
-    /// each row of workgroups, and joined with the residual by a dispatch of their own.
-    pub split: bool,
-    /// The workgroups each projection dispatches, which share its rows out, over its parts when
-    /// it is cut along its columns: one to each workgroup's worth of rows when 0.
+    /// The most tokens a workgroup takes, a multiple of [`TILE`].
+    pub block: u32,
+    /// The steps of [`TILE`] columns ahead of its products that a subgroup loads its weights.
+    pub depth: u32,
+    /// The workgroups each projection dispatches for each part and block of tokens, which share
+    /// its tiles out: one to each workgroup's worth of them when 0.
     pub groups: u32,
 }
 
 impl Tuning {
-    /// One row or one pair of rows to a cluster, in workgroups of 256 that each take a
-    /// workgroup's worth of them, at `subgroup`.
+    /// One pair of tiles or one tile to a subgroup, the output and down projections cut into 2
+    /// and 4 parts, in workgroups of 256 that each take a workgroup's worth of them, the tokens
+    /// staged 512 columns at a time in blocks of 32, the weights loaded 8 steps ahead, at
+    /// `subgroup`. On the Radeon 8060S the sampler's ten steps for one request took 24.4 ms on
+    /// the GPU so, and 26.2 ms staging 256 columns 4 steps ahead.
     pub fn for_subgroup(subgroup: u32) -> Self {
         Tuning {
             subgroup,
             workgroup: 256,
             qkv_pairs: 1,
             gate_up_pairs: 1,
-            o_rows: 1,
-            down_rows: 1,
-            chunk: 1024,
-            split: false,
+            o_tiles: 1,
+            down_tiles: 1,
+            o_parts: 2,
+            down_parts: 4,
+            chunk: 512,
+            block: 32,
+            depth: 8,
             groups: 0,
         }
     }
 
     /// [`for_subgroup`](Self::for_subgroup) at the widest subgroup the kernels are written for
-    /// that the device can require; on a device that says how many compute units it has, one
-    /// workgroup to each, the output and down projections cut along their columns. On the
-    /// Radeon 8060S, whose 40 compute units each hold one workgroup's 22 tokens at once, the
-    /// sampler's ten steps took 28.6 ms on the GPU so, and about 50 ms at one workgroup to each
-    /// workgroup's worth of rows.
+    /// that the device can require, staging fewer columns and then fewer tokens at once where its
+    /// shared memory holds less.
     pub fn for_device(report: &DeviceReport) -> Result<Self, Error> {
         let base = decode::Tuning::for_device(report)?;
-        let units = report
-            .shader_core
-            .and_then(|core| core.active_compute_units);
-        Ok(match units {
-            Some(units) => Tuning {
-                split: true,
-                groups: units,
-                ..Tuning::for_subgroup(base.subgroup)
-            },
-            None => Tuning::for_subgroup(base.subgroup),
-        })
+        let mut tuning = Tuning::for_subgroup(base.subgroup);
+        while tuning.shared_bytes() > report.max_shared_memory as usize {
+            if tuning.chunk > 256 {
+                tuning.chunk /= 2;
+            } else if tuning.block > TILE as u32 {
+                tuning.block -= TILE as u32;
+            } else {
+                return Err(Error::Shape(format!(
+                    "{} bytes of shared memory for a block of {TILE} tokens, of {}",
+                    tuning.shared_bytes(),
+                    report.max_shared_memory
+                )));
+            }
+        }
+        Ok(tuning)
+    }
+
+    /// The most shared memory a projection's workgroup takes: a block of tokens staged, and
+    /// each subgroup's pair of tiles on their way out.
+    pub fn shared_bytes(&self) -> usize {
+        let (block, chunk) = (self.block as usize, self.chunk as usize);
+        let subgroups = (self.workgroup / self.subgroup) as usize;
+        2 * block * (chunk + 8) + subgroups * 2 * TILE * TILE * 4
     }
 }
 
@@ -206,27 +241,6 @@ pub(crate) fn groups(what: &str, total: usize, per_group: usize) -> Result<u32, 
         )));
     }
     u32::try_from(total / per_group).map_err(|_| Error::Shape(format!("{what}: {total}")))
-}
-
-/// The sets of `per_slot` of `total` rows the clusters take, and the workgroups to dispatch over
-/// them: `groups`, or one to each `clusters` of them when 0, and never more.
-fn slots(
-    what: &str,
-    total: usize,
-    per_slot: usize,
-    clusters: usize,
-    groups: u32,
-) -> Result<(u32, u32), Error> {
-    let slots = self::groups(what, total, per_slot)?;
-    let blocks = self::groups(what, slots as usize, clusters)?;
-    Ok((
-        slots,
-        if groups == 0 {
-            blocks
-        } else {
-            groups.min(blocks)
-        },
-    ))
 }
 
 /// Each of `graph`'s tensors where it is: the map for a graph that is not part of another.
@@ -256,33 +270,33 @@ pub struct Stack {
     /// Sequences of `shape.capacity` tokens it runs over at once.
     pub seqs: usize,
     pub layers: Vec<LayerTensors>,
-    /// The final norm's gain, which the stack's user applies.
+    /// The final norm's gain.
     pub norm: TensorId,
     pub cos: TensorId,
     pub sin: TensorId,
+    /// The tokens of the projections' blocks, the last padded past the stack's.
+    padded: usize,
     pipelines: Pipelines,
 }
 
 #[derive(Clone, Debug)]
 struct Pipelines {
-    qkv: (Pipeline, u32),
+    norm: (Pipeline, u32),
+    qkv: Projection,
     attention: (Pipeline, u32),
-    o: Residual,
-    gate_up: (Pipeline, u32),
-    down: Residual,
+    o: Projection,
+    o_add: (Pipeline, u32),
+    gate_up: Projection,
+    down: Projection,
+    down_add: (Pipeline, u32),
 }
 
-/// How a projection with the residual add after it is dispatched.
+/// A projection's pipeline and its grid: workgroups, parts of the columns, blocks of tokens.
 #[derive(Clone, Debug)]
-enum Residual {
-    /// At once.
-    Whole(Pipeline, u32),
-    /// Over `parts` chunks of its columns, and joined with the residual after.
-    Split {
-        partial: (Pipeline, [u32; 3]),
-        combine: (Pipeline, u32),
-        parts: usize,
-    },
+struct Projection {
+    pipeline: Pipeline,
+    groups: [u32; 3],
+    parts: usize,
 }
 
 impl Stack {
@@ -306,26 +320,25 @@ impl Stack {
             workgroup.is_multiple_of(subgroup) && subgroup.is_multiple_of(CLUSTER as u32),
             || format!("workgroups of {workgroup} in subgroups of {subgroup}"),
         )?;
-        let chunk = tuning.chunk as usize;
-        let step = 8 * CLUSTER;
+        let block = tuning.block as usize;
+        check(block > 0 && block.is_multiple_of(TILE), || {
+            format!("blocks of {block} tokens")
+        })?;
         check(
-            s.hidden.is_multiple_of(chunk.min(s.hidden))
-                && chunk.is_multiple_of(step)
-                && (s.heads * s.head_dim).is_multiple_of(chunk)
-                && s.inner.is_multiple_of(chunk),
+            s.heads.is_multiple_of(s.kv_heads)
+                && s.head_dim.is_multiple_of(2 * TILE)
+                && s.hidden.is_multiple_of(TILE * CLUSTER),
             || {
                 format!(
-                    "{} and {} columns in chunks of {chunk}, steps of {step}",
-                    s.heads * s.head_dim,
-                    s.inner
+                    "{} heads over {} of {}, {} wide",
+                    s.heads, s.kv_heads, s.head_dim, s.hidden
                 )
             },
         )?;
-        check(
-            s.heads.is_multiple_of(s.kv_heads) && s.head_dim.is_multiple_of(step),
-            || format!("{} heads over {} of {}", s.heads, s.kv_heads, s.head_dim),
-        )?;
-        let clusters = (workgroup as usize) / CLUSTER;
+        // The fewest blocks that hold the tokens, each the fewest tiles that hold its share.
+        let blocks = m.div_ceil(block);
+        let block = m.div_ceil(blocks).next_multiple_of(TILE);
+        let subgroups = (workgroup / subgroup) as usize;
         let sub = Some(subgroup);
         let common = [
             (0, SpecValue::U32(subgroup)),
@@ -336,16 +349,68 @@ impl Stack {
             constants: common.iter().chain(constants).copied().collect(),
             subgroup_size: sub,
         };
+        // A projection over k columns cut into `parts`, its tiles in `units` of a subgroup each;
+        // the staged columns, the token block and the steps loaded ahead are its last three
+        // constants.
+        let projection = |kernel,
+                          k: usize,
+                          units: usize,
+                          parts: usize,
+                          constants: &[(u32, SpecValue)]|
+         -> Result<Projection, Error> {
+            let part = k / parts.max(1);
+            let chunk = (tuning.chunk as usize).min(part);
+            let depth = tuning.depth as usize;
+            check(
+                parts > 0
+                    && k.is_multiple_of(parts)
+                    && chunk.is_multiple_of(TILE)
+                    && part.is_multiple_of(chunk)
+                    && depth > 0
+                    && (chunk / TILE).is_multiple_of(depth),
+                || format!("{k} columns in {parts} parts, chunks of {chunk}, {depth} steps ahead"),
+            )?;
+            check(part == chunk || units.is_multiple_of(subgroups), || {
+                format!("{units} units restaged by {subgroups} subgroups")
+            })?;
+            let wide = units.div_ceil(subgroups) as u32;
+            let next = constants.len() as u32 + 2;
+            let shared = [
+                (next, u(chunk)),
+                (next + 1, u(block)),
+                (next + 2, SpecValue::U32(tuning.depth)),
+            ];
+            let constants: Vec<_> = constants.iter().chain(&shared).copied().collect();
+            Ok(Projection {
+                pipeline: pipeline(kernel, &constants),
+                groups: [
+                    match tuning.groups {
+                        0 => wide,
+                        groups => groups.min(wide),
+                    },
+                    parts as u32,
+                    blocks as u32,
+                ],
+                parts,
+            })
+        };
+        let pairs = |what: &str, total: usize, per: u32| -> Result<usize, Error> {
+            check(per > 0 && total.is_multiple_of(per as usize), || {
+                format!("{what}: {total} in units of {per}")
+            })?;
+            Ok(total / per as usize)
+        };
         let eps = SpecValue::F32(s.eps);
-        let (qkv_slots, qkv_groups) = slots(
-            "q/k/v row pairs",
-            (s.heads + 2 * s.kv_heads) * s.head_dim / 2,
-            tuning.qkv_pairs as usize,
-            clusters,
-            tuning.groups,
-        )?;
-        let qkv = pipeline(
+        let heads = s.heads + 2 * s.kv_heads;
+        let qkv = projection(
             &LOCAL_QKV_ROPE,
+            s.hidden,
+            pairs(
+                "q/k/v tile pairs",
+                heads * s.head_dim / 2 / TILE,
+                tuning.qkv_pairs,
+            )?,
+            1,
             &[
                 (2, u(s.hidden)),
                 (3, u(m)),
@@ -353,12 +418,9 @@ impl Stack {
                 (5, u(s.heads)),
                 (6, u(s.kv_heads)),
                 (7, u(s.head_dim)),
-                (8, eps),
-                (9, SpecValue::U32(tuning.qkv_pairs)),
-                (10, u(chunk.min(s.hidden))),
-                (11, SpecValue::U32(qkv_slots)),
+                (8, SpecValue::U32(tuning.qkv_pairs)),
             ],
-        );
+        )?;
         let attention = pipeline(
             &LOCAL_ATTENTION,
             &[
@@ -370,72 +432,61 @@ impl Stack {
                 (7, SpecValue::F32(1.0 / (s.head_dim as f32).sqrt())),
             ],
         );
+        let clusters = (workgroup as usize) / CLUSTER;
         let attention_groups = (m * s.heads).div_ceil(clusters) as u32;
-        let residual = |k: usize, rows: u32| -> Result<Residual, Error> {
-            let parts = k / chunk.min(k);
-            let groups = match tuning.groups {
-                0 => 0,
-                all if tuning.split => (all / parts as u32).max(1),
-                all => all,
-            };
-            let (slots, groups) =
-                slots("residual rows", s.hidden, rows as usize, clusters, groups)?;
-            let constants = |kernel| {
-                pipeline(
-                    kernel,
-                    &[
-                        (2, u(k)),
-                        (3, u(chunk.min(k))),
-                        (4, u(m)),
-                        (5, u(s.hidden)),
-                        (6, SpecValue::U32(rows)),
-                        (7, SpecValue::U32(slots)),
-                    ],
-                )
-            };
-            if !tuning.split {
-                return Ok(Residual::Whole(constants(&LOCAL_RESIDUAL), groups));
-            }
-            let len = m * s.hidden;
-            let combine = pipeline(&LOCAL_COMBINE, &[(2, u(len)), (3, u(parts))]);
-            Ok(Residual::Split {
-                partial: (constants(&LOCAL_PARTIAL), [groups, parts as u32, 1]),
-                combine: (combine, len.div_ceil(workgroup as usize) as u32),
-                parts,
-            })
+        let residual = |k: usize, tiles: u32, parts: u32| -> Result<Projection, Error> {
+            projection(
+                &LOCAL_PARTIAL,
+                k,
+                pairs("residual tiles", s.hidden / TILE, tiles)?,
+                parts as usize,
+                &[
+                    (2, u(k)),
+                    (3, u(m)),
+                    (4, u(s.hidden)),
+                    (5, SpecValue::U32(tiles)),
+                    (6, SpecValue::U32(parts)),
+                ],
+            )
         };
-        let (gate_up_slots, gate_up_groups) = slots(
-            "gate/up row pairs",
-            s.inner,
-            tuning.gate_up_pairs as usize,
-            clusters,
-            tuning.groups,
-        )?;
-        let gate_up = pipeline(
+        let padded = blocks * block;
+        let add = |parts: usize| {
+            pipeline(
+                &LOCAL_ADD_NORM,
+                &[(2, u(s.hidden)), (3, u(parts)), (4, u(padded)), (5, eps)],
+            )
+        };
+        let o = residual(s.heads * s.head_dim, tuning.o_tiles, tuning.o_parts)?;
+        let down = residual(s.inner, tuning.down_tiles, tuning.down_parts)?;
+        let gate_up = projection(
             &LOCAL_GATE_UP,
+            s.hidden,
+            pairs("gate/up tiles", s.inner / TILE, tuning.gate_up_pairs)?,
+            1,
             &[
                 (2, u(s.hidden)),
                 (3, u(m)),
                 (4, u(s.inner)),
-                (5, eps),
-                (6, SpecValue::U32(tuning.gate_up_pairs)),
-                (7, u(chunk.min(s.hidden))),
-                (8, SpecValue::U32(gate_up_slots)),
+                (5, SpecValue::U32(tuning.gate_up_pairs)),
             ],
-        );
+        )?;
+        let tokens = m as u32;
         let pipelines = Pipelines {
-            qkv: (qkv, qkv_groups),
+            norm: (pipeline(&LOCAL_NORM, &[(2, u(s.hidden)), (3, eps)]), tokens),
+            qkv,
             attention: (attention, attention_groups),
-            o: residual(s.heads * s.head_dim, tuning.o_rows)?,
-            gate_up: (gate_up, gate_up_groups),
-            down: residual(s.inner, tuning.down_rows)?,
+            o_add: (add(o.parts), tokens),
+            o,
+            gate_up,
+            down_add: (add(down.parts), tokens),
+            down,
         };
 
         let vector = |n: usize| 2 * n as u64;
         let table = (s.capacity * s.head_dim / 2 * 4) as u64;
         let cos = g.tensor(format!("{name}.rope.cos"), table, Kind::Constant);
         let sin = g.tensor(format!("{name}.rope.sin"), table, Kind::Constant);
-        let qkv_rows = (s.heads + 2 * s.kv_heads) * s.head_dim;
+        let qkv_rows = heads * s.head_dim;
         let layers = (0..s.layers)
             .map(|l| {
                 let mut weight = |what: &str, n: usize| {
@@ -463,6 +514,7 @@ impl Stack {
             norm,
             cos,
             sin,
+            padded,
             pipelines,
         })
     }
@@ -473,90 +525,87 @@ impl Stack {
     }
 
     /// Appends the layers over the tokens `x`, `[tokens][hidden]` in f16, to `g`, labelled after
-    /// `name`; returns their output before the final norm, an intermediate of `g`.
+    /// `name`; returns their output after the final norm, an intermediate of `g`.
     pub fn layers(&self, g: &mut Graph, name: &str, x: TensorId) -> TensorId {
         let s = &self.shape;
         let m = self.tokens();
-        let vector = |n: usize| 2 * (m * n) as u64;
         let p = &self.pipelines;
+        let label = |l: usize, what: &str| format!("{name}.layers.{l}.{what}");
+        let intermediate = |g: &mut Graph, l: usize, what: &str, bytes: usize| {
+            g.tensor(label(l, what), bytes as u64, Kind::Intermediate)
+        };
+        let half = |n: usize| 2 * m * n;
+        let partials = |parts: usize| 4 * parts * self.padded * s.hidden;
+        let op = |g: &mut Graph,
+                  label: String,
+                  (pipeline, groups): &(Pipeline, u32),
+                  bindings: &[TensorId]| {
+            g.op(label, pipeline.clone(), bindings, [*groups, 1, 1]);
+        };
+        let project = |g: &mut Graph, label: String, how: &Projection, bindings: &[TensorId]| {
+            g.op(label, how.pipeline.clone(), bindings, how.groups);
+        };
+        let mut normed = intermediate(g, 0, "normed", half(s.hidden));
+        op(
+            g,
+            label(0, "input_norm"),
+            &p.norm,
+            &[x, self.layers[0].input_norm, normed],
+        );
         let mut input = x;
         for (l, t) in self.layers.iter().enumerate() {
-            let label = |what: &str| format!("{name}.layers.{l}.{what}");
-            let mut intermediate =
-                |what: &str, n: usize| g.tensor(label(what), vector(n), Kind::Intermediate);
-            let q = intermediate("q", s.heads * s.head_dim);
-            let k = intermediate("k", s.kv_heads * s.head_dim);
-            let v = intermediate("v", s.kv_heads * s.head_dim);
-            let attended = intermediate("attended", s.heads * s.head_dim);
-            let mid = intermediate("mid", s.hidden);
-            let mlp = intermediate("mlp", s.inner);
-            let output = intermediate("out", s.hidden);
-            let op = |g: &mut Graph,
-                      what: &str,
-                      (pipeline, groups): &(Pipeline, u32),
-                      bindings: &[TensorId]| {
-                g.op(label(what), pipeline.clone(), bindings, [*groups, 1, 1]);
-            };
-            op(
+            let q = intermediate(g, l, "q", half(s.heads * s.head_dim));
+            let k = intermediate(g, l, "k", half(s.kv_heads * s.head_dim));
+            let v = intermediate(g, l, "v", half(s.kv_heads * s.head_dim));
+            let attended = intermediate(g, l, "attended", half(s.heads * s.head_dim));
+            let o = intermediate(g, l, "o_proj.partial", partials(p.o.parts));
+            let mid = intermediate(g, l, "mid", half(s.hidden));
+            let mid_normed = intermediate(g, l, "mid_normed", half(s.hidden));
+            let mlp = intermediate(g, l, "mlp", half(s.inner));
+            let down = intermediate(g, l, "down_proj.partial", partials(p.down.parts));
+            let output = intermediate(g, l, "out", half(s.hidden));
+            let output_normed = intermediate(g, l, "out_normed", half(s.hidden));
+            project(
                 g,
-                "qkv_rope",
+                label(l, "qkv_rope"),
                 &p.qkv,
-                &[input, t.input_norm, t.qkv, self.cos, self.sin, q, k, v],
+                &[normed, t.qkv, self.cos, self.sin, q, k, v],
             );
-            op(g, "attention", &p.attention, &[q, k, v, attended]);
-            self.residual(g, &label("o_proj"), &p.o, [attended, t.o, input, mid]);
+            op(g, label(l, "attention"), &p.attention, &[q, k, v, attended]);
+            project(g, label(l, "o_proj"), &p.o, &[attended, t.o, o]);
             op(
                 g,
-                "gate_up",
-                &p.gate_up,
-                &[mid, t.post_norm, t.gate_up, mlp],
+                label(l, "o_proj_add"),
+                &p.o_add,
+                &[o, input, t.post_norm, mid, mid_normed],
             );
-            self.residual(g, &label("down_proj"), &p.down, [mlp, t.down, mid, output]);
+            project(
+                g,
+                label(l, "gate_up"),
+                &p.gate_up,
+                &[mid_normed, t.gate_up, mlp],
+            );
+            project(g, label(l, "down_proj"), &p.down, &[mlp, t.down, down]);
+            let gain = self
+                .layers
+                .get(l + 1)
+                .map_or(self.norm, |next| next.input_norm);
+            op(
+                g,
+                label(l, "down_proj_add"),
+                &p.down_add,
+                &[down, mid, gain, output, output_normed],
+            );
             input = output;
+            normed = output_normed;
         }
-        input
-    }
-
-    /// Appends the projection `x` -> `out` by `w` with the residual `residual` added after, as
-    /// `how` dispatches it, labelled `label`.
-    fn residual(
-        &self,
-        g: &mut Graph,
-        label: &str,
-        how: &Residual,
-        [x, w, residual, out]: [TensorId; 4],
-    ) {
-        match how {
-            Residual::Whole(pipeline, groups) => {
-                g.op(
-                    label,
-                    pipeline.clone(),
-                    &[x, w, residual, out],
-                    [*groups, 1, 1],
-                );
-            }
-            Residual::Split {
-                partial,
-                combine,
-                parts,
-            } => {
-                let bytes = 4 * (parts * self.tokens() * self.shape.hidden) as u64;
-                let partials = g.tensor(format!("{label}.partial"), bytes, Kind::Intermediate);
-                g.op(label, partial.0.clone(), &[x, w, partials], partial.1);
-                g.op(
-                    format!("{label}_combine"),
-                    combine.0.clone(),
-                    &[partials, residual, out],
-                    [combine.1, 1, 1],
-                );
-            }
-        }
+        normed
     }
 
     /// Writes the rotation tables, and the weights of the stack whose tensors are named after
     /// `prefix` in `checkpoint`, as upstream's state_dict names them, converted to f16, into
     /// `step`, a recording of `graph`, where `ids` puts each tensor of the graph the stack was
-    /// added to.
+    /// added to. The projections' weights are [`tiled`].
     pub fn load(
         &self,
         step: &mut Step,
@@ -572,11 +621,16 @@ impl Stack {
         for (l, t) in self.layers.iter().enumerate() {
             let n = |what: &str| format!("{prefix}layers.{l}.{what}.weight");
             let [q, k, v] = ["q_proj", "k_proj", "v_proj"].map(|p| n(&format!("self_attn.{p}")));
-            write_weight(step, graph, checkpoint, at(t.qkv), &[q, k, v])?;
-            write_weight(step, graph, checkpoint, at(t.o), &[n("self_attn.o_proj")])?;
+            let mut tiles = |t: TensorId, names: &[String], k: usize| {
+                let values = read_weight(graph, checkpoint, at(t), names)?;
+                step.write(at(t), &tiled(&values, k))
+            };
+            let s = &self.shape;
+            tiles(t.qkv, &[q, k, v], s.hidden)?;
+            tiles(t.o, &[n("self_attn.o_proj")], s.heads * s.head_dim)?;
             let [gate, up] = ["gate_proj", "up_proj"].map(|p| n(&format!("mlp.{p}")));
-            write_weight(step, graph, checkpoint, at(t.gate_up), &[gate, up])?;
-            write_weight(step, graph, checkpoint, at(t.down), &[n("mlp.down_proj")])?;
+            tiles(t.gate_up, &[gate, up], s.hidden)?;
+            tiles(t.down, &[n("mlp.down_proj")], s.inner)?;
             write_weight(
                 step,
                 graph,
@@ -612,6 +666,17 @@ pub(crate) fn write_weight(
     t: TensorId,
     names: &[String],
 ) -> Result<(), Error> {
+    let values = read_weight(graph, checkpoint, t, names)?;
+    step.write(t, &values)
+}
+
+/// What [`write_weight`] writes.
+fn read_weight(
+    graph: &Graph,
+    checkpoint: &Checkpoint,
+    t: TensorId,
+    names: &[String],
+) -> Result<Vec<u16>, Error> {
     let values = match names {
         [name] => checkpoint.f16(name)?.1,
         _ => checkpoint.rows_f16(names)?.1,
@@ -623,5 +688,43 @@ pub(crate) fn write_weight(
             values.len()
         )));
     }
-    step.write(t, &values)
+    Ok(values)
+}
+
+/// A row-major matrix of `k` columns in tiles of [`TILE`] rows by [`TILE`] columns, each
+/// row-major, a row of tiles' one after another: as `mma.glsl` reads a weight, so that each
+/// subgroup reads its rows' columns in one stream. The rows and columns are multiples of
+/// [`TILE`], as [`Stack::new`] has them.
+pub fn tiled(values: &[u16], k: usize) -> Vec<u16> {
+    let n = values.len() / k;
+    let mut out = Vec::with_capacity(values.len());
+    for rows in 0..n / TILE {
+        for columns in 0..k / TILE {
+            for r in 0..TILE {
+                let at = (rows * TILE + r) * k + columns * TILE;
+                out.extend_from_slice(&values[at..at + TILE]);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiles_hold_16_rows_of_16_columns_and_follow_each_other_along_the_rows() {
+        let (n, k) = (2 * TILE, 3 * TILE);
+        let values: Vec<u16> = (0..n * k).map(|v| v as u16).collect();
+        let tiles = tiled(&values, k);
+        assert_eq!(tiles.len(), values.len());
+        for row in 0..n {
+            for column in 0..k {
+                let tile = row / TILE * (k / TILE) + column / TILE;
+                let at = tile * TILE * TILE + row % TILE * TILE + column % TILE;
+                assert_eq!(tiles[at], values[row * k + column], "({row}, {column})");
+            }
+        }
+    }
 }

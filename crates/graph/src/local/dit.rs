@@ -171,9 +171,8 @@ pub fn sampler_graph(
                 (4, u(x_at)),
                 (5, u(patch_size)),
                 (6, u(feat_dim)),
-                (7, SpecValue::F32(shape.eps)),
-                (8, SpecValue::F32(dt)),
-                (9, u(feat_dim / clusters)),
+                (7, SpecValue::F32(dt)),
+                (8, u(feat_dim / clusters)),
             ],
         )
     };
@@ -223,7 +222,7 @@ pub fn sampler_graph(
         g.op(
             format!("step.{s}.euler"),
             euler(dt),
-            &[out, stack.norm, out_proj.0, out_proj.1, sampling, patch],
+            &[out, out_proj.0, out_proj.1, sampling, patch],
             [1, 1, 1],
         );
     }

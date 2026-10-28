@@ -1,11 +1,11 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 // The attention's input side for the M tokens of a local stack, sequences of T tokens each: q,
-// k and v = W RMSNorm(x), q and k rotated by RoPE at each token's place in its sequence. W is
-// upstream's q_proj, k_proj and v_proj joined along their outputs, HEADS + 2 KV_HEADS heads of
-// HEAD_DIM rows; a cluster takes PAIRS pairs of rows i and i + HEAD_DIM / 2 of one head, the
-// pairs RoPE rotates together. x is `[M][K]`; q, k and v are `[M][heads][HEAD_DIM]`; the
-// rotation's cosines and sines are `[T][HEAD_DIM / 2]`.
+// k and v = W x, x the tokens after the input norm, q and k rotated by RoPE at each token's place
+// in its sequence. W is upstream's q_proj, k_proj and v_proj joined along their outputs, HEADS +
+// 2 KV_HEADS heads of HEAD_DIM rows; a unit is PAIRS pairs of tiles of rows i and i + HEAD_DIM / 2
+// of one head, the pairs RoPE rotates together. x is `[M][K]`; q, k and v are
+// `[M][heads][HEAD_DIM]`; the rotation's cosines and sines are `[T][HEAD_DIM / 2]`.
 #include "common.glsl"
 
 layout(constant_id = 2) const uint K = 1024;
@@ -14,74 +14,75 @@ layout(constant_id = 4) const uint T = 11;
 layout(constant_id = 5) const uint HEADS = 16;
 layout(constant_id = 6) const uint KV_HEADS = 2;
 layout(constant_id = 7) const uint HEAD_DIM = 128;
-layout(constant_id = 8) const float EPS = 1e-5;
-layout(constant_id = 9) const uint PAIRS = 1;
-layout(constant_id = 10) const uint KC = 1024;
-layout(constant_id = 11) const uint SLOTS = 1024;
-const uint ROWS = 2 * PAIRS;
-const bool SPLIT = false;
+layout(constant_id = 8) const uint PAIRS = 1;
+layout(constant_id = 9) const uint KC = 512;
+layout(constant_id = 10) const uint BM = 32;
+layout(constant_id = 11) const uint DEPTH = 4;
+const uint RT = 2 * PAIRS;
+const uint PARTS = 1;
 const uint HALF = HEAD_DIM / 2;
+const uint UNITS = (HEADS + 2 * KV_HEADS) * (HALF / 16) / PAIRS;
 
 layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
-layout(std430, binding = 1) readonly buffer G { uvec4 g[]; };
-layout(std430, binding = 2) readonly buffer W { uvec4 w[]; };
-layout(std430, binding = 3) readonly buffer Cos { float cos_[]; };
-layout(std430, binding = 4) readonly buffer Sin { float sin_[]; };
-layout(std430, binding = 5) writeonly buffer Q { float16_t q[]; };
-layout(std430, binding = 6) writeonly buffer Key { float16_t k[]; };
-layout(std430, binding = 7) writeonly buffer Value { float16_t v[]; };
+layout(std430, binding = 1) readonly buffer W { uvec4 w[]; };
+layout(std430, binding = 2) readonly buffer Cos { float cos_[]; };
+layout(std430, binding = 3) readonly buffer Sin { float sin_[]; };
+layout(std430, binding = 4) writeonly buffer Q { float16_t q[]; };
+layout(std430, binding = 5) writeonly buffer Key { float16_t k[]; };
+layout(std430, binding = 6) writeonly buffer Value { float16_t v[]; };
 
-#include "gemm.glsl"
-#include "gemm_norm.glsl"
+#include "mma.glsl"
 
-void stage(uint chunk) {
-    if (chunk == 0) {
-        norm_scales();
-    }
-    stage_normed(chunk);
+// Each subgroup's pair of tiles of C^T on their way out, `[2][16 tokens][16 rows]`.
+shared float pair_of[SUBGROUPS * 512];
+
+uint unit_row(uint unit, uint r) {
+    uint pair = unit * PAIRS + r / 2;
+    return pair / (HALF / 16) * HEAD_DIM + pair % (HALF / 16) * 16 + r % 2 * HALF;
 }
 
-void rows_of(uint slot, out uint rows[ROWS]) {
-    uint first = slot * PAIRS;
+void epilogue(uint unit, uint block, TILE_C acc[TILES]) {
+    uint base = gl_SubgroupID * 512;
     [[unroll]] for (uint p = 0; p < PAIRS; p++) {
-        uint pair = first + p;
-        uint row = pair / HALF * HEAD_DIM + pair % HALF;
-        rows[2 * p] = row;
-        rows[2 * p + 1] = row + HALF;
-    }
-}
-
-void epilogue(uint rows[ROWS], float acc[SUMS]) {
-    [[unroll]] for (uint p = 0; p < PAIRS; p++) {
-        uint head = rows[2 * p] / HEAD_DIM;
-        uint i = rows[2 * p] % HEAD_DIM;
-        float a[PER_LANE], b[PER_LANE];
-        mine(acc, 2 * p, a);
-        mine(acc, 2 * p + 1, b);
-        [[unroll]] for (uint t = 0; t < PER_LANE; t++) {
-            uint m = t * CLUSTER + cluster_lane();
-            if (m >= M) {
-                continue;
-            }
-            if (head >= HEADS + KV_HEADS) {
-                uint at = (m * KV_HEADS + head - HEADS - KV_HEADS) * HEAD_DIM + i;
-                v[at] = float16_t(a[t]);
-                v[at + HALF] = float16_t(b[t]);
-                continue;
-            }
-            // As upstream: x cos + rotate_half(x) sin.
-            float c = cos_[m % T * HALF + i];
-            float s = sin_[m % T * HALF + i];
-            float ra = a[t] * c - b[t] * s;
-            float rb = b[t] * c + a[t] * s;
-            if (head < HEADS) {
-                uint at = (m * HEADS + head) * HEAD_DIM + i;
-                q[at] = float16_t(ra);
-                q[at + HALF] = float16_t(rb);
-            } else {
-                uint at = (m * KV_HEADS + head - HEADS) * HEAD_DIM + i;
-                k[at] = float16_t(ra);
-                k[at + HALF] = float16_t(rb);
+        uint row = unit_row(unit, 2 * p);
+        uint head = row / HEAD_DIM;
+        uint first = row % HEAD_DIM;
+        [[unroll]] for (uint t = 0; t < TT; t++) {
+            subgroupBarrier();
+            coopMatStore(acc[2 * p * TT + t], pair_of, base, 16,
+                gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatStore(acc[(2 * p + 1) * TT + t], pair_of, base + 256, 16,
+                gl_CooperativeMatrixLayoutColumnMajor);
+            subgroupBarrier();
+            [[unroll]] for (uint j = 0; j < 256 / SUBGROUP; j++) {
+                uint e = j * SUBGROUP + gl_SubgroupInvocationID;
+                uint i = first + e % 16;
+                uint m = block * BM + t * 16 + e / 16;
+                if (m >= M) {
+                    continue;
+                }
+                float a = pair_of[base + e];
+                float b = pair_of[base + 256 + e];
+                if (head >= HEADS + KV_HEADS) {
+                    uint at = (m * KV_HEADS + head - HEADS - KV_HEADS) * HEAD_DIM + i;
+                    v[at] = float16_t(a);
+                    v[at + HALF] = float16_t(b);
+                    continue;
+                }
+                // As upstream: x cos + rotate_half(x) sin.
+                float c = cos_[m % T * HALF + i];
+                float s = sin_[m % T * HALF + i];
+                float ra = a * c - b * s;
+                float rb = b * c + a * s;
+                if (head < HEADS) {
+                    uint at = (m * HEADS + head) * HEAD_DIM + i;
+                    q[at] = float16_t(ra);
+                    q[at + HALF] = float16_t(rb);
+                } else {
+                    uint at = (m * KV_HEADS + head - HEADS) * HEAD_DIM + i;
+                    k[at] = float16_t(ra);
+                    k[at + HALF] = float16_t(rb);
+                }
             }
         }
     }

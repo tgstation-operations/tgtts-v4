@@ -1,0 +1,19 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// out row r = x row r STRIDE, rows of N f16: the first token of each of a local stack's
+// sequences of STRIDE tokens, the local encoder's embedding of each patch. Workgroup r takes
+// row r.
+#include "common.glsl"
+
+layout(constant_id = 2) const uint N = 1024;
+layout(constant_id = 3) const uint STRIDE = 5;
+
+layout(std430, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(std430, binding = 1) writeonly buffer Out { uvec4 out_[]; };
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    for (uint v = gl_LocalInvocationID.x; v < N / 8; v += WORKGROUP) {
+        out_[r * (N / 8) + v] = x[r * STRIDE * (N / 8) + v];
+    }
+}

@@ -8,12 +8,12 @@
 
 use vulkan::{Context, SpecValue, Timing};
 
-use super::{LOCAL_EMBED, PatchConfig, Stack, Tuning, groups, identity, write_weight};
+use super::{LOCAL_EMBED, LOCAL_ROWS, PatchConfig, Stack, Tuning, groups, identity, write_weight};
 use crate::{
     Error,
     checkpoint::Checkpoint,
     graph::{Graph, Kind, Pipeline, TensorId},
-    kernels::{Kernels, RMSNORM},
+    kernels::Kernels,
     step::Step,
 };
 
@@ -75,7 +75,7 @@ pub fn encoder_graph(config: &PatchConfig, tuning: &Tuning) -> Result<EncoderGra
             (10, SpecValue::Bool(false)),
         ],
     );
-    let norm = pipeline(&RMSNORM, &[(2, u(hidden)), (3, SpecValue::F32(shape.eps))]);
+    let first = pipeline(&LOCAL_ROWS, &[(2, u(hidden)), (3, u(tokens))]);
 
     let half = |n: usize| 2 * n as u64;
     let patch = g.tensor("patch", 4 * (feat_dim * patch_size) as u64, Kind::Input);
@@ -97,8 +97,8 @@ pub fn encoder_graph(config: &PatchConfig, tuning: &Tuning) -> Result<EncoderGra
         ],
     );
     let last = stack.layers(&mut g, "encoder", x);
-    // The special token's output is the first hidden of the last layer's.
-    g.op("norm", norm, &[last, stack.norm, out], [1, 1, 1]);
+    // The special token's output is the first of each sequence.
+    g.op("first", first, &[last, out], [1, 1, 1]);
     Ok(EncoderGraph {
         graph: g,
         stack,

@@ -4,9 +4,9 @@
 //!
 //! ```text
 //! cargo run --release -p graph --example local_timing -- [--timesteps 10] [--runs 20]
-//!     [--subgroup S] [--workgroup W] [--qkv-pairs P] [--gate-up-pairs P] [--o-rows R]
-//!     [--down-rows R] [--chunk C] [--split 0|1] [--groups G] [--warmup-ms 2000]
-//!     [--floor-mib 512]
+//!     [--subgroup S] [--workgroup W] [--qkv-pairs P] [--gate-up-pairs P] [--o-tiles T]
+//!     [--down-tiles T] [--o-parts P] [--down-parts P] [--chunk C] [--block B] [--depth D]
+//!     [--groups G] [--warmup-ms 2000] [--floor-mib 512]
 //! ```
 //!
 //! The tuning defaults to [`Tuning::for_device`]'s. `--floor-mib 0` skips the streaming read.
@@ -216,10 +216,13 @@ fn main() {
         workgroup: arg("--workgroup", base.workgroup as usize) as u32,
         qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
         gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
-        o_rows: arg("--o-rows", base.o_rows as usize) as u32,
-        down_rows: arg("--down-rows", base.down_rows as usize) as u32,
+        o_tiles: arg("--o-tiles", base.o_tiles as usize) as u32,
+        down_tiles: arg("--down-tiles", base.down_tiles as usize) as u32,
+        o_parts: arg("--o-parts", base.o_parts as usize) as u32,
+        down_parts: arg("--down-parts", base.down_parts as usize) as u32,
         chunk: arg("--chunk", base.chunk as usize) as u32,
-        split: arg("--split", usize::from(base.split)) != 0,
+        block: arg("--block", base.block as usize) as u32,
+        depth: arg("--depth", base.depth as usize) as u32,
         groups: arg("--groups", base.groups as usize) as u32,
         ..base
     };
@@ -297,7 +300,7 @@ fn main() {
     let mut bytes = stack_bytes;
     bytes.insert("in_proj", steps as f64 * small(h, c));
     bytes.insert("cond_proj", small(h, c));
-    bytes.insert("euler", steps as f64 * (small(c, h) + 2.0 * h as f64));
+    bytes.insert("euler", steps as f64 * small(c, h));
     report(
         &format!("sampler, {steps} runs of the DiT"),
         per_kernel,
@@ -316,7 +319,6 @@ fn main() {
         encoder.load(&checkpoint).unwrap_or_else(|e| panic!("{e}"));
         bytes = layer_bytes(&encoder.tensors().stack.shape, 1);
         bytes.insert("in_proj", small(h, c));
-        bytes.insert("norm", 2.0 * h as f64);
         let warming = Instant::now();
         while warming.elapsed() < warmup {
             encoder
@@ -355,9 +357,9 @@ fn layer_bytes(s: &graph::decode::Shape, runs: usize) -> BTreeMap<&'static str, 
     let (h, i, d, l) = (s.hidden, s.inner, s.head_dim, s.layers);
     let half = |elements: usize| (2 * l * runs * elements) as f64;
     BTreeMap::from([
-        ("qkv_rope", half((s.heads + 2 * s.kv_heads) * d * h + h)),
+        ("qkv_rope", half((s.heads + 2 * s.kv_heads) * d * h)),
         ("o_proj", half(h * s.heads * d)),
-        ("gate_up", half(2 * i * h + h)),
+        ("gate_up", half(2 * i * h)),
         ("down_proj", half(h * i)),
     ])
 }
