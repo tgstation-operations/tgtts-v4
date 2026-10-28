@@ -12,16 +12,17 @@
 //! - the step recorded untimed and timed per dispatch in turn, `--rounds` times, and each
 //!   kernel's time summed over the layers;
 //! - a sweep over the tunings `--sweep-workgroups`, `--sweep-rows` (row pairs or rows to a
-//!   subgroup, of every GEMV) and `--sweep-ahead` make together, each recorded over the same
-//!   weights, `--rounds` times round robin, with what the driver compiled each GEMV into.
+//!   subgroup, of every GEMV), `--sweep-ahead` and `--sweep-stage` make together, each recorded
+//!   over the same weights, `--rounds` times round robin, with what the driver compiled each GEMV
+//!   into.
 //!
 //! ```text
 //! cargo run --release -p graph --example decode_timing -- [--layers 28] [--context 481]
-//!     [--capacity 768] [--steps 50] [--subgroup S] [--workgroup W] [--qkv-pairs 1]
-//!     [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--floor-mib 512]
-//!     [--warmup-ms 2000] [--settle-ms 200] [--spins-us 0,50000] [--gaps-ms 0,1,4,16]
-//!     [--idle-ms 1000] [--rounds 3] [--sweep-workgroups 64,128] [--sweep-rows 1,2]
-//!     [--sweep-ahead 0,4,8]
+//!     [--capacity 768] [--steps 50] [--batch 1] [--subgroup S] [--workgroup W]
+//!     [--qkv-pairs 1] [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--stage 32768]
+//!     [--floor-mib 512] [--warmup-ms 2000] [--settle-ms 200] [--spins-us 0,50000]
+//!     [--gaps-ms 0,1,4,16] [--idle-ms 1000] [--rounds 3] [--sweep-workgroups 64,128]
+//!     [--sweep-rows 1,2] [--sweep-ahead 0,4,8] [--sweep-stage 16384,32768]
 //! ```
 //!
 //! The subgroup size defaults to the widest the kernels are written for that the device can
@@ -32,7 +33,8 @@
 //!
 //! `VOXCPM2_DIR` names the checkpoint and `GLSL_KERNELS` the compiled kernels. Every step runs at
 //! position `--context`, over a cache whose positions are zero until a step writes them:
-//! attention's cost depends on the position, not on what the cache holds.
+//! attention's cost depends on the position, not on what the cache holds. A step runs `--batch`
+//! requests at once, each in a slot of the cache of its own.
 
 use std::{
     collections::BTreeMap,
@@ -42,11 +44,13 @@ use std::{
 
 use graph::{
     checkpoint::Checkpoint,
-    decode::{Decoder, LmConfig, Shape, Tuning, decode_graph},
-    graph::Pipeline,
-    kernels::{Kernels, STREAM_READ},
+    decode::{Batch, Decoder, LmConfig, Row, Shape, Tuning, decode_batch_graph},
+    kernels::Kernels,
 };
-use vulkan::{Calibration, Context, Residence, SpecValue, memory::STAGING_BYTES};
+use stream_read::stream_read;
+use vulkan::{Calibration, Context};
+
+mod stream_read;
 
 fn arg(name: &str, default: usize) -> usize {
     let args: Vec<String> = std::env::args().collect();
@@ -113,67 +117,9 @@ fn input(hidden: usize, seed: u32) -> Vec<u16> {
         .collect()
 }
 
-/// The best rate, in GB/s, at which `stream_read` reads `bytes` of device memory, over 1, 4 and
-/// 16 loads per invocation in workgroups of 256, each the best of nine dispatches after one.
-fn stream_read(ctx: &Context, kernels: &mut Kernels, subgroup: u32, bytes: u64) -> f64 {
-    let mut data = ctx
-        .buffer_in(bytes, Residence::Device)
-        .unwrap_or_else(|e| panic!("{e}"));
-    // Words that do not repeat, filled a staging buffer at a time.
-    let mut state = 0x2545_f491_u32;
-    let chunk = (STAGING_BYTES / 4) as usize;
-    for at in (0..bytes / 4).step_by(chunk) {
-        let words: Vec<u32> = (0..chunk.min((bytes / 4 - at) as usize))
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state
-            })
-            .collect();
-        data.write_at(4 * at, &words)
-            .unwrap_or_else(|e| panic!("{e}"));
-    }
-    let workgroup = 256;
-    let mut best = 0f64;
-    for loads in [1, 4, 16] {
-        let pipeline = Pipeline {
-            kernel: &STREAM_READ,
-            constants: vec![
-                (0, SpecValue::U32(subgroup)),
-                (1, SpecValue::U32(workgroup)),
-                (2, SpecValue::U32(loads)),
-            ],
-            subgroup_size: Some(subgroup),
-        };
-        let kernel = kernels.get(&pipeline).unwrap_or_else(|e| panic!("{e}"));
-        let groups = bytes / 16 / u64::from(workgroup * loads);
-        let mut out = ctx
-            .buffer_in(
-                4 * groups * u64::from(workgroup / subgroup),
-                Residence::Readback,
-            )
-            .unwrap_or_else(|e| panic!("{e}"));
-        let mut rates = Vec::new();
-        for _ in 0..10 {
-            let t = ctx
-                .dispatch(&kernel, &mut [&mut data, &mut out], [groups as u32, 1, 1])
-                .unwrap_or_else(|e| panic!("{e}"));
-            rates.push(bytes as f64 / t.nanoseconds);
-        }
-        let rate = rates[1..].iter().copied().fold(0.0, f64::max);
-        println!(
-            "stream_read of {} MiB, {loads} loads per invocation: best {rate:.0} GB/s",
-            bytes >> 20
-        );
-        best = best.max(rate);
-    }
-    best
-}
-
-/// The bytes each kernel reads in a step at `position`, summed over the layers: its weights,
-/// and attention's keys and values up to the position.
-fn kernel_bytes(s: &Shape, position: usize) -> BTreeMap<&'static str, f64> {
+/// The bytes each kernel reads in a step of `rows` rows at `position`, summed over the layers:
+/// its weights, and attention's keys and values up to the position in each row's slot.
+fn kernel_bytes(s: &Shape, position: usize, rows: usize) -> BTreeMap<&'static str, f64> {
     let (h, i, d, l) = (s.hidden, s.inner, s.head_dim, s.layers);
     let half = |elements: usize| (2 * l * elements) as f64;
     BTreeMap::from([
@@ -181,7 +127,10 @@ fn kernel_bytes(s: &Shape, position: usize) -> BTreeMap<&'static str, f64> {
         ("o_proj", half(h * s.heads * d)),
         ("gate_up", half(2 * i * h)),
         ("down_proj", half(h * i)),
-        ("attention_split", s.cache_bytes(position) as f64),
+        (
+            "attention_split",
+            (rows as u64 * s.cache_bytes(position)) as f64,
+        ),
     ])
 }
 
@@ -212,7 +161,8 @@ struct Phases {
 struct Bench {
     ctx: Context,
     decoder: Option<Decoder>,
-    position: usize,
+    /// Where each row runs.
+    rows: Vec<Option<Row>>,
     inputs: Vec<Vec<u16>>,
     next: usize,
 }
@@ -236,11 +186,10 @@ impl Bench {
     fn step(&mut self, calibration: Option<&Calibration>) -> Phases {
         let x = &self.inputs[self.next % self.inputs.len()];
         self.next += 1;
-        let position = self.position;
         let decoder = self.decoder.as_mut().expect("a decoder");
         let t0 = monotonic_ns();
         decoder
-            .set_input(position, x)
+            .set_rows(&self.rows, x)
             .unwrap_or_else(|e| panic!("{e}"));
         let t1 = monotonic_ns();
         let submission = decoder.start().unwrap_or_else(|e| panic!("{e}"));
@@ -354,8 +303,13 @@ fn summary(phases: &[Phases]) -> String {
 }
 
 /// Each GEMV pipeline of `tuning`'s step, by label, with what the driver says it compiled it into.
-fn gemv_statistics(kernels: &mut Kernels, shape: &Shape, tuning: &Tuning) -> Vec<String> {
-    let graph = decode_graph(shape, tuning).unwrap_or_else(|e| panic!("{e}"));
+fn gemv_statistics(
+    kernels: &mut Kernels,
+    shape: &Shape,
+    tuning: &Tuning,
+    batch: Batch,
+) -> Vec<String> {
+    let graph = decode_batch_graph(shape, tuning, batch).unwrap_or_else(|e| panic!("{e}"));
     let mut pipelines = BTreeMap::new();
     for op in &graph.graph.ops {
         if op.pipeline.kernel.name.starts_with("gemv") {
@@ -387,6 +341,8 @@ fn main() {
     let context = arg("--context", 481);
     let capacity = arg("--capacity", 768);
     let steps = arg("--steps", 50);
+    let rows = arg("--batch", 1);
+    let batch = Batch { rows, slots: rows };
     let floor_mib = arg("--floor-mib", 512) as u64;
     let warmup = Duration::from_millis(arg("--warmup-ms", 2000) as u64);
     let settle = Duration::from_millis(arg("--settle-ms", 200) as u64);
@@ -412,12 +368,13 @@ fn main() {
         gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
         residual_rows: arg("--residual-rows", base.residual_rows as usize) as u32,
         ahead: arg("--ahead", base.ahead as usize) as u32,
+        stage: arg("--stage", base.stage as usize) as u32,
         ..base
     };
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
         "{} ({}), subgroups of {} to {}, validation {}, robustBufferAccess2 {}, calibrated \
-         timestamps {}; {layers} layers at position {context}, {tuning:?}",
+         timestamps {}; {layers} layers at position {context} in {rows} rows, {tuning:?}",
         report.name,
         report.driver_info,
         report.min_subgroup_size,
@@ -429,11 +386,13 @@ fn main() {
     let floor =
         (floor_mib > 0).then(|| stream_read(&ctx, &mut kernels, tuning.subgroup, floor_mib << 20));
     let weights = shape.weight_bytes() as f64;
-    let bytes = weights + shape.cache_bytes(context) as f64;
+    let cache = (rows as u64 * shape.cache_bytes(context)) as f64;
+    let bytes = weights + cache;
     println!(
-        "bytes read per step: {:.3} GB of weights, {:.1} MB of KV cache at position {context}",
+        "bytes read per step: {:.3} GB of weights, {:.1} MB of KV cache at position {context} in \
+         {rows} rows",
         weights / 1e9,
-        shape.cache_bytes(context) as f64 / 1e6,
+        cache / 1e6,
     );
     if let Some(f) = floor {
         println!(
@@ -448,8 +407,8 @@ fn main() {
     };
 
     let start = Instant::now();
-    let mut decoder =
-        Decoder::new(&ctx, &mut kernels, &shape, &tuning, false).unwrap_or_else(|e| panic!("{e}"));
+    let mut decoder = Decoder::with_batch(&ctx, &mut kernels, &shape, &tuning, batch, false)
+        .unwrap_or_else(|e| panic!("{e}"));
     decoder
         .load(&checkpoint, "base_lm.")
         .unwrap_or_else(|e| panic!("{e}"));
@@ -465,8 +424,20 @@ fn main() {
     let mut bench = Bench {
         ctx: ctx.clone(),
         decoder: Some(decoder),
-        position: context,
-        inputs: (1..=8).map(|seed| input(shape.hidden, seed)).collect(),
+        rows: (0..rows)
+            .map(|slot| {
+                Some(Row {
+                    position: context,
+                    slot,
+                })
+            })
+            .collect(),
+        inputs: (1..=8)
+            .map(|seed| {
+                let rows = (0..rows as u32).map(|r| input(shape.hidden, seed + 8 * r));
+                rows.flatten().collect()
+            })
+            .collect(),
         next: 0,
     };
 
@@ -553,7 +524,7 @@ fn main() {
             "per kernel, summed over the step's layers (median of {} timed steps):",
             rounds * steps
         );
-        let read = kernel_bytes(&shape, context);
+        let read = kernel_bytes(&shape, context, rows);
         for (label, ns) in &per_kernel {
             let m = median(ns);
             let rate = read.get(label.as_str()).map_or(String::new(), |&b| {
@@ -567,9 +538,14 @@ fn main() {
         }
     }
 
-    let sweeping = ["--sweep-workgroups", "--sweep-rows", "--sweep-ahead"]
-        .iter()
-        .any(|a| given(a));
+    let sweeping = [
+        "--sweep-workgroups",
+        "--sweep-rows",
+        "--sweep-ahead",
+        "--sweep-stage",
+    ]
+    .iter()
+    .any(|a| given(a));
     if sweeping {
         sweep(
             &mut bench,
@@ -599,8 +575,10 @@ fn sweep(
     (steps, settle, rounds): (usize, Duration, usize),
     floor: Option<f64>,
 ) {
-    let context = bench.position;
-    let bytes = shape.weight_bytes() as f64 + shape.cache_bytes(context) as f64;
+    let batch = bench.decoder().batch();
+    let context = bench.rows[0].map_or(0, |row| row.position);
+    let cache = batch.rows as u64 * shape.cache_bytes(context);
+    let bytes = (shape.weight_bytes() + cache) as f64;
     let of_floor = |rate: f64| {
         floor.map_or(String::new(), |f| {
             format!(", {:.0}% of the floor", 100.0 * rate / f)
@@ -609,30 +587,34 @@ fn sweep(
     let workgroups = list("--sweep-workgroups", &tuning.workgroup.to_string());
     let rows = list("--sweep-rows", "");
     let aheads = list("--sweep-ahead", &tuning.ahead.to_string());
+    let stages = list("--sweep-stage", &tuning.stage.to_string());
     let mut tunings = Vec::new();
     for &workgroup in &workgroups {
         for &ahead in &aheads {
-            let cut = Tuning {
-                workgroup: workgroup as u32,
-                ahead: ahead as u32,
-                ..*tuning
-            };
-            if rows.is_empty() {
-                tunings.push(cut);
-            }
-            for &r in &rows {
-                let r = r as u32;
-                tunings.push(Tuning {
-                    qkv_pairs: r,
-                    gate_up_pairs: r,
-                    residual_rows: r,
-                    ..cut
-                });
+            for &stage in &stages {
+                let cut = Tuning {
+                    workgroup: workgroup as u32,
+                    ahead: ahead as u32,
+                    stage: stage as u32,
+                    ..*tuning
+                };
+                if rows.is_empty() {
+                    tunings.push(cut);
+                }
+                for &r in &rows {
+                    let r = r as u32;
+                    tunings.push(Tuning {
+                        qkv_pairs: r,
+                        gate_up_pairs: r,
+                        residual_rows: r,
+                        ..cut
+                    });
+                }
             }
         }
     }
     // Refused cuts, such as rows that do not divide a projection, are said and left out.
-    tunings.retain(|t| match decode_graph(shape, t) {
+    tunings.retain(|t| match decode_batch_graph(shape, t, batch) {
         Ok(_) => true,
         Err(e) => {
             println!("sweep: {t:?} left out: {e}");
@@ -657,7 +639,7 @@ fn sweep(
     println!(
         "sweep, GPU ms per step untimed (median of each round's median) and each GEMV's ms timed:"
     );
-    let read = kernel_bytes(shape, context);
+    let read = kernel_bytes(shape, context, batch.rows);
     let mut best: Option<(f64, Tuning)> = None;
     for (t, (untimed, per_kernel)) in tunings.iter().zip(&results) {
         let m = median(untimed);
@@ -670,12 +652,13 @@ fn sweep(
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "  w{} r{}/{}/{} a{}: {:.3} ms [{}]; {gemv}",
+            "  w{} r{}/{}/{} a{} s{}: {:.3} ms [{}]; {gemv}",
             t.workgroup,
             t.qkv_pairs,
             t.gate_up_pairs,
             t.residual_rows,
             t.ahead,
+            t.stage,
             m / 1e6,
             untimed
                 .iter()
@@ -683,7 +666,7 @@ fn sweep(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        for line in gemv_statistics(kernels, shape, t) {
+        for line in gemv_statistics(kernels, shape, t, batch) {
             println!("    {line}");
         }
         if best.is_none_or(|(b, _)| m < b) {

@@ -583,6 +583,22 @@ impl LmSide {
             .collect())
     }
 
+    /// The LM side recorded again cut as `tuning` says, and timed per dispatch when `timed`, over
+    /// the weights and the caches it holds. On an error they go with it.
+    pub fn retuned(
+        self,
+        ctx: &Context,
+        kernels: &mut Kernels,
+        tuning: &Tuning,
+        timed: bool,
+    ) -> Result<Self, Error> {
+        let tensors = lm_side_batch_graph(&self.tensors.shape, tuning, self.tensors.batch)?;
+        let step = self
+            .step
+            .recorded_again(ctx, kernels, &tensors.graph, timed)?;
+        Ok(LmSide { step, tensors })
+    }
+
     /// Each dispatch's label and GPU time in the last step, when recorded timed.
     pub fn timings(&self) -> Result<Option<Vec<(&str, Timing)>>, Error> {
         self.step.timings()
