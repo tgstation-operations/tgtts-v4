@@ -1,11 +1,11 @@
 //! VoxCPM2 on tts-rs's own Vulkan runtime as the service's [`Synthesizer`]: the device `rt`,
 //! built with the feature of the same name, on the `graph` crate's generator, which records the
-//! model's work once and submits it a patch at a time, rather than on burn. A thread of its own
-//! owns the GPU and generates there on an [`Engine`], the requests in the order they come and as
-//! many at once as the engine holds, the generator one. The service talks to it as to the burn
-//! devices: the prompt is built on the caller's thread, and the speech comes back whole. Each
-//! patch is sampled from noise drawn from the request's seed as burn's are, so that a seed gives
-//! the same noise on every device.
+//! model's work once and submits it a step at a time, a patch of each request under way, rather
+//! than on burn. A thread of its own owns the GPU and generates there on an [`Engine`], the
+//! requests in the order they come and as many at once as the engine holds, the generator
+//! sixteen. The service talks to it as to the burn devices: the prompt is built on the caller's
+//! thread, and the speech comes back whole. Each patch is sampled from noise drawn from the
+//! request's seed as burn's are, so that a seed gives the same noise on every device.
 //!
 //! The generator keeps what a prompt computes of its voice for the next prompts in it, within
 //! `prompt_cache_bytes`, so that a request in a voice it keeps runs only its own text and the
@@ -43,8 +43,9 @@ const WARM_UP_LINE: &str = "Hello there, could someone please come to medbay? I 
 /// The patches the warm-up generates: past the audio decoder's first chunk.
 const WARM_UP_PATCHES: usize = 9;
 
-/// The positions the generator's caches hold: a prompt of the longest voice, 188 patches twice,
-/// and the longest message the game sends, 1024 characters, with the patches after it.
+/// The positions each slot of the generator's caches holds: a prompt of the longest voice, 188
+/// patches twice, and the longest message the game sends, 1024 characters, with the patches
+/// after it.
 #[cfg(feature = "rt")]
 const CAPACITY: usize = 2048;
 
@@ -52,9 +53,10 @@ const CAPACITY: usize = 2048;
 #[cfg(feature = "rt")]
 const MAX_ROWS: usize = 512;
 
-/// The requests the generator generates at once.
+/// The requests the generator generates at once: the most rows the LM side's batches were timed
+/// at.
 #[cfg(feature = "rt")]
-const SLOTS: usize = 1;
+const SLOTS: usize = 16;
 
 /// A request as the thread that generates takes it.
 #[derive(Clone, Debug)]

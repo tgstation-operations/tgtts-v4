@@ -1,9 +1,10 @@
 //! The service on the rt device, tts-rs's own runtime on a Vulkan GPU, on the real model, voices
 //! and assets: the device started, speaking and shut down, which leaves nothing of it running; a
 //! message for everyone, as the game asks for it, the model warmed up as the service warms it; a
-//! request in a voice the prompt cache keeps, which comes out as it did the first time; and
-//! voxcpm's golden line in its voice spoken from a seed as the burn CPU device speaks it from that
-//! seed, held to burn's own f16 there. Built with the `rt` feature, and run with `VOXCPM2_DIR`,
+//! request in a voice the prompt cache keeps, which comes out as it did the first time; lines
+//! asked for at once, which come out as each does alone; and voxcpm's golden line in its voice
+//! spoken from a seed as the burn CPU device speaks it from that seed, held to burn's own f16
+//! there. Built with the `rt` feature, and run with `VOXCPM2_DIR`,
 //! `VOICES_DIR` and `ASSETS_DIR` set and `GLSL_KERNELS` and `VULKAN_KERNELS` naming the compiled
 //! kernels, as `nix run .#device-tests` sets them, one test at a time; under the validation layer,
 //! as it runs, a request fails on anything the layer reports.
@@ -14,7 +15,7 @@
 
 mod common;
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, thread};
 
 use burn::tensor::Device;
 use common::real;
@@ -110,6 +111,47 @@ fn a_voice_kept_speaks_as_it_did_the_first_time() {
         "a prompt of {} positions, {} run the second time: {} patches alike, bit for bit",
         start.prompt, kept.prefilled, first.patches
     );
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR, VOICES_DIR, GLSL_KERNELS and VULKAN_KERNELS"]
+fn lines_asked_for_at_once_come_out_as_each_does_alone() {
+    let rt = rt(&real::params());
+    let voices = voices();
+    let names: Vec<&str> = voices.names().take(3).collect();
+    let latents: Vec<_> = names
+        .iter()
+        .map(|name| voices.latent(name).unwrap())
+        .collect();
+    // The same line in the same voice from two seeds among them.
+    let asked = [
+        ("Hello, crew.", 0, 1),
+        ("Hello, crew.", 0, 2),
+        ("Clown in the armory.", 1, 3),
+        ("Security, report to the bridge.", 2, 4),
+        ("Someone set the kitchen on fire.", 0, 5),
+        ("Clown in the armory.", 2, 6),
+        ("Hello, crew.", 1, 7),
+        ("Security, report to the bridge.", 0, 8),
+    ];
+    let speak = |&(line, voice, seed): &(&str, usize, u64)| {
+        let speech = rt.synthesize(line, &latents[voice], seed).unwrap();
+        let bits: Vec<u32> = speech.samples.iter().map(|s| s.to_bits()).collect();
+        bits
+    };
+    let alone: Vec<Vec<u32>> = asked.iter().map(speak).collect();
+    let together: Vec<Vec<u32>> = thread::scope(|s| {
+        let speaking: Vec<_> = asked.iter().map(|a| s.spawn(|| speak(a))).collect();
+        speaking.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    for (i, (got, want)) in together.iter().zip(&alone).enumerate() {
+        assert!(
+            got == want,
+            "line {i} asked for with others is not as it is alone"
+        );
+    }
+    assert!(alone[0] != alone[1], "two seeds speak alike");
+    rt.shut_down().unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// What a device said, as the test keeps it.
