@@ -46,6 +46,15 @@ in
         glslKernels
         ;
     };
+    rt-trial = import ./rt-trial.nix {
+      inherit
+        pkgs
+        rustToolchain
+        ffmpeg
+        gpuKernels
+        glslKernels
+        ;
+    };
     cuda-trial = import ./cuda-trial.nix {
       inherit
         pkgs
