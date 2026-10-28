@@ -823,8 +823,14 @@ struct Speech {
 }
 
 /// `oracle`'s line spoken by `generator` from its noise: each patch sampled after f32's
-/// `stale`-th before, as teacher forcing does, or after its own when `stale` is `None`.
-fn speak(generator: &mut Generator, oracle: &Oracle, stale: Option<usize>) -> Speech {
+/// `stale`-th before, as teacher forcing does, or after its own when `stale` is `None`; the
+/// frames waiting decoded at once after each patch whose number `early` has, counting from 1.
+fn speak(
+    generator: &mut Generator,
+    oracle: &Oracle,
+    stale: Option<usize>,
+    early: &[usize],
+) -> Speech {
     let (_, voice) = voice();
     let sampling = Sampling::default();
     let prompt = graph::prompt::Prompt {
@@ -862,6 +868,9 @@ fn speak(generator: &mut Generator, oracle: &Oracle, stale: Option<usize>) -> Sp
             );
         }
         patches.push(patch.frames);
+        if early.contains(&patches.len()) {
+            generator.decode_waiting().unwrap_or_else(|e| panic!("{e}"));
+        }
         audio.extend(generator.take_audio());
         if patch.last {
             break;
@@ -892,11 +901,13 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
 
     // Each patch after f32's patch before: it stops where f32 does, and its audio is as near
     // f32's as burn's f16's patches' is, decoded by the same decoder.
-    let forced = speak(&mut generator, &oracle, Some(1));
+    let forced = speak(&mut generator, &oracle, Some(1), &[]);
     // Defect: each patch after f32's two before.
-    let stale = speak(&mut generator, &oracle, Some(2));
+    let stale = speak(&mut generator, &oracle, Some(2), &[]);
     // Each patch after its own, as the service generates.
-    let free = speak(&mut generator, &oracle, None);
+    let free = speak(&mut generator, &oracle, None, &[]);
+    // Decoding the frames waiting after the patches a stream decodes early at.
+    let early = speak(&mut generator, &oracle, None, &[1, 2, 4, 8]);
     assert_no_validation_messages(&ctx);
     drop(generator);
     drop(ctx);
@@ -924,6 +935,14 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
     let d = distance(&free.audio, &cpu);
     eprintln!("run free, against the CPU's decoder over its patches: {d:?}");
     assert!(d.max_abs <= 1e-4, "{d:?}");
+    // The audio VAE carries its state from chunk to chunk, so audio decoded early in chunks
+    // of fewer frames is the same audio.
+    assert_eq!(early.patches, free.patches);
+    assert!(
+        early.audio == free.audio,
+        "decoded early: {:?}",
+        distance(&early.audio, &free.audio)
+    );
     // Defect: the CPU's decoder not primed with the voice's last frames.
     let unprimed = cpu_speech(&decoder, &[], &free.patches);
     let d = distance(&free.audio, &unprimed);

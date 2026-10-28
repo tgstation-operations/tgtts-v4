@@ -255,6 +255,14 @@ impl Generator {
         }))
     }
 
+    /// Decodes the frames waiting now rather than once a chunk's worth of them waits: the audio
+    /// sooner, for a submission of the audio VAE on fewer frames than it could take.
+    pub fn decode_waiting(&mut self) -> Result<(), Error> {
+        let request = self.request.as_mut().ok_or_else(no_request)?;
+        let frames = mem::take(&mut request.frames);
+        decode(&mut self.vae, request, &frames)
+    }
+
     /// What the generator keeps of the voices.
     pub fn prompt_cache(&self) -> &PromptCache {
         &self.cache
