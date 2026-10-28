@@ -1,5 +1,5 @@
-//! A prompt run into the patch step's caches at batch 1, as voxcpm's `run_prompt` runs it, all
-//! but its last position, which the step of the first patch after it runs as the patch before
+//! A prompt run into a slot of the patch step's caches, as voxcpm's `run_prompt` runs it, all but
+//! its last position, which the step of the first patch after it runs as the patch before
 //! ([`patch`](crate::patch)): a prompt that ends in audio, as the service's do.
 //!
 //! A position is a text token or a patch of audio latents. A token's embedding is its row of the
@@ -30,7 +30,7 @@ use vulkan::{Buffer, Context, Residence, SpecValue};
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    decode::{LayerTensors, Tuning},
+    decode::{LayerTensors, Row, Tuning},
     graph::{Graph, Kind, Pipeline, TensorId},
     kernels::{
         Access::{Read, Write},
@@ -84,7 +84,8 @@ pub struct PromptTensors {
     /// The patch to embed, laid out as the patch step's `cond`, and its embedding `[hidden]` f16.
     pub patch: TensorId,
     pub embedding: TensorId,
-    /// The first position and the length of the run, two u32.
+    /// The first position and the length of the run, and the slot of the caches it goes to, three
+    /// u32.
     pub run: TensorId,
     /// The positions' embeddings, `[max_rows][hidden]` f16.
     pub x: TensorId,
@@ -157,7 +158,7 @@ pub fn prompt_graphs(
     let embed_ops = g.ops.len();
 
     let rows_of = |n: usize| (max_rows * n * 2) as u64;
-    let run = g.tensor("prompt.run", 8, Kind::Param);
+    let run = g.tensor("prompt.run", 12, Kind::Param);
     let x = g.tensor("prompt.x", rows_of(hidden), Kind::Input);
     let audio_x = g.tensor("prompt.audio_x", rows_of(hidden), Kind::Input);
     let audio = g.tensor("prompt.audio", (max_rows * 4) as u64, Kind::Input);
@@ -172,6 +173,7 @@ pub fn prompt_graphs(
     let (residual_layers, residual_norm) = stack_layers(&side.residual, at);
     let stack = |shape, layers, norm| StackTensors {
         shape,
+        slots: side.batch.slots,
         layers,
         norm,
         cos: at(side.cos),
@@ -482,11 +484,11 @@ impl PromptCache {
     }
 }
 
-/// Where the LMs' keys and values over positions `0..len` lie in `graph`'s caches, laid out as
-/// `rope_rows.comp` writes them, `[kv_heads][capacity][head_dim]` in f16 for each layer's keys
-/// and values: for each in turn, each head's `len` positions, from `held` positions apart in the
-/// buffer outside.
-fn cache_regions(graph: &PatchGraph, len: usize, held: usize) -> Vec<Region> {
+/// Where the LMs' keys and values over positions `0..len` lie in slot `slot` of `graph`'s caches,
+/// laid out as `rope_rows.comp` writes them, `[slots][kv_heads][capacity][head_dim]` in f16 for
+/// each layer's keys and values: for each in turn, each head's `len` positions, from `held`
+/// positions apart in the buffer outside.
+fn cache_regions(graph: &PatchGraph, slot: usize, len: usize, held: usize) -> Vec<Region> {
     let side = &graph.side;
     let stacks = [
         (&side.base, &side.shape.base),
@@ -496,9 +498,10 @@ fn cache_regions(graph: &PatchGraph, len: usize, held: usize) -> Vec<Region> {
     let mut other = 0;
     for (stack, shape) in stacks {
         let row = 2 * shape.head_dim as u64;
+        let heads = shape.kv_heads as u64;
         for layer in &stack.layers {
             for cache in [layer.k_cache, layer.v_cache] {
-                for head in 0..shape.kv_heads as u64 {
+                for head in slot as u64 * heads..(slot as u64 + 1) * heads {
                     regions.push(Region {
                         tensor: graph.side_ids[cache.0],
                         offset: head * shape.capacity as u64 * row,
@@ -566,17 +569,19 @@ impl Prompter {
         recorded.read(self.tensors.embedding)
     }
 
-    /// Runs `prompt` but its last position into `step`'s caches from position 0, the tokens'
-    /// embeddings read from `checkpoint`. The step of the first patch after it runs the last,
-    /// whose patch it takes as the patch before.
+    /// Runs `prompt` but its last position into slot `slot` of `step`'s caches from position 0,
+    /// the tokens' embeddings read from `checkpoint`. The step of the first patch after it runs
+    /// the last, whose patch it takes as the patch before.
     pub fn run(
         &self,
         step: &mut PatchStep,
+        slot: usize,
         checkpoint: &Checkpoint,
         prompt: Prompt<'_>,
     ) -> Result<(), Error> {
         let (x, audio_x) = self.embeddings(step, checkpoint, prompt)?;
-        self.run_rows(step, 0, &x, &audio_x, &prompt.audio[..prompt.len() - 1])
+        let at = Row { position: 0, slot };
+        self.run_rows(step, at, &x, &audio_x, &prompt.audio[..prompt.len() - 1])
     }
 
     /// Runs `prompt` as [`run`](Self::run) does, in the voice whose latent frames are `voice`:
@@ -586,6 +591,7 @@ impl Prompter {
     pub fn run_cached(
         &self,
         step: &mut PatchStep,
+        slot: usize,
         checkpoint: &Checkpoint,
         prompt: Prompt<'_>,
         voice: &[f32],
@@ -601,12 +607,19 @@ impl Prompter {
             .min(len - 1);
         let (x, audio_x) =
             self.embeddings_from(step, checkpoint, prompt, shared, &mut kept.embeddings)?;
+        if slot >= step.slots() {
+            return Err(Error::Shape(format!("slot {slot} of {}", step.slots())));
+        }
         if let Some(prefix) = kept.prefix.as_ref().filter(|_| shared > 0) {
             let (graph, recorded) = step.parts_mut();
-            let regions = cache_regions(graph, shared, prefix.len());
+            let regions = cache_regions(graph, slot, shared, prefix.len());
             recorded.copy_in(&prefix.kept, &regions)?;
         }
-        self.run_rows(step, shared, &x, &audio_x, &prompt.audio[shared..len - 1])?;
+        let at = Row {
+            position: shared,
+            slot,
+        };
+        self.run_rows(step, at, &x, &audio_x, &prompt.audio[shared..len - 1])?;
         let held = prompt
             .audio
             .iter()
@@ -614,7 +627,7 @@ impl Prompter {
             .map_or(0, |text| text + 1);
         if kept.prefix.is_none() && held > 0 {
             let (graph, recorded) = step.parts_mut();
-            let regions = cache_regions(graph, held, held);
+            let regions = cache_regions(graph, slot, held, held);
             let bytes: u64 = regions.iter().map(|r| r.bytes).sum();
             let patch = prompt.patches.len() / len;
             let prefix = Prefix::bytes_of(bytes, patch, held);
@@ -683,25 +696,34 @@ impl Prompter {
         Ok((x, audio_x))
     }
 
-    /// Runs the positions from `start` on whose embeddings are `x`, `[len][hidden]` as f16 bits,
+    /// Runs the positions from `at` on whose embeddings are `x`, `[len][hidden]` as f16 bits,
     /// those of audio as `audio` says, through both LMs into `step`'s caches: `audio_x` holds the
     /// embeddings of the audio positions, zero at text. A run of more than
     /// [`max_rows`](Self::max_rows) positions runs in pieces.
     pub fn run_rows(
         &self,
         step: &mut PatchStep,
-        start: usize,
+        at: Row,
         x: &[u16],
         audio_x: &[u16],
         audio: &[bool],
     ) -> Result<(), Error> {
         let (hidden, max_rows) = (self.hidden, self.tensors.max_rows);
         let len = audio.len();
-        if x.len() != len * hidden || audio_x.len() != x.len() || start + len > step.capacity() {
+        let Row {
+            position: start,
+            slot,
+        } = at;
+        if x.len() != len * hidden
+            || audio_x.len() != x.len()
+            || start + len > step.capacity()
+            || slot >= step.slots()
+        {
             return Err(Error::Shape(format!(
-                "{} and {} values for {len} positions from {start} in a cache of {}",
+                "{} and {} values for {len} positions from {start} in slot {slot} of {} of {}",
                 x.len(),
                 audio_x.len(),
+                step.slots(),
                 step.capacity()
             )));
         }
@@ -719,7 +741,7 @@ impl Prompter {
             for (flag, &a) in flags.iter_mut().zip(audio) {
                 *flag = u32::from(a);
             }
-            recorded.write(t.run, &[(start + first) as u32, rows as u32])?;
+            recorded.write(t.run, &[(start + first) as u32, rows as u32, slot as u32])?;
             recorded.write(t.x, &padded)?;
             recorded.write(t.audio_x, &padded_audio)?;
             recorded.write(t.audio, &flags)?;
@@ -818,10 +840,11 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_and_values_kept_are_each_caches_first_positions_held_apart() {
-        let patch = patch::tests::graph(64);
+    fn the_keys_and_values_kept_are_each_caches_first_positions_in_the_slot_held_apart() {
+        let (slots, slot) = (4, 2);
+        let patch = patch::tests::batch_graph(64, 1, slots);
         let (len, held) = (5, 7);
-        let regions = cache_regions(&patch, len, held);
+        let regions = cache_regions(&patch, slot, len, held);
         let side = &patch.side;
         let caches: Vec<TensorId> = [&side.base, &side.residual]
             .into_iter()
@@ -835,8 +858,8 @@ mod tests {
         for (i, r) in regions.iter().enumerate() {
             assert_eq!(r.tensor, caches[i / s.kv_heads]);
             let bytes = patch.graph.tensors[r.tensor.0].bytes;
-            let head = bytes / s.kv_heads as u64;
-            assert_eq!(r.offset, (i % s.kv_heads) as u64 * head);
+            let head = bytes / (slots * s.kv_heads) as u64;
+            assert_eq!(r.offset, (slot * s.kv_heads + i % s.kv_heads) as u64 * head);
             assert_eq!(r.bytes, len as u64 * row);
             assert_eq!(r.other, i as u64 * held as u64 * row);
         }

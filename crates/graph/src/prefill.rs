@@ -124,7 +124,8 @@ pub struct PrefillGraph {
     /// The rows it runs, a multiple of [`TILE`].
     pub rows: usize,
     pub max_rows: usize,
-    /// The first position and the length of the run, two u32.
+    /// The first position and the length of the run, and the slot of the cache it goes to, three
+    /// u32.
     pub run: TensorId,
     /// The run's hidden states `[max_rows][hidden]` in f16, and the outputs after the final
     /// norm.
@@ -137,6 +138,8 @@ pub struct PrefillGraph {
 #[derive(Clone, Copy, Debug)]
 pub struct StackTensors<'a> {
     pub shape: &'a Shape,
+    /// The slots of the cache.
+    pub slots: usize,
     pub layers: &'a [LayerTensors],
     pub norm: TensorId,
     pub cos: TensorId,
@@ -147,6 +150,7 @@ impl<'a> From<&'a DecodeGraph> for StackTensors<'a> {
     fn from(decode: &'a DecodeGraph) -> Self {
         StackTensors {
             shape: &decode.shape,
+            slots: decode.batch.slots,
             layers: &decode.layers,
             norm: decode.norm,
             cos: decode.cos,
@@ -166,7 +170,7 @@ pub fn prefill_graph(
     let mut g = decode.graph.clone();
     g.ops.clear();
     let half = (max_rows * decode.shape.hidden * 2) as u64;
-    let run = g.tensor("prefill.run", 8, Kind::Param);
+    let run = g.tensor("prefill.run", 12, Kind::Param);
     let x = g.tensor("prefill.x", half, Kind::Input);
     let out = g.tensor("prefill.out", half, Kind::Output);
     let stack = StackTensors::from(decode);
@@ -190,10 +194,10 @@ pub fn prefill_graph(
 }
 
 /// Appends to `g` the run of `rows` rows through `stack`, one of `g`'s, from the hidden states
-/// `x` of the positions `run` gives to their outputs after the final norm, `out`, both
-/// `[max_rows][hidden]` in f16; its tensors of its own named after `name` and sized for
-/// `max_rows` rows, so that the runs of any rows lay them out alike. Its kernels run at
-/// `tuning`'s subgroup size.
+/// `x` of the positions `run` gives, in the slot of the cache it gives, to their outputs after the
+/// final norm, `out`, both `[max_rows][hidden]` in f16; its tensors of its own named after `name`
+/// and sized for `max_rows` rows, so that the runs of any rows lay them out alike. Its kernels run
+/// at `tuning`'s subgroup size.
 pub fn append_prefill(
     g: &mut Graph,
     name: &str,
@@ -254,12 +258,16 @@ pub fn append_prefill(
         (4, u(s.head_dim)),
         (5, u(s.capacity)),
     ];
+    let slots = (7, u(stack.slots));
     let rope_pipeline = pipeline(
         &ROPE_ROWS,
-        &[shape.as_slice(), &[(6, SpecValue::Bool(s.rope))]].concat(),
+        &[shape.as_slice(), &[(6, SpecValue::Bool(s.rope)), slots]].concat(),
     );
     let scale = SpecValue::F32(1.0 / (s.head_dim as f32).sqrt());
-    let attention = pipeline(&ATTENTION_ROWS, &[shape.as_slice(), &[(6, scale)]].concat());
+    let attention = pipeline(
+        &ATTENTION_ROWS,
+        &[shape.as_slice(), &[(6, scale), slots]].concat(),
+    );
     let silu = pipeline(&SILU_MUL_ROWS, &[(2, u(s.inner))]);
     let qkv_width = (s.heads + 2 * s.kv_heads) * s.head_dim;
     let gemm_op = |n: usize, k: usize| -> Result<(Pipeline, [u32; 3]), Error> {
@@ -281,7 +289,7 @@ pub fn append_prefill(
 
     let half = |n: usize| (max_rows * n * 2) as u64;
     let single = |n: usize| (max_rows * n * 4) as u64;
-    for (t, want) in [(run, 8), (x, half(s.hidden)), (out, half(s.hidden))] {
+    for (t, want) in [(run, 12), (x, half(s.hidden)), (out, half(s.hidden))] {
         let bytes = g.tensors[t.0].bytes;
         check(
             bytes == want,
@@ -386,8 +394,8 @@ pub fn append_prefill(
 }
 
 /// A stack's prefill on the GPU: programs over a [`Decoder`]'s memory, one for each number of
-/// rows up to its most in steps of [`TILE`], which write a run's keys and values into the
-/// decoder's cache for its steps to go on from.
+/// rows up to its most in steps of [`TILE`], which write a run's keys and values into the first
+/// slot of the decoder's cache for its steps to go on from.
 #[derive(Debug)]
 pub struct Prefill {
     /// `programs[i]` runs `(i + 1) TILE` rows.
@@ -440,9 +448,9 @@ impl Prefill {
 
     /// Runs the stack over `x`, the hidden states `[len][hidden]` of positions `start` to
     /// `start + len - 1` as f16 bits, in `decoder`, the one the programs were recorded over:
-    /// writes their keys and values into its cache there, each attending over the cache up to
-    /// it. Returns their outputs after the final norm, `[len][hidden]` as f16 bits. A run of
-    /// more than [`max_rows`](Self::max_rows) positions runs in pieces.
+    /// writes their keys and values into its cache's first slot there, each attending over the
+    /// slot up to it. Returns their outputs after the final norm, `[len][hidden]` as f16 bits. A
+    /// run of more than [`max_rows`](Self::max_rows) positions runs in pieces.
     pub fn run(&self, decoder: &mut Decoder, start: usize, x: &[u16]) -> Result<Vec<u16>, Error> {
         let hidden = self.hidden;
         let len = x.len() / hidden;
@@ -466,7 +474,7 @@ impl Prefill {
             let rows = piece.len() / hidden;
             let at = start + i * max_rows;
             padded[..piece.len()].copy_from_slice(piece);
-            step.write(self.run, &[at as u32, rows as u32])?;
+            step.write(self.run, &[at as u32, rows as u32, 0])?;
             step.write(self.x, &padded)?;
             step.run(self.programs[rows.div_ceil(TILE) - 1])?;
             let all: Vec<u16> = step.read(self.out)?;

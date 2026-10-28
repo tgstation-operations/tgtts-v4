@@ -197,6 +197,7 @@ impl Generator {
         }
         let prefilled = self.prompter.run_cached(
             &mut self.step,
+            0,
             &self.checkpoint,
             prompt,
             voice,

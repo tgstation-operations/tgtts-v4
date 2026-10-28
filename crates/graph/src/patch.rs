@@ -597,7 +597,7 @@ pub(crate) mod tests {
 
     /// [`graph`] for `rows` rows over caches of `slots` slots, the LM side cut as a batch of as
     /// many rows is.
-    fn batch_graph(subgroup: u32, rows: usize, slots: usize) -> PatchGraph {
+    pub(crate) fn batch_graph(subgroup: u32, rows: usize, slots: usize) -> PatchGraph {
         let lm = decode::Tuning::for_batch(subgroup, rows);
         let local = local::Tuning::for_subgroup(subgroup);
         let batch = Batch { rows, slots };

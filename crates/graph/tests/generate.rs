@@ -53,7 +53,7 @@ use burn::{
 };
 use graph::{
     checkpoint::Checkpoint,
-    decode::{self, SUBGROUPS},
+    decode::{self, Row, SUBGROUPS},
     generator::{Generator, Settings},
     graph::{Kind, TensorId},
     kernels::Kernels,
@@ -717,7 +717,10 @@ fn patches_after_a_prompt(oracle: &Oracle, subgroup: Option<u32>, how: Prompting
         Prompting::QuantizedText => vec![true; ran],
         _ => oracle.audio[..ran].to_vec(),
     };
-    let at = usize::from(how == Prompting::Shifted);
+    let at = Row {
+        position: usize::from(how == Prompting::Shifted),
+        slot: 0,
+    };
     let start = Instant::now();
     prompter
         .run_rows(&mut step, at, &x, &audio_x, &audio)

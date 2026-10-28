@@ -1,21 +1,22 @@
 //! The prompt cache on the GPU, on the real weights: prompts in voices it keeps, run from what it
 //! keeps of them, against the same prompts run whole. The LMs are causal and their kernels compute
 //! each position's row alone, so a prompt that goes on from the keys and values kept of the
-//! positions it begins with samples the same patches from the same noise, bit for bit. Built with
-//! the `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices
-//! directory and `GLSL_KERNELS` and `VULKAN_KERNELS` the compiled kernels, as `nix run
-//! .#device-tests` sets the last two.
+//! positions it begins with samples the same patches from the same noise, bit for bit. So does a
+//! prompt run, whole or from what is kept, into any slot of the caches, which leaves the others as
+//! they were. Built with the `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint,
+//! `VOICES_DIR` a voices directory and `GLSL_KERNELS` and `VULKAN_KERNELS` the compiled kernels,
+//! as `nix run .#device-tests` sets the last two.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
 
 use graph::{
     checkpoint::Checkpoint,
-    decode,
+    decode::{self, Batch, Row},
     kernels::Kernels,
     lm_side::{self, LmSideShape},
     local::{self, PatchConfig},
-    patch::{PatchStep, patch_graph},
+    patch::{PatchRow, PatchStep, patch_batch_graph},
     prefill::TILE,
     prompt::{Prompt, PromptCache, Prompter},
 };
@@ -78,9 +79,9 @@ fn prompts(lines: &[&str]) -> Vec<(Vec<voxcpm::Prompt>, Vec<f32>)> {
         .collect()
 }
 
-/// The patch step for prompts of up to `positions` positions and [`PATCHES`] after them, and a
-/// prompter over it whose runs take up to two tiles of positions, so that a prompt runs in
-/// pieces.
+/// The patch step for prompts of up to `positions` positions and [`PATCHES`] after them in caches
+/// of `slots` slots, and a prompter over it whose runs take up to two tiles of positions, so that
+/// a prompt runs in pieces.
 struct Gpu {
     ctx: Context,
     step: PatchStep,
@@ -88,7 +89,7 @@ struct Gpu {
     checkpoint: Checkpoint,
 }
 
-fn gpu(positions: usize) -> Gpu {
+fn gpu(positions: usize, slots: usize) -> Gpu {
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     let json = fs::read_to_string(checkpoint_dir().join("config.json")).unwrap();
@@ -100,8 +101,9 @@ fn gpu(positions: usize) -> Gpu {
     let local = local::Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let start = Instant::now();
     let timesteps = Sampling::default().timesteps;
-    let graph =
-        patch_graph(&shape, &config, timesteps, &lm, &local).unwrap_or_else(|e| panic!("{e}"));
+    let batch = Batch { rows: 1, slots };
+    let graph = patch_batch_graph(&shape, &config, timesteps, &lm, &local, batch)
+        .unwrap_or_else(|e| panic!("{e}"));
     let mut step =
         PatchStep::new(&ctx, &mut kernels, graph, false).unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
@@ -157,13 +159,15 @@ impl std::fmt::Debug for Generated {
     }
 }
 
-/// `prompt` in the voice of latent frames `voice` run from what `cache` keeps, then [`PATCHES`]
-/// patches each after the one before from noise seeded alike for every prompt.
+/// `prompt` in the voice of latent frames `voice` run into slot `slot` from what `cache` keeps,
+/// then [`PATCHES`] patches there each after the one before from noise seeded alike for every
+/// prompt.
 fn generate(
     gpu: &mut Gpu,
     cache: &mut PromptCache,
     prompt: &voxcpm::Prompt,
     voice: &[f32],
+    slot: usize,
 ) -> Generated {
     let positions = Prompt {
         tokens: &prompt.tokens,
@@ -172,8 +176,21 @@ fn generate(
     };
     let prefilled = gpu
         .prompter
-        .run_cached(&mut gpu.step, &gpu.checkpoint, positions, voice, cache)
+        .run_cached(
+            &mut gpu.step,
+            slot,
+            &gpu.checkpoint,
+            positions,
+            voice,
+            cache,
+        )
         .unwrap_or_else(|e| panic!("{e}"));
+    sample(gpu, prompt, slot, prefilled)
+}
+
+/// [`PATCHES`] patches after `prompt`, which `slot` of the caches holds, as [`generate`] samples
+/// them.
+fn sample(gpu: &mut Gpu, prompt: &voxcpm::Prompt, slot: usize, prefilled: usize) -> Generated {
     let sampling = Sampling::default();
     let len = prompt.len();
     let patch = prompt.patches.len() / len;
@@ -181,16 +198,23 @@ fn generate(
     let mut before = transposed(&prompt.patches[(len - 1) * patch..], 4);
     let mut bits = vec![];
     for i in 0..PATCHES {
+        let noise = noise.next(patch);
+        let row = PatchRow {
+            at: Row {
+                position: len - 1 + i,
+                slot,
+            },
+            cond: &before,
+            noise: &noise,
+            temperature: sampling.temperature,
+            cfg: sampling.cfg_value,
+        };
         let sampled = gpu
             .step
-            .run(
-                len - 1 + i,
-                &before,
-                &noise.next(patch),
-                sampling.temperature,
-                sampling.cfg_value,
-            )
-            .unwrap_or_else(|e| panic!("{e}"));
+            .run_rows(&[Some(row)])
+            .unwrap_or_else(|e| panic!("{e}"))
+            .remove(0)
+            .expect("a row that runs");
         bits.extend(sampled.patch.iter().map(|v| v.to_bits()));
         bits.extend(sampled.stop_logits.map(f32::to_bits));
         before = sampled.patch;
@@ -230,13 +254,16 @@ fn a_prompt_in_a_kept_voice_samples_as_it_does_run_whole() {
     let (prompts, voice) = &voices[0];
     let [a, b] = [&prompts[0], &prompts[1]];
     let (other, other_voice) = (&voices[1].0[2], &voices[1].1);
-    let mut gpu = gpu([a, b, other]
-        .map(voxcpm::Prompt::len)
-        .into_iter()
-        .max()
-        .unwrap());
+    let mut gpu = gpu(
+        [a, b, other]
+            .map(voxcpm::Prompt::len)
+            .into_iter()
+            .max()
+            .unwrap(),
+        1,
+    );
     let mut whole = PromptCache::new(&gpu.ctx, 0);
-    let want = [a, b].map(|prompt| generate(&mut gpu, &mut whole, prompt, voice));
+    let want = [a, b].map(|prompt| generate(&mut gpu, &mut whole, prompt, voice, 0));
     for (want, prompt) in want.iter().zip([a, b]) {
         assert_eq!(want.prefilled, prompt.len());
     }
@@ -244,11 +271,11 @@ fn a_prompt_in_a_kept_voice_samples_as_it_does_run_whole() {
     // A prompt in another voice between two in this one, so that what the caches hold of the
     // first is not this voice's when the second is run.
     assert!(other.len() - 1 + PATCHES >= held(a));
-    let mut overwrite = |gpu: &mut Gpu| generate(gpu, &mut whole, other, other_voice);
+    let mut overwrite = |gpu: &mut Gpu| generate(gpu, &mut whole, other, other_voice, 0);
 
     let mut cache = PromptCache::new(&gpu.ctx, BUDGET);
     // The first in the voice runs whole, and the cache keeps it up to its last run of audio.
-    let first = generate(&mut gpu, &mut cache, a, voice);
+    let first = generate(&mut gpu, &mut cache, a, voice, 0);
     assert_eq!(first, want[0]);
     assert_eq!(cache.voices(), 1);
     // The next goes on from the positions it shares with that: the voice as reference audio and
@@ -261,13 +288,13 @@ fn a_prompt_in_a_kept_voice_samples_as_it_does_run_whole() {
         held(a)
     );
     overwrite(&mut gpu);
-    let next = generate(&mut gpu, &mut cache, b, voice);
+    let next = generate(&mut gpu, &mut cache, b, voice, 0);
     assert_eq!(next.prefilled, b.len() - alike);
     let differing = next.differing(&want[1]);
     assert_eq!(differing, 0, "a prompt from {alike} positions kept");
     // The first again shares all it kept, and runs only the voice spoken again.
     overwrite(&mut gpu);
-    let again = generate(&mut gpu, &mut cache, a, voice);
+    let again = generate(&mut gpu, &mut cache, a, voice, 0);
     assert_eq!(again.prefilled, a.len() - held(a));
     let differing = again.differing(&want[0]);
     assert_eq!(differing, 0, "a prompt from {} positions kept", held(a));
@@ -286,23 +313,23 @@ fn a_prompt_in_a_kept_voice_samples_as_it_does_run_whole() {
 fn the_cache_keeps_what_fits_and_drops_the_voice_used_longest_ago() {
     let voices = prompts(&["Clown in the armory."]);
     let [(a, v), (c, w)] = [&voices[0], &voices[1]].map(|(prompts, voice)| (&prompts[0], voice));
-    let mut gpu = gpu(a.len().max(c.len()));
+    let mut gpu = gpu(a.len().max(c.len()), 1);
     let mut whole = PromptCache::new(&gpu.ctx, 0);
-    let want = generate(&mut gpu, &mut whole, a, v);
+    let want = generate(&mut gpu, &mut whole, a, v, 0);
 
     let kept = |gpu: &mut Gpu, prompt, voice| {
         let mut cache = PromptCache::new(&gpu.ctx, BUDGET);
-        generate(gpu, &mut cache, prompt, voice);
+        generate(gpu, &mut cache, prompt, voice, 0);
         cache.bytes()
     };
     let (bytes_v, bytes_w) = (kept(&mut gpu, a, v), kept(&mut gpu, c, w));
     // Room for either voice, and not both.
     let mut cache = PromptCache::new(&gpu.ctx, bytes_v.max(bytes_w));
-    generate(&mut gpu, &mut cache, a, v);
+    generate(&mut gpu, &mut cache, a, v, 0);
     assert_eq!((cache.voices(), cache.bytes()), (1, bytes_v));
-    generate(&mut gpu, &mut cache, c, w);
+    generate(&mut gpu, &mut cache, c, w, 0);
     assert_eq!((cache.voices(), cache.bytes()), (1, bytes_w));
-    let back = generate(&mut gpu, &mut cache, a, v);
+    let back = generate(&mut gpu, &mut cache, a, v, 0);
     assert_eq!(back, want, "the voice dropped runs whole");
     assert_eq!((cache.voices(), cache.bytes()), (1, bytes_v));
 
@@ -310,7 +337,7 @@ fn the_cache_keeps_what_fits_and_drops_the_voice_used_longest_ago() {
     // and runs whole each time.
     let mut cache = PromptCache::new(&gpu.ctx, bytes_v - 1);
     for _ in 0..2 {
-        assert_eq!(generate(&mut gpu, &mut cache, a, v), want);
+        assert_eq!(generate(&mut gpu, &mut cache, a, v, 0), want);
         assert_eq!(cache.voices(), 1);
         assert!(
             cache.bytes() < bytes_v / 2,
@@ -318,5 +345,98 @@ fn the_cache_keeps_what_fits_and_drops_the_voice_used_longest_ago() {
             cache.bytes()
         );
     }
+    assert_no_validation_messages(&gpu.ctx);
+}
+
+/// The slots of the caches a prompt is run into below.
+const SLOTS: usize = 4;
+
+/// The bits of each slot of each of both LMs' caches, `[cache][slot]`.
+fn caches(gpu: &mut Gpu) -> Vec<Vec<Vec<u16>>> {
+    let (graph, step) = gpu.step.parts_mut();
+    let side = &graph.side;
+    [&side.base, &side.residual]
+        .into_iter()
+        .flat_map(|stack| &stack.layers)
+        .flat_map(|l| [l.k_cache, l.v_cache])
+        .map(|t| {
+            let bits: Vec<u16> = step
+                .read(graph.side_ids[t.0])
+                .unwrap_or_else(|e| panic!("{e}"));
+            let slot = bits.len() / side.batch.slots;
+            bits.chunks(slot).map(<[u16]>::to_vec).collect()
+        })
+        .collect()
+}
+
+/// The slots whose bits differ between two readings of [`caches`].
+fn changed(before: &[Vec<Vec<u16>>], after: &[Vec<Vec<u16>>]) -> Vec<usize> {
+    (0..SLOTS)
+        .filter(|&s| before.iter().zip(after).any(|(b, a)| b[s] != a[s]))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
+fn a_prompt_runs_into_any_slot_as_into_the_first_and_leaves_the_others_alone() {
+    let voices = prompts(&["Hello, crew.", "Someone set the kitchen on fire."]);
+    let (prompts, voice) = &voices[0];
+    let [a, b] = [&prompts[0], &prompts[1]];
+    let (other, other_voice) = (&voices[1].0[1], &voices[1].1);
+    let longest = [a, b, other].map(voxcpm::Prompt::len).into_iter().max();
+    let mut gpu = gpu(longest.unwrap(), SLOTS);
+    let mut whole = PromptCache::new(&gpu.ctx, 0);
+    let want = [a, b].map(|prompt| generate(&mut gpu, &mut whole, prompt, voice, 0));
+    generate(&mut gpu, &mut whole, other, other_voice, 1);
+    generate(&mut gpu, &mut whole, b, voice, 3);
+
+    // Whole, into a slot no prompt has been run into.
+    let before = caches(&mut gpu);
+    let got = generate(&mut gpu, &mut whole, a, voice, 2);
+    assert_eq!(got, want[0], "a prompt run whole into slot 2");
+    assert_eq!(changed(&before, &caches(&mut gpu)), [2]);
+
+    // From what a cache keeps of the voice from one slot, into another that holds another
+    // prompt.
+    for (kept, into) in [(0, 2), (2, 1)] {
+        let mut cache = PromptCache::new(&gpu.ctx, BUDGET);
+        generate(&mut gpu, &mut cache, a, voice, kept);
+        let before = caches(&mut gpu);
+        let got = generate(&mut gpu, &mut cache, b, voice, into);
+        assert!(got.prefilled < b.len(), "{got:?}");
+        let differing = got.differing(&want[1]);
+        assert_eq!(
+            differing, 0,
+            "a prompt kept from slot {kept} run into slot {into}"
+        );
+        assert_eq!(
+            changed(&before, &caches(&mut gpu)),
+            [into],
+            "from {kept} into {into}"
+        );
+    }
+
+    // Defect: the prompt run into another slot than the one its patches are sampled in, which
+    // holds another prompt in the voice.
+    let before = caches(&mut gpu);
+    let positions = Prompt {
+        tokens: &a.tokens,
+        patches: &a.patches,
+        audio: &a.audio,
+    };
+    gpu.prompter
+        .run(&mut gpu.step, 1, &gpu.checkpoint, positions)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let stray = sample(&mut gpu, a, 3, a.len());
+    let differing = stray.differing(&want[0]);
+    let touched = changed(&before, &caches(&mut gpu));
+    eprintln!(
+        "the prompt in slot 1 and its patches in slot 3: {differing} values apart, slots \
+         {touched:?} changed"
+    );
+    assert!(
+        differing > 0 && touched != [3],
+        "a prompt run into another slot passes"
+    );
     assert_no_validation_messages(&gpu.ctx);
 }
