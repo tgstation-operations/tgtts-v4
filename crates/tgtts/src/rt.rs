@@ -296,6 +296,7 @@ impl Rt {
             chunk_frames: params.decode_chunk_frames.get(),
             timed: false,
             prompt_cache_bytes,
+            subgroup: None,
         };
         let sampling = params.sampling.clone();
         let patch = config.patch_size * config.feat_dim;

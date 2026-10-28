@@ -789,8 +789,8 @@ fn cpu_speech(decoder: &audiovae::Decoder, voice: &[f32], patches: &[Vec<f32>]) 
 }
 
 /// The generator for the checkpoint, as the service would run it, with caches for `capacity`
-/// positions.
-fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize) -> Generator {
+/// positions, its kernels at `subgroup`.
+fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize, subgroup: u32) -> Generator {
     let weights = Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap();
     let settings = Settings {
         capacity,
@@ -799,6 +799,7 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize) -> Generator
         chunk_frames: Params::default().decode_chunk_frames.get(),
         timed: false,
         prompt_cache_bytes: 0,
+        subgroup: Some(subgroup),
     };
     let start = Instant::now();
     let parameter = |name: &str| {
@@ -810,7 +811,7 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize) -> Generator
     let generator = Generator::new(ctx, kernels, &checkpoint_dir(), &settings, parameter)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "generator recorded and loaded: {:.1} s",
+        "generator recorded and loaded at subgroups of {subgroup}: {:.1} s",
         start.elapsed().as_secs_f64()
     );
     generator
@@ -894,23 +895,42 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
     let patches = oracle.noise.len();
     let samples = patches * 4 * 1920;
     assert_eq!(want.len(), samples);
+    let decoder = cpu_decoder();
+    let (_, voice) = voice();
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     let capacity = (oracle.len() + Params::default().max_patches).next_multiple_of(32);
-    let mut generator = generator(&ctx, &mut kernels, capacity);
+    let mut failed = vec![];
+    for subgroup in subgroups() {
+        let mut generator = generator(&ctx, &mut kernels, capacity, subgroup);
+        let fails = speech_at(&mut generator, &oracle, &decoder, &voice, [&want, &burn]);
+        assert_no_validation_messages(&ctx);
+        if let Err(fails) = fails {
+            failed.push(format!("wave{subgroup}: {fails}"));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
 
+/// The speech test on `generator`, the failures it finds, if any.
+fn speech_at(
+    generator: &mut Generator,
+    oracle: &Oracle,
+    decoder: &audiovae::Decoder,
+    voice: &Latent,
+    [want, burn]: [&[f32]; 2],
+) -> Result<(), String> {
+    let patches = oracle.noise.len();
+    let samples = want.len();
     // Each patch after f32's patch before: it stops where f32 does, and its audio is as near
     // f32's as burn's f16's patches' is, decoded by the same decoder.
-    let forced = speak(&mut generator, &oracle, Some(1), &[]);
+    let forced = speak(generator, oracle, Some(1), &[]);
     // Defect: each patch after f32's two before.
-    let stale = speak(&mut generator, &oracle, Some(2), &[]);
+    let stale = speak(generator, oracle, Some(2), &[]);
     // Each patch after its own, as the service generates.
-    let free = speak(&mut generator, &oracle, None, &[]);
+    let free = speak(generator, oracle, None, &[]);
     // Decoding the frames waiting after the patches a stream decodes early at.
-    let early = speak(&mut generator, &oracle, None, &[1, 2, 4, 8]);
-    assert_no_validation_messages(&ctx);
-    drop(generator);
-    drop(ctx);
+    let early = speak(generator, oracle, None, &[1, 2, 4, 8]);
 
     let audio_margins = |name: &str, speech: &Speech| match speech.audio.len() == samples {
         true => margins(name, &speech.audio, &burn, &want),
@@ -921,9 +941,7 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
 
     // Run free, it stops where f32 does too, and its audio is what the service's decoder makes
     // of its patches on the CPU, to f32 rounding, which f16 storage does not reach.
-    let decoder = cpu_decoder();
-    let (_, voice) = voice();
-    let cpu = cpu_speech(&decoder, voice.frames.as_flattened(), &free.patches);
+    let cpu = cpu_speech(decoder, voice.frames.as_flattened(), &free.patches);
     let d = distance(&free.audio, &cpu);
     eprintln!("run free, against the CPU's decoder over its patches: {d:?}");
     // The audio VAE carries its state from chunk to chunk, so audio decoded early in chunks
@@ -933,7 +951,7 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
         eprintln!("decoded early, against run free: {early:?}");
     }
     // Defect: the CPU's decoder not primed with the voice's last frames.
-    let unprimed = cpu_speech(&decoder, &[], &free.patches);
+    let unprimed = cpu_speech(decoder, &[], &free.patches);
     let unprimed = distance(&free.audio, &unprimed);
     eprintln!("run free, against the CPU's decoder not primed: {unprimed:?}");
 
@@ -952,11 +970,13 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
     .filter(|&(_, holds)| !holds)
     .map(|(name, _)| name)
     .collect();
-    assert!(
-        fails.is_empty(),
+    if fails.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
         "{fails:?}: {} patches of {patches}, {} run free; audio {margin:.2?}, after stale \
          patches {stale_margin:.2?}; run free {d:?}, not primed {unprimed:?}",
         forced.patches.len(),
         free.patches.len()
-    );
+    ))
 }

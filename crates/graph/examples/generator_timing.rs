@@ -174,6 +174,7 @@ fn main() {
         chunk_frames: Params::default().decode_chunk_frames.get(),
         timed: true,
         prompt_cache_bytes: 0,
+        subgroup: None,
     };
     let loaded = Instant::now();
     let parameter = |name: &str| {

@@ -43,6 +43,9 @@ pub struct Settings {
     pub timed: bool,
     /// The bytes the prompt cache keeps of the voices.
     pub prompt_cache_bytes: usize,
+    /// The subgroup size the kernels run at, the device's widest they are written for when
+    /// `None`.
+    pub subgroup: Option<u32>,
 }
 
 /// The parts of VoxCPM2's `config.json` the generator reads.
@@ -116,8 +119,12 @@ impl Generator {
         let config: PatchConfig = serde_json::from_str(&json).map_err(parse)?;
         let AudioVae { audio_vae_config } = serde_json::from_str(&json).map_err(parse)?;
         let report = ctx.report();
-        let lm = decode::Tuning::for_device(report)?;
-        let local = local::Tuning::for_device(report)?;
+        let subgroup = match settings.subgroup {
+            Some(subgroup) => subgroup,
+            None => decode::Tuning::for_device(report)?.subgroup,
+        };
+        let lm = decode::Tuning::for_subgroup(subgroup);
+        let local = local::Tuning::for_subgroup(subgroup).fit(report)?;
         let shape = lm_side::LmSideShape::new(&side_config, settings.capacity)?;
         let graph = patch_graph(&shape, &config, settings.timesteps, &lm, &local)?;
         let mut step = PatchStep::new(ctx, kernels, graph, settings.timed)?;
