@@ -129,12 +129,24 @@ pkgs.writeShellApplication {
       return "$status"
     }
 
+    # tgtts as it is deployed, on the rt device alone, builds nothing of burn.
+    burn_free() {
+      local packages
+      packages=$(cargo tree --locked -p tgtts --no-default-features --features rt \
+        -e normal,build --prefix none --format '{p}') || return 1
+      if grep -E '^(burn|cubecl)' <<<"$packages"; then
+        echo "audit: tgtts without its burn feature still builds the packages above" >&2
+        return 1
+      fi
+    }
+
     stage hooks hooks
     stage fmt fmt --check
     stage ascii ascii
     stage deadnix deadnix_files
     stage statix statix_files
     stage vendor-pins vendor_pins
+    stage burn-free burn_free
     # Each crate's default features, those of the CPU: a GPU feature compiles
     # wgpu into every crate it reaches, and its tests need the GPU. The GPU
     # code is linted on its own.
@@ -144,8 +156,11 @@ pkgs.writeShellApplication {
     # cubecl's CUDA runtime links the LLVM its build script finds there.
     stage clippy-cuda env XDG_DATA_HOME=${tracelLlvm} cargo clippy --locked -p gpu -p tgtts \
       -p bench --all-targets --features gpu/nvrtc,tgtts/cuda,bench/cuda -- -D warnings
+    stage clippy-burn-free cargo clippy --locked -p tgtts --all-targets --no-default-features \
+      --features rt -- -D warnings
     stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
     stage test cargo test --locked --workspace
+    stage test-burn-free cargo test --locked -p tgtts --no-default-features --features rt
 
     if [ "''${#failed[@]}" -gt 0 ]; then
       echo "audit: FAILED: ''${failed[*]}" >&2
