@@ -1000,4 +1000,22 @@ mod tests {
             assert_eq!(replied(reply).1.unwrap().patches, seed);
         }
     }
+
+    /// The four of the real model's DiT time constants that an f64 rounded once to f16 puts an
+    /// ulp below where rounding through f32 does, as the build with burn writes them. Tested
+    /// here, as only a build without burn has half without std, where it rounds once; graph's
+    /// tests take burn.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn writes_the_time_constants_as_the_build_with_burn_does() {
+        for (value, bits) in [
+            (0x4036_fa00_e1ad_d5dd, 0x4dbf),
+            (0xc011_fa00_5296_9974, 0xc47f),
+            (0xc004_ba00_794e_d8ca, 0xc12f),
+            (0x402c_da00_d74d_552a, 0x4b37),
+        ] {
+            let value = f64::from_bits(value);
+            assert_eq!(graph::local::dit::time_constant(value), bits, "{value:e}");
+        }
+    }
 }
