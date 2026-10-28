@@ -1,16 +1,17 @@
 //! Times a running service's streams as a player gets them: `stream_timing BASE [--jobs N]
 //! [--at-once N] [--voices N] [--radio] [--streamed-radio] [--whole]`, with the token in `TOKEN`.
 //!
-//! It makes `N` jobs of the lines below, each line once, so that none comes from the cache, in
-//! voices spread over `/tts-voices`, or over `--voices` of them, so that the model keeps what it
-//! computed of each, `--at-once` of them at a time, and plays each job's speech stream, and its radio with `--radio`, as it comes, noting
-//! when each page of it arrives. For each stream it writes a line of JSON: from the job's making
-//! to the first page of audio, `first_audio_ms`; to the stream's end, `done_ms`; the audio's
-//! length; and `buffer_ms`, the least a player that starts playing once the first audio has come
-//! and that much more has passed must hold to play it without a gap: the most any page came after
-//! its audio was due. With `--whole` it asks the whole-file route for the same lines instead and
-//! times each whole reply, which is when the game can play it today. It ends with the medians and
-//! the 90th percentiles.
+//! It makes `N` jobs of the lines below, each with its job's number and the run's start time, so
+//! that no run asks for a line another asked for and none comes from the cache, in voices spread
+//! over `/tts-voices`, or over `--voices` of them, so that the model keeps what it computed of
+//! each, `--at-once` of them at a time, and plays each job's speech stream, and its radio with
+//! `--radio`, as it comes, noting when each page of it arrives. For each stream it writes a line
+//! of JSON: from the job's making to the first page of audio, `first_audio_ms`; to the stream's
+//! end, `done_ms`; the audio's length; and `buffer_ms`, the least a player that starts playing
+//! once the first audio has come and that much more has passed must hold to play it without a
+//! gap: the most any page came after its audio was due. With `--whole` it asks the whole-file
+//! route for its lines instead and times each whole reply, which is when the game can play it
+//! today. It ends with the medians and the 90th percentiles.
 
 use std::{
     env,
@@ -18,7 +19,7 @@ use std::{
     process::ExitCode,
     sync::{Mutex, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tgtts::ogg;
@@ -128,6 +129,9 @@ fn run(options: &Options) -> Result<(), Failure> {
     let voices: Vec<&str> = (0..spread)
         .map(|i| all[i * all.len() / spread].as_str())
         .collect();
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() % 100_000);
     let work: Mutex<Vec<usize>> = Mutex::new((0..options.jobs).rev().collect());
     let (timed, received) = mpsc::channel();
     thread::scope(|scope| {
@@ -136,7 +140,7 @@ fn run(options: &Options) -> Result<(), Failure> {
             scope.spawn(move || {
                 while let Some(job) = work.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                     let voice = voices[(job * 7919) % voices.len()];
-                    let line = format!("{} {job}.", LINES[job % LINES.len()]);
+                    let line = format!("{} {job}, {run}.", LINES[job % LINES.len()]);
                     let _ = timed.send((job, voice, one(options, job, voice, &line)));
                 }
             });
