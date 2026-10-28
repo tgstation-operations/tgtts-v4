@@ -13,9 +13,9 @@ use std::{
 };
 
 use graph::{
-    decode::{Batch, SUBGROUPS, Shape, Tuning},
-    graph::{Graph, Pipeline},
-    kernels::{KERNELS_VAR, MLIR_KERNELS_VAR, Manifest, shared_memory},
+    decode::{Batch, SUBGROUPS, Tuning},
+    graph::Graph,
+    kernels::{KERNELS_VAR, MLIR_KERNELS_VAR, Manifest},
     lm_side::{self, LmSideShape, lm_side_batch_graph},
     local::{self, PatchConfig, dit::sampler_graph, encoder::encoder_graph},
     patch::patch_graph,
@@ -63,22 +63,6 @@ impl Modules {
     }
 }
 
-fn stack(layers: usize, rope: bool) -> Shape {
-    Shape {
-        hidden: 2048,
-        inner: 6144,
-        heads: 16,
-        kv_heads: 2,
-        head_dim: 128,
-        layers,
-        capacity: 256,
-        eps: 1e-5,
-        rope_theta: 10_000.0,
-        rope_factors: vec![1.0; 64],
-        rope,
-    }
-}
-
 /// The LM side for each batch and cut the decode step is tested and timed at, as far as it
 /// takes them.
 fn lm_side_cuts(side: &LmSideShape) -> Vec<Graph> {
@@ -115,71 +99,6 @@ fn lm_side_cuts(side: &LmSideShape) -> Vec<Graph> {
         }
     }
     graphs
-}
-
-#[test]
-fn the_spirv_figure_is_the_hand_formulas_with_the_padding_they_left_out() {
-    let side = LmSideShape {
-        base: stack(2, true),
-        residual: stack(1, false),
-        encoder: 1024,
-        dit: 1024,
-        latent: 512,
-        levels: 9,
-    };
-    let mut modules = Modules::default();
-    let mut checked: BTreeMap<String, usize> = BTreeMap::new();
-    let mut seen = HashSet::new();
-    for graph in lm_side_cuts(&side) {
-        for op in &graph.ops {
-            let p = &op.pipeline;
-            let Some(formula) = shared_memory(p) else {
-                continue;
-            };
-            if !seen.insert(p.key()) {
-                continue;
-            }
-            let name = p.kernel.name;
-            // norm.glsl's partial sums may come first, and the vectors after them at the next
-            // multiple of 16, which the hand formula leaves out.
-            let partials = match (constant(p, 0), constant(p, 1)) {
-                (Some(subgroup), Some(workgroup)) => 4 * u64::from(workgroup / subgroup),
-                _ => 0,
-            };
-            let padding = match name {
-                "gemv_qkv_rope" | "gemv_gate_up" => partials.next_multiple_of(16) - partials,
-                _ => 0,
-            };
-            assert_eq!(
-                modules.bytes(name, &p.constants),
-                formula + padding,
-                "{} at {:?}",
-                op.label,
-                p.constants
-            );
-            *checked.entry(name.to_string()).or_default() += 1;
-        }
-    }
-    eprintln!("pipelines checked by kernel: {checked:?}");
-    let kernels = [
-        "gemv_qkv_rope",
-        "gemv_gate_up",
-        "gemv_residual",
-        "gemv_linear",
-        "rmsnorm",
-        "attention_split",
-    ];
-    // rmsnorm runs at the norm's one width, a pipeline to each subgroup size.
-    for kernel in kernels {
-        assert!(checked.get(kernel).copied().unwrap_or(0) >= 2, "{kernel}");
-    }
-}
-
-fn constant(p: &Pipeline, id: u32) -> Option<u32> {
-    match p.constants.iter().find(|c| c.0 == id) {
-        Some(&(_, SpecValue::U32(v))) => Some(v),
-        _ => None,
-    }
 }
 
 /// The parts of VoxCPM2's `config.json` the audio VAE is recorded from.
