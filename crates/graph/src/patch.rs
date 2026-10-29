@@ -110,19 +110,31 @@ pub fn patch_batch_graph(
     let sampler = sampler_graph(config, timesteps, batch.rows, local)?;
     let mut g = Graph::default();
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
-    let cond = g.untyped("cond", bytes(&sampler.graph, sampler.cond), Kind::Input);
+    let cond = g.untyped(
+        "cond",
+        bytes(&sampler.graph, sampler.cond.id()),
+        Kind::Input,
+    );
     let position = g.untyped(
         "position",
         bytes(&side.graph, side.position.id()),
         Kind::Param,
     );
-    let noise = g.untyped("noise", bytes(&sampler.graph, sampler.noise), Kind::Input);
+    let noise = g.untyped(
+        "noise",
+        bytes(&sampler.graph, sampler.noise.id()),
+        Kind::Input,
+    );
     let sampling = g.untyped(
         "sampling",
-        bytes(&sampler.graph, sampler.sampling),
+        bytes(&sampler.graph, sampler.sampling.id()),
         Kind::Param,
     );
-    let patch = g.untyped("patch", bytes(&sampler.graph, sampler.patch), Kind::Output);
+    let patch = g.untyped(
+        "patch",
+        bytes(&sampler.graph, sampler.patch.id()),
+        Kind::Output,
+    );
     let stop_logits = g.untyped(
         "stop_logits",
         bytes(&side.graph, side.stop_logits.id()),
@@ -134,7 +146,7 @@ pub fn patch_batch_graph(
         &mut g,
         &encoder.graph,
         "encoder.",
-        &[(encoder.patch, cond), (encoder.out, enc)],
+        &[(encoder.patch.id(), cond), (encoder.out.id(), enc)],
     );
     let side_ids = splice(
         &mut g,
@@ -152,11 +164,11 @@ pub fn patch_batch_graph(
         &sampler.graph,
         "sampler.",
         &[
-            (sampler.mu, mu),
-            (sampler.cond, cond),
-            (sampler.noise, noise),
-            (sampler.sampling, sampling),
-            (sampler.patch, patch),
+            (sampler.mu.id(), mu),
+            (sampler.cond.id(), cond),
+            (sampler.noise.id(), noise),
+            (sampler.sampling.id(), sampling),
+            (sampler.patch.id(), patch),
         ],
     );
     Ok(PatchGraph {
@@ -597,14 +609,14 @@ pub(crate) mod tests {
             assert!(patch.iter().all(|&(i, _)| i >= g.ops.len() - sampler));
             // The condition is the LM side's, ready before the sampler reads it.
             let mu = p.side.mu.moved(&p.side_ids).id();
-            assert_eq!(mu, p.sampler_ids[p.sampler.mu.0]);
+            assert_eq!(mu, p.sampler.mu.moved(&p.sampler_ids).id());
             let mu_uses = uses(g, mu);
             let last_write = mu_uses.iter().filter(|u| u.1).map(|u| u.0).max().unwrap();
             let first_read = mu_uses.iter().filter(|u| !u.1).map(|u| u.0).min().unwrap();
             assert!(last_write < first_read, "{mu_uses:?}");
             let needs_barrier = barriers(g, &plan(g));
             assert!(needs_barrier[last_write + 1..=first_read].contains(&true));
-            let enc = p.encoder_ids[p.encoder.out.0];
+            let enc = p.encoder.out.moved(&p.encoder_ids).id();
             assert_eq!(enc, p.side.enc.moved(&p.side_ids).id());
             assert_eq!(g.tensors[enc.0].kind, Kind::Intermediate);
         }

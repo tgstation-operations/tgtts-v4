@@ -15,7 +15,7 @@ use std::{fs, time::Instant};
 
 use graph::{
     checkpoint::Checkpoint,
-    graph::{Graph, Kind, TensorId},
+    graph::{Graph, Kind},
     kernels::Kernels,
     lm_side::splice,
     local::{
@@ -526,7 +526,7 @@ fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     // A tensor of another graph's first, so that each of theirs is somewhere else: loading
     // them where they were would write the wrong tensors.
     let mut g = Graph::default();
-    g.untyped("before", 256, Kind::Constant);
+    g.tensor::<F16>("before", &[128], Kind::Constant);
     let sampler = sampler_graph(&config, 2, rows, &tuning).unwrap_or_else(|e| panic!("{e}"));
     let dit = splice(&mut g, &sampler.graph, "dit.", &[]);
     let enc = encoder_graph(&config, rows, &tuning).unwrap_or_else(|e| panic!("{e}"));
@@ -534,26 +534,25 @@ fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     let mut step = Step::new(&ctx, &mut kernels, &g, false).unwrap_or_else(|e| panic!("{e}"));
     load_sampler(&mut step, &g, &sampler, &dit, &checkpoint).unwrap_or_else(|e| panic!("{e}"));
     load_encoder(&mut step, &g, &enc, &local, &checkpoint).unwrap_or_else(|e| panic!("{e}"));
-    let at = |ids: &[TensorId], t: TensorId| ids[t.0];
     let all =
         |part: fn(&Case) -> &[f32]| -> Vec<f32> { cases.iter().flat_map(part).copied().collect() };
-    step.write(at(&dit, sampler.mu), &halves(&all(|case| &case.mu)))
+    step.write(sampler.mu.moved(&dit), &halves(&all(|case| &case.mu)))
         .unwrap();
-    step.write(at(&dit, sampler.cond), &all(|case| &case.cond))
+    step.write(sampler.cond.moved(&dit), &all(|case| &case.cond))
         .unwrap();
-    step.write(at(&dit, sampler.noise), &all(|case| &case.noise))
+    step.write(sampler.noise.moved(&dit), &all(|case| &case.noise))
         .unwrap();
     let sampling: Vec<f32> = cases.iter().flat_map(|case| case.sampling).collect();
-    step.write(at(&dit, sampler.sampling), &sampling).unwrap();
+    step.write(sampler.sampling.moved(&dit), &sampling).unwrap();
     let laid_out: Vec<f32> = patches
         .iter()
         .flat_map(|patch| transposed(patch, config.patch_size))
         .collect();
-    step.write(at(&local, enc.patch), &laid_out).unwrap();
+    step.write(enc.patch.moved(&local), &laid_out).unwrap();
     step.submit().unwrap_or_else(|e| panic!("{e}"));
-    let got: Vec<f32> = step.read(at(&dit, sampler.patch)).unwrap();
+    let got: Vec<f32> = step.read(sampler.patch.moved(&dit)).unwrap();
     assert_eq!(got, alone, "the spliced sampler's patches");
-    let got: Vec<F16> = step.read(at(&local, enc.out)).unwrap();
+    let got: Vec<F16> = step.read(enc.out.moved(&local)).unwrap();
     let got: Vec<f32> = got.iter().map(|h| h.to_f32()).collect();
     assert_eq!(got, embedded, "the spliced encoder's embeddings");
     assert_no_validation_messages(&ctx);

@@ -13,7 +13,7 @@ use super::{LOCAL_EMBED, LOCAL_ROWS, PatchConfig, Stack, Tuning, groups, identit
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Graph, Kind, Pipeline, Tensor, TensorId},
     kernels::Kernels,
     step::Step,
 };
@@ -24,11 +24,14 @@ pub struct EncoderGraph {
     pub graph: Graph,
     pub stack: Stack,
     pub rows: usize,
-    pub patch: TensorId,
-    /// The learned token that leads the frames.
-    pub special: TensorId,
-    pub in_proj: (TensorId, TensorId),
-    pub out: TensorId,
+    /// `[rows][feat_dim][patch_size]`.
+    pub patch: Tensor<f32>,
+    /// The learned token that leads the frames, `[hidden]`.
+    pub special: Tensor<F16>,
+    /// The weight and the bias.
+    pub in_proj: (Tensor<F16>, Tensor<F16>),
+    /// `[rows][hidden]`.
+    pub out: Tensor<F16>,
 }
 
 fn u(v: usize) -> SpecValue {
@@ -87,28 +90,19 @@ pub fn encoder_graph(
     );
     let first = pipeline(&LOCAL_ROWS, &[(2, u(hidden)), (3, u(tokens))]);
 
-    let half = |n: usize| 2 * n as u64;
-    let patch = g.untyped(
-        "patch",
-        4 * (rows * feat_dim * patch_size) as u64,
-        Kind::Input,
-    );
-    let special = g.untyped("special_token", half(hidden), Kind::Constant);
+    let patch = g.tensor("patch", &[rows, feat_dim, patch_size], Kind::Input);
+    let special = g.tensor("special_token", &[hidden], Kind::Constant);
     let in_proj = (
-        g.untyped("in_proj.weight", half(hidden * feat_dim), Kind::Constant),
-        g.untyped("in_proj.bias", half(hidden), Kind::Constant),
+        g.tensor("in_proj.weight", &[hidden, feat_dim], Kind::Constant),
+        g.tensor("in_proj.bias", &[hidden], Kind::Constant),
     );
-    let x = g.untyped(
-        "encoder.x",
-        half(rows * tokens * hidden),
-        Kind::Intermediate,
-    );
-    let out = g.untyped("out", half(rows * hidden), Kind::Output);
+    let x = g.tensor("encoder.x", &[rows * tokens, hidden], Kind::Intermediate);
+    let out = g.tensor("out", &[rows, hidden], Kind::Output);
     let each_row = u32::try_from(rows).map_err(|_| Error::Shape(format!("{rows} rows")))?;
     g.op(
         "in_proj",
         embed,
-        &[patch, in_proj.0, in_proj.1, special, x],
+        (patch, in_proj.0, in_proj.1, special, x),
         [
             groups("embedded columns", hidden, workgroup as usize)?,
             each_row,
@@ -140,7 +134,6 @@ pub fn load_encoder(
     checkpoint: &Checkpoint,
 ) -> Result<(), Error> {
     let t = encoder;
-    let at = |t: TensorId| ids[t.0];
     let prefix = "feat_encoder.";
     t.stack
         .load(step, graph, ids, checkpoint, &format!("{prefix}encoder."))?;
@@ -149,21 +142,21 @@ pub fn load_encoder(
         step,
         graph,
         checkpoint,
-        at(t.special),
+        t.special.moved(ids),
         &name("special_token"),
     )?;
     write_weight(
         step,
         graph,
         checkpoint,
-        at(t.in_proj.0),
+        t.in_proj.0.moved(ids),
         &name("in_proj.weight"),
     )?;
     write_weight(
         step,
         graph,
         checkpoint,
-        at(t.in_proj.1),
+        t.in_proj.1.moved(ids),
         &name("in_proj.bias"),
     )
 }

@@ -20,7 +20,7 @@ use crate::{
     Error,
     checkpoint::Checkpoint,
     decode::{LmConfig, SUBGROUPS, Shape},
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Bindings, Graph, Kind, Pipeline, Tensor, TensorId},
     kernels::{KernelInfo, read, write},
     step::Step,
 };
@@ -303,12 +303,12 @@ fn check(ok: bool, why: impl FnOnce() -> String) -> Result<(), Error> {
 /// One layer's weights.
 #[derive(Clone, Debug)]
 pub struct LayerTensors {
-    pub input_norm: TensorId,
-    pub qkv: TensorId,
-    pub o: TensorId,
-    pub post_norm: TensorId,
-    pub gate_up: TensorId,
-    pub down: TensorId,
+    pub input_norm: Tensor<F16>,
+    pub qkv: Tensor<F16>,
+    pub o: Tensor<F16>,
+    pub post_norm: Tensor<F16>,
+    pub gate_up: Tensor<F16>,
+    pub down: Tensor<F16>,
 }
 
 /// A local stack's weights and tables in a graph, and the pipelines its layers dispatch.
@@ -319,9 +319,10 @@ pub struct Stack {
     pub seqs: usize,
     pub layers: Vec<LayerTensors>,
     /// The final norm's gain.
-    pub norm: TensorId,
-    pub cos: TensorId,
-    pub sin: TensorId,
+    pub norm: Tensor<F16>,
+    /// `[capacity][head_dim / 2]` each.
+    pub cos: Tensor<f32>,
+    pub sin: Tensor<f32>,
     /// The tokens of the projections' blocks, the last padded past the stack's.
     padded: usize,
     pipelines: Pipelines,
@@ -530,31 +531,26 @@ impl Stack {
             down,
         };
 
-        let vector = |n: usize| 2 * n as u64;
-        let table = (s.capacity * s.head_dim / 2 * 4) as u64;
-        let cos = g.untyped(format!("{name}.rope.cos"), table, Kind::Constant);
-        let sin = g.untyped(format!("{name}.rope.sin"), table, Kind::Constant);
+        let table = [s.capacity, s.head_dim / 2];
+        let cos = g.tensor(format!("{name}.rope.cos"), &table, Kind::Constant);
+        let sin = g.tensor(format!("{name}.rope.sin"), &table, Kind::Constant);
         let qkv_rows = heads * s.head_dim;
         let layers = (0..s.layers)
             .map(|l| {
-                let mut weight = |what: &str, n: usize| {
-                    g.untyped(
-                        format!("{name}.layers.{l}.{what}"),
-                        vector(n),
-                        Kind::Constant,
-                    )
+                let mut weight = |what: &str, shape: &[usize]| {
+                    g.tensor(format!("{name}.layers.{l}.{what}"), shape, Kind::Constant)
                 };
                 LayerTensors {
-                    input_norm: weight("input_layernorm", s.hidden),
-                    qkv: weight("qkv_proj", qkv_rows * s.hidden),
-                    o: weight("o_proj", s.hidden * s.heads * s.head_dim),
-                    post_norm: weight("post_attention_layernorm", s.hidden),
-                    gate_up: weight("gate_up_proj", 2 * s.inner * s.hidden),
-                    down: weight("down_proj", s.hidden * s.inner),
+                    input_norm: weight("input_layernorm", &[s.hidden]),
+                    qkv: weight("qkv_proj", &[qkv_rows, s.hidden]),
+                    o: weight("o_proj", &[s.hidden, s.heads * s.head_dim]),
+                    post_norm: weight("post_attention_layernorm", &[s.hidden]),
+                    gate_up: weight("gate_up_proj", &[2 * s.inner, s.hidden]),
+                    down: weight("down_proj", &[s.hidden, s.inner]),
                 }
             })
             .collect();
-        let norm = g.untyped(format!("{name}.norm"), vector(s.hidden), Kind::Constant);
+        let norm = g.tensor(format!("{name}.norm"), &[s.hidden], Kind::Constant);
         Ok(Stack {
             shape: shape.clone(),
             seqs,
@@ -572,28 +568,33 @@ impl Stack {
         self.seqs * self.shape.capacity
     }
 
-    /// Appends the layers over the tokens `x`, `[tokens][hidden]` in f16, to `g`, labelled after
-    /// `name`; returns their output after the final norm, an intermediate of `g`.
-    pub fn layers(&self, g: &mut Graph, name: &str, x: TensorId) -> TensorId {
+    /// Appends the layers over the tokens `x`, `[tokens][hidden]`, to `g`, labelled after `name`;
+    /// returns their output after the final norm, an intermediate of `g`.
+    pub fn layers(&self, g: &mut Graph, name: &str, x: Tensor<F16>) -> Tensor<F16> {
         let s = &self.shape;
         let m = self.tokens();
         let p = &self.pipelines;
         let label = |l: usize, what: &str| format!("{name}.layers.{l}.{what}");
-        let intermediate = |g: &mut Graph, l: usize, what: &str, bytes: usize| {
-            g.untyped(label(l, what), bytes as u64, Kind::Intermediate)
+        let half = |g: &mut Graph, l: usize, what: &str, n: usize| {
+            g.tensor::<F16>(label(l, what), &[m, n], Kind::Intermediate)
         };
-        let half = |n: usize| 2 * m * n;
-        let partials = |parts: usize| 4 * parts * self.padded * s.hidden;
-        let op = |g: &mut Graph,
-                  label: String,
-                  (pipeline, groups): &(Pipeline, u32),
-                  bindings: &[TensorId]| {
+        // Each part's sums of the tokens of the blocks, the last padded.
+        let partials = |g: &mut Graph, l: usize, what: &str, parts: usize| {
+            let shape = [parts, self.padded, s.hidden];
+            g.tensor::<f32>(label(l, what), &shape, Kind::Intermediate)
+        };
+        fn op(
+            g: &mut Graph,
+            label: String,
+            (pipeline, groups): &(Pipeline, u32),
+            bindings: impl Bindings,
+        ) {
             g.op(label, pipeline.clone(), bindings, [*groups, 1, 1]);
-        };
-        let project = |g: &mut Graph, label: String, how: &Projection, bindings: &[TensorId]| {
+        }
+        fn project(g: &mut Graph, label: String, how: &Projection, bindings: impl Bindings) {
             g.op(label, how.pipeline.clone(), bindings, how.groups);
-        };
-        let mut normed = intermediate(g, 0, "normed", half(s.hidden));
+        }
+        let mut normed = half(g, 0, "normed", s.hidden);
         op(
             g,
             label(0, "input_norm"),
@@ -602,30 +603,30 @@ impl Stack {
         );
         let mut input = x;
         for (l, t) in self.layers.iter().enumerate() {
-            let q = intermediate(g, l, "q", half(s.heads * s.head_dim));
-            let k = intermediate(g, l, "k", half(s.kv_heads * s.head_dim));
-            let v = intermediate(g, l, "v", half(s.kv_heads * s.head_dim));
-            let attended = intermediate(g, l, "attended", half(s.heads * s.head_dim));
-            let o = intermediate(g, l, "o_proj.partial", partials(p.o.parts));
-            let mid = intermediate(g, l, "mid", half(s.hidden));
-            let mid_normed = intermediate(g, l, "mid_normed", half(s.hidden));
-            let mlp = intermediate(g, l, "mlp", half(s.inner));
-            let down = intermediate(g, l, "down_proj.partial", partials(p.down.parts));
-            let output = intermediate(g, l, "out", half(s.hidden));
-            let output_normed = intermediate(g, l, "out_normed", half(s.hidden));
+            let q = half(g, l, "q", s.heads * s.head_dim);
+            let k = half(g, l, "k", s.kv_heads * s.head_dim);
+            let v = half(g, l, "v", s.kv_heads * s.head_dim);
+            let attended = half(g, l, "attended", s.heads * s.head_dim);
+            let o = partials(g, l, "o_proj.partial", p.o.parts);
+            let mid = half(g, l, "mid", s.hidden);
+            let mid_normed = half(g, l, "mid_normed", s.hidden);
+            let mlp = half(g, l, "mlp", s.inner);
+            let down = partials(g, l, "down_proj.partial", p.down.parts);
+            let output = half(g, l, "out", s.hidden);
+            let output_normed = half(g, l, "out_normed", s.hidden);
             project(
                 g,
                 label(l, "qkv_rope"),
                 &p.qkv,
-                &[normed, t.qkv, self.cos, self.sin, q, k, v],
+                (normed, t.qkv, self.cos, self.sin, q, k, v),
             );
             op(g, label(l, "attention"), &p.attention, &[q, k, v, attended]);
-            project(g, label(l, "o_proj"), &p.o, &[attended, t.o, o]);
+            project(g, label(l, "o_proj"), &p.o, (attended, t.o, o));
             op(
                 g,
                 label(l, "o_proj_add"),
                 &p.o_add,
-                &[o, input, t.post_norm, mid, mid_normed],
+                (o, input, t.post_norm, mid, mid_normed),
             );
             project(
                 g,
@@ -633,7 +634,7 @@ impl Stack {
                 &p.gate_up,
                 &[mid_normed, t.gate_up, mlp],
             );
-            project(g, label(l, "down_proj"), &p.down, &[mlp, t.down, down]);
+            project(g, label(l, "down_proj"), &p.down, (mlp, t.down, down));
             let gain = self
                 .layers
                 .get(l + 1)
@@ -642,7 +643,7 @@ impl Stack {
                 g,
                 label(l, "down_proj_add"),
                 &p.down_add,
-                &[down, mid, gain, output, output_normed],
+                (down, mid, gain, output, output_normed),
             );
             input = output;
             normed = output_normed;
@@ -662,16 +663,15 @@ impl Stack {
         checkpoint: &Checkpoint,
         prefix: &str,
     ) -> Result<(), Error> {
-        let at = |t: TensorId| ids[t.0];
         let (cos, sin) = self.shape.rope_tables();
-        step.write(at(self.cos), &cos)?;
-        step.write(at(self.sin), &sin)?;
+        step.write(self.cos.moved(ids), &cos)?;
+        step.write(self.sin.moved(ids), &sin)?;
         for (l, t) in self.layers.iter().enumerate() {
             let n = |what: &str| format!("{prefix}layers.{l}.{what}.weight");
             let [q, k, v] = ["q_proj", "k_proj", "v_proj"].map(|p| n(&format!("self_attn.{p}")));
-            let mut tiles = |t: TensorId, names: &[String], k: usize| {
-                let values = read_weight(graph, checkpoint, at(t), names)?;
-                step.write(at(t), &tiled(&values, k))
+            let mut tiles = |t: Tensor<F16>, names: &[String], k: usize| {
+                let values = read_weight(graph, checkpoint, t.moved(ids), names)?;
+                step.write(t.moved(ids), &tiled(&values, k))
             };
             let s = &self.shape;
             tiles(t.qkv, &[q, k, v], s.hidden)?;
@@ -683,14 +683,14 @@ impl Stack {
                 step,
                 graph,
                 checkpoint,
-                at(t.input_norm),
+                t.input_norm.moved(ids),
                 &[n("input_layernorm")],
             )?;
             write_weight(
                 step,
                 graph,
                 checkpoint,
-                at(t.post_norm),
+                t.post_norm.moved(ids),
                 &[n("post_attention_layernorm")],
             )?;
         }
@@ -698,7 +698,7 @@ impl Stack {
             step,
             graph,
             checkpoint,
-            at(self.norm),
+            self.norm.moved(ids),
             &[format!("{prefix}norm.weight")],
         )
     }
@@ -711,7 +711,7 @@ pub(crate) fn write_weight(
     step: &mut Step,
     graph: &Graph,
     checkpoint: &Checkpoint,
-    t: TensorId,
+    t: Tensor<F16>,
     names: &[String],
 ) -> Result<(), Error> {
     let values = read_weight(graph, checkpoint, t, names)?;
@@ -722,14 +722,14 @@ pub(crate) fn write_weight(
 fn read_weight(
     graph: &Graph,
     checkpoint: &Checkpoint,
-    t: TensorId,
+    t: Tensor<F16>,
     names: &[String],
 ) -> Result<Vec<F16>, Error> {
     let values = match names {
         [name] => checkpoint.f16(name)?.1,
         _ => checkpoint.rows_f16(names)?.1,
     };
-    let want = graph.tensors[t.0].bytes as usize / 2;
+    let want = graph.info(t).len();
     if values.len() != want {
         return Err(Error::Checkpoint(format!(
             "{names:?}: {} values, not {want}",

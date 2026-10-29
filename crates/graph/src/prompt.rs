@@ -135,12 +135,12 @@ pub fn prompt_graphs(
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
     let input = g.untyped(
         "embed.patch",
-        bytes(&encoder.graph, encoder.patch),
+        bytes(&encoder.graph, encoder.patch.id()),
         Kind::Input,
     );
     let enc = g.untyped(
         "embed.enc",
-        bytes(&encoder.graph, encoder.out),
+        bytes(&encoder.graph, encoder.out.id()),
         Kind::Intermediate,
     );
     let embedding = g.untyped("embed.out", 2 * hidden as u64, Kind::Output);
@@ -148,7 +148,7 @@ pub fn prompt_graphs(
     let shared: Vec<(TensorId, TensorId)> = weights
         .filter(|(_, t)| t.kind == Kind::Constant)
         .map(|(i, _)| (TensorId(i), patch.encoder_ids[i]))
-        .chain([(encoder.patch, input), (encoder.out, enc)])
+        .chain([(encoder.patch.id(), input), (encoder.out.id(), enc)])
         .collect();
     splice(&mut g, &encoder.graph, "embed.", &shared);
     append_linear(

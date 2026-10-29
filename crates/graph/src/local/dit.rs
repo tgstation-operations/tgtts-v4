@@ -28,7 +28,7 @@ use super::{
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Graph, Kind, Pipeline, Tensor, TensorId},
     kernels::Kernels,
     step::Step,
 };
@@ -89,18 +89,21 @@ pub struct SamplerGraph {
     pub patch_size: usize,
     /// The time and step length of each step the DiT runs at.
     pub steps: Vec<(f32, f32)>,
-    pub mu: TensorId,
-    pub cond: TensorId,
-    pub noise: TensorId,
-    /// Each row's temperature, then its guidance scale, in f32.
-    pub sampling: TensorId,
+    /// `[rows][MU_TOKENS][hidden]`.
+    pub mu: Tensor<F16>,
+    /// `[rows][feat_dim][patch_size]`, as `noise` and `patch`.
+    pub cond: Tensor<f32>,
+    pub noise: Tensor<f32>,
+    /// Each row's temperature, then its guidance scale.
+    pub sampling: Tensor<f32>,
     /// Each row's patch, written in place by each step.
-    pub patch: TensorId,
-    pub in_proj: (TensorId, TensorId),
-    pub cond_proj: (TensorId, TensorId),
-    pub out_proj: (TensorId, TensorId),
-    /// The time token of each step.
-    pub times: Vec<TensorId>,
+    pub patch: Tensor<f32>,
+    /// Each linear layer's weight and bias.
+    pub in_proj: (Tensor<F16>, Tensor<F16>),
+    pub cond_proj: (Tensor<F16>, Tensor<F16>),
+    pub out_proj: (Tensor<F16>, Tensor<F16>),
+    /// The time token of each step, `[hidden]`.
+    pub times: Vec<Tensor<F16>>,
 }
 
 fn u(v: usize) -> SpecValue {
@@ -187,27 +190,26 @@ pub fn sampler_graph(
         )
     };
 
-    let half = |n: usize| 2 * n as u64;
-    let float = |n: usize| 4 * n as u64;
-    let mu = g.untyped("mu", half(rows * MU_TOKENS * hidden), Kind::Input);
-    let cond = g.untyped("cond", float(rows * len), Kind::Input);
-    let noise = g.untyped("noise", float(rows * len), Kind::Input);
-    let sampling = g.untyped("sampling", float(rows * 2), Kind::Param);
-    let patch = g.untyped("patch", float(rows * len), Kind::Output);
+    let mu = g.tensor("mu", &[rows, MU_TOKENS, hidden], Kind::Input);
+    let patches = [rows, feat_dim, patch_size];
+    let cond = g.tensor("cond", &patches, Kind::Input);
+    let noise = g.tensor("noise", &patches, Kind::Input);
+    let sampling = g.tensor("sampling", &[rows, 2], Kind::Param);
+    let patch = g.tensor("patch", &patches, Kind::Output);
     let mut linear = |name: &str, n: usize, k: usize| {
         (
-            g.untyped(format!("{name}.weight"), half(n * k), Kind::Constant),
-            g.untyped(format!("{name}.bias"), half(n), Kind::Constant),
+            g.tensor(format!("{name}.weight"), &[n, k], Kind::Constant),
+            g.tensor(format!("{name}.bias"), &[n], Kind::Constant),
         )
     };
     let in_proj = linear("in_proj", hidden, feat_dim);
     let cond_proj = linear("cond_proj", hidden, feat_dim);
     let out_proj = linear("out_proj", feat_dim, hidden);
     let steps = euler_steps(timesteps);
-    let times: Vec<TensorId> = (0..steps.len())
-        .map(|s| g.untyped(format!("time.{s}"), half(hidden), Kind::Constant))
+    let times: Vec<Tensor<F16>> = (0..steps.len())
+        .map(|s| g.tensor(format!("time.{s}"), &[hidden], Kind::Constant))
         .collect();
-    let x = g.untyped("dit.x", half(stack.tokens() * hidden), Kind::Intermediate);
+    let x = g.tensor("dit.x", &[stack.tokens(), hidden], Kind::Intermediate);
 
     let each_row = u32::try_from(rows).map_err(|_| Error::Shape(format!("{rows} rows")))?;
     g.op(
@@ -219,21 +221,21 @@ pub fn sampler_graph(
     g.op(
         "cond_proj",
         embed(COND_AT, 0, MU_TOKENS, true, false),
-        &[cond, cond_proj.0, cond_proj.1, mu, x],
+        (cond, cond_proj.0, cond_proj.1, mu, x),
         [embed_groups, each_row, 1],
     );
     for (s, &(_, dt)) in steps.iter().enumerate() {
         g.op(
             format!("step.{s}.in_proj"),
             embed(x_at, TIME_AT, 1, false, true),
-            &[patch, in_proj.0, in_proj.1, times[s], x],
+            (patch, in_proj.0, in_proj.1, times[s], x),
             [embed_groups, each_row, 1],
         );
         let out = stack.layers(&mut g, &format!("step.{s}.dit"), x);
         g.op(
             format!("step.{s}.euler"),
             euler(dt),
-            &[out, out_proj.0, out_proj.1, sampling, patch],
+            (out, out_proj.0, out_proj.1, sampling, patch),
             [1, each_row, 1],
         );
     }
@@ -333,7 +335,6 @@ pub fn load_sampler(
     checkpoint: &Checkpoint,
 ) -> Result<(), Error> {
     let t = sampler;
-    let at = |t: TensorId| ids[t.0];
     let prefix = "feat_decoder.estimator.";
     t.stack
         .load(step, graph, ids, checkpoint, &format!("{prefix}decoder."))?;
@@ -343,8 +344,8 @@ pub fn load_sampler(
         ("out_proj", t.out_proj),
     ] {
         let name = |part: &str| vec![format!("{prefix}{name}.{part}")];
-        write_weight(step, graph, checkpoint, at(weight), &name("weight"))?;
-        write_weight(step, graph, checkpoint, at(bias), &name("bias"))?;
+        write_weight(step, graph, checkpoint, weight.moved(ids), &name("weight"))?;
+        write_weight(step, graph, checkpoint, bias.moved(ids), &name("bias"))?;
     }
     let hidden = t.stack.shape.hidden;
     let mlp = |name: &str| TimeMlp::read(checkpoint, &format!("{prefix}{name}"), hidden);
@@ -359,7 +360,7 @@ pub fn load_sampler(
             .zip(&constant)
             .map(|(a, b)| F16::from_f64(a + b))
             .collect();
-        step.write(at(token), &values)?;
+        step.write(token.moved(ids), &values)?;
     }
     Ok(())
 }
