@@ -15,7 +15,7 @@ use vulkan::{Context, F16, SpecValue};
 use crate::{
     Error,
     decode::{DecodeGraph, Decoder, LayerTensors, SUBGROUPS, Shape, Tuning},
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Graph, Holds, Kind, Pipeline, Tensor},
     kernels::{KernelInfo, Kernels, read, write},
     step::Program,
 };
@@ -143,13 +143,11 @@ pub struct PrefillGraph {
     /// The rows it runs, a multiple of [`TILE`].
     pub rows: usize,
     pub max_rows: usize,
-    /// The first position and the length of the run, and the slot of the cache it goes to, three
-    /// u32.
-    pub run: TensorId,
-    /// The run's hidden states `[max_rows][hidden]` in f16, and the outputs after the final
-    /// norm.
-    pub x: TensorId,
-    pub out: TensorId,
+    /// The first position and the length of the run, and the slot of the cache it goes to.
+    pub run: Tensor<u32>,
+    /// The run's hidden states `[max_rows][hidden]`, and the outputs after the final norm.
+    pub x: Tensor<F16>,
+    pub out: Tensor<F16>,
 }
 
 /// A stack's tensors in a graph, which a prefill runs over: its weights, its cache and the
@@ -160,9 +158,9 @@ pub struct StackTensors<'a> {
     /// The slots of the cache.
     pub slots: usize,
     pub layers: &'a [LayerTensors],
-    pub norm: TensorId,
-    pub cos: TensorId,
-    pub sin: TensorId,
+    pub norm: Tensor<F16>,
+    pub cos: Tensor<f32>,
+    pub sin: Tensor<f32>,
 }
 
 impl<'a> From<&'a DecodeGraph> for StackTensors<'a> {
@@ -171,9 +169,9 @@ impl<'a> From<&'a DecodeGraph> for StackTensors<'a> {
             shape: &decode.shape,
             slots: decode.batch.slots,
             layers: &decode.layers,
-            norm: decode.norm.id(),
-            cos: decode.cos.id(),
-            sin: decode.sin.id(),
+            norm: decode.norm,
+            cos: decode.cos,
+            sin: decode.sin,
         }
     }
 }
@@ -188,10 +186,10 @@ pub fn prefill_graph(
 ) -> Result<PrefillGraph, Error> {
     let mut g = decode.graph.clone();
     g.ops.clear();
-    let half = (max_rows * decode.shape.hidden * 2) as u64;
-    let run = g.untyped("prefill.run", 12, Kind::Param);
-    let x = g.untyped("prefill.x", half, Kind::Input);
-    let out = g.untyped("prefill.out", half, Kind::Output);
+    let rows_of = [max_rows, decode.shape.hidden];
+    let run = g.tensor("prefill.run", &[3], Kind::Param);
+    let x = g.tensor("prefill.x", &rows_of, Kind::Input);
+    let out = g.tensor("prefill.out", &rows_of, Kind::Output);
     let stack = StackTensors::from(decode);
     append_prefill(
         &mut g,
@@ -200,7 +198,7 @@ pub fn prefill_graph(
         rows,
         max_rows,
         tuning,
-        [run, x, out],
+        (run, x, out),
     )?;
     Ok(PrefillGraph {
         graph: g,
@@ -224,7 +222,11 @@ pub fn append_prefill(
     rows: usize,
     max_rows: usize,
     tuning: &Tuning,
-    [run, x, out]: [TensorId; 3],
+    (run, x, out): (
+        impl Holds<u32> + Copy,
+        impl Holds<F16> + Copy,
+        impl Holds<F16> + Copy,
+    ),
 ) -> Result<(), Error> {
     let s = stack.shape;
     let check = |ok: bool, why: String| if ok { Ok(()) } else { Err(Error::Shape(why)) };
@@ -306,120 +308,114 @@ pub fn append_prefill(
     let gate_up_gemm = gemm_op(2 * s.inner, s.hidden)?;
     let down_gemm = gemm_op(s.hidden, s.inner)?;
 
-    let half = |n: usize| (max_rows * n * 2) as u64;
-    let single = |n: usize| (max_rows * n * 4) as u64;
-    for (t, want) in [(run, 12), (x, half(s.hidden)), (out, half(s.hidden))] {
-        let bytes = g.tensors[t.0].bytes;
+    let rows_of = |n: usize| [max_rows, n];
+    let ins = [
+        (run.id(), 3 * size_of::<u32>()),
+        (x.id(), max_rows * s.hidden * size_of::<F16>()),
+        (out.id(), max_rows * s.hidden * size_of::<F16>()),
+    ];
+    for (t, want) in ins {
+        let bytes = g.info(t).bytes;
         check(
-            bytes == want,
+            bytes == want as u64,
             format!("{name}: tensor {} of {bytes} bytes, not {want}", t.0),
         )?;
     }
     let row_groups = [rows as u32, 1, 1];
-    let mut input = x;
-    let mut normed = g.untyped(
-        format!("{name}.layers.0.normed"),
-        half(s.hidden),
-        Kind::Intermediate,
-    );
+    let mut input = x.id();
+    let mut normed = g
+        .tensor::<F16>(
+            format!("{name}.layers.0.normed"),
+            &rows_of(s.hidden),
+            Kind::Intermediate,
+        )
+        .id();
     g.op(
         format!("{name}.input_norm"),
         norm,
-        &[run, x, stack.layers[0].input_norm.id(), normed],
+        (run, x, stack.layers[0].input_norm, normed),
         row_groups,
     );
     for (l, w) in stack.layers.iter().enumerate() {
-        let mut t = |what: &str, bytes| {
-            g.untyped(
-                format!("{name}.layers.{l}.{what}"),
-                bytes,
-                Kind::Intermediate,
-            )
+        let layer = |what: &str| format!("{name}.layers.{l}.{what}");
+        let half = |g: &mut Graph, what: &str, n: usize| {
+            g.tensor::<F16>(layer(what), &rows_of(n), Kind::Intermediate)
         };
-        let qkv = t("qkv", single(qkv_width));
-        let q = t("q", half(s.heads * s.head_dim));
-        let attended = t("attended", half(s.heads * s.head_dim));
-        let o = t("o", single(s.hidden));
-        let mid = t("mid", half(s.hidden));
-        let mid_normed = t("mid_normed", half(s.hidden));
-        let gate_up = t("gate_up", single(2 * s.inner));
-        let mlp = t("mlp", half(s.inner));
-        let down = t("down", single(s.hidden));
-        let output = t("out", half(s.hidden));
+        let single = |g: &mut Graph, what: &str, n: usize| {
+            g.tensor::<f32>(layer(what), &rows_of(n), Kind::Intermediate)
+        };
+        let qkv = single(g, "qkv", qkv_width);
+        let q = half(g, "q", s.heads * s.head_dim);
+        let attended = half(g, "attended", s.heads * s.head_dim);
+        let o = single(g, "o", s.hidden);
+        let mid = half(g, "mid", s.hidden);
+        let mid_normed = half(g, "mid_normed", s.hidden);
+        let gate_up = single(g, "gate_up", 2 * s.inner);
+        let mlp = half(g, "mlp", s.inner);
+        let down = single(g, "down", s.hidden);
+        let output = half(g, "out", s.hidden);
         let (next_normed, gain) = match stack.layers.get(l + 1) {
             Some(next) => (
-                g.untyped(
+                g.tensor::<F16>(
                     format!("{name}.layers.{}.normed", l + 1),
-                    half(s.hidden),
+                    &rows_of(s.hidden),
                     Kind::Intermediate,
-                ),
-                next.input_norm.id(),
+                )
+                .id(),
+                next.input_norm,
             ),
-            None => (out, stack.norm),
+            None => (out.id(), stack.norm),
         };
         g.op(
             "qkv_proj",
             qkv_gemm.0.clone(),
-            &[normed, w.qkv.id(), qkv],
+            (normed, w.qkv, qkv),
             qkv_gemm.1,
         );
         g.op(
             "rope_rows",
             rope_pipeline.clone(),
-            &[
-                run,
-                qkv,
-                stack.cos,
-                stack.sin,
-                q,
-                w.k_cache.id(),
-                w.v_cache.id(),
-            ],
+            (run, qkv, stack.cos, stack.sin, q, w.k_cache, w.v_cache),
             row_groups,
         );
         g.op(
             "attention_rows",
             attention.clone(),
-            &[run, q, w.k_cache.id(), w.v_cache.id(), attended],
+            (run, q, w.k_cache, w.v_cache, attended),
             [(rows / per_group) as u32, s.kv_heads as u32, 1],
         );
-        g.op(
-            "o_proj",
-            o_gemm.0.clone(),
-            &[attended, w.o.id(), o],
-            o_gemm.1,
-        );
+        g.op("o_proj", o_gemm.0.clone(), (attended, w.o, o), o_gemm.1);
         g.op(
             "add_norm_rows",
             add_norm.clone(),
-            &[run, o, input, w.post_norm.id(), mid, mid_normed],
+            (run, o, input, w.post_norm, mid, mid_normed),
             row_groups,
         );
         g.op(
             "gate_up_proj",
             gate_up_gemm.0.clone(),
-            &[mid_normed, w.gate_up.id(), gate_up],
+            (mid_normed, w.gate_up, gate_up),
             gate_up_gemm.1,
         );
         g.op(
             "silu_mul_rows",
             silu.clone(),
-            &[run, gate_up, mlp],
+            (run, gate_up, mlp),
             row_groups,
         );
         g.op(
             "down_proj",
             down_gemm.0.clone(),
-            &[mlp, w.down.id(), down],
+            (mlp, w.down, down),
             down_gemm.1,
         );
         g.op(
             "add_norm_rows",
             add_norm.clone(),
-            &[run, down, mid, gain, output, next_normed],
+            (run, down, mid, gain, output, next_normed),
             row_groups,
         );
-        input = output;
+        input = output.id();
         normed = next_normed;
     }
     Ok(())
@@ -432,9 +428,9 @@ pub fn append_prefill(
 pub struct Prefill {
     /// `programs[i]` runs `(i + 1) TILE` rows.
     programs: Vec<Program>,
-    run: TensorId,
-    x: TensorId,
-    out: TensorId,
+    run: Tensor<u32>,
+    x: Tensor<F16>,
+    out: Tensor<F16>,
     max_rows: usize,
     hidden: usize,
     capacity: usize,

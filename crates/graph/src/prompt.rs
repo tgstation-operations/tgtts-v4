@@ -31,7 +31,7 @@ use crate::{
     Error,
     checkpoint::Checkpoint,
     decode::{LayerTensors, Row, Tuning},
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Graph, Kind, Pipeline, Tensor, TensorId},
     kernels::{KernelInfo, Kernels, read, write},
     lm_side::{Act, Linear, Stack, append_linear, splice},
     patch::{PatchGraph, PatchStep, transposed},
@@ -110,10 +110,10 @@ fn u(v: usize) -> SpecValue {
 }
 
 /// The stack `stack` of the LM side, where `ids` puts its tensors in the patch step's graph.
-fn stack_layers(stack: &Stack, ids: &[TensorId]) -> (Vec<LayerTensors>, TensorId) {
+fn stack_layers(stack: &Stack, ids: &[TensorId]) -> (Vec<LayerTensors>, Tensor<F16>) {
     (
         stack.layers.iter().map(|l| l.moved(ids)).collect(),
-        stack.norm.moved(ids).id(),
+        stack.norm.moved(ids),
     )
 }
 
@@ -182,8 +182,8 @@ pub fn prompt_graphs(
         slots: side.batch.slots,
         layers,
         norm,
-        cos: side.cos.moved(&patch.side_ids).id(),
-        sin: side.sin.moved(&patch.side_ids).id(),
+        cos: side.cos.moved(&patch.side_ids),
+        sin: side.sin.moved(&patch.side_ids),
     };
     let base = stack(&s.base, &base_layers[..], base_norm);
     let residual = stack(&s.residual, &residual_layers[..], residual_norm);
@@ -251,7 +251,7 @@ pub fn prompt_graphs(
     for tiles in 1..=max_rows / TILE {
         let rows = tiles * TILE;
         let mut p = g.clone();
-        let io = |x, out| [run, x, out];
+        let io = |x, out| (run, x, out);
         append_prefill(
             &mut p,
             "prompt.base_lm",
