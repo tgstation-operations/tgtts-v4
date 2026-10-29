@@ -8,6 +8,7 @@ pub mod gibberish;
 pub mod limiter;
 pub mod loudness;
 pub mod pitch;
+pub mod quantity;
 pub mod radio;
 pub mod resample;
 pub mod segment;
