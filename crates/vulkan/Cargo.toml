@@ -11,6 +11,7 @@ device = []
 
 [dependencies]
 ash.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 half.workspace = true
