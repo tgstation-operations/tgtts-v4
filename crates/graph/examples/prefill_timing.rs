@@ -2,48 +2,43 @@
 //! timestamps, summed by kernel, and whole runs from submission to fence.
 //!
 //! ```text
-//! cargo run --release -p graph --example prefill_timing -- [--layers 28]
-//!     [--lengths 128,256,512] [--runs 5] [--subgroup S]
+//! cargo run --release -p graph --example prefill_timing -- [OPTIONS]
 //! ```
 //!
 //! `VOXCPM2_DIR` names the checkpoint, and `GLSL_KERNELS` and `VULKAN_KERNELS` the compiled
 //! kernels. A prompt is hidden states of nothing in particular at the scale of the base LM's
 //! embeddings, from position 0: a prefill's cost depends on its length, not on what it holds.
-//! Each length runs once to warm up, then `--runs` times.
 
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
+use argh::FromArgs;
 use graph::{
     checkpoint::Checkpoint,
     decode::{Decoder, LmConfig, Shape, Tuning},
     kernels::Kernels,
     prefill::{Prefill, TILE},
 };
+use list::List;
 use vulkan::{Context, F16};
 
-fn arg(name: &str, default: usize) -> usize {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .map(|i| {
-            args[i + 1]
-                .parse()
-                .unwrap_or_else(|e| panic!("{name}: {e}"))
-        })
-        .unwrap_or(default)
-}
+mod list;
 
-/// A comma-separated list of numbers; `default` when the argument is not given.
-fn list(name: &str, default: &str) -> Vec<usize> {
-    let args: Vec<String> = std::env::args().collect();
-    let text = args
-        .iter()
-        .position(|a| a == name)
-        .map_or(default, |i| args[i + 1].as_str());
-    text.split(',')
-        .filter(|v| !v.is_empty())
-        .map(|v| v.parse().unwrap_or_else(|e| panic!("{name}: {e}")))
-        .collect()
+/// Times prompts' prefills through the base LM on the GPU at batch 1.
+#[derive(FromArgs)]
+struct Args {
+    /// the base LM's layers to run, 28 by default
+    #[argh(option, default = "28")]
+    layers: usize,
+    /// the prompts' lengths, 128,256,512 by default
+    #[argh(option, default = "List(vec![128, 256, 512])")]
+    lengths: List,
+    /// the runs timed of each length, after one to warm up, 5 by default
+    #[argh(option, default = "5")]
+    runs: usize,
+    /// the subgroup size, by default the widest the kernels are written for that the device can
+    /// require
+    #[argh(option)]
+    subgroup: Option<u32>,
 }
 
 fn median(v: &[f64]) -> f64 {
@@ -67,9 +62,8 @@ fn prompt(len: usize, hidden: usize) -> Vec<F16> {
 }
 
 fn main() {
-    let layers = arg("--layers", 28);
-    let lengths = list("--lengths", "128,256,512");
-    let runs = arg("--runs", 5);
+    let args: Args = argh::from_env();
+    let (layers, lengths, runs) = (args.layers, &args.lengths.0, args.runs);
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
@@ -81,7 +75,7 @@ fn main() {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     let report = ctx.report();
     let device = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
-    let tuning = Tuning::for_subgroup(arg("--subgroup", device.subgroup as usize) as u32);
+    let tuning = Tuning::for_subgroup(args.subgroup.unwrap_or(device.subgroup));
     eprintln!(
         "{} ({}), validation {}; {layers} layers, programs of up to {max_rows} rows, the \
          kernels at {tuning:?}",
@@ -115,7 +109,7 @@ fn main() {
         ("gate_up_proj", (2 * i, h)),
         ("down_proj", (h, i)),
     ]);
-    for &len in &lengths {
+    for &len in lengths {
         let x = prompt(len, h);
         let rows = len.next_multiple_of(TILE);
         let mut hosts = Vec::new();

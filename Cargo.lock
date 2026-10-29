@@ -382,6 +382,7 @@ dependencies = [
 name = "graph"
 version = "0.1.0"
 dependencies = [
+ "argh",
  "libc",
  "serde",
  "serde_json",

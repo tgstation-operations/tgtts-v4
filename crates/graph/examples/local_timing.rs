@@ -3,13 +3,8 @@
 //! bytes of weights they read and against the floor a streaming read of device memory sets.
 //!
 //! ```text
-//! cargo run --release -p graph --example local_timing -- [--rows 1] [--timesteps 10]
-//!     [--runs 20] [--subgroup S] [--workgroup W] [--qkv-pairs P] [--gate-up-pairs P] [--o-tiles T]
-//!     [--down-tiles T] [--o-parts P] [--down-parts P] [--chunk C] [--block B] [--depth D]
-//!     [--groups G] [--warmup-ms 2000] [--floor-mib 512]
+//! cargo run --release -p graph --example local_timing -- [OPTIONS]
 //! ```
-//!
-//! The tuning defaults to [`Tuning::for_device`]'s. `--floor-mib 0` skips the streaming read.
 //!
 //! `VOXCPM2_DIR` names the checkpoint and `GLSL_KERNELS` the compiled kernels. What is sampled
 //! does not change the time: the inputs are fixed sequences of about their scale.
@@ -20,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use argh::FromArgs;
 use graph::{
     checkpoint::Checkpoint,
     graph::Pipeline,
@@ -28,16 +24,63 @@ use graph::{
 };
 use vulkan::{Context, F16, Residence, SpecValue, Timing, memory::STAGING_BYTES};
 
-fn arg(name: &str, default: usize) -> usize {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .map(|i| {
-            args[i + 1]
-                .parse()
-                .unwrap_or_else(|e| panic!("{name}: {e}"))
-        })
-        .unwrap_or(default)
+/// Times the patch sampler and the local encoder on the GPU.
+#[derive(FromArgs)]
+struct Args {
+    /// the rows, each a request of its own, 1 by default
+    #[argh(option, default = "1")]
+    rows: usize,
+    /// the sampler's Euler steps, 10 by default
+    #[argh(option, default = "10")]
+    timesteps: usize,
+    /// the runs timed of each, 20 by default
+    #[argh(option, default = "20")]
+    runs: usize,
+    /// the subgroup size, or 0 for the device's, the default; the rest of the tuning defaults to
+    /// Tuning::for_device's
+    #[argh(option, default = "0")]
+    subgroup: u32,
+    /// the workgroup width
+    #[argh(option)]
+    workgroup: Option<u32>,
+    /// pairs of tiles a subgroup takes at once in the q/k/v projection
+    #[argh(option)]
+    qkv_pairs: Option<u32>,
+    /// pairs of tiles a subgroup takes at once in the gate/up projection
+    #[argh(option)]
+    gate_up_pairs: Option<u32>,
+    /// tiles a subgroup takes at once in the output projection
+    #[argh(option)]
+    o_tiles: Option<u32>,
+    /// tiles a subgroup takes at once in the down projection
+    #[argh(option)]
+    down_tiles: Option<u32>,
+    /// the parts the output projection's columns are cut into
+    #[argh(option)]
+    o_parts: Option<u32>,
+    /// the parts the down projection's columns are cut into
+    #[argh(option)]
+    down_parts: Option<u32>,
+    /// the columns of the tokens each projection stages at once
+    #[argh(option)]
+    chunk: Option<u32>,
+    /// the most tokens a workgroup takes
+    #[argh(option)]
+    block: Option<u32>,
+    /// the steps ahead of its products that a subgroup loads its weights
+    #[argh(option)]
+    depth: Option<u32>,
+    /// the workgroups each projection dispatches for each part and block of tokens
+    #[argh(option)]
+    groups: Option<u32>,
+    // The GPU's clocks ramp up over a second or two of load and fall back when it idles, as
+    // between the recordings.
+    /// how long each recording, and the streaming read, runs before it is timed, 2000 by default
+    #[argh(option, default = "2000")]
+    warmup_ms: u64,
+    /// the MiB of device memory the streaming read reads, 512 by default; 0 skips it
+    #[argh(option, default = "512")]
+    floor_mib: u64,
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -190,14 +233,10 @@ fn report(
 }
 
 fn main() {
-    let rows = arg("--rows", 1);
-    let timesteps = arg("--timesteps", 10);
-    let runs = arg("--runs", 20);
-    let floor_mib = arg("--floor-mib", 512) as u64;
-    // The GPU's clocks ramp up over a second or two of load and fall back when it idles, as
-    // between the recordings: each recording, and the streaming read, runs this long before it
-    // is timed.
-    let warmup = Duration::from_millis(arg("--warmup-ms", 2000) as u64);
+    let args: Args = argh::from_env();
+    let (rows, timesteps, runs) = (args.rows, args.timesteps, args.runs);
+    let floor_mib = args.floor_mib;
+    let warmup = Duration::from_millis(args.warmup_ms);
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
     let config: PatchConfig = serde_json::from_str(&json).unwrap();
@@ -206,25 +245,22 @@ fn main() {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     let device_report = ctx.report();
     let device = Tuning::for_device(device_report).unwrap_or_else(|e| panic!("{e}"));
-    let base = match arg("--subgroup", 0) {
+    let base = match args.subgroup {
         0 => device,
-        s => Tuning {
-            subgroup: s as u32,
-            ..device
-        },
+        subgroup => Tuning { subgroup, ..device },
     };
     let tuning = Tuning {
-        workgroup: arg("--workgroup", base.workgroup as usize) as u32,
-        qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
-        gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
-        o_tiles: arg("--o-tiles", base.o_tiles as usize) as u32,
-        down_tiles: arg("--down-tiles", base.down_tiles as usize) as u32,
-        o_parts: arg("--o-parts", base.o_parts as usize) as u32,
-        down_parts: arg("--down-parts", base.down_parts as usize) as u32,
-        chunk: arg("--chunk", base.chunk as usize) as u32,
-        block: arg("--block", base.block as usize) as u32,
-        depth: arg("--depth", base.depth as usize) as u32,
-        groups: arg("--groups", base.groups as usize) as u32,
+        workgroup: args.workgroup.unwrap_or(base.workgroup),
+        qkv_pairs: args.qkv_pairs.unwrap_or(base.qkv_pairs),
+        gate_up_pairs: args.gate_up_pairs.unwrap_or(base.gate_up_pairs),
+        o_tiles: args.o_tiles.unwrap_or(base.o_tiles),
+        down_tiles: args.down_tiles.unwrap_or(base.down_tiles),
+        o_parts: args.o_parts.unwrap_or(base.o_parts),
+        down_parts: args.down_parts.unwrap_or(base.down_parts),
+        chunk: args.chunk.unwrap_or(base.chunk),
+        block: args.block.unwrap_or(base.block),
+        depth: args.depth.unwrap_or(base.depth),
+        groups: args.groups.unwrap_or(base.groups),
         ..base
     };
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));

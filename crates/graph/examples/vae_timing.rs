@@ -2,7 +2,7 @@
 //! from GPU timestamps, summed by layer kind, and whole chunks from submission to fence.
 //!
 //! ```text
-//! cargo run --release -p graph --example vae_timing -- [--chunk 25] [--chunks 40]
+//! cargo run --release -p graph --example vae_timing -- [OPTIONS]
 //! ```
 //!
 //! `VOXCPM2_DIR` names the checkpoint, `VOICES_DIR` a voices directory whose first voice's
@@ -10,6 +10,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
+use argh::FromArgs;
 use graph::{
     graph::Kind,
     kernels::Kernels,
@@ -19,16 +20,15 @@ use graph::{
 use voices::Voices;
 use vulkan::Context;
 
-fn arg(name: &str, default: usize) -> usize {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .map(|i| {
-            args[i + 1]
-                .parse()
-                .unwrap_or_else(|e| panic!("{name}: {e}"))
-        })
-        .unwrap_or(default)
+/// Times the audio VAE's decoder on the GPU, a chunk of latent frames at a time.
+#[derive(FromArgs)]
+struct Args {
+    /// the frames of a chunk, 25 by default
+    #[argh(option, default = "25")]
+    chunk: usize,
+    /// the chunks timed, after 3 to warm up, 40 by default
+    #[argh(option, default = "40")]
+    chunks: usize,
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -37,8 +37,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn main() {
-    let chunk = arg("--chunk", 25);
-    let chunks = arg("--chunks", 40);
+    let Args { chunk, chunks } = argh::from_env();
     let warmup = 3;
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let json: serde_json::Value =

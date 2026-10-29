@@ -16,6 +16,7 @@ thiserror.workspace = true
 vulkan = { path = "../vulkan" }
 
 [dev-dependencies]
+argh.workspace = true
 libc.workspace = true
 testkit = { path = "../testkit" }
 voices = { path = "../voices" }

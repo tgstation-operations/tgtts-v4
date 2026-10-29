@@ -17,20 +17,12 @@
 //!   driver compiled each GEMV into.
 //!
 //! ```text
-//! cargo run --release -p graph --example decode_timing -- [--layers 28] [--context 481]
-//!     [--capacity 768] [--steps 50] [--batch 1] [--subgroup S] [--workgroup W]
-//!     [--qkv-pairs 1] [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--stage 32768]
-//!     [--vectors V] [--floor-mib 512] [--warmup-ms 2000] [--settle-ms 200]
-//!     [--spins-us 0,50000] [--gaps-ms 0,1,4,16] [--idle-ms 1000] [--rounds 3]
-//!     [--sweep-workgroups 64,128] [--sweep-rows 1,2] [--sweep-ahead 0,4,8]
-//!     [--sweep-stage 16384,32768] [--sweep-vectors 1,4,16]
+//! cargo run --release -p graph --example decode_timing -- [OPTIONS]
 //! ```
 //!
-//! The subgroup size defaults to the widest the kernels are written for that the device can
-//! require, and the rest of the tuning to [`Tuning::for_batch`]'s at it. `--floor-mib 0` skips
-//! the streaming read, and an empty list skips its part; the sweep runs when any of its lists is
-//! given, the others defaulting to the tuning's own value. Each block of `--steps` steps follows
-//! `--settle-ms` of steps back to back, so that it starts at the clocks of a busy GPU.
+//! An empty list skips its part; the sweep runs when any of its lists is given, the others
+//! defaulting to the tuning's own value. Each block of `--steps` steps follows `--settle-ms` of
+//! steps back to back, so that it starts at the clocks of a busy GPU.
 //!
 //! `VOXCPM2_DIR` names the checkpoint and `GLSL_KERNELS` the compiled kernels. Every step runs at
 //! position `--context`, over a cache whose positions are zero until a step writes them:
@@ -43,43 +35,98 @@ use std::{
     time::{Duration, Instant},
 };
 
+use argh::FromArgs;
 use graph::{
     checkpoint::Checkpoint,
     decode::{Batch, Decoder, LmConfig, Row, Shape, Tuning, decode_batch_graph},
     kernels::Kernels,
 };
+use list::List;
 use stream_read::stream_read;
 use vulkan::{Calibration, Context, F16};
 
+mod list;
 mod stream_read;
 
-fn arg(name: &str, default: usize) -> usize {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .map(|i| {
-            args[i + 1]
-                .parse()
-                .unwrap_or_else(|e| panic!("{name}: {e}"))
-        })
-        .unwrap_or(default)
-}
-
-/// A comma-separated list of numbers; `default` when the argument is not given.
-fn list(name: &str, default: &str) -> Vec<usize> {
-    let args: Vec<String> = std::env::args().collect();
-    let text = args
-        .iter()
-        .position(|a| a == name)
-        .map_or(default, |i| args[i + 1].as_str());
-    text.split(',')
-        .filter(|v| !v.is_empty())
-        .map(|v| v.parse().unwrap_or_else(|e| panic!("{name}: {e}")))
-        .collect()
-}
-
-fn given(name: &str) -> bool {
-    std::env::args().any(|a| a == name)
+/// Times the base LM's decode step on the GPU, and says what a step's wall time is made of.
+#[derive(FromArgs)]
+struct Args {
+    /// the base LM's layers to run, 28 by default
+    #[argh(option, default = "28")]
+    layers: usize,
+    /// the position every step runs at, 481 by default
+    #[argh(option, default = "481")]
+    context: usize,
+    /// the positions each slot of the cache holds, 768 by default
+    #[argh(option, default = "768")]
+    capacity: usize,
+    /// the steps of each block, 50 by default
+    #[argh(option, default = "50")]
+    steps: usize,
+    /// the requests a step runs, 1 by default
+    #[argh(option, default = "1")]
+    batch: usize,
+    /// the subgroup size, by default the widest the kernels are written for that the device can
+    /// require; the rest of the tuning defaults to Tuning::for_batch's at it
+    #[argh(option)]
+    subgroup: Option<u32>,
+    /// the GEMVs' workgroup width
+    #[argh(option)]
+    workgroup: Option<u32>,
+    /// row pairs per subgroup of the q/k/v projection
+    #[argh(option)]
+    qkv_pairs: Option<u32>,
+    /// row pairs per subgroup of the gate/up projection
+    #[argh(option)]
+    gate_up_pairs: Option<u32>,
+    /// rows per subgroup of the output and down projections
+    #[argh(option)]
+    residual_rows: Option<u32>,
+    /// the steps of its rows each GEMV lane loads before the kernel's prologue
+    #[argh(option)]
+    ahead: Option<u32>,
+    /// the bytes of shared memory a GEMV takes at most
+    #[argh(option)]
+    stage: Option<u32>,
+    /// the rows of a batch a GEMV workgroup takes at most
+    #[argh(option)]
+    vectors: Option<u32>,
+    /// the MiB of device memory the streaming read reads, 512 by default; 0 skips it
+    #[argh(option, default = "512")]
+    floor_mib: u64,
+    /// how long the warm-up from the load runs, 2000 by default
+    #[argh(option, default = "2000")]
+    warmup_ms: u64,
+    /// how long steps run back to back before each block, 200 by default
+    #[argh(option, default = "200")]
+    settle_ms: u64,
+    /// the fence spins, a block of steps back to back at each, 0,50000 by default
+    #[argh(option, default = "List(vec![0, 50000])")]
+    spins_us: List,
+    /// the host's idle gaps before each step, a block at each, 0,1,4,16 by default
+    #[argh(option, default = "List(vec![0, 1, 4, 16])")]
+    gaps_ms: List,
+    /// how long the host idles before the steps after it, 1000 by default; 0 skips them
+    #[argh(option, default = "1000")]
+    idle_ms: u64,
+    /// the rounds of the step untimed and timed per dispatch, and of the sweep, 3 by default
+    #[argh(option, default = "3")]
+    rounds: usize,
+    /// the sweep's workgroup widths
+    #[argh(option)]
+    sweep_workgroups: Option<List>,
+    /// the sweep's row pairs or rows to a subgroup, of every GEMV
+    #[argh(option)]
+    sweep_rows: Option<List>,
+    /// the sweep's loads ahead
+    #[argh(option)]
+    sweep_ahead: Option<List>,
+    /// the sweep's stages
+    #[argh(option)]
+    sweep_stage: Option<List>,
+    /// the sweep's vectors
+    #[argh(option)]
+    sweep_vectors: Option<List>,
 }
 
 /// The value at quantile `q` of `v`, from 0 for the least to 1 for the greatest.
@@ -335,19 +382,15 @@ fn gemv_statistics(
 }
 
 fn main() {
-    let layers = arg("--layers", 28);
-    let context = arg("--context", 481);
-    let capacity = arg("--capacity", 768);
-    let steps = arg("--steps", 50);
-    let rows = arg("--batch", 1);
+    let args: Args = argh::from_env();
+    let (layers, context, capacity) = (args.layers, args.context, args.capacity);
+    let (steps, rows, rounds) = (args.steps, args.batch, args.rounds);
     let batch = Batch { rows, slots: rows };
-    let floor_mib = arg("--floor-mib", 512) as u64;
-    let warmup = Duration::from_millis(arg("--warmup-ms", 2000) as u64);
-    let settle = Duration::from_millis(arg("--settle-ms", 200) as u64);
-    let idle = Duration::from_millis(arg("--idle-ms", 1000) as u64);
-    let rounds = arg("--rounds", 3);
-    let spins = list("--spins-us", "0,50000");
-    let gaps = list("--gaps-ms", "0,1,4,16");
+    let floor_mib = args.floor_mib;
+    let warmup = Duration::from_millis(args.warmup_ms);
+    let settle = Duration::from_millis(args.settle_ms);
+    let idle = Duration::from_millis(args.idle_ms);
+    let (spins, gaps) = (&args.spins_us.0, &args.gaps_ms.0);
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
@@ -359,15 +402,15 @@ fn main() {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     let report = ctx.report();
     let device = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
-    let base = Tuning::for_batch(arg("--subgroup", device.subgroup as usize) as u32, rows);
+    let base = Tuning::for_batch(args.subgroup.unwrap_or(device.subgroup), rows);
     let tuning = Tuning {
-        workgroup: arg("--workgroup", base.workgroup as usize) as u32,
-        qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
-        gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
-        residual_rows: arg("--residual-rows", base.residual_rows as usize) as u32,
-        ahead: arg("--ahead", base.ahead as usize) as u32,
-        stage: arg("--stage", base.stage as usize) as u32,
-        vectors: arg("--vectors", base.vectors as usize) as u32,
+        workgroup: args.workgroup.unwrap_or(base.workgroup),
+        qkv_pairs: args.qkv_pairs.unwrap_or(base.qkv_pairs),
+        gate_up_pairs: args.gate_up_pairs.unwrap_or(base.gate_up_pairs),
+        residual_rows: args.residual_rows.unwrap_or(base.residual_rows),
+        ahead: args.ahead.unwrap_or(base.ahead),
+        stage: args.stage.unwrap_or(base.stage),
+        vectors: args.vectors.unwrap_or(base.vectors),
         ..base
     };
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
@@ -460,13 +503,13 @@ fn main() {
         fifths.join(" ")
     );
 
-    for &us in &spins {
+    for &us in spins {
         ctx.set_fence_spin(Duration::from_micros(us as u64));
         let (phases, _) = bench.block(steps, Duration::ZERO, settle);
         println!("back to back, spin {us} us: {}", summary(&phases));
     }
     ctx.set_fence_spin(Duration::ZERO);
-    for &ms in &gaps {
+    for &ms in gaps {
         let (phases, _) = bench.block(steps, Duration::from_millis(ms as u64), settle);
         println!("gap {ms} ms: {}", summary(&phases));
     }
@@ -538,23 +581,16 @@ fn main() {
     }
 
     let sweeping = [
-        "--sweep-workgroups",
-        "--sweep-rows",
-        "--sweep-ahead",
-        "--sweep-stage",
-        "--sweep-vectors",
+        &args.sweep_workgroups,
+        &args.sweep_rows,
+        &args.sweep_ahead,
+        &args.sweep_stage,
+        &args.sweep_vectors,
     ]
     .iter()
-    .any(|a| given(a));
+    .any(|list| list.is_some());
     if sweeping {
-        sweep(
-            &mut bench,
-            &mut kernels,
-            &shape,
-            &tuning,
-            (steps, settle, rounds),
-            floor,
-        );
+        sweep(&mut bench, &mut kernels, &shape, &tuning, &args, floor);
     }
     let messages = ctx.validation_messages();
     if ctx.validating() {
@@ -566,15 +602,17 @@ fn main() {
 }
 
 /// Each tuning the sweep's lists make together, recorded over the bench's weights and measured
-/// untimed and timed, `rounds` times round robin; and the best.
+/// untimed and timed, `--rounds` times round robin; and the best.
 fn sweep(
     bench: &mut Bench,
     kernels: &mut Kernels,
     shape: &Shape,
     tuning: &Tuning,
-    (steps, settle, rounds): (usize, Duration, usize),
+    args: &Args,
     floor: Option<f64>,
 ) {
+    let (steps, rounds) = (args.steps, args.rounds);
+    let settle = Duration::from_millis(args.settle_ms);
     let batch = bench.decoder().batch();
     let context = bench.rows[0].map_or(0, |row| row.position);
     let cache = batch.rows as u64 * shape.cache_bytes(context);
@@ -584,11 +622,15 @@ fn sweep(
             format!(", {:.0}% of the floor", 100.0 * rate / f)
         })
     };
-    let workgroups = list("--sweep-workgroups", &tuning.workgroup.to_string());
-    let rows = list("--sweep-rows", "");
-    let aheads = list("--sweep-ahead", &tuning.ahead.to_string());
-    let stages = list("--sweep-stage", &tuning.stage.to_string());
-    let vectors = list("--sweep-vectors", &tuning.vectors.to_string());
+    let given = |list: &Option<List>, or: &[u32]| match list {
+        Some(list) => list.0.clone(),
+        None => or.iter().map(|&v| v as usize).collect(),
+    };
+    let workgroups = given(&args.sweep_workgroups, &[tuning.workgroup]);
+    let rows = given(&args.sweep_rows, &[]);
+    let aheads = given(&args.sweep_ahead, &[tuning.ahead]);
+    let stages = given(&args.sweep_stage, &[tuning.stage]);
+    let vectors = given(&args.sweep_vectors, &[tuning.vectors]);
     let mut tunings = Vec::new();
     for &workgroup in &workgroups {
         for &ahead in &aheads {

@@ -4,15 +4,8 @@
 //! submission to fence, against the bytes a patch reads and the floor a streaming read sets.
 //!
 //! ```text
-//! cargo run --release -p graph --example lm_side_timing -- [--context 481] [--capacity 768]
-//!     [--steps 30] [--batch 1,2,4,8,16] [--subgroup S] [--workgroup W] [--qkv-pairs 1]
-//!     [--gate-up-pairs 1] [--residual-rows 1] [--ahead 0] [--stage 32768] [--vectors V]
-//!     [--floor-mib 512]
+//! cargo run --release -p graph --example lm_side_timing -- [OPTIONS]
 //! ```
-//!
-//! The subgroup size defaults to the widest the kernels are written for that the device can
-//! require, and the rest of the tuning to [`Tuning::for_batch`]'s at it for each batch, which the
-//! options override. `--floor-mib 0` skips the streaming read.
 //!
 //! `VOXCPM2_DIR` names the checkpoint and `GLSL_KERNELS` the compiled kernels. The patches run at
 //! positions from `--context` on, each request of a batch in a slot of the caches of its own,
@@ -21,40 +14,63 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
+use argh::FromArgs;
 use graph::{
     checkpoint::Checkpoint,
     decode::{Batch, Row, Tuning},
     kernels::Kernels,
     lm_side::{self, LmSide, LmSideShape},
 };
+use list::List;
 use stream_read::stream_read;
 use vulkan::{Context, F16};
 
+mod list;
 mod stream_read;
 
-fn arg(name: &str, default: usize) -> usize {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .map(|i| {
-            args[i + 1]
-                .parse()
-                .unwrap_or_else(|e| panic!("{name}: {e}"))
-        })
-        .unwrap_or(default)
-}
-
-/// A comma-separated list of numbers; `default` when the argument is not given.
-fn list(name: &str, default: &str) -> Vec<usize> {
-    let args: Vec<String> = std::env::args().collect();
-    let text = args
-        .iter()
-        .position(|a| a == name)
-        .map_or(default, |i| args[i + 1].as_str());
-    text.split(',')
-        .filter(|v| !v.is_empty())
-        .map(|v| v.parse().unwrap_or_else(|e| panic!("{name}: {e}")))
-        .collect()
+/// Times VoxCPM2's LM side of a patch on the GPU, for a batch of each size --batch lists.
+#[derive(FromArgs)]
+struct Args {
+    /// the position the first patch runs at, 481 by default
+    #[argh(option, default = "481")]
+    context: usize,
+    /// the positions each slot of the caches holds, 768 by default
+    #[argh(option, default = "768")]
+    capacity: usize,
+    /// the patches timed, after 5 to warm up, 30 by default
+    #[argh(option, default = "30")]
+    steps: usize,
+    /// the batch sizes to time, 1 by default
+    #[argh(option, default = "List(vec![1])")]
+    batch: List,
+    /// the subgroup size, by default the widest the kernels are written for that the device can
+    /// require; the rest of the tuning defaults to Tuning::for_batch's at it for each batch
+    #[argh(option)]
+    subgroup: Option<u32>,
+    /// the GEMVs' workgroup width
+    #[argh(option)]
+    workgroup: Option<u32>,
+    /// row pairs per subgroup of the q/k/v projection
+    #[argh(option)]
+    qkv_pairs: Option<u32>,
+    /// row pairs per subgroup of the gate/up projection
+    #[argh(option)]
+    gate_up_pairs: Option<u32>,
+    /// rows per subgroup of the output and down projections
+    #[argh(option)]
+    residual_rows: Option<u32>,
+    /// the steps of its rows each GEMV lane loads before the kernel's prologue
+    #[argh(option)]
+    ahead: Option<u32>,
+    /// the bytes of shared memory a GEMV takes at most
+    #[argh(option)]
+    stage: Option<u32>,
+    /// the rows of a batch a GEMV workgroup takes at most
+    #[argh(option)]
+    vectors: Option<u32>,
+    /// the MiB of device memory the streaming read reads, 512 by default; 0 skips it
+    #[argh(option, default = "512")]
+    floor_mib: u64,
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -95,11 +111,10 @@ struct Measured {
 }
 
 fn main() {
-    let context = arg("--context", 481);
-    let capacity = arg("--capacity", 768);
-    let steps = arg("--steps", 30);
-    let batches = list("--batch", "1");
-    let floor_mib = arg("--floor-mib", 512) as u64;
+    let args: Args = argh::from_env();
+    let (context, capacity, steps) = (args.context, args.capacity, args.steps);
+    let batches = &args.batch.0;
+    let floor_mib = args.floor_mib;
     let warmup = 5;
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
@@ -114,17 +129,17 @@ fn main() {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
     let report = ctx.report();
     let device = Tuning::for_device(report).unwrap_or_else(|e| panic!("{e}"));
-    let subgroup = arg("--subgroup", device.subgroup as usize) as u32;
+    let subgroup = args.subgroup.unwrap_or(device.subgroup);
     let tuning = |rows: usize| {
         let base = Tuning::for_batch(subgroup, rows);
         Tuning {
-            workgroup: arg("--workgroup", base.workgroup as usize) as u32,
-            qkv_pairs: arg("--qkv-pairs", base.qkv_pairs as usize) as u32,
-            gate_up_pairs: arg("--gate-up-pairs", base.gate_up_pairs as usize) as u32,
-            residual_rows: arg("--residual-rows", base.residual_rows as usize) as u32,
-            ahead: arg("--ahead", base.ahead as usize) as u32,
-            stage: arg("--stage", base.stage as usize) as u32,
-            vectors: arg("--vectors", base.vectors as usize) as u32,
+            workgroup: args.workgroup.unwrap_or(base.workgroup),
+            qkv_pairs: args.qkv_pairs.unwrap_or(base.qkv_pairs),
+            gate_up_pairs: args.gate_up_pairs.unwrap_or(base.gate_up_pairs),
+            residual_rows: args.residual_rows.unwrap_or(base.residual_rows),
+            ahead: args.ahead.unwrap_or(base.ahead),
+            stage: args.stage.unwrap_or(base.stage),
+            vectors: args.vectors.unwrap_or(base.vectors),
             ..base
         }
     };
@@ -153,7 +168,7 @@ fn main() {
         cache / 1e6
     );
     let mut measured = Vec::new();
-    for &rows in &batches {
+    for &rows in batches {
         let batch = Batch { rows, slots: rows };
         let tuning = tuning(rows);
         let start = Instant::now();

@@ -4,8 +4,7 @@
 //! per dispatch from GPU timestamps.
 //!
 //! ```text
-//! cargo run --release -p graph --example generator_timing -- [--voice-patches 70]
-//!     [--patches 32] [--runs 3] [--slots 1]
+//! cargo run --release -p graph --example generator_timing -- [OPTIONS]
 //! ```
 //!
 //! `VOXCPM2_DIR` names the checkpoint, `VOICES_DIR` a voices directory, and `GLSL_KERNELS` and
@@ -22,6 +21,7 @@
 
 use std::{path::PathBuf, time::Instant};
 
+use argh::FromArgs;
 use graph::{
     generator::{Generator, Settings},
     kernels::Kernels,
@@ -32,21 +32,26 @@ use voices::Latent;
 use voxcpm::{Config, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer};
 use vulkan::Context;
 
+/// Times VoxCPM2's generation on the GPU, a request at a time or several at once.
+#[derive(FromArgs)]
+struct Args {
+    /// the voice's patches the cut prompt keeps, 70 by default
+    #[argh(option, default = "70")]
+    voice_patches: usize,
+    /// the patches of each request, 32 by default
+    #[argh(option, default = "32")]
+    patches: usize,
+    /// the requests timed of each prompt, after one to warm up, 3 by default
+    #[argh(option, default = "3")]
+    runs: usize,
+    /// the requests the generator holds at once, 1 by default
+    #[argh(option, default = "1")]
+    slots: usize,
+}
+
 /// A line twice as long as a median line, so that the stop head does not end a request first.
 const LINE: &str = "Hello there, could someone please come to medbay? I need help. The captain \
                     is down in the bridge, and nobody has seen the doctor for an hour.";
-
-fn arg(name: &str, default: usize) -> usize {
-    let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .map(|i| {
-            args[i + 1]
-                .parse()
-                .unwrap_or_else(|e| panic!("{name}: {e}"))
-        })
-        .unwrap_or(default)
-}
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
@@ -218,10 +223,12 @@ fn batched(generator: &mut Generator, prompt: &Prompt, voice: &[f32], patches: u
 }
 
 fn main() {
-    let patches = arg("--patches", 32);
-    let runs = arg("--runs", 3);
-    let voice_patches = arg("--voice-patches", 70);
-    let slots = arg("--slots", 1);
+    let Args {
+        voice_patches,
+        patches,
+        runs,
+        slots,
+    } = argh::from_env();
     let dir = PathBuf::from(std::env::var_os("VOXCPM2_DIR").expect("VOXCPM2_DIR"));
     let voices = PathBuf::from(std::env::var_os("VOICES_DIR").expect("VOICES_DIR"));
     let config = Config::from_json(&std::fs::read_to_string(dir.join("config.json")).unwrap())
