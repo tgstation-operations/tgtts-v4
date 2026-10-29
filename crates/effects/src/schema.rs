@@ -131,7 +131,7 @@ pub enum Node {
         ceiling_db: f64,
     },
     /// A sine waveshaper, as ffmpeg's acontrast: full scale stays at full scale, quiet sounds
-    /// come up by 4 to 6 dB, the more the more `amount`, in [0, 1], and whatever is over full
+    /// come up by 4 to 8 dB, the more the more `amount`, in [0, 1], and whatever is over full
     /// scale folds back down, which is what makes a megaphone crunch.
     Saturate {
         /// How far from a plain sine the curve bends.
@@ -214,8 +214,8 @@ pub enum Node {
     /// cutoff swinging between `center_hz` - `swing_hz` and `center_hz` + `swing_hz`, starting
     /// at the center and going down, `rate_hz` times a second, the sound is lifted by up to 5 dB
     /// below the cutoff, cut by a notch at 1.27 times it, and boosted above that, 12 dB more
-    /// each octave: 23 dB at four times the cutoff. The cutoff moves in steps of a 5.3 ms frame. The
-    /// center is in [20, 20000], the swing in [0, center - 20], the rate in [0.1, 90].
+    /// each octave: 23 dB at four times the cutoff. The cutoff moves in 5.3 ms steps. The center
+    /// is in [20, 20000], the swing in [0, center - 20], the rate in [0.1, 90].
     Wobble {
         /// The cutoff's middle, in Hz.
         center_hz: f64,

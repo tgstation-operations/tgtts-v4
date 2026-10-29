@@ -5,7 +5,7 @@ use std::f64::consts::{PI, TAU};
 use crate::{Processor, RATE};
 
 /// A sine waveshaper, as ffmpeg's acontrast: `sin(pi/2 x + amount * 2/15 * sin(2 pi x))`, which
-/// leaves full scale at full scale, brings quiet sounds up by 4 to 6 dB, more with more of
+/// leaves full scale at full scale, brings quiet sounds up by 4 to 8 dB, more with more of
 /// `amount`, and folds whatever is over full scale back down.
 #[derive(Clone, Debug)]
 pub struct Saturate(f64);

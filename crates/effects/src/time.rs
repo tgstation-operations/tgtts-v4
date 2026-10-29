@@ -38,7 +38,7 @@ pub struct Splice {
     ratio: f64,
     window: Vec<f64>,
     /// The input from `start`, after `SEEK + HOP` zeros put before the stream, so that the first
-    /// frame can be centred on its first sample and moved back.
+    /// frame can be centered on its first sample and moved back.
     input: Vec<f64>,
     start: usize,
     /// The input's length with the zeros, and the stream's.
