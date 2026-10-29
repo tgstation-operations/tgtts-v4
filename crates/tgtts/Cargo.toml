@@ -12,6 +12,7 @@ dsp = { path = "../dsp" }
 effects = { path = "../effects" }
 futures-util.workspace = true
 graph = { path = "../graph" }
+libc.workspace = true
 rand = { workspace = true, features = ["thread_rng"] }
 # The SQLite built in, so the binary needs no library at run time.
 rusqlite = { workspace = true, features = ["bundled"] }

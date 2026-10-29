@@ -33,6 +33,12 @@ struct Args {
 }
 
 fn main() -> ExitCode {
+    // glibc gives each thread that allocates an arena of its own, up to eight a CPU, and returns
+    // an arena's freed memory only from its top: in a 3-hour soak the service's resident set grew
+    // to 808 MiB, most of it fifteen arenas holding freed audio buffers. Two arenas held it flat
+    // at no cost measured. Set before any other thread starts, and over any MALLOC_ARENA_MAX.
+    // SAFETY: mallopt sets one of glibc's allocator parameters, under the allocator's lock.
+    let arenas_capped = unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) } == 1;
     let Args { config: file } = argh::from_env();
     let config = match Config::load(file.as_deref(), |key| env::var(key).ok()) {
         Ok(config) => config,
@@ -46,6 +52,9 @@ fn main() -> ExitCode {
         .with(level)
         .with(tracing_subscriber::fmt::layer())
         .init();
+    if !arenas_capped {
+        warn!("glibc refused to cap its malloc arenas at two");
+    }
     let set_level = move |level: LevelFilter| {
         if let Err(e) = reload.modify(|filter| *filter = config::log_filter(level)) {
             error!("setting the log level: {e}");

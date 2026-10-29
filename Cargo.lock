@@ -1101,6 +1101,7 @@ dependencies = [
  "effects",
  "futures-util",
  "graph",
+ "libc",
  "pkg-config",
  "rand",
  "rusqlite",
