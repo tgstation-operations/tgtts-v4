@@ -7,6 +7,7 @@ use std::{
 };
 
 use ash::vk;
+use tracing::info;
 
 use crate::{
     error::{Error, Result, VkCall},
@@ -15,7 +16,7 @@ use crate::{
     memory::{Buffer, Residence},
     recording::{Dispatch, Recording},
     report::DeviceReport,
-    select::{self, Features, REQUIRED_EXTENSIONS},
+    select::{self, Candidate, Features, REQUIRED_EXTENSIONS},
 };
 
 /// How long a dispatch may take before waiting for it is abandoned as a hung GPU.
@@ -240,6 +241,9 @@ impl Context {
         let mut devices = instance.devices()?;
         let candidates: Vec<_> = devices.iter().map(|(_, r)| r.candidate()).collect();
         let chosen = select::choose(&candidates).map_err(Error::NoDevice)?;
+        for why in candidates.iter().filter_map(Candidate::rejection) {
+            info!("passed over the Vulkan device {why}");
+        }
         let (physical, report) = devices.swap_remove(chosen);
         let queue_family = select::compute_queue_family(&report.queue_families)
             .ok_or_else(|| Error::NoDevice(vec![format!("{}: no compute queue", report.name)]))?;

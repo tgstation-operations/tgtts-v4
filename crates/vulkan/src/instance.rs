@@ -4,14 +4,15 @@ use std::{
 };
 
 use ash::vk;
+use tracing::{error, warn};
 
 use crate::{
     error::{Error, Result, VkCall},
     report::DeviceReport,
 };
 
-/// Set to `1`, attaches `VK_LAYER_KHRONOS_validation` and collects every warning and error it
-/// reports ([`Instance::validation_messages`]). The loader finds the layer through
+/// Set to `1`, attaches `VK_LAYER_KHRONOS_validation`, and logs and collects every warning and
+/// error it reports ([`Instance::validation_messages`]). The loader finds the layer through
 /// `VK_LAYER_PATH`; asking for it when it cannot be found is an error, never a silent run
 /// without it.
 pub const VALIDATION_VAR: &str = "VULKAN_VALIDATION";
@@ -153,8 +154,8 @@ impl Drop for Instance {
     }
 }
 
-/// The validation messenger's callback: appends the message, tagged with its severity, to the
-/// sink `user` points at. Never panics, since it is called from C.
+/// The validation messenger's callback: logs the message, and appends it, tagged with its severity,
+/// to the sink `user` points at. Never panics, since it is called from C.
 unsafe extern "system" fn on_message(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _kind: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -169,8 +170,10 @@ unsafe extern "system" fn on_message(
         .map(|m| m.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tag = if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        error!("the validation layer reported: {text}");
         "error"
     } else {
+        warn!("the validation layer reported: {text}");
         "warning"
     };
     if let Ok(mut messages) = sink.lock() {

@@ -19,6 +19,7 @@
 use std::{mem::ManuallyDrop, sync::Arc};
 
 use ash::vk;
+use tracing::error;
 
 use crate::{
     context::{FENCE_TIMEOUT_NS, Inner, Timing, check_groups, elapsed_ticks, ticks_to_ns},
@@ -761,6 +762,7 @@ impl Drop for Recording {
         let idle = !self.pending
             || unsafe { device.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS) }.is_ok();
         if !idle {
+            error!("dropped a recording whose submission did not finish: leaking its buffers");
             // The GPU may still read and write them: leaking the buffers and the commands is
             // the only safe end, freeing them would hand it memory reused by something else.
             std::mem::forget(std::mem::take(&mut self.buffers));
