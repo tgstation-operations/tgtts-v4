@@ -189,15 +189,15 @@ pub fn sampler_graph(
 
     let half = |n: usize| 2 * n as u64;
     let float = |n: usize| 4 * n as u64;
-    let mu = g.tensor("mu", half(rows * MU_TOKENS * hidden), Kind::Input);
-    let cond = g.tensor("cond", float(rows * len), Kind::Input);
-    let noise = g.tensor("noise", float(rows * len), Kind::Input);
-    let sampling = g.tensor("sampling", float(rows * 2), Kind::Param);
-    let patch = g.tensor("patch", float(rows * len), Kind::Output);
+    let mu = g.untyped("mu", half(rows * MU_TOKENS * hidden), Kind::Input);
+    let cond = g.untyped("cond", float(rows * len), Kind::Input);
+    let noise = g.untyped("noise", float(rows * len), Kind::Input);
+    let sampling = g.untyped("sampling", float(rows * 2), Kind::Param);
+    let patch = g.untyped("patch", float(rows * len), Kind::Output);
     let mut linear = |name: &str, n: usize, k: usize| {
         (
-            g.tensor(format!("{name}.weight"), half(n * k), Kind::Constant),
-            g.tensor(format!("{name}.bias"), half(n), Kind::Constant),
+            g.untyped(format!("{name}.weight"), half(n * k), Kind::Constant),
+            g.untyped(format!("{name}.bias"), half(n), Kind::Constant),
         )
     };
     let in_proj = linear("in_proj", hidden, feat_dim);
@@ -205,9 +205,9 @@ pub fn sampler_graph(
     let out_proj = linear("out_proj", feat_dim, hidden);
     let steps = euler_steps(timesteps);
     let times: Vec<TensorId> = (0..steps.len())
-        .map(|s| g.tensor(format!("time.{s}"), half(hidden), Kind::Constant))
+        .map(|s| g.untyped(format!("time.{s}"), half(hidden), Kind::Constant))
         .collect();
-    let x = g.tensor("dit.x", half(stack.tokens() * hidden), Kind::Intermediate);
+    let x = g.untyped("dit.x", half(stack.tokens() * hidden), Kind::Intermediate);
 
     let each_row = u32::try_from(rows).map_err(|_| Error::Shape(format!("{rows} rows")))?;
     g.op(

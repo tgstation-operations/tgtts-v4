@@ -15,7 +15,7 @@ use vulkan::{
 
 use crate::{
     Error,
-    graph::{ALIGN, Graph, Kind, Plan, TensorId, barriers, plan, plan_programs},
+    graph::{ALIGN, Graph, Holds, Kind, Plan, TensorId, barriers, plan, plan_programs},
     kernels::Kernels,
 };
 
@@ -258,7 +258,8 @@ impl Step {
     /// # Panics
     ///
     /// If they do not fill it.
-    pub fn write<E: Element>(&mut self, t: TensorId, values: &[E]) -> Result<(), Error> {
+    pub fn write<E: Element>(&mut self, t: impl Holds<E>, values: &[E]) -> Result<(), Error> {
+        let t = t.id();
         let len = self.tensors[t.0].0;
         assert_eq!(
             size_of_val(values) as u64,
@@ -271,7 +272,8 @@ impl Step {
     }
 
     /// Tensor `t`'s contents.
-    pub fn read<E: Element>(&self, t: TensorId) -> Result<Vec<E>, Error> {
+    pub fn read<E: Element>(&self, t: impl Holds<E>) -> Result<Vec<E>, Error> {
+        let t = t.id();
         let (buffer, at) = self.element_place::<E>(t);
         let count = (self.tensors[t.0].0 / E::TYPE.bytes()) as usize;
         Ok(self.recording.buffer::<E>(buffer).read_at(at, count)?)

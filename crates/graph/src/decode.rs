@@ -616,11 +616,11 @@ pub fn decode_batch_graph(
     let mut g = Graph::default();
     let half = 2u64;
     let vector = |n: usize| (rows * n) as u64 * half;
-    let x = g.tensor("x", vector(s.hidden), Kind::Input);
-    let position = g.tensor("position", 4 * batch.words() as u64, Kind::Param);
+    let x = g.untyped("x", vector(s.hidden), Kind::Input);
+    let position = g.untyped("position", 4 * batch.words() as u64, Kind::Param);
     let table = (s.capacity * s.head_dim / 2 * 4) as u64;
-    let cos = g.tensor("rope.cos", table, Kind::Constant);
-    let sin = g.tensor("rope.sin", table, Kind::Constant);
+    let cos = g.untyped("rope.cos", table, Kind::Constant);
+    let sin = g.untyped("rope.sin", table, Kind::Constant);
     let chunks = s.capacity / CHUNK;
     let weight = |n: usize| n as u64 * half;
     let cache = weight(slots * s.kv_heads * s.capacity * s.head_dim);
@@ -630,54 +630,54 @@ pub fn decode_batch_graph(
     for l in 0..s.layers {
         let name = |what: &str| format!("layers.{l}.{what}");
         let t = LayerTensors {
-            input_norm: g.tensor(name("input_layernorm"), weight(s.hidden), Kind::Constant),
-            qkv: g.tensor(
+            input_norm: g.untyped(name("input_layernorm"), weight(s.hidden), Kind::Constant),
+            qkv: g.untyped(
                 name("qkv_proj"),
                 weight(qkv_rows * s.hidden),
                 Kind::Constant,
             ),
-            o: g.tensor(
+            o: g.untyped(
                 name("o_proj"),
                 weight(s.hidden * s.heads * s.head_dim),
                 Kind::Constant,
             ),
-            post_norm: g.tensor(
+            post_norm: g.untyped(
                 name("post_attention_layernorm"),
                 weight(s.hidden),
                 Kind::Constant,
             ),
-            gate_up: g.tensor(
+            gate_up: g.untyped(
                 name("gate_up_proj"),
                 weight(2 * s.inner * s.hidden),
                 Kind::Constant,
             ),
-            down: g.tensor(
+            down: g.untyped(
                 name("down_proj"),
                 weight(s.hidden * s.inner),
                 Kind::Constant,
             ),
-            k_cache: g.tensor(name("k_cache"), cache, Kind::State),
-            v_cache: g.tensor(name("v_cache"), cache, Kind::State),
+            k_cache: g.untyped(name("k_cache"), cache, Kind::State),
+            v_cache: g.untyped(name("v_cache"), cache, Kind::State),
         };
-        let q = g.tensor(name("q"), vector(s.heads * s.head_dim), Kind::Intermediate);
-        let partial_o = g.tensor(
+        let q = g.untyped(name("q"), vector(s.heads * s.head_dim), Kind::Intermediate);
+        let partial_o = g.untyped(
             name("partial_o"),
             (rows * s.heads * chunks * s.head_dim * 4) as u64,
             Kind::Intermediate,
         );
-        let partial_ml = g.tensor(
+        let partial_ml = g.untyped(
             name("partial_ml"),
             (rows * s.heads * chunks * 8) as u64,
             Kind::Intermediate,
         );
-        let attended = g.tensor(
+        let attended = g.untyped(
             name("attended"),
             vector(s.heads * s.head_dim),
             Kind::Intermediate,
         );
-        let mid = g.tensor(name("mid"), vector(s.hidden), Kind::Intermediate);
-        let mlp = g.tensor(name("mlp"), vector(s.inner), Kind::Intermediate);
-        let output = g.tensor(name("out"), vector(s.hidden), Kind::Intermediate);
+        let mid = g.untyped(name("mid"), vector(s.hidden), Kind::Intermediate);
+        let mlp = g.untyped(name("mlp"), vector(s.inner), Kind::Intermediate);
+        let output = g.untyped(name("out"), vector(s.hidden), Kind::Intermediate);
         g.op(
             "qkv_rope",
             qkv_pipeline.clone(),
@@ -727,8 +727,8 @@ pub fn decode_batch_graph(
         layers.push(t);
         input = output;
     }
-    let norm = g.tensor("norm", weight(s.hidden), Kind::Constant);
-    let out = g.tensor("out", vector(s.hidden), Kind::Output);
+    let norm = g.untyped("norm", weight(s.hidden), Kind::Constant);
+    let out = g.untyped("out", vector(s.hidden), Kind::Output);
     g.op(
         "final_norm",
         norm_pipeline,

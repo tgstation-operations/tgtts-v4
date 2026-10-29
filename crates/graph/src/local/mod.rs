@@ -13,7 +13,6 @@
 pub mod dit;
 pub mod encoder;
 
-use Access::{Read, Write};
 use serde::Deserialize;
 use vulkan::{DeviceReport, F16, SpecValue};
 
@@ -22,69 +21,95 @@ use crate::{
     checkpoint::Checkpoint,
     decode::{LmConfig, SUBGROUPS, Shape},
     graph::{Graph, Kind, Pipeline, TensorId},
-    kernels::{Access, KernelInfo},
+    kernels::{KernelInfo, read, write},
     step::Step,
 };
 
 /// `local_norm.comp`: x, gain -> out.
 pub static LOCAL_NORM: KernelInfo = KernelInfo {
     name: "local_norm",
-    access: &[Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `local_qkv_rope.comp`: x, W, cos, sin -> q, k, v.
 pub static LOCAL_QKV_ROPE: KernelInfo = KernelInfo {
     name: "local_qkv_rope",
-    access: &[Read, Read, Read, Read, Write, Write, Write],
+    bindings: &[
+        read::<F16>(),
+        read::<F16>(),
+        read::<f32>(),
+        read::<f32>(),
+        write::<F16>(),
+        write::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `local_attention.comp`: q, k, v -> out.
 pub static LOCAL_ATTENTION: KernelInfo = KernelInfo {
     name: "local_attention",
-    access: &[Read, Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `local_partial.comp`: x, W -> partial products over parts of the columns.
 pub static LOCAL_PARTIAL: KernelInfo = KernelInfo {
     name: "local_partial",
-    access: &[Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), write::<f32>()],
 };
 
 /// `local_add_norm.comp`: partial products, residual, gain -> sum, normed.
 pub static LOCAL_ADD_NORM: KernelInfo = KernelInfo {
     name: "local_add_norm",
-    access: &[Read, Read, Read, Write, Write],
+    bindings: &[
+        read::<f32>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `local_gate_up.comp`: x, W -> out.
 pub static LOCAL_GATE_UP: KernelInfo = KernelInfo {
     name: "local_gate_up",
-    access: &[Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `local_rows.comp`: x -> every few of its rows.
 pub static LOCAL_ROWS: KernelInfo = KernelInfo {
     name: "local_rows",
-    access: &[Read, Write],
+    bindings: &[read::<F16>(), write::<F16>()],
 };
 
 /// `local_embed.comp`: frames, W, bias, tokens -> some of a stack's input tokens.
 pub static LOCAL_EMBED: KernelInfo = KernelInfo {
     name: "local_embed",
-    access: &[Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<f32>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `cfm_noise.comp`: noise, sampling -> x.
 pub static CFM_NOISE: KernelInfo = KernelInfo {
     name: "cfm_noise",
-    access: &[Read, Read, Write],
+    bindings: &[read::<f32>(), read::<f32>(), write::<f32>()],
 };
 
 /// `dit_euler.comp`: hidden states after the final norm, out_proj, bias, sampling -> x, which it
 /// also reads.
 pub static DIT_EULER: KernelInfo = KernelInfo {
     name: "dit_euler",
-    access: &[Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<f32>(),
+        write::<f32>(),
+    ],
 };
 
 /// The tokens gemm.glsl's clusters take a row at a time, fixed in the kernels.
@@ -507,13 +532,13 @@ impl Stack {
 
         let vector = |n: usize| 2 * n as u64;
         let table = (s.capacity * s.head_dim / 2 * 4) as u64;
-        let cos = g.tensor(format!("{name}.rope.cos"), table, Kind::Constant);
-        let sin = g.tensor(format!("{name}.rope.sin"), table, Kind::Constant);
+        let cos = g.untyped(format!("{name}.rope.cos"), table, Kind::Constant);
+        let sin = g.untyped(format!("{name}.rope.sin"), table, Kind::Constant);
         let qkv_rows = heads * s.head_dim;
         let layers = (0..s.layers)
             .map(|l| {
                 let mut weight = |what: &str, n: usize| {
-                    g.tensor(
+                    g.untyped(
                         format!("{name}.layers.{l}.{what}"),
                         vector(n),
                         Kind::Constant,
@@ -529,7 +554,7 @@ impl Stack {
                 }
             })
             .collect();
-        let norm = g.tensor(format!("{name}.norm"), vector(s.hidden), Kind::Constant);
+        let norm = g.untyped(format!("{name}.norm"), vector(s.hidden), Kind::Constant);
         Ok(Stack {
             shape: shape.clone(),
             seqs,
@@ -555,7 +580,7 @@ impl Stack {
         let p = &self.pipelines;
         let label = |l: usize, what: &str| format!("{name}.layers.{l}.{what}");
         let intermediate = |g: &mut Graph, l: usize, what: &str, bytes: usize| {
-            g.tensor(label(l, what), bytes as u64, Kind::Intermediate)
+            g.untyped(label(l, what), bytes as u64, Kind::Intermediate)
         };
         let half = |n: usize| 2 * m * n;
         let partials = |parts: usize| 4 * parts * self.padded * s.hidden;

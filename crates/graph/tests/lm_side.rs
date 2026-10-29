@@ -524,7 +524,7 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
         let mut tensors =
             lm_side_batch_graph(&shape, &base, batch).unwrap_or_else(|e| panic!("{e}"));
         let bytes = tensors.graph.tensors[tensors.position.0].bytes;
-        let wrong = tensors.graph.tensor("wrong_position", bytes, Kind::Param);
+        let wrong = tensors.graph.untyped("wrong_position", bytes, Kind::Param);
         for op in &mut tensors.graph.ops {
             if op.label.ends_with("attention_split") {
                 op.bindings[3] = wrong;

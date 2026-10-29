@@ -322,7 +322,7 @@ fn rows_sample_bit_for_bit_as_they_do_alone() {
         // while their keys and values go to their own. Only those two may come out otherwise.
         let mut crossed = model.graph(subgroup, 16, SLOTS);
         let bytes = crossed.graph.tensors[crossed.position.0].bytes;
-        let wrong = crossed.graph.tensor("wrong_position", bytes, Kind::Param);
+        let wrong = crossed.graph.untyped("wrong_position", bytes, Kind::Param);
         for op in &mut crossed.graph.ops {
             if op.label.ends_with("attention_split") {
                 op.bindings[3] = wrong;

@@ -1,15 +1,122 @@
 //! A step as data: the tensors it touches, the dispatches over them in order, where each
 //! tensor lives, and where a barrier must go. Nothing here touches a GPU.
+//!
+//! A tensor holds elements of one type in a shape, its bytes theirs, and the host names it by a
+//! [`Tensor`] of that type. A tensor is not a byte count:
+//!
+//! ```compile_fail,E0308
+//! use graph::graph::{Graph, Kind};
+//! let mut g = Graph::default();
+//! let x = g.tensor::<vulkan::F16>("x", 4096u64, Kind::Input);
+//! ```
 
-use std::ops::Range;
+use std::{fmt, marker::PhantomData, ops::Range};
 
-use vulkan::{Residence, SpecValue};
+use vulkan::{Element, ElementType, Residence, SpecValue};
 
 use crate::kernels::{Access, KernelInfo};
 
-/// A tensor of a [`Graph`], by its index.
+/// A tensor of a [`Graph`], by its index, whatever it holds: as the planner and an op's bindings
+/// take it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TensorId(pub usize);
+
+/// A tensor of a [`Graph`] that holds elements of `E`: what the host writes and reads it as.
+pub struct Tensor<E> {
+    id: TensorId,
+    element: PhantomData<fn() -> E>,
+}
+
+impl<E> Tensor<E> {
+    pub fn id(self) -> TensorId {
+        self.id
+    }
+}
+
+impl<E> Clone for Tensor<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E> Copy for Tensor<E> {}
+
+impl<E> PartialEq for Tensor<E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl<E> Eq for Tensor<E> {}
+
+impl<E: Element> fmt::Debug for Tensor<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Tensor<{}>({})", E::TYPE, self.id.0)
+    }
+}
+
+/// A tensor an op binds: by its id, or by the handle of what it holds.
+pub trait Bound {
+    fn id(&self) -> TensorId;
+}
+
+impl Bound for TensorId {
+    fn id(&self) -> TensorId {
+        *self
+    }
+}
+
+impl<E> Bound for Tensor<E> {
+    fn id(&self) -> TensorId {
+        self.id
+    }
+}
+
+/// A name for a tensor of elements of `E`: its handle, or its id, which no element type is checked
+/// against.
+pub trait Holds<E>: Bound {}
+
+impl<E> Holds<E> for Tensor<E> {}
+
+impl<E> Holds<E> for TensorId {}
+
+/// The tensors an op binds, one per binding of its kernel in order: a tuple of them, or a slice
+/// or array of one kind.
+pub trait Bindings {
+    fn ids(&self) -> Vec<TensorId>;
+}
+
+impl<B: Bound> Bindings for &[B] {
+    fn ids(&self) -> Vec<TensorId> {
+        self.iter().map(Bound::id).collect()
+    }
+}
+
+impl<B: Bound, const N: usize> Bindings for &[B; N] {
+    fn ids(&self) -> Vec<TensorId> {
+        self.iter().map(Bound::id).collect()
+    }
+}
+
+macro_rules! tuple_bindings {
+    ($($t:ident $v:ident),+) => {
+        impl<$($t: Bound),+> Bindings for ($($t,)+) {
+            fn ids(&self) -> Vec<TensorId> {
+                let ($($v,)+) = self;
+                vec![$($v.id()),+]
+            }
+        }
+    };
+}
+
+tuple_bindings!(A a, B b);
+tuple_bindings!(A a, B b, C c);
+tuple_bindings!(A a, B b, C c, D d);
+tuple_bindings!(A a, B b, C c, D d, E e);
+tuple_bindings!(A a, B b, C c, D d, E e, F f);
+tuple_bindings!(A a, B b, C c, D d, E e, F f, G g);
+tuple_bindings!(A a, B b, C c, D d, E e, F f, G g, H h);
+tuple_bindings!(A a, B b, C c, D d, E e, F f, G g, H h, I i);
 
 /// What a tensor holds, which decides where it lives and for how long.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,11 +153,38 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Tensor {
+/// What a graph holds of one of its tensors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TensorInfo {
     pub name: String,
     pub bytes: u64,
+    /// What it holds, and its extents; none for a tensor added by its bytes alone
+    /// ([`Graph::untyped`]).
+    pub element: Option<(ElementType, Vec<usize>)>,
     pub kind: Kind,
+}
+
+impl TensorInfo {
+    /// Its extents.
+    ///
+    /// # Panics
+    ///
+    /// If it was added by its bytes alone.
+    pub fn shape(&self) -> &[usize] {
+        match &self.element {
+            Some((_, shape)) => shape,
+            None => panic!("{} was added by its bytes alone", self.name),
+        }
+    }
+
+    /// The elements it holds.
+    pub fn len(&self) -> usize {
+        self.shape().iter().product()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A pipeline: a kernel at a choice of specialization constants and subgroup size.
@@ -88,15 +222,37 @@ pub struct Op {
 /// The dispatches of a step at fixed shapes, in the order they run.
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
-    pub tensors: Vec<Tensor>,
+    pub tensors: Vec<TensorInfo>,
     pub ops: Vec<Op>,
 }
 
 impl Graph {
-    pub fn tensor(&mut self, name: impl Into<String>, bytes: u64, kind: Kind) -> TensorId {
-        self.tensors.push(Tensor {
+    /// Adds a tensor of `shape` elements of `E`, named `name`, to live as `kind` says.
+    pub fn tensor<E: Element>(
+        &mut self,
+        name: impl Into<String>,
+        shape: &[usize],
+        kind: Kind,
+    ) -> Tensor<E> {
+        let elements: usize = shape.iter().product();
+        self.tensors.push(TensorInfo {
+            name: name.into(),
+            bytes: elements as u64 * E::TYPE.bytes(),
+            element: Some((E::TYPE, shape.to_vec())),
+            kind,
+        });
+        Tensor {
+            id: TensorId(self.tensors.len() - 1),
+            element: PhantomData,
+        }
+    }
+
+    /// Adds a tensor of `bytes` bytes, whose element type no op checks.
+    pub fn untyped(&mut self, name: impl Into<String>, bytes: u64, kind: Kind) -> TensorId {
+        self.tensors.push(TensorInfo {
             name: name.into(),
             bytes,
+            element: None,
             kind,
         });
         TensorId(self.tensors.len() - 1)
@@ -106,29 +262,42 @@ impl Graph {
     ///
     /// # Panics
     ///
-    /// If the bindings do not match the kernel's, or name a tensor this graph does not have.
+    /// If the bindings do not match the kernel's in number or in element type, or name a tensor
+    /// this graph does not have.
     pub fn op(
         &mut self,
         label: impl Into<String>,
         pipeline: Pipeline,
-        bindings: &[TensorId],
+        bindings: impl Bindings,
         groups: [u32; 3],
     ) {
         let label = label.into();
+        let bindings = bindings.ids();
+        let kernel = pipeline.kernel;
         assert_eq!(
             bindings.len(),
-            pipeline.kernel.access.len(),
+            kernel.bindings.len(),
             "{label}: {} bindings for {}",
             bindings.len(),
-            pipeline.kernel.name
+            kernel.name
         );
-        for t in bindings {
-            assert!(t.0 < self.tensors.len(), "{label}: no tensor {}", t.0);
+        for (i, (t, binding)) in bindings.iter().zip(kernel.bindings).enumerate() {
+            let tensor = self.tensors.get(t.0);
+            let tensor = tensor.unwrap_or_else(|| panic!("{label}: no tensor {}", t.0));
+            if let Some((element, _)) = &tensor.element {
+                assert!(
+                    *element == binding.element,
+                    "{label}: {}, bound as binding {i} of {}, holds {element}, not {}",
+                    tensor.name,
+                    kernel.name,
+                    binding.element
+                );
+            }
         }
         self.ops.push(Op {
             label,
             pipeline,
-            bindings: bindings.to_vec(),
+            bindings,
             groups,
         });
     }
@@ -136,10 +305,8 @@ impl Graph {
     /// The tensors op `i` reads and those it writes.
     fn accesses(&self, i: usize) -> impl Iterator<Item = (TensorId, Access)> + '_ {
         let op = &self.ops[i];
-        op.bindings
-            .iter()
-            .copied()
-            .zip(op.pipeline.kernel.access.iter().copied())
+        let access = op.pipeline.kernel.bindings.iter().map(|b| b.access);
+        op.bindings.iter().copied().zip(access)
     }
 
     /// The ops each arena tensor is live across, first to last inclusive. None for a tensor
@@ -280,15 +447,18 @@ pub fn barriers(graph: &Graph, plan: &Plan) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
+    use vulkan::F16;
+
     use super::*;
+    use crate::kernels::{read, write};
 
     static COPY: KernelInfo = KernelInfo {
         name: "copy",
-        access: &[Access::Read, Access::Write],
+        bindings: &[read::<F16>(), write::<F16>()],
     };
     static ADD: KernelInfo = KernelInfo {
         name: "add",
-        access: &[Access::Read, Access::Read, Access::Write],
+        bindings: &[read::<F16>(), read::<F16>(), write::<F16>()],
     };
 
     fn pipeline(kernel: &'static KernelInfo) -> Pipeline {
@@ -302,11 +472,11 @@ mod tests {
     /// x -> a -> b -> c -> out, each link a copy: a and c never live together.
     fn chain() -> (Graph, [TensorId; 5]) {
         let mut g = Graph::default();
-        let x = g.tensor("x", 1000, Kind::Input);
-        let a = g.tensor("a", 1000, Kind::Intermediate);
-        let b = g.tensor("b", 1000, Kind::Intermediate);
-        let c = g.tensor("c", 1000, Kind::Intermediate);
-        let out = g.tensor("out", 1000, Kind::Output);
+        let x = g.tensor::<F16>("x", &[500], Kind::Input).id();
+        let a = g.tensor::<F16>("a", &[500], Kind::Intermediate).id();
+        let b = g.tensor::<F16>("b", &[500], Kind::Intermediate).id();
+        let c = g.tensor::<F16>("c", &[500], Kind::Intermediate).id();
+        let out = g.tensor::<F16>("out", &[500], Kind::Output).id();
         for (from, to) in [(x, a), (a, b), (b, c), (c, out)] {
             g.op("copy", pipeline(&COPY), &[from, to], [1, 1, 1]);
         }
@@ -342,13 +512,13 @@ mod tests {
     #[test]
     fn what_the_host_reaches_and_what_outlives_a_step_have_buffers_of_their_own() {
         let mut g = Graph::default();
-        let x = g.tensor("x", 64, Kind::Input);
-        let y = g.tensor("y", 64, Kind::Intermediate);
-        let z = g.tensor("z", 64, Kind::Intermediate);
-        let out = g.tensor("out", 64, Kind::Output);
-        let w = g.tensor("w", 64, Kind::Constant);
-        let cache = g.tensor("cache", 64, Kind::State);
-        let position = g.tensor("position", 4, Kind::Param);
+        let x = g.tensor::<F16>("x", &[32], Kind::Input).id();
+        let y = g.tensor::<F16>("y", &[32], Kind::Intermediate).id();
+        let z = g.tensor::<F16>("z", &[32], Kind::Intermediate).id();
+        let out = g.tensor::<F16>("out", &[32], Kind::Output).id();
+        let w = g.tensor::<F16>("w", &[32], Kind::Constant).id();
+        let cache = g.tensor::<F16>("cache", &[32], Kind::State).id();
+        let position = g.tensor::<F16>("position", &[2], Kind::Param).id();
         g.op("a", pipeline(&ADD), &[w, position, y], [1, 1, 1]);
         g.op("b", pipeline(&ADD), &[x, y, out], [1, 1, 1]);
         g.op("c", pipeline(&ADD), &[w, cache, z], [1, 1, 1]);
@@ -375,11 +545,11 @@ mod tests {
         // P: x -> a -> b -> out, and Q: x -> c -> b -> out, over the same tensors: a meets b in
         // P and c meets b in Q, but a and c never meet. b, the largest, is placed first.
         let mut p = Graph::default();
-        let x = p.tensor("x", 1000, Kind::Input);
-        let a = p.tensor("a", 1000, Kind::Intermediate);
-        let b = p.tensor("b", 2000, Kind::Intermediate);
-        let c = p.tensor("c", 1000, Kind::Intermediate);
-        let out = p.tensor("out", 2000, Kind::Output);
+        let x = p.tensor::<F16>("x", &[500], Kind::Input).id();
+        let a = p.tensor::<F16>("a", &[500], Kind::Intermediate).id();
+        let b = p.tensor::<F16>("b", &[1000], Kind::Intermediate).id();
+        let c = p.tensor::<F16>("c", &[500], Kind::Intermediate).id();
+        let out = p.tensor::<F16>("out", &[1000], Kind::Output).id();
         let mut q = p.clone();
         for (from, to) in [(x, a), (a, b), (b, out)] {
             p.op("copy", pipeline(&COPY), &[from, to], [1, 1, 1]);
@@ -399,6 +569,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "copy: floats, bound as binding 1 of copy, holds f32, not f16")]
+    fn an_op_refuses_a_tensor_of_another_element_type_than_its_kernel_binds() {
+        let mut g = Graph::default();
+        let x = g.tensor::<F16>("x", &[32], Kind::Input);
+        let out = g.tensor::<F16>("out", &[32], Kind::Output);
+        let floats = g.tensor::<f32>("floats", &[32], Kind::Output);
+        g.op("ok", pipeline(&COPY), (x, out), [1, 1, 1]);
+        g.op("copy", pipeline(&COPY), (x, floats), [1, 1, 1]);
+    }
+
+    #[test]
     fn a_barrier_goes_before_each_op_that_reads_or_overwrites_what_came_before() {
         let (g, _) = chain();
         let plan = plan(&g);
@@ -408,10 +589,10 @@ mod tests {
     #[test]
     fn independent_ops_share_no_barrier() {
         let mut g = Graph::default();
-        let x = g.tensor("x", 64, Kind::Input);
-        let a = g.tensor("a", 64, Kind::Output);
-        let b = g.tensor("b", 64, Kind::Output);
-        let c = g.tensor("c", 64, Kind::Output);
+        let x = g.tensor::<F16>("x", &[32], Kind::Input).id();
+        let a = g.tensor::<F16>("a", &[32], Kind::Output).id();
+        let b = g.tensor::<F16>("b", &[32], Kind::Output).id();
+        let c = g.tensor::<F16>("c", &[32], Kind::Output).id();
         g.op("a", pipeline(&COPY), &[x, a], [1, 1, 1]);
         g.op("b", pipeline(&COPY), &[x, b], [1, 1, 1]);
         g.op("c", pipeline(&ADD), &[a, b, c], [1, 1, 1]);
@@ -424,11 +605,11 @@ mod tests {
         // a is read by the second op; c, written by the third, may take a's bytes only once
         // that read is done.
         let mut g = Graph::default();
-        let x = g.tensor("x", 256, Kind::Input);
-        let a = g.tensor("a", 256, Kind::Intermediate);
-        let b = g.tensor("b", 256, Kind::Output);
-        let w = g.tensor("w", 256, Kind::Constant);
-        let c = g.tensor("c", 256, Kind::Intermediate);
+        let x = g.tensor::<F16>("x", &[128], Kind::Input).id();
+        let a = g.tensor::<F16>("a", &[128], Kind::Intermediate).id();
+        let b = g.tensor::<F16>("b", &[128], Kind::Output).id();
+        let w = g.tensor::<F16>("w", &[128], Kind::Constant).id();
+        let c = g.tensor::<F16>("c", &[128], Kind::Intermediate).id();
         g.op("a", pipeline(&COPY), &[x, a], [1, 1, 1]);
         g.op("b", pipeline(&COPY), &[a, b], [1, 1, 1]);
         g.op("c", pipeline(&COPY), &[w, c], [1, 1, 1]);

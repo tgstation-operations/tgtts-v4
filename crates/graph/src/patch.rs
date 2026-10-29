@@ -110,22 +110,22 @@ pub fn patch_batch_graph(
     let sampler = sampler_graph(config, timesteps, batch.rows, local)?;
     let mut g = Graph::default();
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
-    let cond = g.tensor("cond", bytes(&sampler.graph, sampler.cond), Kind::Input);
-    let position = g.tensor("position", bytes(&side.graph, side.position), Kind::Param);
-    let noise = g.tensor("noise", bytes(&sampler.graph, sampler.noise), Kind::Input);
-    let sampling = g.tensor(
+    let cond = g.untyped("cond", bytes(&sampler.graph, sampler.cond), Kind::Input);
+    let position = g.untyped("position", bytes(&side.graph, side.position), Kind::Param);
+    let noise = g.untyped("noise", bytes(&sampler.graph, sampler.noise), Kind::Input);
+    let sampling = g.untyped(
         "sampling",
         bytes(&sampler.graph, sampler.sampling),
         Kind::Param,
     );
-    let patch = g.tensor("patch", bytes(&sampler.graph, sampler.patch), Kind::Output);
-    let stop_logits = g.tensor(
+    let patch = g.untyped("patch", bytes(&sampler.graph, sampler.patch), Kind::Output);
+    let stop_logits = g.untyped(
         "stop_logits",
         bytes(&side.graph, side.stop_logits),
         Kind::Output,
     );
-    let enc = g.tensor("enc", bytes(&side.graph, side.enc), Kind::Intermediate);
-    let mu = g.tensor("mu", bytes(&side.graph, side.mu), Kind::Intermediate);
+    let enc = g.untyped("enc", bytes(&side.graph, side.enc), Kind::Intermediate);
+    let mu = g.untyped("mu", bytes(&side.graph, side.mu), Kind::Intermediate);
     let encoder_ids = splice(
         &mut g,
         &encoder.graph,
@@ -548,10 +548,10 @@ pub(crate) mod tests {
     fn uses(g: &Graph, t: TensorId) -> Vec<(usize, bool)> {
         let mut uses = Vec::new();
         for (i, op) in g.ops.iter().enumerate() {
-            let access = op.pipeline.kernel.access.iter();
+            let access = op.pipeline.kernel.bindings.iter().map(|b| b.access);
             for (&bound, access) in op.bindings.iter().zip(access) {
                 if bound == t {
-                    uses.push((i, *access == crate::kernels::Access::Write));
+                    uses.push((i, access == crate::kernels::Access::Write));
                 }
             }
         }

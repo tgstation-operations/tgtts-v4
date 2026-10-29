@@ -88,22 +88,22 @@ pub fn encoder_graph(
     let first = pipeline(&LOCAL_ROWS, &[(2, u(hidden)), (3, u(tokens))]);
 
     let half = |n: usize| 2 * n as u64;
-    let patch = g.tensor(
+    let patch = g.untyped(
         "patch",
         4 * (rows * feat_dim * patch_size) as u64,
         Kind::Input,
     );
-    let special = g.tensor("special_token", half(hidden), Kind::Constant);
+    let special = g.untyped("special_token", half(hidden), Kind::Constant);
     let in_proj = (
-        g.tensor("in_proj.weight", half(hidden * feat_dim), Kind::Constant),
-        g.tensor("in_proj.bias", half(hidden), Kind::Constant),
+        g.untyped("in_proj.weight", half(hidden * feat_dim), Kind::Constant),
+        g.untyped("in_proj.bias", half(hidden), Kind::Constant),
     );
-    let x = g.tensor(
+    let x = g.untyped(
         "encoder.x",
         half(rows * tokens * hidden),
         Kind::Intermediate,
     );
-    let out = g.tensor("out", half(rows * hidden), Kind::Output);
+    let out = g.untyped("out", half(rows * hidden), Kind::Output);
     let each_row = u32::try_from(rows).map_err(|_| Error::Shape(format!("{rows} rows")))?;
     g.op(
         "in_proj",

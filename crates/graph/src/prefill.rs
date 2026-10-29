@@ -16,7 +16,7 @@ use crate::{
     Error,
     decode::{DecodeGraph, Decoder, LayerTensors, SUBGROUPS, Shape, Tuning},
     graph::{Graph, Kind, Pipeline, TensorId},
-    kernels::{Access, KernelInfo, Kernels},
+    kernels::{KernelInfo, Kernels, read, write},
     step::Program,
 };
 
@@ -29,36 +29,55 @@ pub const MAX_ROWS: usize = 1024;
 /// The width of the GLSL kernels' workgroups.
 const WORKGROUP: u32 = 256;
 
-use Access::{Read, Write};
-
 /// `norm_rows.comp`: run, x, gain -> out.
 pub static NORM_ROWS: KernelInfo = KernelInfo {
     name: "norm_rows",
-    access: &[Read, Read, Read, Write],
+    bindings: &[read::<u32>(), read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `add_norm_rows.comp`: run, c, residual, gain -> sum, normed.
 pub static ADD_NORM_ROWS: KernelInfo = KernelInfo {
     name: "add_norm_rows",
-    access: &[Read, Read, Read, Read, Write, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<f32>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `rope_rows.comp`: run, c, cos, sin -> q, k cache, v cache.
 pub static ROPE_ROWS: KernelInfo = KernelInfo {
     name: "rope_rows",
-    access: &[Read, Read, Read, Read, Write, Write, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        write::<F16>(),
+        write::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `attention_rows.comp`: run, q, k cache, v cache -> out.
 pub static ATTENTION_ROWS: KernelInfo = KernelInfo {
     name: "attention_rows",
-    access: &[Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `silu_mul_rows.comp`: run, c -> out.
 pub static SILU_MUL_ROWS: KernelInfo = KernelInfo {
     name: "silu_mul_rows",
-    access: &[Read, Read, Write],
+    bindings: &[read::<u32>(), read::<f32>(), write::<F16>()],
 };
 
 /// The query positions attention_rows takes per workgroup: four invocations to each of the
@@ -71,7 +90,7 @@ macro_rules! gemm {
     ($m:literal, $n:literal, $k:literal, $subgroup:literal) => {
         KernelInfo {
             name: concat!("gemm_f32acc_", $m, "x", $n, "x", $k, "_sg", $subgroup),
-            access: &[Read, Read, Write],
+            bindings: &[read::<F16>(), read::<F16>(), write::<f32>()],
         }
     };
 }
@@ -170,9 +189,9 @@ pub fn prefill_graph(
     let mut g = decode.graph.clone();
     g.ops.clear();
     let half = (max_rows * decode.shape.hidden * 2) as u64;
-    let run = g.tensor("prefill.run", 12, Kind::Param);
-    let x = g.tensor("prefill.x", half, Kind::Input);
-    let out = g.tensor("prefill.out", half, Kind::Output);
+    let run = g.untyped("prefill.run", 12, Kind::Param);
+    let x = g.untyped("prefill.x", half, Kind::Input);
+    let out = g.untyped("prefill.out", half, Kind::Output);
     let stack = StackTensors::from(decode);
     append_prefill(
         &mut g,
@@ -298,7 +317,7 @@ pub fn append_prefill(
     }
     let row_groups = [rows as u32, 1, 1];
     let mut input = x;
-    let mut normed = g.tensor(
+    let mut normed = g.untyped(
         format!("{name}.layers.0.normed"),
         half(s.hidden),
         Kind::Intermediate,
@@ -311,7 +330,7 @@ pub fn append_prefill(
     );
     for (l, w) in stack.layers.iter().enumerate() {
         let mut t = |what: &str, bytes| {
-            g.tensor(
+            g.untyped(
                 format!("{name}.layers.{l}.{what}"),
                 bytes,
                 Kind::Intermediate,
@@ -329,7 +348,7 @@ pub fn append_prefill(
         let output = t("out", half(s.hidden));
         let (next_normed, gain) = match stack.layers.get(l + 1) {
             Some(next) => (
-                g.tensor(
+                g.untyped(
                     format!("{name}.layers.{}.normed", l + 1),
                     half(s.hidden),
                     Kind::Intermediate,

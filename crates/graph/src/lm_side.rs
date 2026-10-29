@@ -20,10 +20,7 @@ use crate::{
         load_stack,
     },
     graph::{Graph, Kind, Pipeline, TensorId},
-    kernels::{
-        Access::{Read, Write},
-        KernelInfo, Kernels,
-    },
+    kernels::{KernelInfo, Kernels, read, write},
     local::identity,
     step::Step,
 };
@@ -31,7 +28,13 @@ use crate::{
 /// `gemv_linear.comp`: x0, x1, W, bias -> out.
 pub static GEMV_LINEAR: KernelInfo = KernelInfo {
     name: "gemv_linear",
-    access: &[Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// What the LM side reads of VoxCPM2's `config.json`; the rest is ignored.
@@ -184,14 +187,14 @@ pub fn splice(
                     assert_eq!(bytes, t.bytes, "{prefix}{} as {bytes} bytes", t.name);
                     ours
                 }
-                None => g.tensor(format!("{prefix}{}", t.name), t.bytes, t.kind),
+                None => g.untyped(format!("{prefix}{}", t.name), t.bytes, t.kind),
             },
         )
         .collect();
     for op in &from.ops {
         let bindings: Vec<TensorId> = op.bindings.iter().map(|t| ids[t.0]).collect();
         let label = format!("{prefix}{}", op.label);
-        g.op(label, op.pipeline.clone(), &bindings, op.groups);
+        g.op(label, op.pipeline.clone(), bindings.as_slice(), op.groups);
     }
     ids
 }
@@ -329,20 +332,20 @@ pub fn lm_side_batch_graph(
     let rows = batch.rows;
     let vector = |n: usize| (rows * n) as u64 * 2;
     let weight = |n: usize| n as u64 * 2;
-    let enc = g.tensor("enc", vector(s.encoder), Kind::Input);
-    let position = g.tensor("position", 4 * batch.words() as u64, Kind::Param);
+    let enc = g.untyped("enc", vector(s.encoder), Kind::Input);
+    let position = g.untyped("position", 4 * batch.words() as u64, Kind::Param);
     let table = base.graph.tensors[base.cos.0].bytes;
-    let cos = g.tensor("rope.cos", table, Kind::Constant);
-    let sin = g.tensor("rope.sin", table, Kind::Constant);
-    let mu = g.tensor("mu", vector(2 * s.dit), Kind::Output);
-    let stop_logits = g.tensor("stop_logits", vector(2), Kind::Output);
+    let cos = g.untyped("rope.cos", table, Kind::Constant);
+    let sin = g.untyped("rope.sin", table, Kind::Constant);
+    let mu = g.untyped("mu", vector(2 * s.dit), Kind::Output);
+    let stop_logits = g.untyped("stop_logits", vector(2), Kind::Output);
     let mut linear = |name: &str, rows: usize, columns: usize| Linear {
-        weight: g.tensor(
+        weight: g.untyped(
             format!("{name}.weight"),
             weight(rows * columns),
             Kind::Constant,
         ),
-        bias: g.tensor(format!("{name}.bias"), weight(rows), Kind::Constant),
+        bias: g.untyped(format!("{name}.bias"), weight(rows), Kind::Constant),
     };
     let heads = Heads {
         enc_to_lm_proj: linear("enc_to_lm_proj", hidden, s.encoder),
@@ -354,7 +357,7 @@ pub fn lm_side_batch_graph(
         stop_proj: linear("stop_proj", hidden, hidden),
         stop_head: linear("stop_head", 2, hidden),
     };
-    let mut between = |name: &str, n: usize| g.tensor(name, vector(n), Kind::Intermediate);
+    let mut between = |name: &str, n: usize| g.untyped(name, vector(n), Kind::Intermediate);
     let embed = between("embed", hidden);
     let base_out = between("base_lm.out", hidden);
     let levels = between("fsq_layer.levels", s.latent);
@@ -784,7 +787,7 @@ mod tests {
         let tuning = Tuning::for_subgroup(64);
         let stack = decode_graph(&stack(1, true), &tuning).unwrap();
         let mut g = Graph::default();
-        let x = g.tensor("x", 2 * s.base.hidden as u64, Kind::Intermediate);
+        let x = g.untyped("x", 2 * s.base.hidden as u64, Kind::Intermediate);
         let ids = splice(&mut g, &stack.graph, "a.", &[(stack.x, x)]);
         assert_eq!(ids[stack.x.0], x);
         // The stack's own x is not added: x stands for it.

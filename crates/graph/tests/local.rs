@@ -526,7 +526,7 @@ fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     // A tensor of another graph's first, so that each of theirs is somewhere else: loading
     // them where they were would write the wrong tensors.
     let mut g = Graph::default();
-    g.tensor("before", 256, Kind::Constant);
+    g.untyped("before", 256, Kind::Constant);
     let sampler = sampler_graph(&config, 2, rows, &tuning).unwrap_or_else(|e| panic!("{e}"));
     let dit = splice(&mut g, &sampler.graph, "dit.", &[]);
     let enc = encoder_graph(&config, rows, &tuning).unwrap_or_else(|e| panic!("{e}"));

@@ -32,10 +32,7 @@ use crate::{
     checkpoint::Checkpoint,
     decode::{LayerTensors, Row, Tuning},
     graph::{Graph, Kind, Pipeline, TensorId},
-    kernels::{
-        Access::{Read, Write},
-        KernelInfo, Kernels,
-    },
+    kernels::{KernelInfo, Kernels, read, write},
     lm_side::{Act, Linear, Stack, append_linear, splice},
     patch::{PatchGraph, PatchStep, transposed},
     prefill::{StackTensors, TILE, append_prefill},
@@ -45,13 +42,26 @@ use crate::{
 /// `linear_rows.comp`: run, x0, x1, W, bias -> out.
 pub static LINEAR_ROWS: KernelInfo = KernelInfo {
     name: "linear_rows",
-    access: &[Read, Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `select_rows.comp`: run, flags, a, b -> out.
 pub static SELECT_ROWS: KernelInfo = KernelInfo {
     name: "select_rows",
-    access: &[Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<u32>(),
+        read::<F16>(),
+        read::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// The width of the rows kernels' workgroups.
@@ -127,17 +137,17 @@ pub fn prompt_graphs(
 
     let encoder = &patch.encoder;
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
-    let input = g.tensor(
+    let input = g.untyped(
         "embed.patch",
         bytes(&encoder.graph, encoder.patch),
         Kind::Input,
     );
-    let enc = g.tensor(
+    let enc = g.untyped(
         "embed.enc",
         bytes(&encoder.graph, encoder.out),
         Kind::Intermediate,
     );
-    let embedding = g.tensor("embed.out", 2 * hidden as u64, Kind::Output);
+    let embedding = g.untyped("embed.out", 2 * hidden as u64, Kind::Output);
     let weights = encoder.graph.tensors.iter().enumerate();
     let shared: Vec<(TensorId, TensorId)> = weights
         .filter(|(_, t)| t.kind == Kind::Constant)
@@ -158,11 +168,11 @@ pub fn prompt_graphs(
     let embed_ops = g.ops.len();
 
     let rows_of = |n: usize| (max_rows * n * 2) as u64;
-    let run = g.tensor("prompt.run", 12, Kind::Param);
-    let x = g.tensor("prompt.x", rows_of(hidden), Kind::Input);
-    let audio_x = g.tensor("prompt.audio_x", rows_of(hidden), Kind::Input);
-    let audio = g.tensor("prompt.audio", (max_rows * 4) as u64, Kind::Input);
-    let mut between = |name: &str, n: usize| g.tensor(name, rows_of(n), Kind::Intermediate);
+    let run = g.untyped("prompt.run", 12, Kind::Param);
+    let x = g.untyped("prompt.x", rows_of(hidden), Kind::Input);
+    let audio_x = g.untyped("prompt.audio_x", rows_of(hidden), Kind::Input);
+    let audio = g.untyped("prompt.audio", (max_rows * 4) as u64, Kind::Input);
+    let mut between = |name: &str, n: usize| g.untyped(name, rows_of(n), Kind::Intermediate);
     let base_out = between("prompt.base_lm.out", hidden);
     let levels = between("prompt.fsq_layer.levels", s.latent);
     let quantized = between("prompt.fsq_layer.out", hidden);
@@ -817,8 +827,8 @@ mod tests {
                 let written: Vec<TensorId> = g
                     .ops
                     .iter()
-                    .flat_map(|op| op.bindings.iter().zip(op.pipeline.kernel.access))
-                    .filter(|&(t, access)| *access == Access::Write && keys.contains(t))
+                    .flat_map(|op| op.bindings.iter().zip(op.pipeline.kernel.bindings))
+                    .filter(|&(t, b)| b.access == Access::Write && keys.contains(t))
                     .map(|(&t, _)| t)
                     .collect();
                 assert_eq!(written, keys, "{rows} rows");

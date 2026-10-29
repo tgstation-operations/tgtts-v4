@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use vulkan::{Context, Kernel, KernelDesc};
+use vulkan::{Context, Element, ElementType, F16, Kernel, KernelDesc};
 
 use crate::{
     Error,
@@ -31,11 +31,35 @@ pub enum Access {
     Write,
 }
 
-/// A kernel of `kernels/glsl`: its file's stem, and how it uses each binding, in order.
+/// One of a kernel's bindings: how the kernel uses it, and the elements the data bound there are,
+/// whatever the kernel loads them as, such as an f16 tensor eight halves to a uvec4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub access: Access,
+    pub element: ElementType,
+}
+
+/// A binding of elements of `E` the kernel reads.
+pub const fn read<E: Element>() -> Binding {
+    Binding {
+        access: Access::Read,
+        element: E::TYPE,
+    }
+}
+
+/// A binding of elements of `E` the kernel writes.
+pub const fn write<E: Element>() -> Binding {
+    Binding {
+        access: Access::Write,
+        element: E::TYPE,
+    }
+}
+
+/// A kernel of `kernels/glsl`: its file's stem, and its bindings, in order.
 #[derive(Debug)]
 pub struct KernelInfo {
     pub name: &'static str,
-    pub access: &'static [Access],
+    pub bindings: &'static [Binding],
 }
 
 /// What a kernel compiled from MLIR says of itself in the manifest beside its SPIR-V, as
@@ -54,51 +78,86 @@ pub struct Manifest {
 pub struct ManifestBinding {
     pub name: String,
     pub access: String,
+    pub element: String,
     pub bytes: u64,
 }
 
-use Access::{Read, Write};
+/// Why `manifest` does not describe `kernel`'s bindings: their access or their elements differ.
+fn unlike(kernel: &KernelInfo, manifest: &Manifest) -> Option<String> {
+    let access = |a: Access| match a {
+        Access::Read => "read",
+        Access::Write => "write",
+    };
+    let declared: Vec<(&str, &str)> = kernel
+        .bindings
+        .iter()
+        .map(|b| (access(b.access), b.element.name()))
+        .collect();
+    let found: Vec<(&str, &str)> = manifest
+        .bindings
+        .iter()
+        .map(|b| (b.access.as_str(), b.element.as_str()))
+        .collect();
+    (declared != found).then(|| format!("bindings {found:?}, declared {declared:?}"))
+}
 
 /// `rmsnorm.comp`: x, gain -> out.
 pub static RMSNORM: KernelInfo = KernelInfo {
     name: "rmsnorm",
-    access: &[Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `gemv_qkv_rope.comp`: x, gain, W, cos, sin, position -> q, k cache, v cache.
 pub static GEMV_QKV_ROPE: KernelInfo = KernelInfo {
     name: "gemv_qkv_rope",
-    access: &[Read, Read, Read, Read, Read, Read, Write, Write, Write],
+    bindings: &[
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<u32>(),
+        write::<F16>(),
+        write::<F16>(),
+        write::<F16>(),
+    ],
 };
 
 /// `attention_split.comp`: q, k cache, v cache, position -> partial outputs, maxima and sums.
 pub static ATTENTION_SPLIT: KernelInfo = KernelInfo {
     name: "attention_split",
-    access: &[Read, Read, Read, Read, Write, Write],
+    bindings: &[
+        read::<F16>(),
+        read::<F16>(),
+        read::<F16>(),
+        read::<u32>(),
+        write::<f32>(),
+        write::<f32>(),
+    ],
 };
 
 /// `attention_combine.comp`: position, partial outputs, maxima and sums -> out.
 pub static ATTENTION_COMBINE: KernelInfo = KernelInfo {
     name: "attention_combine",
-    access: &[Read, Read, Read, Write],
+    bindings: &[read::<u32>(), read::<f32>(), read::<f32>(), write::<F16>()],
 };
 
 /// `gemv_residual.comp`: x, W, residual -> out.
 pub static GEMV_RESIDUAL: KernelInfo = KernelInfo {
     name: "gemv_residual",
-    access: &[Read, Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `gemv_gate_up.comp`: x, gain, W -> out.
 pub static GEMV_GATE_UP: KernelInfo = KernelInfo {
     name: "gemv_gate_up",
-    access: &[Read, Read, Read, Write],
+    bindings: &[read::<F16>(), read::<F16>(), read::<F16>(), write::<F16>()],
 };
 
 /// `stream_read.comp`: data -> one word per subgroup.
 pub static STREAM_READ: KernelInfo = KernelInfo {
     name: "stream_read",
-    access: &[Read, Write],
+    bindings: &[read::<u32>(), write::<u32>()],
 };
 
 type Key = (&'static str, Vec<(u32, u32)>, Option<u32>);
@@ -158,18 +217,8 @@ impl Kernels {
                     let json = std::fs::read(&path).map_err(|e| bad(e.to_string()))?;
                     let manifest: Manifest =
                         serde_json::from_slice(&json).map_err(|e| bad(e.to_string()))?;
-                    let access = |a: &Access| match a {
-                        Access::Read => "read",
-                        Access::Write => "write",
-                    };
-                    let declared: Vec<&str> = kernel.access.iter().map(access).collect();
-                    let found: Vec<&str> = manifest
-                        .bindings
-                        .iter()
-                        .map(|b| b.access.as_str())
-                        .collect();
-                    if declared != found {
-                        return Err(bad(format!("bindings {found:?}, declared {declared:?}")));
+                    if let Some(why) = unlike(kernel, &manifest) {
+                        return Err(bad(why));
                     }
                     Some(manifest)
                 }
@@ -234,7 +283,7 @@ impl Kernels {
             std::fs::read(&path).map_err(|e| Error::Kernels(format!("{}: {e}", path.display())))?;
         let desc = KernelDesc {
             entry: &entry,
-            storage_buffers: pipeline.kernel.access.len() as u32,
+            storage_buffers: pipeline.kernel.bindings.len() as u32,
             subgroup_size: pipeline.subgroup_size,
             full_subgroups: pipeline.subgroup_size.is_some(),
             constants: &pipeline.constants,
@@ -251,5 +300,39 @@ impl Kernels {
 
     pub fn is_empty(&self) -> bool {
         self.built.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(bindings: &[(&str, &str)]) -> Manifest {
+        let bindings = bindings.iter().map(|&(access, element)| ManifestBinding {
+            name: "t".into(),
+            access: access.into(),
+            element: element.into(),
+            bytes: 64,
+        });
+        Manifest {
+            entry_point: "main".into(),
+            dispatch: [1, 1, 1],
+            required_subgroup_size: None,
+            bindings: bindings.collect(),
+        }
+    }
+
+    #[test]
+    fn a_manifest_of_other_bindings_than_the_kernel_declares_is_refused() {
+        let gemm = crate::prefill::gemm(128, 2048, 2048, 64).unwrap();
+        let built = [("read", "f16"), ("read", "f16"), ("write", "f32")];
+        assert_eq!(unlike(gemm, &manifest(&built)), None);
+        for other in [
+            [("read", "f16"), ("read", "f16"), ("write", "f16")],
+            [("read", "f16"), ("write", "f16"), ("write", "f32")],
+        ] {
+            assert!(unlike(gemm, &manifest(&other)).is_some(), "{other:?}");
+        }
+        assert!(unlike(gemm, &manifest(&built[..2])).is_some());
     }
 }

@@ -26,35 +26,58 @@ use vulkan::{Context, Memory, Residence, SpecValue, Timing};
 use crate::{
     Error,
     graph::{Graph, Kind, Pipeline, TensorId},
-    kernels::{
-        Access::{Read, Write},
-        KernelInfo, Kernels,
-    },
+    kernels::{KernelInfo, Kernels, read, write},
     step::{Region, Step},
 };
 
 /// `vae_gemm.comp`: chunk, x, ring, prologue, W, bias, residual -> out.
 pub static VAE_GEMM: KernelInfo = KernelInfo {
     name: "vae_gemm",
-    access: &[Read, Read, Read, Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        write::<f32>(),
+    ],
 };
 
 /// `vae_depthwise.comp`: chunk, x, ring, prologue, w, bias, epilogue -> out.
 pub static VAE_DEPTHWISE: KernelInfo = KernelInfo {
     name: "vae_depthwise",
-    access: &[Read, Read, Read, Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        write::<f32>(),
+    ],
 };
 
 /// `vae_keep.comp`: chunk, x -> ring, with the prologue.
 pub static VAE_KEEP: KernelInfo = KernelInfo {
     name: "vae_keep",
-    access: &[Read, Read, Write, Read],
+    bindings: &[read::<u32>(), read::<f32>(), write::<f32>(), read::<f32>()],
 };
 
 /// `vae_out.comp`: chunk, x, ring, prologue, w, bias -> audio.
 pub static VAE_OUT: KernelInfo = KernelInfo {
     name: "vae_out",
-    access: &[Read, Read, Read, Read, Read, Read, Write],
+    bindings: &[
+        read::<u32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        read::<f32>(),
+        write::<f32>(),
+    ],
 };
 
 /// The width of every workgroup; no kernel here needs a subgroup size.
@@ -231,7 +254,7 @@ fn u(v: usize) -> SpecValue {
 impl Builder {
     fn activations(&mut self, name: String, up: usize, channels: usize) -> Activations {
         let bytes = 4 * self.shape.chunk * up * channels;
-        let id = self.g.tensor(name, bytes as u64, Kind::Intermediate);
+        let id = self.g.untyped(name, bytes as u64, Kind::Intermediate);
         Activations { id, up, channels }
     }
 
@@ -244,7 +267,7 @@ impl Builder {
             | Fill::Output(n)
             | Fill::Snake { alpha: n, .. } => n.clone(),
         };
-        let id = self.g.tensor(name, bytes as u64, Kind::Constant);
+        let id = self.g.untyped(name, bytes as u64, Kind::Constant);
         self.constants.push((id, fill));
         id
     }
@@ -255,7 +278,7 @@ impl Builder {
 
     fn ring(&mut self, name: String, reach: usize, channels: usize) -> TensorId {
         let bytes = 4 * self.shape.streams * reach * channels;
-        let id = self.g.tensor(name, bytes as u64, Kind::State);
+        let id = self.g.untyped(name, bytes as u64, Kind::State);
         self.rings.push((id, reach));
         id
     }
@@ -512,14 +535,14 @@ impl Builder {
 /// The decoder's step of `shape`.
 pub fn vae_graph(shape: &VaeShape) -> Result<VaeGraph, Error> {
     let mut g = Graph::default();
-    let chunk = g.tensor("chunk", 12, Kind::Param);
-    let unused = g.tensor("unused", 16, Kind::Constant);
-    let latents = g.tensor(
+    let chunk = g.untyped("chunk", 12, Kind::Param);
+    let unused = g.untyped("unused", 16, Kind::Constant);
+    let latents = g.untyped(
         "latents",
         (4 * shape.chunk * shape.latent) as u64,
         Kind::Input,
     );
-    let audio = g.tensor(
+    let audio = g.untyped(
         "audio",
         (shape.chunk * shape.hop() * 4) as u64,
         Kind::Output,
@@ -836,7 +859,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, op)| {
-                    let access = op.pipeline.kernel.access.iter().copied();
+                    let access = op.pipeline.kernel.bindings.iter().map(|b| b.access);
                     let bound = op.bindings.iter().zip(access);
                     bound.filter(|&(&t, _)| t == ring).map(move |(_, a)| (i, a))
                 })
