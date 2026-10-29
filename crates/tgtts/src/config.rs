@@ -12,8 +12,8 @@
 //! - `metrics_db`: the SQLite database the metrics go to, none by default.
 //! - `ffmpeg`: the ffmpeg to run, `ffmpeg` on the `PATH` by default.
 //! - `synthesis_limit`: syntheses run at once, 16 by default, as the old model service ran.
-//! - `prompt_cache_bytes`: the bytes on the GPU the prompt cache keeps of the voices, 512 MiB by
-//!   default.
+//! - `prompt_cache_bytes`: the bytes the prompt cache keeps of the voices, on the host and the GPU
+//!   together, 512 MiB by default.
 //! - `cpu_limit`: other work on the CPU run at once, one per CPU by default.
 //! - `queue_timeout_seconds`: how long a request waits for the model, 5 by default.
 //! - `radio_wait_seconds`: how long a radio route waits for the route that makes what it puts on

@@ -52,12 +52,12 @@ pub const LINES: [&str; 12] = [
     "I am not a changeling, I swear! Ask anyone who knows me.",
 ];
 
-/// How much more than its voice's gain the whole-file path may raise a line by, in dB: 7189 of
-/// the 7197 lines 600 voices said in a gains run came within 12 dB under their voice's level.
+/// How much more than its voice's gain the whole-file path may raise a line by: 7189 of the 7197
+/// lines 600 voices said in a gains run came within 12 dB under their voice's level.
 pub const MARGIN: Gain = Gain::new(12.0);
 
-/// The most the whole-file path raises speech in a voice without a level by, in dB: more than
-/// 589 of those 600 voices' levels allow with [`MARGIN`].
+/// The most the whole-file path raises speech in a voice without a level by: more than 589 of
+/// those 600 voices' levels allow with [`MARGIN`].
 pub const MOST_GAIN: Gain = Gain::new(24.0);
 
 /// The voices' levels.

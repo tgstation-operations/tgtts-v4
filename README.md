@@ -60,7 +60,8 @@ the token as `TTS_HTTP_TOKEN`. The service runs ffmpeg for the filter strings
 the game sent before effects, which needs rubberband, as the devshell's has.
 The end-to-end tests run on the GPU with `VOXCPM2_DIR`, `VOICES_DIR`,
 `ASSETS_DIR` and `GOLDEN_DIR` set and `GLSL_KERNELS` and `VULKAN_KERNELS` naming
-the kernels: `cargo test --release -p tgtts --test rt -- --ignored`.
+the kernels, one test at a time:
+`cargo test --release -p tgtts --test rt -- --ignored --test-threads=1`.
 
 Entering the devshell points `core.hooksPath` at `.githooks/`. The pre-commit
 hook runs the gate over the staged tree, and post-checkout seeds a new

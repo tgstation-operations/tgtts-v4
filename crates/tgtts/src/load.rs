@@ -9,9 +9,9 @@ use voxcpm::Params;
 
 use crate::{config::Config, rt::Rt, synth::Synthesizer};
 
-/// The bytes on the device the prompt cache keeps of the voices unless the configuration says
-/// otherwise: on a GPU in f16 a median voice takes about 11 MB, so about 45 of them. On real
-/// rounds twice as much made no difference to how long requests took.
+/// The bytes the prompt cache keeps of the voices unless the configuration says otherwise: on a
+/// replayed round 43 of them, about 12 MB each on the host and the GPU together. On real rounds
+/// twice as much made no difference to how long requests took.
 pub const PROMPT_CACHE_BYTES: usize = 1 << 29;
 
 /// VoxCPM2 as `config` asks for it, warmed up.

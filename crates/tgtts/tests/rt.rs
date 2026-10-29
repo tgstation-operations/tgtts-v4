@@ -28,7 +28,7 @@ use voices::Voices;
 use voxcpm::Params;
 
 /// voxcpm's golden line and voice: run free from the seed, the generator stops after its 24th
-/// patch, where voxcpm in f32 on the CPU did.
+/// patch on the Radeon 8060S.
 const LINE: &str = "Security, report to the bridge. ";
 const VOICE: &str = "Man (Infected)";
 const SEED: u64 = 0;

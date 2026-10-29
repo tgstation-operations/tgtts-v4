@@ -41,9 +41,9 @@ const WARM_UP_LINE: &str = "Hello there, could someone please come to medbay? I 
 /// The patches the warm-up generates: past the audio decoder's first chunk.
 const WARM_UP_PATCHES: usize = 9;
 
-/// The longest the babble cap lets a request's speech run, in ms: this, and
-/// [`BABBLE_MS_PER_CHAR`] for each character of its text. VoxCPM2 now and then talks on past its
-/// text to the last patch it may have; this is about nine times as long as it says a line of
+/// The longest the babble cap lets a request's speech run: this, and [`BABBLE_MS_PER_CHAR`] for
+/// each character of its text. VoxCPM2 now and then talks on past its text to the last patch it
+/// may have; this is about nine times as long as it says a line of
 /// that length at the median, where in a gains run all but 2 of the 7191 lines it ended itself
 /// came within seven times.
 const BABBLE_MS: Millis = Millis::new(3000);

@@ -54,8 +54,8 @@ impl Audio {
         self.frames() as f64 / f64::from(self.rate)
     }
 
-    /// The RMS level of all the samples, in dB from full scale: 0 for a full-scale square wave,
-    /// -3 for a full-scale sine, and negative infinity for digital silence or no samples at all.
+    /// The RMS level of all the samples: 0 for a full-scale square wave, -3 for a full-scale
+    /// sine, and negative infinity for digital silence or no samples at all.
     pub fn rms_dbfs(&self) -> Level {
         let energy: f64 = self.samples.iter().map(|&s| f64::from(s).powi(2)).sum();
         if energy == 0.0 {
