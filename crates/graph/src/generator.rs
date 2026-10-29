@@ -158,8 +158,8 @@ impl Generator {
                 let mut graph =
                     patch_batch_graph(&shape, &config, settings.timesteps, &lm, &local, batch)?;
                 // For the host to read, out of the arena, whose later ops would reuse its bytes.
-                let levels = graph.side_ids[graph.side.levels.0];
-                graph.graph.tensors[levels.0].kind = Kind::Output;
+                let levels = graph.side.levels.moved(&graph.side_ids);
+                graph.graph.tensors[levels.id().0].kind = Kind::Output;
                 Ok(graph)
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -352,7 +352,7 @@ impl Generator {
             .and_then(|_| self.rows[slot])
             .ok_or_else(|| no_request(slot))?;
         let graph = self.step.last_run();
-        let tensor = graph.side_ids[graph.side.levels.0];
+        let tensor = graph.side.levels.moved(&graph.side_ids);
         let levels: Vec<F16> = self.step.graph_step().read(tensor)?;
         let shape = &graph.side.shape;
         let unit = shape.levels as f32;

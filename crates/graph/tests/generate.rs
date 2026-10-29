@@ -37,7 +37,7 @@ use graph::{
     checkpoint::Checkpoint,
     decode::{self, Row, SUBGROUPS},
     generator::{Generator, Settings},
-    graph::{Kind, TensorId},
+    graph::{Kind, Tensor},
     kernels::Kernels,
     lm_side::{self, LmSideShape},
     local::{self, PatchConfig},
@@ -145,7 +145,7 @@ fn patch_step(
     kernels: &mut Kernels,
     input: &Input,
     subgroup: Option<u32>,
-) -> (PatchStep, [TensorId; 2], decode::Tuning) {
+) -> (PatchStep, [Tensor<F16>; 2], decode::Tuning) {
     let json = config_json();
     let side_config: lm_side::Config = serde_json::from_str(&json).unwrap();
     let config: PatchConfig = serde_json::from_str(&json).unwrap();
@@ -163,9 +163,9 @@ fn patch_step(
     let timesteps = Sampling::default().timesteps;
     let mut graph =
         patch_graph(&shape, &config, timesteps, &lm, &local).unwrap_or_else(|e| panic!("{e}"));
-    let probes = [graph.side.base_out, graph.side.levels].map(|t| graph.side_ids[t.0]);
+    let probes = [graph.side.base_out, graph.side.levels].map(|t| t.moved(&graph.side_ids));
     for t in probes {
-        graph.graph.tensors[t.0].kind = Kind::Output;
+        graph.graph.tensors[t.id().0].kind = Kind::Output;
     }
     let mut step = PatchStep::new(ctx, kernels, graph, false).unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
@@ -196,7 +196,7 @@ struct Run {
 
 /// Samples each of `input`'s patches on `step`, whose caches hold its prompt but the last
 /// position, after the patch before, its `stale`-th before rather than the last.
-fn sample(step: &mut PatchStep, probes: [TensorId; 2], input: &Input, stale: usize) -> Run {
+fn sample(step: &mut PatchStep, probes: [Tensor<F16>; 2], input: &Input, stale: usize) -> Run {
     let sampling = Sampling::default();
     let len = input.len();
     let patch = input.prompt.len() / len;
@@ -223,8 +223,8 @@ fn sample(step: &mut PatchStep, probes: [TensorId; 2], input: &Input, stale: usi
             )
             .unwrap_or_else(|e| panic!("{e}"));
         elapsed += start.elapsed().as_secs_f64();
-        let read = |t: TensorId| -> Vec<f32> {
-            let values: Vec<F16> = step.graph_step().read(t).unwrap();
+        let read = |t: Tensor<F16>| -> Vec<f32> {
+            let values = step.graph_step().read(t).unwrap();
             values.iter().map(|h| h.to_f32()).collect()
         };
         let levels = read(probes[1]).iter().map(|&l| (l * 9.0).round()).collect();

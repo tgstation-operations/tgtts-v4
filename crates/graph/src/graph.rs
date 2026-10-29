@@ -261,6 +261,12 @@ impl Graph {
         &self.tensors[t.id().0]
     }
 
+    /// Adds a tensor as `info` describes it.
+    pub(crate) fn add(&mut self, info: TensorInfo) -> TensorId {
+        self.tensors.push(info);
+        TensorId(self.tensors.len() - 1)
+    }
+
     /// Adds a tensor of `bytes` bytes, whose element type no op checks.
     pub fn untyped(&mut self, name: impl Into<String>, bytes: u64, kind: Kind) -> TensorId {
         self.tensors.push(TensorInfo {

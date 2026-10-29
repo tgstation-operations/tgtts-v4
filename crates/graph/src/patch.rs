@@ -111,7 +111,11 @@ pub fn patch_batch_graph(
     let mut g = Graph::default();
     let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
     let cond = g.untyped("cond", bytes(&sampler.graph, sampler.cond), Kind::Input);
-    let position = g.untyped("position", bytes(&side.graph, side.position), Kind::Param);
+    let position = g.untyped(
+        "position",
+        bytes(&side.graph, side.position.id()),
+        Kind::Param,
+    );
     let noise = g.untyped("noise", bytes(&sampler.graph, sampler.noise), Kind::Input);
     let sampling = g.untyped(
         "sampling",
@@ -121,11 +125,11 @@ pub fn patch_batch_graph(
     let patch = g.untyped("patch", bytes(&sampler.graph, sampler.patch), Kind::Output);
     let stop_logits = g.untyped(
         "stop_logits",
-        bytes(&side.graph, side.stop_logits),
+        bytes(&side.graph, side.stop_logits.id()),
         Kind::Output,
     );
-    let enc = g.untyped("enc", bytes(&side.graph, side.enc), Kind::Intermediate);
-    let mu = g.untyped("mu", bytes(&side.graph, side.mu), Kind::Intermediate);
+    let enc = g.untyped("enc", bytes(&side.graph, side.enc.id()), Kind::Intermediate);
+    let mu = g.untyped("mu", bytes(&side.graph, side.mu.id()), Kind::Intermediate);
     let encoder_ids = splice(
         &mut g,
         &encoder.graph,
@@ -137,10 +141,10 @@ pub fn patch_batch_graph(
         &side.graph,
         "",
         &[
-            (side.enc, enc),
-            (side.position, position),
-            (side.mu, mu),
-            (side.stop_logits, stop_logits),
+            (side.enc.id(), enc),
+            (side.position.id(), position),
+            (side.mu.id(), mu),
+            (side.stop_logits.id(), stop_logits),
         ],
     );
     let sampler_ids = splice(
@@ -314,9 +318,9 @@ impl PatchStep {
         let tensors = &programs[0].1;
         let base = &tensors.side.shape.base;
         let (cos, sin) = base.rope_tables();
-        let at = |t: TensorId| tensors.side_ids[t.0];
-        step.write(at(tensors.side.cos), &cos)?;
-        step.write(at(tensors.side.sin), &sin)?;
+        let ids = &tensors.side_ids;
+        step.write(tensors.side.cos.moved(ids), &cos)?;
+        step.write(tensors.side.sin.moved(ids), &sin)?;
         Ok(PatchStep {
             capacity: base.capacity,
             step,
@@ -592,7 +596,7 @@ pub(crate) mod tests {
             let patch = uses(g, p.patch);
             assert!(patch.iter().all(|&(i, _)| i >= g.ops.len() - sampler));
             // The condition is the LM side's, ready before the sampler reads it.
-            let mu = p.side_ids[p.side.mu.0];
+            let mu = p.side.mu.moved(&p.side_ids).id();
             assert_eq!(mu, p.sampler_ids[p.sampler.mu.0]);
             let mu_uses = uses(g, mu);
             let last_write = mu_uses.iter().filter(|u| u.1).map(|u| u.0).max().unwrap();
@@ -601,7 +605,7 @@ pub(crate) mod tests {
             let needs_barrier = barriers(g, &plan(g));
             assert!(needs_barrier[last_write + 1..=first_read].contains(&true));
             let enc = p.encoder_ids[p.encoder.out.0];
-            assert_eq!(enc, p.side_ids[p.side.enc.0]);
+            assert_eq!(enc, p.side.enc.moved(&p.side_ids).id());
             assert_eq!(g.tensors[enc.0].kind, Kind::Intermediate);
         }
     }
@@ -622,7 +626,6 @@ pub(crate) mod tests {
         let held = graphs[0].graph.tensors.len();
         let all = shared(graphs[0].clone(), graphs[1..].to_vec()).unwrap();
         let tensors = &all[0].graph.tensors;
-        let at = |p: &PatchGraph, t: TensorId| p.side_ids[t.0];
         let mut owner: HashMap<TensorId, usize> = HashMap::new();
         for (i, p) in all.iter().enumerate() {
             assert_eq!(p.batch().rows, rows[i]);
@@ -653,9 +656,9 @@ pub(crate) mod tests {
             let bytes = |t: TensorId| tensors[t.0].bytes;
             assert_eq!(bytes(p.cond), (rows[i] * 64 * 4 * 4) as u64);
             assert_eq!(bytes(p.position), (2 * rows[i] * 4) as u64);
-            let head = p.side.heads.stop_head.weight;
             let first = &all[0];
-            assert_eq!(at(p, head), at(first, first.side.heads.stop_head.weight));
+            let head_at = |p: &PatchGraph| p.side.heads.stop_head.weight.moved(&p.side_ids);
+            assert_eq!(head_at(p), head_at(first));
             let cache_at = |p: &PatchGraph| p.side.base.layers[0].k_cache.moved(&p.side_ids);
             assert_eq!(cache_at(p), cache_at(first));
         }

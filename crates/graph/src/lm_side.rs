@@ -19,7 +19,7 @@ use crate::{
         Batch, DecodeGraph, LayerTensors, LmConfig, Row, Shape, Tuning, decode_batch_graph,
         load_stack,
     },
-    graph::{Graph, Kind, Pipeline, Tensor, TensorId},
+    graph::{Graph, Holds, Kind, Pipeline, Tensor, TensorId, TensorInfo},
     kernels::{KernelInfo, Kernels, read, write},
     local::identity,
     step::Step,
@@ -91,11 +91,21 @@ impl LmSideShape {
     }
 }
 
-/// A linear layer's tensors.
+/// A linear layer's tensors: the weight `[out][in]` and the bias `[out]`.
 #[derive(Clone, Copy, Debug)]
 pub struct Linear {
-    pub weight: TensorId,
-    pub bias: TensorId,
+    pub weight: Tensor<F16>,
+    pub bias: Tensor<F16>,
+}
+
+impl Linear {
+    /// The layer where `ids` puts its tensors ([`Tensor::moved`]).
+    pub fn moved(self, ids: &[TensorId]) -> Self {
+        Linear {
+            weight: self.weight.moved(ids),
+            bias: self.bias.moved(ids),
+        }
+    }
 }
 
 /// The layers between the stacks, under their names in the checkpoint.
@@ -142,34 +152,33 @@ pub struct LmSideGraph {
     pub graph: Graph,
     pub shape: LmSideShape,
     pub batch: Batch,
-    /// The local encoder's output for the last patch, `[encoder]` f16: the step's input.
-    pub enc: TensorId,
-    /// Where the patch goes in both LMs' caches, [`Batch::words`] u32: at batch 1, the one
-    /// position.
-    pub position: TensorId,
-    /// The DiT's condition for the next patch, `[2 * dit]` f16: lm_to_dit_proj's output, then
+    /// The local encoder's output for the last patch, `[rows][encoder]`: the step's input.
+    pub enc: Tensor<F16>,
+    /// Where the patch goes in both LMs' caches, [`Batch::words`]: at batch 1, the one position.
+    pub position: Tensor<u32>,
+    /// The DiT's condition for the next patch, `[rows][2 * dit]`: lm_to_dit_proj's output, then
     /// res_to_dit_proj's.
-    pub mu: TensorId,
-    /// The stop head's logits `[2]` f16, of going on and of stopping after the next patch.
-    pub stop_logits: TensorId,
-    /// The base LM's output `[hidden]` f16, which the scalar quantizer takes.
-    pub base_out: TensorId,
-    /// The scalar quantizer's levels `[latent]` f16, each a multiple of `1 / levels`.
-    pub levels: TensorId,
-    pub cos: TensorId,
-    pub sin: TensorId,
+    pub mu: Tensor<F16>,
+    /// The stop head's logits `[rows][2]`, of going on and of stopping after the next patch.
+    pub stop_logits: Tensor<F16>,
+    /// The base LM's output `[rows][hidden]`, which the scalar quantizer takes.
+    pub base_out: Tensor<F16>,
+    /// The scalar quantizer's levels `[rows][latent]`, each a multiple of `1 / levels`.
+    pub levels: Tensor<F16>,
+    pub cos: Tensor<f32>,
+    pub sin: Tensor<f32>,
     pub base: Stack,
     pub residual: Stack,
     pub heads: Heads,
 }
 
 /// Appends `from`'s tensors and ops to `g`, names and labels after `prefix`: each tensor `shared`
-/// pairs with one of `g` taken as that one, the rest added. Gives each of `from`'s tensors' place
-/// in `g`.
+/// pairs with one of `g` of as many of the same elements, in any shape, taken as that one, the rest
+/// added as they are. Gives each of `from`'s tensors' place in `g`.
 ///
 /// # Panics
 ///
-/// If a shared pair differs in size.
+/// If a shared pair differs in its elements or their number.
 pub fn splice(
     g: &mut Graph,
     from: &Graph,
@@ -183,11 +192,23 @@ pub fn splice(
         .map(
             |(i, t)| match shared.iter().find(|(theirs, _)| theirs.0 == i) {
                 Some(&(_, ours)) => {
-                    let bytes = g.tensors[ours.0].bytes;
-                    assert_eq!(bytes, t.bytes, "{prefix}{} as {bytes} bytes", t.name);
+                    let held = &g.tensors[ours.0];
+                    let element = |t: &TensorInfo| t.element.as_ref().map(|e| e.0);
+                    let typed = element(held).is_some() && element(t).is_some();
+                    assert!(
+                        held.bytes == t.bytes && (!typed || element(held) == element(t)),
+                        "{prefix}{} as {}, of {} bytes of {:?}",
+                        t.name,
+                        held.name,
+                        held.bytes,
+                        element(held)
+                    );
                     ours
                 }
-                None => g.untyped(format!("{prefix}{}", t.name), t.bytes, t.kind),
+                None => g.add(TensorInfo {
+                    name: format!("{prefix}{}", t.name),
+                    ..t.clone()
+                }),
             },
         )
         .collect();
@@ -205,14 +226,15 @@ fn append_stack(
     g: &mut Graph,
     stack: &DecodeGraph,
     prefix: &str,
-    [x, position, cos, sin, out]: [TensorId; 5],
+    (x, out): (Tensor<F16>, Tensor<F16>),
+    (position, cos, sin): (Tensor<u32>, Tensor<f32>, Tensor<f32>),
 ) -> Stack {
     let shared = [
-        (stack.x.id(), x),
-        (stack.position.id(), position),
-        (stack.cos.id(), cos),
-        (stack.sin.id(), sin),
-        (stack.out.id(), out),
+        (stack.x.id(), x.id()),
+        (stack.position.id(), position.id()),
+        (stack.cos.id(), cos.id()),
+        (stack.sin.id(), sin.id()),
+        (stack.out.id(), out.id()),
     ];
     let ids = splice(g, &stack.graph, prefix, &shared);
     Stack {
@@ -239,9 +261,9 @@ pub(crate) fn append_linear(
     g: &mut Graph,
     label: &str,
     layer: Linear,
-    x: &[TensorId],
+    x: &[impl Holds<F16> + Copy],
     act: Act,
-    out: (TensorId, usize),
+    out: (impl Holds<F16>, usize),
     tuning: &Tuning,
     levels: u32,
 ) -> Result<(), Error> {
@@ -254,9 +276,9 @@ fn append_batch_linear(
     g: &mut Graph,
     label: &str,
     layer: Linear,
-    x: &[TensorId],
+    x: &[impl Holds<F16> + Copy],
     act: Act,
-    (out, offset): (TensorId, usize),
+    (out, offset): (impl Holds<F16>, usize),
     tuning: &Tuning,
     levels: u32,
     rows: usize,
@@ -267,8 +289,8 @@ fn append_batch_linear(
         ..
     } = *tuning;
     let subgroups = (workgroup / subgroup) as usize;
-    let len = |t: TensorId| g.tensors[t.0].bytes as usize / 2 / rows;
-    let (x0, x1) = (x[0], x[x.len() - 1]);
+    let len = |t: TensorId| g.info(t).bytes as usize / size_of::<F16>() / rows;
+    let (x0, x1) = (x[0].id(), x[x.len() - 1].id());
     let (k0, k1) = (len(x0), if x.len() > 1 { len(x1) } else { 0 });
     for k in [k0, k1] {
         if !k.is_multiple_of(8 * subgroup as usize) {
@@ -278,7 +300,7 @@ fn append_batch_linear(
             )));
         }
     }
-    let n = g.tensors[layer.bias.0].bytes as usize / 2;
+    let n = g.info(layer.bias).len();
     let (taken, split) = tuning.split(rows);
     let pipeline = Pipeline {
         kernel: &GEMV_LINEAR,
@@ -293,14 +315,14 @@ fn append_batch_linear(
             (7, SpecValue::F32(levels as f32)),
             (8, SpecValue::U32(taken as u32)),
             (9, SpecValue::U32(tuning.span(k0 + k1, taken, 0)?)),
-            (10, SpecValue::U32(len(out) as u32)),
+            (10, SpecValue::U32(len(out.id()) as u32)),
             (11, SpecValue::U32(split as u32)),
         ],
         subgroup_size: Some(subgroup),
     };
     let groups = (n.div_ceil(subgroups) * split) as u32;
-    let bindings = [x0, x1, layer.weight, layer.bias, out];
-    g.op(label, pipeline, &bindings, [groups, 1, 1]);
+    let bindings = (x0, x1, layer.weight, layer.bias, out.id());
+    g.op(label, pipeline, bindings, [groups, 1, 1]);
     Ok(())
 }
 
@@ -329,22 +351,16 @@ pub fn lm_side_batch_graph(
 
     let mut g = Graph::default();
     let rows = batch.rows;
-    let vector = |n: usize| (rows * n) as u64 * 2;
-    let weight = |n: usize| n as u64 * 2;
-    let enc = g.untyped("enc", vector(s.encoder), Kind::Input);
-    let position = g.untyped("position", 4 * batch.words() as u64, Kind::Param);
-    let table = base.graph.info(base.cos).bytes;
-    let cos = g.untyped("rope.cos", table, Kind::Constant);
-    let sin = g.untyped("rope.sin", table, Kind::Constant);
-    let mu = g.untyped("mu", vector(2 * s.dit), Kind::Output);
-    let stop_logits = g.untyped("stop_logits", vector(2), Kind::Output);
+    let enc = g.tensor("enc", &[rows, s.encoder], Kind::Input);
+    let position = g.tensor("position", &[batch.words()], Kind::Param);
+    let table = base.graph.info(base.cos).shape().to_vec();
+    let cos = g.tensor("rope.cos", &table, Kind::Constant);
+    let sin = g.tensor("rope.sin", &table, Kind::Constant);
+    let mu = g.tensor("mu", &[rows, 2 * s.dit], Kind::Output);
+    let stop_logits = g.tensor("stop_logits", &[rows, 2], Kind::Output);
     let mut linear = |name: &str, rows: usize, columns: usize| Linear {
-        weight: g.untyped(
-            format!("{name}.weight"),
-            weight(rows * columns),
-            Kind::Constant,
-        ),
-        bias: g.untyped(format!("{name}.bias"), weight(rows), Kind::Constant),
+        weight: g.tensor(format!("{name}.weight"), &[rows, columns], Kind::Constant),
+        bias: g.tensor(format!("{name}.bias"), &[rows], Kind::Constant),
     };
     let heads = Heads {
         enc_to_lm_proj: linear("enc_to_lm_proj", hidden, s.encoder),
@@ -356,7 +372,7 @@ pub fn lm_side_batch_graph(
         stop_proj: linear("stop_proj", hidden, hidden),
         stop_head: linear("stop_head", 2, hidden),
     };
-    let mut between = |name: &str, n: usize| g.untyped(name, vector(n), Kind::Intermediate);
+    let mut between = |name: &str, n: usize| g.tensor(name, &[rows, n], Kind::Intermediate);
     let embed = between("embed", hidden);
     let base_out = between("base_lm.out", hidden);
     let levels = between("fsq_layer.levels", s.latent);
@@ -368,9 +384,9 @@ pub fn lm_side_batch_graph(
     let apply = |g: &mut Graph,
                  label: &str,
                  layer: Linear,
-                 x: &[TensorId],
+                 x: &[Tensor<F16>],
                  act: Act,
-                 out: (TensorId, usize)| {
+                 out: (Tensor<F16>, usize)| {
         append_batch_linear(g, label, layer, x, act, out, tuning, s.levels, rows)
     };
     let h = &heads;
@@ -382,8 +398,13 @@ pub fn lm_side_batch_graph(
         Act::None,
         (embed, 0),
     )?;
-    let at = [embed, position, cos, sin, base_out];
-    let base_stack = append_stack(&mut g, &base, "base_lm.", at);
+    let base_stack = append_stack(
+        &mut g,
+        &base,
+        "base_lm.",
+        (embed, base_out),
+        (position, cos, sin),
+    );
     apply(
         &mut g,
         "fsq_layer.in_proj",
@@ -434,8 +455,13 @@ pub fn lm_side_batch_graph(
         Act::None,
         (stop_logits, 0),
     )?;
-    let at = [residual_in, position, cos, sin, residual_out];
-    let residual_stack = append_stack(&mut g, &residual, "residual_lm.", at);
+    let residual_stack = append_stack(
+        &mut g,
+        &residual,
+        "residual_lm.",
+        (residual_in, residual_out),
+        (position, cos, sin),
+    );
     apply(
         &mut g,
         "res_to_dit_proj",
@@ -472,7 +498,6 @@ pub fn load_lm_side(
     ids: &[TensorId],
     checkpoint: &Checkpoint,
 ) -> Result<(), Error> {
-    let at = |t: TensorId| ids[t.0];
     for (stack, prefix) in [(&side.base, "base_lm."), (&side.residual, "residual_lm.")] {
         let layers: Vec<LayerTensors> = stack.layers.iter().map(|l| l.moved(ids)).collect();
         load_stack(
@@ -491,14 +516,15 @@ pub fn load_lm_side(
         for (part, tensor) in parts {
             let name = format!("{name}.{part}");
             let (_, values) = checkpoint.f16(&name)?;
-            let want = graph.tensors[at(tensor).0].bytes as usize / 2;
+            let tensor = tensor.moved(ids);
+            let want = graph.info(tensor).len();
             if values.len() != want {
                 return Err(Error::Checkpoint(format!(
                     "{name}: {} values, not {want}",
                     values.len()
                 )));
             }
-            step.write(at(tensor), &values)?;
+            step.write(tensor, &values)?;
         }
     }
     Ok(())
@@ -759,8 +785,8 @@ mod tests {
             layers += 1;
         }
         assert_eq!(layers, 8);
-        assert_eq!(g.graph.tensors[g.mu.0].bytes, 4 * 2 * s.dit as u64 * 2);
-        assert_eq!(g.graph.tensors[g.stop_logits.0].bytes, 4 * 2 * 2);
+        assert_eq!(g.graph.info(g.mu).shape(), [4, 2 * s.dit]);
+        assert_eq!(g.graph.info(g.stop_logits).shape(), [4, 2]);
     }
 
     #[test]

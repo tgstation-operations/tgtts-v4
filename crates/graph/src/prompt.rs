@@ -127,11 +127,7 @@ pub fn prompt_graphs(
     let side = &patch.side;
     let s = &side.shape;
     let hidden = s.base.hidden;
-    let at = |t: TensorId| patch.side_ids[t.0];
-    let layer = |l: Linear| Linear {
-        weight: at(l.weight),
-        bias: at(l.bias),
-    };
+    let layer = |l: Linear| l.moved(&patch.side_ids);
     let mut g = patch.graph.clone();
     g.ops.clear();
 
@@ -186,8 +182,8 @@ pub fn prompt_graphs(
         slots: side.batch.slots,
         layers,
         norm,
-        cos: at(side.cos),
-        sin: at(side.sin),
+        cos: side.cos.moved(&patch.side_ids).id(),
+        sin: side.sin.moved(&patch.side_ids).id(),
     };
     let base = stack(&s.base, &base_layers[..], base_norm);
     let residual = stack(&s.residual, &residual_layers[..], residual_norm);
@@ -245,8 +241,8 @@ pub fn prompt_graphs(
             (rows / BLOCK) as u32,
             1,
         ];
-        let bindings = [run, x[0], x[x.len() - 1], layer.weight, layer.bias, out];
-        g.op(label, pipeline, &bindings, groups);
+        let bindings = (run, x[0], x[x.len() - 1], layer.weight, layer.bias, out);
+        g.op(label, pipeline, bindings, groups);
         Ok(())
     };
     let select = pipeline(&SELECT_ROWS, &[(2, u(hidden))]);
