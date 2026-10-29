@@ -1,21 +1,18 @@
-//! The patch sampler and the local encoder on the GPU against voxcpm's on burn's CPU backend,
-//! on VoxCPM2's real weights: each case a patch upstream generated, as the patch before, and the
-//! noise it drew for the next, sampled at a temperature and a guidance scale of its own. Built
-//! with the `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint and `GLSL_KERNELS`
-//! the compiled kernels, as `nix run .#device-tests` sets it.
+//! The patch sampler and the local encoder on the GPU, on VoxCPM2's real weights, held to their
+//! goldens at every tuning they are checked at: each case a patch upstream generated, as the
+//! patch before, and the noise it drew for the next, sampled at a temperature and a guidance
+//! scale of its own. Built with the `device` feature, and run with `VOXCPM2_DIR` naming the
+//! checkpoint, `GOLDEN_DIR` the goldens and `GLSL_KERNELS` the compiled kernels, as `nix run
+//! .#device-tests` sets the last. Each tolerance is set as testkit's `golden` says.
 //!
 //! Each case is run alone, and with others as rows of one run, where it must come out bit for
 //! bit as it does alone: what a row's sums come to depends on the tuning alone, never on what
 //! else is in a block of tokens (`local`'s documentation), so that a request's audio does not
-//! depend on the others served beside it. Alone, each is held to burn's f16.
-//!
-//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
-//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
+//! depend on the others served beside it. Alone, each is held to its golden.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
 
-use burn::tensor::{FloatDType, Tensor, TensorData};
 use graph::{
     checkpoint::Checkpoint,
     graph::{Graph, Kind, TensorId},
@@ -29,8 +26,8 @@ use graph::{
     step::Step,
 };
 use half::f16;
-use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
-use voxcpm::{Cfm, Config, LocalEncoder, Sampling};
+use testkit::{Fixture, checkpoint_dir};
+use voxcpm::Sampling;
 use vulkan::{Context, executable::count_mnemonics};
 
 fn context() -> Context {
@@ -59,10 +56,9 @@ fn weights() -> std::path::PathBuf {
 }
 
 /// What one patch is sampled from: the conditions, the patch before and the noise, each laid
-/// out as the sampler takes it, and the temperature and guidance scale; named for what it is.
+/// out as the sampler takes it, and the temperature and guidance scale.
 #[derive(Clone)]
 struct Case {
-    name: String,
     mu: Vec<f32>,
     cond: Vec<f32>,
     noise: Vec<f32>,
@@ -91,11 +87,9 @@ fn golden() -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     );
     let fixture = Fixture::open(path);
     let rows = |name: &str| -> Vec<Vec<f32>> {
-        let tensor = fixture.tensor::<3>(name, &device());
-        let [n, ..] = tensor.dims();
-        let values: Vec<f32> = tensor.into_data().iter::<f32>().collect();
+        let (shape, values) = fixture.floats(name);
         values
-            .chunks(values.len() / n)
+            .chunks(values.len() / shape[0])
             .map(<[f32]>::to_vec)
             .collect()
     };
@@ -112,10 +106,9 @@ fn transposed(patch: &[f32], rows: usize) -> Vec<f32> {
 /// The most rows a case is run among.
 const ROWS: usize = 16;
 
-/// [`ROWS`] patches of the golden after the ones before them, with conditions of about the scale
-/// of a hidden state after a norm, the conditions rounded to f16 as the GPU takes them, so that
-/// the oracles take them so too, the difference of their inputs being none of the GPU's error.
-/// The first two at voxcpm's temperature and guidance scale, the rest each at a pair of its own.
+/// [`ROWS`] patches of upstream's golden after the ones before them, with conditions of about the
+/// scale of a hidden state after a norm, rounded to f16 as the GPU takes them. The first two at
+/// voxcpm's temperature and guidance scale, the rest each at a pair of its own.
 fn cases(config: &PatchConfig) -> Vec<Case> {
     let (patches, noise) = golden();
     let hidden = config.dit_config.stack.hidden_dim;
@@ -133,7 +126,6 @@ fn cases(config: &PatchConfig) -> Vec<Case> {
             };
             let mu = uniform(2 * hidden, seed, 1.7);
             Case {
-                name: format!("golden{at}-mu{seed}-t{}-cfg{}", sampling[0], sampling[1]),
                 mu: mu.iter().map(|&v| f16::from_f32(v).to_f32()).collect(),
                 cond: transposed(&patches[at - 1], config.patch_size),
                 noise: noise[at].clone(),
@@ -153,6 +145,12 @@ struct Distance {
     max_abs: f64,
     /// RMS of the differences over RMS of the reference.
     relative_rms: f64,
+}
+
+impl Distance {
+    fn within(self, tolerance: Distance) -> bool {
+        self.max_abs <= tolerance.max_abs && self.relative_rms <= tolerance.relative_rms
+    }
 }
 
 impl std::fmt::Debug for Distance {
@@ -181,61 +179,21 @@ fn distance(got: &[f32], want: &[f32]) -> Distance {
     }
 }
 
-/// The GPU's largest error and relative RMS error against f32, over burn's f16 own.
-fn margins_of(got: &[f32], want: &[f32], burn_f16: &[f32]) -> [f64; 2] {
-    let (ours, burn) = (distance(got, want), distance(burn_f16, want));
-    eprintln!("GPU {ours:?}; burn f16 {burn:?}");
-    [
-        ours.max_abs / burn.max_abs,
-        ours.relative_rms / burn.relative_rms,
-    ]
+/// Whether `got` is within `tolerance` of `golden`: which of two runs rounds a few large values
+/// worse is luck, so a value is held to the largest error any run reached.
+fn check(name: &str, got: &[f32], golden: &[f32], tolerance: Distance) -> bool {
+    let d = distance(got, golden);
+    eprintln!("{name} against the golden: {d:?}");
+    d.within(tolerance)
 }
 
-/// Whether the GPU stays as close to f32 as f16 arithmetic on the CPU does, give or take a
-/// quarter: which of two runs rounds a few large values worse is luck.
-fn within(margins: [f64; 2]) -> bool {
-    margins.iter().all(|&m| m <= 1.25)
-}
-
-/// What voxcpm's sampler gives for each case in `timesteps` steps, its DiT in `dtype`, the
-/// patches `[feat_dim][patch_size]` flattened one after another, each kept by the case's name.
-fn oracle(cases: &[Case], timesteps: usize, dtype: FloatDType) -> Vec<f32> {
-    let config = Config::from_json(&config_json()).unwrap();
-    let (feat_dim, patch_size) = (config.feat_dim, config.patch_size);
-    let cpu = device();
-    let mut cfm = None;
-    let mut out = Vec::new();
-    for case in cases {
-        let name = format!("local-{}-{timesteps}-{dtype:?}", case.name);
-        out.extend(kept::<Vec<f32>>(&name, || {
-            let start = Instant::now();
-            let cfm = cfm.get_or_insert_with(|| {
-                Cfm::load(&config, &weights(), dtype, &cpu).unwrap_or_else(|e| panic!("{e}"))
-            });
-            let sampling = Sampling {
-                timesteps,
-                temperature: case.sampling[0],
-                cfg_value: case.sampling[1],
-            };
-            let tensor = |values: &[f32], shape: [usize; 3]| {
-                Tensor::<3>::from_data(TensorData::new(values.to_vec(), shape), &cpu)
-            };
-            let mu = TensorData::new(case.mu.clone(), [1, case.mu.len()]);
-            let patch = cfm.sample(
-                Tensor::<2>::from_data(mu, &cpu),
-                tensor(&case.cond, [1, feat_dim, patch_size]),
-                tensor(&case.noise, [1, feat_dim, patch_size]),
-                &sampling,
-            );
-            eprintln!(
-                "{} in {timesteps} steps on the CPU, {dtype:?}: {:.1} s",
-                case.name,
-                start.elapsed().as_secs_f64()
-            );
-            patch.into_data().iter::<f32>().collect()
-        }));
-    }
-    out
+/// The golden of the cases' patches in `timesteps` steps, `[feat_dim][patch_size]` one after
+/// another: the device's tuning's, each case alone.
+fn sampler_golden(ctx: &Context, cases: &[Case], timesteps: usize) -> Vec<f32> {
+    testkit::golden(&format!("local-sampler-{timesteps}"), || {
+        let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+        gpu(ctx, cases, timesteps, 1, &tuning)
+    })
 }
 
 fn patch_config() -> PatchConfig {
@@ -372,38 +330,27 @@ fn fitted(ctx: &Context, tuning: Tuning) -> Tuning {
     tuning.fit(ctx.report()).unwrap_or_else(|e| panic!("{e}"))
 }
 
-#[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
-            ORACLE_DIR a directory to keep the oracles in"]
-fn keeps_the_oracles() {
-    if oracle_dir().is_none() {
-        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
-        return;
-    }
-    let config = patch_config();
-    let cases = cases(&config);
-    let patches = encoder_patches(&config);
-    for dtype in [FloatDType::F32, FloatDType::F16] {
-        oracle(&cases, 2, dtype);
-        oracle(&cases, Sampling::default().timesteps, dtype);
-        encoder_oracle(&patches, dtype);
-    }
-}
+/// One Euler step's tolerance: against burn's CPU in f32, the largest error and relative RMS
+/// error of any run on the Radeon 8060S and the RTX 4070 Ti SUPER were 1.76e-2 and 1.98e-3, and
+/// the golden's 1.46e-2 and 1.89e-3.
+const ONE_EULER_STEP: Distance = Distance {
+    max_abs: 4.1e-2,
+    relative_rms: 4.9e-3,
+};
 
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
-fn one_euler_step_samples_as_voxcpm_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn one_euler_step_samples_as_its_golden() {
     let config = patch_config();
     let len = config.feat_dim * config.patch_size;
     // Two steps, the first of which stays where it starts: one run of the DiT.
     let cases = cases(&config);
-    let want = oracle(&cases, 2, FloatDType::F32);
-    let burn_f16 = oracle(&cases, 2, FloatDType::F16);
     let ctx = context();
+    let want = sampler_golden(&ctx, &cases, 2);
     for tuning in tunings(&ctx) {
         let alone = gpu(&ctx, &cases, 2, 1, &tuning);
-        let margins = margins_of(&alone, &want, &burn_f16);
-        assert!(within(margins), "{tuning:?}: {margins:.2?}");
+        let name = format!("{tuning:?}");
+        assert!(check(&name, &alone, &want, ONE_EULER_STEP), "{name}");
         for rows in [3, ROWS] {
             let got = gpu(&ctx, &cases, 2, rows, &tuning);
             as_alone(&got, &alone, len).unwrap_or_else(|e| panic!("{rows} rows, {tuning:?}: {e}"));
@@ -419,26 +366,34 @@ fn one_euler_step_samples_as_voxcpm_does_on_the_cpu() {
         .collect();
     let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let got = gpu(&ctx, &unguided, 2, ROWS, &tuning);
-    let margins = margins_of(&got, &want, &burn_f16);
-    assert!(!within(margins), "without mu: {margins:.2?}");
+    assert!(
+        !check("without mu", &got, &want, ONE_EULER_STEP),
+        "without mu passes"
+    );
     assert_no_validation_messages(&ctx);
 }
 
+/// Ten steps' tolerance: against f32, any run's were 3.25e-2 and 1.99e-3, and the golden's
+/// 2.48e-2 and 1.60e-3.
+const TEN_STEPS: Distance = Distance {
+    max_abs: 7.2e-2,
+    relative_rms: 4.5e-3,
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
-fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn ten_steps_sample_as_their_golden() {
     let config = patch_config();
     let len = config.feat_dim * config.patch_size;
     let cases = cases(&config);
     let timesteps = Sampling::default().timesteps;
-    let want = oracle(&cases, timesteps, FloatDType::F32);
-    let burn_f16 = oracle(&cases, timesteps, FloatDType::F16);
     let ctx = context();
+    let want = sampler_golden(&ctx, &cases, timesteps);
     for subgroup in subgroups(&ctx) {
         let tuning = fitted(&ctx, Tuning::for_subgroup(subgroup));
         let alone = gpu(&ctx, &cases, timesteps, 1, &tuning);
-        let margins = margins_of(&alone, &want, &burn_f16);
-        assert!(within(margins), "{tuning:?}: {margins:.2?}");
+        let name = format!("{tuning:?}");
+        assert!(check(&name, &alone, &want, TEN_STEPS), "{name}");
         for rows in [5, ROWS] {
             let got = gpu(&ctx, &cases, timesteps, rows, &tuning);
             as_alone(&got, &alone, len).unwrap_or_else(|e| panic!("{rows} rows, {tuning:?}: {e}"));
@@ -447,31 +402,11 @@ fn ten_steps_sample_as_voxcpm_does_on_the_cpu() {
     // Defect: a step short, the last step's velocity left out.
     let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let short = gpu(&ctx, &cases, timesteps - 1, ROWS, &tuning);
-    let margins = margins_of(&short, &want, &burn_f16);
-    assert!(!within(margins), "a step short: {margins:.2?}");
+    assert!(
+        !check("a step short", &short, &want, TEN_STEPS),
+        "a step short passes"
+    );
     assert_no_validation_messages(&ctx);
-}
-
-/// [`compute_encoder_oracle`]'s, kept by the dtype alone: the encoder's test embeds the golden's
-/// patches and [`voice_patches`]' 40.
-fn encoder_oracle(patches: &[Vec<f32>], dtype: FloatDType) -> Vec<f32> {
-    kept(&format!("local-encoder-{dtype:?}"), || {
-        compute_encoder_oracle(patches, dtype)
-    })
-}
-
-/// What voxcpm's local encoder gives for each patch `[patch_size][feat_dim]`, in `dtype`.
-fn compute_encoder_oracle(patches: &[Vec<f32>], dtype: FloatDType) -> Vec<f32> {
-    let config = Config::from_json(&config_json()).unwrap();
-    let cpu = device();
-    let encoder =
-        LocalEncoder::load(&config, &weights(), dtype, &cpu).unwrap_or_else(|e| panic!("{e}"));
-    let n = patches.len();
-    let values: Vec<f32> = patches.concat();
-    let shape = [1, n, config.patch_size, config.feat_dim];
-    let patches = Tensor::<4>::from_data(TensorData::new(values, shape), &cpu);
-    let out = encoder.forward(patches).cast(FloatDType::F32);
-    out.into_data().iter::<f32>().collect()
 }
 
 /// The first `count` patches of each of a few voices' latents, `[patch_size][feat_dim]` each,
@@ -483,8 +418,7 @@ fn voice_patches(config: &PatchConfig, count: usize) -> Vec<Vec<f32>> {
         .into_iter()
         .flat_map(|voice| {
             let path = std::path::Path::new(&dir).join(format!("latents/{voice}.safetensors"));
-            let latents = Fixture::open(path).tensor::<2>("latents", &device());
-            let values: Vec<f32> = latents.into_data().iter::<f32>().collect();
+            let (_, values) = Fixture::open(path).floats("latents");
             let patches: Vec<Vec<f32>> = values.chunks_exact(len).map(<[f32]>::to_vec).collect();
             patches.into_iter().take(count)
         })
@@ -532,20 +466,30 @@ fn embed(
     got
 }
 
+/// The encoder's tolerance: against f32, any run's were 3.27e-2 and 8.83e-4, and the golden's
+/// too.
+const THE_ENCODER: Distance = Distance {
+    max_abs: 8.2e-2,
+    relative_rms: 2.3e-3,
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
+            GOLDEN_DIR the goldens"]
+fn the_encoder_embeds_as_its_golden() {
     let config = patch_config();
     let hidden = config.encoder_config.hidden_dim;
     let patches = encoder_patches(&config);
-    let want = encoder_oracle(&patches, FloatDType::F32);
-    let burn_f16 = encoder_oracle(&patches, FloatDType::F16);
     let ctx = context();
     let checkpoint = Checkpoint::open(weights()).unwrap_or_else(|e| panic!("{e}"));
+    let want = testkit::golden("local-encoder", || {
+        let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+        embed(&ctx, &checkpoint, &patches, 1, &tuning)
+    });
     for tuning in tunings(&ctx) {
         let alone = embed(&ctx, &checkpoint, &patches, 1, &tuning);
-        let margins = margins_of(&alone, &want, &burn_f16);
-        assert!(within(margins), "{tuning:?}: {margins:.2?}");
+        let name = format!("{tuning:?}");
+        assert!(check(&name, &alone, &want, THE_ENCODER), "{name}");
         for rows in [7, ROWS] {
             let got = embed(&ctx, &checkpoint, &patches, rows, &tuning);
             as_alone(&got, &alone, hidden)
@@ -563,8 +507,10 @@ fn the_encoder_embeds_as_voxcpm_does_on_the_cpu() {
         .collect();
     let tuning = Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
     let got = embed(&ctx, &checkpoint, &reversed, ROWS, &tuning);
-    let margins = margins_of(&got, &want, &burn_f16);
-    assert!(!within(margins), "frames reversed: {margins:.2?}");
+    assert!(
+        !check("frames reversed", &got, &want, THE_ENCODER),
+        "frames reversed pass"
+    );
     assert_no_validation_messages(&ctx);
 }
 

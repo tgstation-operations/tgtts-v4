@@ -3183,11 +3183,8 @@ dependencies = [
 name = "graph"
 version = "0.1.0"
 dependencies = [
- "audiovae",
- "burn",
  "half",
  "libc",
- "minicpm4",
  "serde",
  "serde_json",
  "testkit",
@@ -6054,6 +6051,7 @@ name = "testkit"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "half",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

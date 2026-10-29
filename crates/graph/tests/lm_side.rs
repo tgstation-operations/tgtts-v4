@@ -1,23 +1,18 @@
-//! The LM side on the GPU against voxcpm's model on burn's CPU backend, on VoxCPM2's real weights.
-//! The model is prompted with a voice's patches alone, which it runs as it runs the patches it
-//! generates, and generates patches from seeded noise; the GPU is given the local encoder's output
-//! for every patch, the prompt's one at a time, and gives the condition and the stop logits the
-//! model's `conditioning` gives, from the prompt's last position on. burn's f16 is fed the f32
-//! run's patches, so that all three follow one generation. Built with the `device` feature, and run
-//! with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS`
-//! the compiled kernels, as `nix run .#device-tests` sets the last.
+//! The LM side on the GPU, on VoxCPM2's real weights, held to its golden. It is given the local
+//! encoder's output for every patch of a generation burn's CPU backend ran in f32, prompted with a
+//! voice's patches alone and generating from seeded noise, the prompt's one at a time, and gives
+//! the condition and the stop logits from the prompt's last position on. Built with the `device`
+//! feature, and run with `VOXCPM2_DIR` naming the checkpoint, `GOLDEN_DIR` the goldens and
+//! `GLSL_KERNELS` the compiled kernels, as `nix run .#device-tests` sets the last. Each tolerance
+//! is set as testkit's `golden` says.
 //!
 //! The LM side runs several requests at once too, a row each, each at its own position in its own
 //! slot of the caches: a row comes out bit for bit as it does alone, which a few layers are held
-//! to over inputs made up for each request, and as voxcpm's on the oracle's patches.
-//!
-//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
-//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
+//! to over inputs made up for each request, and the golden's generation.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
 
-use burn::tensor::{FloatDType, Tensor, TensorData};
 use graph::{
     checkpoint::Checkpoint,
     decode::{Batch, Row, SUBGROUPS, Tuning},
@@ -27,14 +22,9 @@ use graph::{
     step::Step,
 };
 use half::f16;
-use serde::{Deserialize, Serialize};
-use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
-use voices::Latent;
-use voxcpm::{Config, Dtypes, Generation, LocalEncoder, Model, Prompt, Sampling, SeededNoise};
+use serde::Deserialize;
+use testkit::{checkpoint_dir, golden, golden_input};
 use vulkan::Context;
-
-/// Patches generated after the prompt.
-const GENERATED: usize = 8;
 
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
@@ -53,137 +43,46 @@ fn assert_no_validation_messages(ctx: &Context) {
     );
 }
 
-/// The latent frames of the voice voxcpm's golden was made with.
-fn voice() -> Vec<f32> {
-    let golden = Fixture::open(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../voxcpm/tests/fixtures/voxcpm_checkpoint.safetensors"
-    ));
-    let Some(dir) = std::env::var_os("VOICES_DIR").filter(|dir| !dir.is_empty()) else {
-        panic!("VOICES_DIR is not set; point it at a voices directory");
-    };
-    let dir = std::path::absolute(dir).unwrap();
-    let path = voices::latent_path(&dir, &golden.metadata()["voice"]);
-    let latent = Latent::read(&path).unwrap_or_else(|e| panic!("{e}"));
-    latent.frames.as_flattened().to_vec()
-}
-
-/// VoxCPM2's config, as voxcpm and as the LM side read it, with `layers` of the base LM and
+/// VoxCPM2's config, as the LM side reads it, with `layers` of the base LM and
 /// `residual_layers` of the residual LM.
-fn configs(layers: usize, residual_layers: usize) -> (Config, lm_side::Config) {
+fn config(layers: usize, residual_layers: usize) -> lm_side::Config {
     let json = fs::read_to_string(checkpoint_dir().join("config.json")).unwrap();
-    let mut config = Config::from_json(&json).unwrap();
+    let mut config: lm_side::Config = serde_json::from_str(&json).unwrap();
     config.lm_config.num_hidden_layers = layers;
     config.residual_lm_num_layers = residual_layers;
-    let mut ours: lm_side::Config = serde_json::from_str(&json).unwrap();
-    ours.lm_config.num_hidden_layers = layers;
-    ours.residual_lm_num_layers = residual_layers;
-    (config, ours)
+    config
 }
 
-/// What voxcpm's model gives on the CPU.
-#[derive(Serialize, Deserialize)]
-struct Oracle {
-    /// The local encoder's output for every patch, the prompt's and then the generated ones,
-    /// rounded to f16: `[patches][encoder]` as f16 bits.
+/// What the LM side is given: the local encoder's output for every patch of a generation burn's
+/// CPU backend ran in f32 with `layers` of the base LM and `residual_layers` of the residual LM,
+/// prompted with Baraka's patches alone and generating 8 patches from `SeededNoise::new(0)`,
+/// the prompt's and then the generated ones, rounded to f16: `[patches][encoder]` as f16 bits.
+#[derive(Deserialize)]
+struct Input {
     enc: Vec<u16>,
     /// The patches of the prompt.
     prompt: usize,
-    /// The condition `[GENERATED + 1][2 * dit]` and the stop logits `[GENERATED + 1][2]` after the
-    /// prompt and after each generated patch, in f32 and in burn's f16.
-    mu: [Vec<f32>; 2],
-    stop: [Vec<f32>; 2],
 }
 
-fn floats<const D: usize>(t: Tensor<D>) -> Vec<f32> {
-    t.cast(FloatDType::F32).into_data().iter::<f32>().collect()
-}
-
-fn oracle(config: &Config) -> Oracle {
+fn input(config: &lm_side::Config) -> Input {
     let (layers, residual) = (
         config.lm_config.num_hidden_layers,
         config.residual_lm_num_layers,
     );
-    kept(&format!("lm-side-{layers}-{residual}"), || {
-        compute_oracle(config)
-    })
+    golden_input(&format!("input-lm-side-{layers}-{residual}"))
 }
 
-fn compute_oracle(config: &Config) -> Oracle {
-    let weights = checkpoint_dir().join("model.safetensors");
-    let cpu = device();
-    let voice = voice();
-    let patch = config.patch_size * config.feat_dim;
-    let len = voice.len() / patch;
-    let prompt = Prompt {
-        tokens: vec![0; len],
-        patches: voice.clone(),
-        audio: vec![true; len],
-    };
-    let load = |lm| {
-        let dtypes = Dtypes {
-            lm,
-            local_encoder: FloatDType::F32,
-            local_dit: FloatDType::F32,
-            audio_decoder: FloatDType::F32,
-        };
-        Model::load(config, &weights, &dtypes, &cpu).unwrap_or_else(|e| panic!("{e}"))
-    };
-    let start = Instant::now();
-
-    let model = load(FloatDType::F32);
-    let mut generation = model.start(&prompt, GENERATED).unwrap();
-    let mut noise = SeededNoise::new(0);
-    let (mut mu, mut stop, mut patches) = (vec![], vec![], vec![]);
-    for i in 0..=GENERATED {
-        let (m, s) = generation.conditioning();
-        mu.extend(floats(m));
-        stop.extend(floats(s));
-        if i < GENERATED {
-            let step = generation.sample(model.noise(&mut noise), &Sampling::default());
-            patches.push(step.patch.clone());
-            generation.advance(step.patch);
-        }
-    }
-    drop(generation);
-    drop(model);
-
-    let encoder = LocalEncoder::load(config, &weights, FloatDType::F32, &cpu).unwrap();
-    let shape = [1, len, config.patch_size, config.feat_dim];
-    let prompt_patches = Tensor::<4>::from_data(TensorData::new(voice, shape), &cpu);
-    let generated = Tensor::cat(patches.clone(), 0).unsqueeze_dim::<4>(0);
-    let enc = encoder.forward(Tensor::cat(vec![prompt_patches, generated], 1));
-    let enc = floats(enc)
-        .iter()
-        .map(|&v| f16::from_f32(v).to_bits())
-        .collect();
-    drop(encoder);
-
-    let model = load(FloatDType::F16);
-    let mut generation = model.start(&prompt, GENERATED).unwrap();
-    let (mut mu16, mut stop16) = (vec![], vec![]);
-    let mut record = |generation: &Generation| {
-        let (m, s) = generation.conditioning();
-        mu16.extend(floats(m));
-        stop16.extend(floats(s));
-    };
-    record(&generation);
-    for patch in patches {
-        generation.advance(patch);
-        record(&generation);
-    }
-    eprintln!(
-        "{} and {} layers on the CPU, f32 and f16: {:.1} s",
+/// The golden of `config` over `input`: the condition `[patches][2 * dit]` and the stop logits
+/// `[patches][2]` after the prompt and after each generated patch, at the device's default
+/// tuning.
+fn golden_of(config: &lm_side::Config, input: &Input) -> (Vec<f32>, Vec<f32>) {
+    let (layers, residual) = (
         config.lm_config.num_hidden_layers,
         config.residual_lm_num_layers,
-        start.elapsed().as_secs_f64()
     );
-    Oracle {
-        enc,
-        prompt: len,
-        mu: [mu, mu16],
-        stop: [stop, stop16],
-    }
+    golden(&format!("lm-side-{layers}-{residual}"), || {
+        gpu(config, input, None, None, 1).remove(0)
+    })
 }
 
 /// A request a batch runs: from step `start` on, positions 0 to `len - 1`, a position a step, in
@@ -253,21 +152,21 @@ fn row_inputs(
     x
 }
 
-/// The GPU's conditions and stop logits for the oracle's patches, from the prompt's last on, with
+/// The GPU's conditions and stop logits for `input`'s patches, from the prompt's last on, with
 /// the kernels at `subgroup` (the device's default when `None`), the residual LM rotated by RoPE
 /// as `shape` says unless `residual_rope` says otherwise; for each of `rows` requests run at
 /// once, cut as [`Tuning::for_batch`] cuts them, request r from step 2 r on in slot
 /// `rows - 1 - r` of the caches.
 fn gpu(
     config: &lm_side::Config,
-    oracle: &Oracle,
+    input: &Input,
     subgroup: Option<u32>,
     residual_rope: Option<bool>,
     rows: usize,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let positions = oracle.enc.len() / config.encoder_config.hidden_dim;
+    let positions = input.enc.len() / config.encoder_config.hidden_dim;
     let mut shape = LmSideShape::new(config, positions.next_multiple_of(32)).unwrap();
     if let Some(rope) = residual_rope {
         shape.residual.rope = rope;
@@ -304,7 +203,7 @@ fn gpu(
         })
         .collect();
     let width = shape.encoder;
-    let inputs = vec![oracle.enc.as_slice(); rows];
+    let inputs = vec![input.enc.as_slice(); rows];
     let got = run_batch(&requests, rows, |placed, which| {
         let enc = row_inputs(placed, which, &inputs, width);
         side.step_rows(placed, &enc)
@@ -314,7 +213,7 @@ fn gpu(
     got.into_iter()
         .map(|patches| {
             let (mut mu, mut stop) = (vec![], vec![]);
-            for out in &patches[oracle.prompt - 1..] {
+            for out in &patches[input.prompt - 1..] {
                 mu.extend(out.mu.iter().map(|&h| f16::from_bits(h).to_f32()));
                 stop.extend(out.stop_logits);
             }
@@ -329,6 +228,12 @@ struct Distance {
     max_abs: f64,
     /// RMS of the differences over RMS of the reference.
     relative_rms: f64,
+}
+
+impl Distance {
+    fn within(self, tolerance: Distance) -> bool {
+        self.max_abs <= tolerance.max_abs && self.relative_rms <= tolerance.relative_rms
+    }
 }
 
 impl std::fmt::Debug for Distance {
@@ -356,52 +261,42 @@ fn distance(got: &[f32], want: &[f32]) -> Distance {
     }
 }
 
-/// How the GPU's conditions and stop logits compare with burn's f16, both against f32: the GPU's
-/// largest error and relative RMS error over every patch, each over burn's, for the condition and
-/// for the stop logits. Errors are compared over all the patches, not at each: the scalar
-/// quantizer rounds a value either way of a level by luck, and one level is a ninth.
-fn check(oracle: &Oracle, (mu, stop): &(Vec<f32>, Vec<f32>)) -> [f64; 4] {
-    let [want, burn] = &oracle.mu;
-    let width = want.len() / (GENERATED + 1);
-    for i in 0..=GENERATED {
+/// A run's tolerances: of the condition, and of the stop logits.
+struct Tolerance {
+    mu: Distance,
+    stop: Distance,
+}
+
+/// Whether the GPU's conditions and stop logits are within `tolerance` of the golden's, by their
+/// largest error and relative RMS error over every patch. Errors are compared over all the
+/// patches, not at each: the scalar quantizer rounds a value either way of a level by luck, and
+/// one level is a ninth.
+fn check(
+    name: &str,
+    (mu, stop): &(Vec<f32>, Vec<f32>),
+    (want, want_stop): &(Vec<f32>, Vec<f32>),
+    tolerance: &Tolerance,
+) -> bool {
+    let patches = want_stop.len() / 2;
+    let width = want.len() / patches;
+    for i in 0..patches {
         let at = |v: &[f32]| v[i * width..(i + 1) * width].to_vec();
         let logits = |v: &[f32]| [v[2 * i], v[2 * i + 1]];
         eprintln!(
-            "after patch {i}: condition GPU {:?}, burn f16 {:?}; stop logits f32 {:?}, GPU {:?}, \
-             burn f16 {:?}",
+            "{name}, after patch {i}: condition {:?}; stop logits {:?}, the golden's {:?}",
             distance(&at(mu), &at(want)),
-            distance(&at(burn), &at(want)),
-            logits(&oracle.stop[0]),
             logits(stop),
-            logits(&oracle.stop[1]),
+            logits(want_stop),
         );
     }
-    let (ours, theirs) = (distance(mu, want), distance(burn, want));
-    let (ours_stop, theirs_stop) = (
-        distance(stop, &oracle.stop[0]),
-        distance(&oracle.stop[1], &oracle.stop[0]),
-    );
-    let margin = [
-        ours.max_abs / theirs.max_abs,
-        ours.relative_rms / theirs.relative_rms,
-        ours_stop.max_abs / theirs_stop.max_abs,
-        ours_stop.relative_rms / theirs_stop.relative_rms,
-    ];
-    eprintln!(
-        "condition: GPU {ours:?}; burn f16 {theirs:?}\nstop logits: GPU {ours_stop:?}; burn f16 \
-         {theirs_stop:?}\nthe GPU's against burn's f16: {margin:.2?}"
-    );
-    margin
+    let (ours, ours_stop) = (distance(mu, want), distance(stop, want_stop));
+    eprintln!("{name} against the golden: condition {ours:?}; stop logits {ours_stop:?}");
+    ours.within(tolerance.mu) && ours_stop.within(tolerance.stop)
 }
 
-fn within(margin: [f64; 4]) -> bool {
-    margin.iter().all(|&m| m <= 1.25)
-}
-
-/// Whether the GPU and f32 decide alike whether to stop, wherever f32's margin between going on
-/// and stopping is wider than the GPU's error in the logits.
-fn decides_alike(oracle: &Oracle, stop: &[f32]) -> bool {
-    let want = &oracle.stop[0];
+/// Whether the GPU and the golden decide alike whether to stop, wherever the golden's margin
+/// between going on and stopping is wider than the GPU's distance from it in the logits.
+fn decides_alike(want: &[f32], stop: &[f32]) -> bool {
     let error = distance(stop, want).max_abs as f32;
     want.chunks(2).zip(stop.chunks(2)).all(|(w, g)| {
         let margin = w[1] - w[0];
@@ -419,49 +314,48 @@ fn full() -> (usize, usize) {
     )
 }
 
-#[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
-            ORACLE_DIR a directory to keep the oracles in"]
-fn keeps_the_oracles() {
-    if oracle_dir().is_none() {
-        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
-        return;
-    }
-    oracle(&configs(2, 1).0);
-    let json = fs::read_to_string(checkpoint_dir().join("config.json")).unwrap();
-    oracle(&Config::from_json(&json).unwrap());
-}
+/// A few layers' tolerances: against burn's CPU in f32, the largest errors and relative RMS
+/// errors of any run on the Radeon 8060S and the RTX 4070 Ti SUPER were 7.37e-2 and 4.39e-3 over
+/// the condition and 1.94e-3 and 2.16e-3 over the stop logits, and the golden's 7.37e-2 and
+/// 4.32e-3, and 1.94e-3 and 2.07e-3.
+const A_FEW_LAYERS: Tolerance = Tolerance {
+    mu: Distance {
+        max_abs: 1.9e-1,
+        relative_rms: 1.1e-2,
+    },
+    stop: Distance {
+        max_abs: 4.9e-3,
+        relative_rms: 5.3e-3,
+    },
+};
 
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn a_few_layers_condition_as_voxcpm_does_on_the_cpu() {
-    let (config, ours) = configs(2, 1);
-    let oracle = oracle(&config);
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn a_few_layers_condition_as_their_golden() {
+    let config = config(2, 1);
+    let input = input(&config);
+    let want = golden_of(&config, &input);
     // At every subgroup size the device can require: 32, as on NVIDIA, also on the Radeon.
     let report = context().report().clone();
     for subgroup in SUBGROUPS
         .into_iter()
         .filter(|&s| report.can_require_subgroup_size(s))
     {
-        let got = gpu(&ours, &oracle, Some(subgroup), None, 1).remove(0);
-        let margin = check(&oracle, &got);
-        assert!(within(margin), "wave{subgroup}: {margin:?}");
-        assert!(decides_alike(&oracle, &got.1), "wave{subgroup}");
+        let got = gpu(&config, &input, Some(subgroup), None, 1).remove(0);
+        let name = format!("wave{subgroup}");
+        assert!(check(&name, &got, &want, &A_FEW_LAYERS), "{name}");
+        assert!(decides_alike(&want.1, &got.1), "{name}");
         // Three requests at once, each at its own position: each as it is alone.
-        let rows = gpu(&ours, &oracle, Some(subgroup), None, 3);
+        let rows = gpu(&config, &input, Some(subgroup), None, 3);
         for (r, row) in rows.iter().enumerate() {
-            assert!(
-                row == &got,
-                "wave{subgroup}: row {r} of 3 is not as it is alone"
-            );
+            assert!(row == &got, "{name}: row {r} of 3 is not as it is alone");
         }
     }
     // Defect: the residual LM rotated by RoPE, as the base LM is.
-    let rotated = gpu(&ours, &oracle, None, Some(true), 1).remove(0);
-    let margin = check(&oracle, &rotated);
+    let rotated = gpu(&config, &input, None, Some(true), 1).remove(0);
     assert!(
-        !within(margin),
-        "a residual LM with RoPE passes: {margin:?}"
+        !check("the residual LM rotated", &rotated, &want, &A_FEW_LAYERS),
+        "a residual LM with RoPE passes"
     );
 }
 
@@ -517,7 +411,7 @@ fn made_up(len: usize, width: usize, seed: u32) -> Vec<u16> {
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
 fn rows_condition_bit_for_bit_as_they_do_alone() {
-    let (_, config) = configs(2, 1);
+    let config = config(2, 1);
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
@@ -681,18 +575,32 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
     assert_no_validation_messages(&ctx);
 }
 
+/// The full stacks' tolerances: against f32, any run's were 1.49e-1 and 9.94e-3 over the
+/// condition and 3.55e-2 and 4.56e-3 over the stop logits, and the golden's 1.43e-1 and 8.99e-3,
+/// and 3.55e-2 and 4.56e-3.
+const THE_LM_SIDE: Tolerance = Tolerance {
+    mu: Distance {
+        max_abs: 3.7e-1,
+        relative_rms: 2.4e-2,
+    },
+    stop: Distance {
+        max_abs: 8.9e-2,
+        relative_rms: 1.2e-2,
+    },
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn the_lm_side_conditions_as_voxcpm_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn the_lm_side_conditions_as_its_golden() {
     let (layers, residual_layers) = full();
-    let (config, ours) = configs(layers, residual_layers);
-    let oracle = oracle(&config);
-    let got = gpu(&ours, &oracle, None, None, 1).remove(0);
-    let margin = check(&oracle, &got);
-    assert!(within(margin), "{margin:?}");
-    assert!(decides_alike(&oracle, &got.1));
+    let config = config(layers, residual_layers);
+    let input = input(&config);
+    let want = golden_of(&config, &input);
+    let got = gpu(&config, &input, None, None, 1).remove(0);
+    assert!(check("the LM side", &got, &want, &THE_LM_SIDE));
+    assert!(decides_alike(&want.1, &got.1));
     // Sixteen requests at once, each at its own position: each as it is alone.
-    let rows = gpu(&ours, &oracle, None, None, 16);
+    let rows = gpu(&config, &input, None, None, 16);
     for (r, row) in rows.iter().enumerate() {
         assert!(row == &got, "row {r} of 16 is not as it is alone");
     }

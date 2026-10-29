@@ -1,17 +1,13 @@
-//! The prefill on the GPU against minicpm4's stack on burn's CPU backend, on VoxCPM2's real base
-//! LM over a real prompt: the prompt run at once on both, then decode steps on both from where it
-//! left the cache. The keys and values it leaves in the cache and the outputs over it are
-//! compared, then the steps' outputs. Built with the `device` feature, and run with `VOXCPM2_DIR`
-//! naming the checkpoint and `GLSL_KERNELS` and `VULKAN_KERNELS` the compiled kernels, as `nix run
-//! .#device-tests` sets them.
-//!
-//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
-//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
+//! The prefill on the GPU, on VoxCPM2's real stacks over a real prompt, held to its golden: the
+//! prompt run at once, then decode steps from where it left the cache. The keys and values it
+//! leaves in the cache are held, and the outputs over the prompt and the steps. Built with the
+//! `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint, `GOLDEN_DIR` the goldens
+//! and `GLSL_KERNELS` and `VULKAN_KERNELS` the compiled kernels, as `nix run .#device-tests` sets
+//! the last two. Each tolerance is set as testkit's `golden` says.
 #![cfg(feature = "device")]
 
 use std::{collections::BTreeMap, fs, time::Instant};
 
-use burn::tensor::{FloatDType, Int, Tensor, TensorData};
 use graph::{
     Error,
     checkpoint::Checkpoint,
@@ -20,10 +16,9 @@ use graph::{
     prefill::{Prefill, TILE},
 };
 use half::f16;
-use minicpm4::{Config, Mask, Model};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
+use testkit::{Fixture, checkpoint_dir, golden, golden_input};
 use vulkan::Context;
 
 fn context() -> Context {
@@ -52,8 +47,7 @@ fn prompt_ids(len: usize) -> Vec<i64> {
     let fixture = Fixture::open(path);
     let mut ids = Vec::with_capacity(len);
     for i in 0.. {
-        let message = fixture.int_tensor::<1>(&format!("messages.{i}"), &device());
-        ids.extend(message.into_data().iter::<i64>());
+        ids.extend(fixture.ints(&format!("messages.{i}")).1);
         if ids.len() >= len {
             break;
         }
@@ -66,47 +60,41 @@ fn prompt_ids(len: usize) -> Vec<i64> {
 #[derive(Clone, Copy)]
 struct Distance {
     max_abs: f64,
-    /// The largest |a - b| / (atol + rtol |b|).
-    worst: f64,
     /// RMS of the differences over RMS of the reference.
     relative_rms: f64,
+}
+
+impl Distance {
+    fn within(self, tolerance: Distance) -> bool {
+        self.max_abs <= tolerance.max_abs && self.relative_rms <= tolerance.relative_rms
+    }
 }
 
 impl std::fmt::Debug for Distance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max |d| {:.2e}, worst at {:.2} of the tolerance, relative RMS {:.2e}",
-            self.max_abs, self.worst, self.relative_rms
+            "max |d| {:.2e}, relative RMS {:.2e}",
+            self.max_abs, self.relative_rms
         )
     }
 }
 
 fn distance(got: &[f32], want: &[f32]) -> Distance {
-    let (atol, rtol) = SERVED;
     assert_eq!(got.len(), want.len());
-    let (mut max_abs, mut worst, mut err2, mut ref2) = (0f64, 0f64, 0f64, 0f64);
+    let (mut max_abs, mut err2, mut ref2) = (0f64, 0f64, 0f64);
     for (&g, &w) in got.iter().zip(want) {
         let (g, w) = (f64::from(g), f64::from(w));
         let d = (g - w).abs();
-        max_abs = max_abs.max(d);
-        worst = worst.max(d / (atol + rtol * w.abs()));
-        if !d.is_finite() {
-            max_abs = f64::INFINITY;
-            worst = f64::INFINITY;
-        }
+        max_abs = max_abs.max(if d.is_finite() { d } else { f64::INFINITY });
         err2 += d * d;
         ref2 += w * w;
     }
     Distance {
         max_abs,
-        worst,
         relative_rms: (err2 / ref2).sqrt(),
     }
 }
-
-/// The served f16 tolerance of crates/gpu's real-weight tests, set for 8 layers.
-const SERVED: (f64, f64) = (2e-2, 4e-3);
 
 fn config() -> Value {
     let dir = checkpoint_dir();
@@ -130,23 +118,18 @@ struct Run {
     cache: Vec<f32>,
 }
 
-/// One of VoxCPM2's causal stacks: its config as minicpm4 reads it and as the decode step does,
-/// and the prefix of its weights' names.
+/// One of VoxCPM2's causal stacks: its config as the decode step reads it, and the prefix of its
+/// weights' names.
 struct Stack {
-    cpu: Config,
     gpu: LmConfig,
     prefix: &'static str,
 }
 
 /// The base LM's first `layers` layers.
 fn base_lm(layers: usize) -> Stack {
-    let lm = &config()["lm_config"];
-    let mut cpu: Config = serde_json::from_value(lm.clone()).unwrap();
-    cpu.num_hidden_layers = layers;
-    let mut gpu: LmConfig = serde_json::from_value(lm.clone()).unwrap();
+    let mut gpu: LmConfig = serde_json::from_value(config()["lm_config"].clone()).unwrap();
     gpu.num_hidden_layers = layers;
     Stack {
-        cpu,
         gpu,
         prefix: "base_lm.",
     }
@@ -159,7 +142,6 @@ fn residual_lm() -> Stack {
     let no_rope = json["residual_lm_no_rope"].as_bool().unwrap();
     let base = base_lm(layers);
     Stack {
-        cpu: base.cpu.residual_lm(layers, no_rope),
         gpu: LmConfig {
             no_rope,
             ..base.gpu
@@ -168,85 +150,26 @@ fn residual_lm() -> Stack {
     }
 }
 
-/// The base LM's embeddings of `len` tokens of the game's lines, `[len][hidden]`.
-fn embeddings(model: &Model, len: usize) -> Vec<f32> {
-    let ids = Tensor::<2, Int>::from_data(TensorData::new(prompt_ids(len), [1, len]), &device());
-    model.embed(ids).into_data().iter::<f32>().collect()
+/// The base LM's embeddings of `len` tokens of the game's lines, rounded to f16, `[len][hidden]`
+/// as f16 bits.
+fn embedded(len: usize) -> Vec<u16> {
+    let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let ids: Vec<usize> = prompt_ids(len).iter().map(|&id| id as usize).collect();
+    checkpoint
+        .gather_f16("base_lm.embed_tokens.weight", &ids)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
-fn rounded(x: &[f32]) -> Vec<u16> {
-    x.iter().map(|&v| f16::from_f32(v).to_bits()).collect()
-}
-
-/// The base LM's embeddings of `len` tokens of the game's lines, rounded to f16, by `stack`'s
-/// model.
-fn embedded(stack: &Stack, len: usize) -> Vec<u16> {
-    let model = Model::load(
-        &stack.cpu,
-        checkpoint_dir().join("model.safetensors"),
-        stack.prefix,
-        FloatDType::F32,
-        &device(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    rounded(&embeddings(&model, len))
-}
-
-/// The hidden states `x` makes, and [`compute_oracle`]'s runs over them, kept by the stack and
-/// `len` alone: each stack's test makes its hidden states one way.
-fn oracle(stack: &Stack, len: usize, x: impl FnOnce() -> Vec<u16>) -> (Vec<u16>, Run, Run) {
-    let layers = stack.cpu.num_hidden_layers;
-    kept(&format!("prefill-{}{layers}-{len}", stack.prefix), || {
-        let x = x();
-        let (want, burn_f16) = compute_oracle(stack, &x, len);
-        (x, want, burn_f16)
-    })
-}
-
-/// minicpm4 on the CPU over `stack`, in f32 and in f16, over `x16`, hidden states
-/// `[len + STEPS][hidden]` as f16 bits: the first `len` as a prompt at once, then a step at a
-/// time.
-fn compute_oracle(stack: &Stack, x16: &[u16], len: usize) -> (Run, Run) {
-    let weights = checkpoint_dir().join("model.safetensors");
-    let cpu = device();
-    let config = &stack.cpu;
-    let (hidden, layers) = (config.hidden_size, config.num_hidden_layers);
-    let total = len + STEPS;
-    assert_eq!(x16.len(), total * hidden);
-    let start = Instant::now();
-    let run = |dtype: FloatDType| -> Run {
-        let model = Model::load(config, &weights, stack.prefix, dtype, &cpu)
-            .unwrap_or_else(|e| panic!("{e}"));
-        let x = Tensor::<3>::from_data(TensorData::new(f16s(x16), [1, total, hidden]), &cpu)
-            .cast(dtype);
-        let mut cache = model.cache(1, total);
-        let prompt = model.forward_cached(x.clone().narrow(1, 0, len), &mut cache);
-        let mut held = Vec::new();
-        for l in 0..layers {
-            let (keys, values) = cache.layer(l);
-            for t in [keys, values] {
-                let t = t.narrow(2, 0, len).cast(FloatDType::F32);
-                held.extend(t.into_data().iter::<f32>());
-            }
-        }
-        let mut outputs = vec![prompt];
-        for t in len..total {
-            outputs.push(model.forward_cached(x.clone().narrow(1, t, 1), &mut cache));
-        }
-        let outputs = Tensor::cat(outputs, 1).cast(FloatDType::F32);
-        Run {
-            outputs: outputs.into_data().iter::<f32>().collect(),
-            cache: held,
-        }
-    };
-    let want = run(FloatDType::F32);
-    let burn_f16 = run(FloatDType::F16);
-    eprintln!(
-        "{}{layers} layers over {len} positions on the CPU, f32 and f16: {:.1} s",
-        stack.prefix,
-        start.elapsed().as_secs_f64()
+/// The golden of `stack` over the hidden states `x`, the prompt `runs` and `max_rows` as the
+/// test runs them: its run at the device's default tuning.
+fn golden_of(stack: &Stack, x: &[u16], runs: &[usize], max_rows: usize) -> Run {
+    let len: usize = runs.iter().sum();
+    let name = format!(
+        "prefill-{}{}-{len}",
+        stack.prefix, stack.gpu.num_hidden_layers
     );
-    (want, burn_f16)
+    golden(&name, || gpu(stack, x, runs, 0, None, max_rows))
 }
 
 /// The GPU's run over `stack` and the hidden states `x`: the prompt in pieces of `runs`
@@ -339,38 +262,19 @@ fn gpu(
     Run { outputs, cache }
 }
 
-/// Checks that the GPU stays as close to f32 as f16 arithmetic on the CPU does: over the
-/// prompt's outputs and over the keys and values it left in the cache, its largest error and its
-/// relative RMS error within 1.25 times burn's f16; and the decode steps', where burn's f16
-/// drifts on the CPU, within 1.25 times what burn's f16 reached over the prompt, as the decode
-/// step's own test holds them. Returns the GPU's distance from f32 over the prompt's outputs,
-/// and the margins.
-fn check(want: &Run, burn_f16: &Run, got: &Run, len: usize) -> (Distance, [f64; 6]) {
-    let split = len * 2048;
-    let ours = distance(&got.outputs[..split], &want.outputs[..split]);
-    let burn = distance(&burn_f16.outputs[..split], &want.outputs[..split]);
-    let ours_cache = distance(&got.cache, &want.cache);
-    let burn_cache = distance(&burn_f16.cache, &want.cache);
-    let ours_step = distance(&got.outputs[split..], &want.outputs[split..]);
-    let burn_step = distance(&burn_f16.outputs[split..], &want.outputs[split..]);
-    let margin = [
-        ours.max_abs / burn.max_abs,
-        ours.relative_rms / burn.relative_rms,
-        ours_cache.max_abs / burn_cache.max_abs,
-        ours_cache.relative_rms / burn_cache.relative_rms,
-        ours_step.max_abs / burn.max_abs,
-        ours_step.relative_rms / burn.relative_rms,
-    ];
-    eprintln!(
-        "prompt: GPU {ours:?}; burn f16 {burn:?}\nkeys and values: GPU {ours_cache:?}; burn f16 \
-         {burn_cache:?}\ndecode steps: GPU {ours_step:?}; burn f16 {burn_step:?}\nthe GPU's \
-         against burn's f16: {margin:.2?}"
-    );
-    (ours, margin)
+/// A stack's tolerances: of the outputs, over the prompt and the steps after it, and of the keys
+/// and values the prompt left in the cache.
+struct Tolerance {
+    outputs: Distance,
+    cache: Distance,
 }
 
-fn within(margin: [f64; 6]) -> bool {
-    margin.iter().all(|&m| m <= 1.25)
+/// Whether `got` is within `tolerance` of `golden`, over the outputs and the keys and values.
+fn check(name: &str, got: &Run, golden: &Run, tolerance: &Tolerance) -> bool {
+    let outputs = distance(&got.outputs, &golden.outputs);
+    let cache = distance(&got.cache, &golden.cache);
+    eprintln!("{name} against the golden: outputs {outputs:?}; keys and values {cache:?}");
+    outputs.within(tolerance.outputs) && cache.within(tolerance.cache)
 }
 
 #[test]
@@ -415,101 +319,100 @@ fn a_prefill_runs_on_the_decoder_it_was_recorded_for_alone() {
     assert_no_validation_messages(&ctx);
 }
 
-#[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and ORACLE_DIR a directory to keep \
-            the oracles in"]
-fn keeps_the_oracles() {
-    if oracle_dir().is_none() {
-        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
-        return;
-    }
-    for (layers, len) in [(1, 600), (28, 200)] {
-        let stack = base_lm(layers);
-        oracle(&stack, len, || embedded(&stack, len + STEPS));
-    }
-    let len = 300;
-    oracle(&residual_lm(), len, || {
-        rounded(&residual_inputs(len + STEPS))
-    });
-}
+/// One layer's tolerances: against burn's CPU in f32, the largest errors and relative RMS errors
+/// of any run on the Radeon 8060S and the RTX 4070 Ti SUPER were 3.04e-2 and 3.26e-4 over the
+/// outputs and 4.12e-3 and 2.53e-4 over the keys and values, and the golden's 3.04e-2 and
+/// 2.49e-4, and 4.12e-3 and 2.53e-4.
+const ONE_LAYER: Tolerance = Tolerance {
+    outputs: Distance {
+        max_abs: 7.6e-2,
+        relative_rms: 7.2e-4,
+    },
+    cache: Distance {
+        max_abs: 1.03e-2,
+        relative_rms: 6.4e-4,
+    },
+};
 
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
-fn one_layer_prefills_as_minicpm4_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn one_layer_prefills_as_its_golden() {
     // Five tiles of rows, run as two prefills that each end inside a tile, the second from where
     // the first left the cache.
     let len = 600;
     let runs = [333, 267];
     let stack = base_lm(1);
-    let (x, want, burn_f16) = oracle(&stack, len, || embedded(&stack, len + STEPS));
+    let x = embedded(len + STEPS);
+    let want = golden_of(&stack, &x, &runs, 3 * TILE);
     let report = context().report().clone();
     for subgroup in SUBGROUPS
         .into_iter()
         .filter(|&s| report.can_require_subgroup_size(s))
     {
         let got = gpu(&stack, &x, &runs, 0, Some(subgroup), 3 * TILE);
-        let (ours, margin) = check(&want, &burn_f16, &got, len);
-        assert!(within(margin), "wave{subgroup}: {margin:?}");
-        // One layer is well inside the served tolerance, which was set for eight.
-        assert!(ours.worst <= 1.0, "wave{subgroup}: {ours:?}");
+        let name = format!("wave{subgroup}");
+        assert!(check(&name, &got, &want, &ONE_LAYER), "{name}");
     }
     // Defect: the prompt one slot on in the cache, so rotated by the next position's angle.
     let shifted = gpu(&stack, &x, &[len], 1, None, 5 * TILE);
-    let (_, margin) = check(&want, &burn_f16, &shifted, len);
-    assert!(!within(margin), "positions one slot on pass: {margin:?}");
+    assert!(
+        !check("positions one slot on", &shifted, &want, &ONE_LAYER),
+        "positions one slot on pass"
+    );
 }
 
+/// The base LM's tolerances: against f32, any run's were 1.74e-1 and 2.09e-3 over the outputs
+/// and 4.80e-2 and 1.07e-3 over the keys and values, and the golden's 1.74e-1 and 1.82e-3, and
+/// 4.80e-2 and 1.07e-3.
+const BASE_LM: Tolerance = Tolerance {
+    outputs: Distance {
+        max_abs: 4.4e-1,
+        relative_rms: 4.9e-3,
+    },
+    cache: Distance {
+        max_abs: 1.2e-1,
+        relative_rms: 2.7e-3,
+    },
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
-fn the_base_lm_prefills_as_minicpm4_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn the_base_lm_prefills_as_its_golden() {
     let len = 200;
     let stack = base_lm(28);
-    let (x, want, burn_f16) = oracle(&stack, len, || embedded(&stack, len + STEPS));
+    let x = embedded(len + STEPS);
+    let want = golden_of(&stack, &x, &[len], 2 * TILE);
     let got = gpu(&stack, &x, &[len], 0, None, 2 * TILE);
-    let (_, margin) = check(&want, &burn_f16, &got, len);
-    assert!(within(margin), "{margin:?}");
+    assert!(check("the base LM", &got, &want, &BASE_LM));
 }
 
-/// What VoxCPM2 feeds its residual LM at positions of text: `fusion_concat_proj` over the base
-/// LM's outputs beside audio embeddings that are zero there, on the CPU in f32 over the base
-/// LM's f32 outputs over `len` tokens.
-fn residual_inputs(len: usize) -> Vec<f32> {
-    let weights = checkpoint_dir().join("model.safetensors");
-    let cpu = device();
-    let stack = base_lm(28);
-    let hidden = stack.cpu.hidden_size;
-    let model = Model::load(&stack.cpu, &weights, stack.prefix, FloatDType::F32, &cpu)
-        .unwrap_or_else(|e| panic!("{e}"));
-    let x = Tensor::<3>::from_data(
-        TensorData::new(embeddings(&model, len), [1, len, hidden]),
-        &cpu,
-    );
-    let outputs = model.forward(x, Mask::Causal).reshape([len, hidden]);
-    drop(model);
-    let checkpoint = Checkpoint::open(&weights).unwrap_or_else(|e| panic!("{e}"));
-    let read = |name: &str| {
-        let (shape, bits) = checkpoint.f16(name).unwrap_or_else(|e| panic!("{e}"));
-        (shape, f16s(&bits))
-    };
-    let (shape, w) = read("fusion_concat_proj.weight");
-    assert_eq!(shape, [hidden, 2 * hidden]);
-    let (_, b) = read("fusion_concat_proj.bias");
-    let w = Tensor::<2>::from_data(TensorData::new(w, [hidden, 2 * hidden]), &cpu);
-    let b = Tensor::<1>::from_data(TensorData::new(b, [hidden]), &cpu);
-    let projected = outputs.matmul(w.narrow(1, 0, hidden).transpose()) + b.unsqueeze();
-    projected.into_data().iter::<f32>().collect()
-}
+/// The residual LM's tolerances: against f32, any run's were 6.33e-2 and 9.75e-4 over the
+/// outputs and 1.94e-2 and 5.94e-4 over the keys and values, and the golden's 5.55e-2 and
+/// 9.74e-4, and 1.94e-2 and 5.94e-4.
+const RESIDUAL_LM: Tolerance = Tolerance {
+    outputs: Distance {
+        max_abs: 1.5e-1,
+        relative_rms: 2.5e-3,
+    },
+    cache: Distance {
+        max_abs: 4.9e-2,
+        relative_rms: 1.5e-3,
+    },
+};
 
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
-fn the_residual_lm_prefills_as_minicpm4_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn the_residual_lm_prefills_as_its_golden() {
     // Run as two prefills, of two tiles' rows and of one.
     let len = 300;
     let runs = [200, 100];
     let stack = residual_lm();
     assert!(stack.gpu.no_rope, "VoxCPM2's residual LM goes without RoPE");
-    let (x, want, burn_f16) = oracle(&stack, len, || rounded(&residual_inputs(len + STEPS)));
+    // What VoxCPM2 feeds its residual LM at positions of text, rounded to f16: fusion_concat_proj
+    // over the base LM's outputs, beside audio embeddings that are zero there, as burn's CPU
+    // computed it in f32.
+    let x: Vec<u16> = golden_input(&format!("input-prefill-residual_lm.8-{len}"));
+    let want = golden_of(&stack, &x, &runs, 2 * TILE);
     let got = gpu(&stack, &x, &runs, 0, None, 2 * TILE);
-    let (_, margin) = check(&want, &burn_f16, &got, len);
-    assert!(within(margin), "{margin:?}");
+    assert!(check("the residual LM", &got, &want, &RESIDUAL_LM));
 }

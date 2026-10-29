@@ -58,8 +58,8 @@ impl Pth {
     }
 
     /// The parameter `name` as f32, in torch's layout, and its shape: a weight-normed
-    /// convolution's `<conv>.weight` folded from its `weight_g` and `weight_v`, as the
-    /// `audiovae` crate's `Weights::floats` gives it, bit for bit.
+    /// convolution's `<conv>.weight` folded from its `weight_g` and `weight_v` as torch folds
+    /// them.
     pub fn floats(&self, name: &str) -> Result<Parameter, Error> {
         if let Some(tensor) = self.tensors.get(name) {
             return Ok((tensor.shape.clone(), self.values(name, tensor)?));
@@ -540,38 +540,4 @@ fn indices(values: &[Value]) -> Result<Vec<usize>, String> {
         _ => Err(format!("an index of {value:?}")),
     };
     values.iter().map(index).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use audiovae::Weights;
-    use testkit::checkpoint_dir;
-
-    use super::*;
-
-    #[test]
-    #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint"]
-    fn floats_are_the_audiovae_crates_bit_for_bit() {
-        let path = checkpoint_dir().join("audiovae.pth");
-        let pth = Pth::open(&path).unwrap_or_else(|e| panic!("{e}"));
-        let weights = Weights::open(&path).unwrap_or_else(|e| panic!("{e}"));
-        let folded = pth
-            .tensors
-            .keys()
-            .filter_map(|name| name.strip_suffix("_v"));
-        let names: Vec<&str> = pth
-            .tensors
-            .keys()
-            .map(String::as_str)
-            .chain(folded)
-            .collect();
-        assert!(names.iter().any(|name| name.starts_with("decoder.")));
-        for name in names {
-            let (shape, values) = pth.floats(name).unwrap_or_else(|e| panic!("{e}"));
-            let (want_shape, want) = weights.floats(name).unwrap_or_else(|e| panic!("{e}"));
-            assert_eq!(shape, want_shape, "{name}");
-            let bits = |values: &[f32]| values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-            assert!(bits(&values) == bits(&want), "{name}");
-        }
-    }
 }

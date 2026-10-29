@@ -103,6 +103,39 @@ fn float_tensor_is_not_an_int_tensor() {
 }
 
 #[test]
+fn floats_read_f32_exactly_and_widen_halves() {
+    let fixture = fixture!("testkit");
+    let to_bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let (shape, f32s) = fixture.floats("f32");
+    let expected: [f32; 6] = [1.5, -2.25, 0.1, 3.0, 1e-3, -0.0];
+    assert_eq!(
+        (shape, to_bits(f32s)),
+        (vec![2, 3], expected.map(f32::to_bits).to_vec())
+    );
+    let bf16 = to_bits(fixture.floats("bf16").1);
+    assert_eq!(bf16, [0x3f80_0000, 0xc020_0000, 0x3dcd_0000, 0x4049_0000]);
+    let expected: [f32; 3] = [0.099_975_586, -65504.0, 5.960_464_5e-8];
+    assert_eq!(to_bits(fixture.floats("f16").1), expected.map(f32::to_bits));
+}
+
+#[test]
+#[should_panic(expected = "testkit.safetensors: tensor \"i64\" is I64, not F32, F16 or BF16")]
+fn integers_are_not_floats() {
+    let _ = fixture!("testkit").floats("i64");
+}
+
+#[test]
+fn ints_read_exactly() {
+    assert_eq!(fixture!("testkit").ints("i64"), (vec![2], vec![7, -1]));
+}
+
+#[test]
+#[should_panic(expected = "testkit.safetensors: tensor \"f32\" is F32, not I64")]
+fn floats_are_not_ints() {
+    let _ = fixture!("testkit").ints("f32");
+}
+
+#[test]
 fn close_within_either_tolerance() {
     assert_close(floats([1.0005, -0.0]), floats([1.0, 0.0]), 1e-3, 0.0);
     assert_close(

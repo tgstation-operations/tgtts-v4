@@ -1,23 +1,18 @@
-//! The audio VAE's decoder on the GPU against the audiovae crate's on burn's CPU backend, on
-//! VoxCPM2's real weights over a real voice's latents; and decoding several streams, each bit for
-//! bit as it does alone. Built with the `device` feature, and run with `VOXCPM2_DIR` naming the
-//! checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS` the compiled kernels, as `nix
-//! run .#device-tests` sets it.
-//!
-//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
-//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
+//! The audio VAE's decoder on the GPU, on VoxCPM2's real weights over a real voice's latents,
+//! held to its golden; and decoding several streams, each bit for bit as it does alone. Built with
+//! the `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices
+//! directory, `GOLDEN_DIR` the goldens and `GLSL_KERNELS` the compiled kernels, as `nix run
+//! .#device-tests` sets the last. Each tolerance is set as testkit's `golden` says.
 #![cfg(feature = "device")]
 
 use std::{collections::VecDeque, fs, path::PathBuf, time::Instant};
 
-use audiovae::{AudioVaeConfig, Decoder, Weights};
-use burn::tensor::{FloatDType, Tensor, TensorData};
 use graph::{
     kernels::Kernels,
     pth::Pth,
     vae::{VaeConfig, VaeDecoder, VaeShape},
 };
-use testkit::{checkpoint_dir, device, kept, oracle_dir};
+use testkit::{checkpoint_dir, golden};
 use voices::Latent;
 use vulkan::Context;
 
@@ -46,10 +41,6 @@ fn config() -> serde_json::Value {
     json["audio_vae_config"].clone()
 }
 
-fn weights() -> Weights {
-    Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap_or_else(|e| panic!("{e}"))
-}
-
 /// `frames` frames of a voice's latents, `[frames][64]`: speech, past the quiet start.
 fn latents(frames: usize) -> Vec<f32> {
     latents_from(4, frames)
@@ -68,35 +59,6 @@ fn latents_from(first: usize, frames: usize) -> Vec<f32> {
         voice.frames.len()
     );
     voice.frames[first..first + frames].as_flattened().to_vec()
-}
-
-/// [`compute_oracle`]'s, kept by the frames and the dtype alone: the tests decode [`latents`]'.
-fn cpu(latents: &[f32], dtype: FloatDType) -> Vec<f32> {
-    let frames = latents.len() / LATENT;
-    kept(&format!("vae-{frames}-{dtype:?}"), || {
-        compute_oracle(latents, dtype)
-    })
-}
-
-/// What the audiovae crate decodes `latents` into on the CPU, whole, with the decoder in `dtype`.
-fn compute_oracle(latents: &[f32], dtype: FloatDType) -> Vec<f32> {
-    let start = Instant::now();
-    let config: AudioVaeConfig = serde_json::from_value(config()).unwrap();
-    let device = device();
-    let decoder = Decoder::load(&config, &weights(), dtype, &device).unwrap();
-    let frames = latents.len() / LATENT;
-    let x = Tensor::<2>::from_data(TensorData::new(latents.to_vec(), [frames, LATENT]), &device);
-    let audio = decoder.decode(x.transpose().unsqueeze_dim(0));
-    let audio = audio
-        .cast(FloatDType::F32)
-        .into_data()
-        .iter::<f32>()
-        .collect();
-    eprintln!(
-        "{frames} frames on the CPU in {dtype:?}: {:.1} s",
-        start.elapsed().as_secs_f64()
-    );
-    audio
 }
 
 /// The decoder on the GPU of `streams` streams in chunks of at most `chunk` frames.
@@ -186,62 +148,53 @@ fn distance(got: &[f32], want: &[f32]) -> Distance {
     }
 }
 
-/// Checks the GPU's audio against the CPU's in f32 and burn's in f16: within `max_abs` of f32,
-/// which f32 arithmetic in another order reaches and f16 storage does not, and closer to it than
-/// burn's f16 is.
-fn check(got: &[f32], want: &[f32], burn_f16: &[f32], max_abs: f64) {
-    let (ours, burn) = (distance(got, want), distance(burn_f16, want));
-    eprintln!("against f32: GPU {ours:?}; burn f16 {burn:?}");
-    assert!(ours.max_abs <= max_abs, "{ours:?}");
+/// Checks the GPU's audio against the golden: within `tolerance`, which f32 arithmetic in
+/// another order reaches and f16 storage does not.
+fn check(got: &[f32], golden: &[f32], tolerance: Distance) {
+    let d = distance(got, golden);
+    eprintln!("against the golden: {d:?}");
     assert!(
-        ours.relative_rms <= burn.relative_rms,
-        "{ours:?} against {burn:?}"
+        d.max_abs <= tolerance.max_abs && d.relative_rms <= tolerance.relative_rms,
+        "{d:?}"
     );
 }
+
+/// A frame at a time's tolerance: against burn's CPU in f32, the largest error and relative RMS
+/// error of any run on the Radeon 8060S and the RTX 4070 Ti SUPER were 7.45e-7 and 5.79e-7, the
+/// golden's.
+const A_FRAME_AT_A_TIME: Distance = Distance {
+    max_abs: 1.9e-6,
+    relative_rms: 1.5e-6,
+};
 
 #[test]
 #[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
-            ORACLE_DIR a directory to keep the oracles in"]
-fn keeps_the_oracles() {
-    if oracle_dir().is_none() {
-        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
-        return;
-    }
-    for frames in [3, 50] {
-        let latents = latents(frames);
-        cpu(&latents, FloatDType::F32);
-        cpu(&latents, FloatDType::F16);
-    }
-}
-
-#[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn frames_one_at_a_time_decode_as_audiovae_does_on_the_cpu() {
+            GOLDEN_DIR the goldens"]
+fn frames_one_at_a_time_decode_as_their_golden() {
     let frames = 3;
     let latents = latents(frames);
-    let (want, burn_f16) = (
-        cpu(&latents, FloatDType::F32),
-        cpu(&latents, FloatDType::F16),
-    );
     let ctx = context();
     let mut decoder = gpu(&ctx, 1, 1, true);
     let got = streamed(&mut decoder, &latents, &vec![1; frames]);
     let (label, slowest, total) = dispatch_times(&decoder);
     eprintln!("a frame: {total:.2} ms on the GPU, the slowest dispatch {label} at {slowest:.2} ms");
     assert_no_validation_messages(&ctx);
-    check(&got, &want, &burn_f16, 1e-4);
+    check(&got, &golden("vae-3", || got.clone()), A_FRAME_AT_A_TIME);
 }
 
+/// Two chunks' tolerance: against f32, any run's were 8.05e-6 and 1.75e-6, the golden's.
+const CHUNKS: Distance = Distance {
+    max_abs: 2.1e-5,
+    relative_rms: 4.4e-6,
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn chunks_decode_as_audiovae_does_on_the_cpu() {
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
+            GOLDEN_DIR the goldens"]
+fn chunks_decode_as_their_golden() {
     // Two chunks of the service's 25 frames.
     let frames = 50;
     let latents = latents(frames);
-    let (want, burn_f16) = (
-        cpu(&latents, FloatDType::F32),
-        cpu(&latents, FloatDType::F16),
-    );
     let ctx = context();
     let mut decoder = gpu(&ctx, 25, 1, true);
     let got = streamed(&mut decoder, &latents, &[25, 25]);
@@ -250,7 +203,7 @@ fn chunks_decode_as_audiovae_does_on_the_cpu() {
         "25 frames: {total:.2} ms on the GPU, the slowest dispatch {label} at {slowest:.2} ms"
     );
     assert_no_validation_messages(&ctx);
-    check(&got, &want, &burn_f16, 1e-4);
+    check(&got, &golden("vae-50", || got.clone()), CHUNKS);
 }
 
 /// Lengths of 1 to `longest` frames, the last cut short, that add up to `frames`, from a seeded

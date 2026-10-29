@@ -1,56 +1,38 @@
-//! VoxCPM2's generation on the GPU against voxcpm's on burn's CPU backend, on the real weights.
-//! The CPU generates patches from seeded noise in f32, and again in burn's f16 sampling each patch
-//! after f32's patch before; the GPU samples each from the same noise after f32's patch before
-//! too, so that all three follow one generation. Built with the `device` feature, and run with
-//! `VOXCPM2_DIR` naming the checkpoint, `VOICES_DIR` a voices directory and `GLSL_KERNELS` and
-//! `VULKAN_KERNELS` the compiled kernels, as `nix run .#device-tests` sets the last two.
+//! VoxCPM2's generation on the GPU, on the real weights, held to its goldens. Each patch is
+//! sampled from the noise burn's CPU backend sampled it from in f32, after the patch it sampled
+//! before, so that every run follows that one generation, and the goldens hold what the GPU gave
+//! there. Built with the `device` feature, and run with `VOXCPM2_DIR` naming the checkpoint,
+//! `VOICES_DIR` a voices directory, `GOLDEN_DIR` the goldens and `GLSL_KERNELS` and
+//! `VULKAN_KERNELS` the compiled kernels, as `nix run .#device-tests` sets the last two. Each
+//! tolerance is set as testkit's `golden` says.
 //!
 //! The patch step is checked on a prompt of a voice's patches alone, run through the patch step a
 //! position at a time: the sampler conditioned on what the LM side computes, where its own tests
 //! make the condition up. The prompt is checked on the one the service builds, of the golden's
 //! line in its voice, run at once into the patch step's caches. The generator speaks that line,
-//! after f32's patches as above, its audio held to burn's f16's patches' against f32's, all
-//! decoded in f32; and run free, it stops where f32 does, its audio what the CPU's decoder makes
-//! of its own patches.
+//! after those patches as above, its audio held to its golden; and run free, its audio is what
+//! the GPU's decoder makes of its own patches. Where a free run stops is not held: a level apart
+//! sends a generation elsewhere, and which levels land apart differs from one GPU to another.
 //!
 //! The scalar quantizer rounds the base LM's output to levels, and a value near a boundary
-//! between two lands on either by luck of rounding: a level apart from f32's is a discrete event,
-//! which the sampler amplifies into the patch, not an error of the rounding's size. On the real
-//! weights levels are apart at most positions, for burn's f16 as for the GPU. So the GPU is held
-//! to burn's f16 on the quantizer's input, a continuous value, by its largest and its RMS error;
-//! on how many levels are apart; on the stop logits by their largest and RMS error; on the
-//! decisions to stop; and on the patches by being the closer to f32's at half of them at least,
-//! and at each where none of its levels is apart when a run has `CLEAN` such patches. Only a
-//! run with fewer is held to the patches' RMS error over all of them: where the GPU's error is
-//! otherwise small, one level apart that the sampler amplifies decides that error, and how many
-//! are apart is held already. Teacher forcing keeps a level's effect on a patch from reaching the
-//! next through the patch.
+//! between two lands on either by luck of rounding: a level apart from the golden's is a
+//! discrete event, which the sampler amplifies into the patch, not an error of the rounding's
+//! size. So a run is held on the quantizer's input, a continuous value, by its largest and its RMS
+//! error; on how many levels are apart; on the stop logits by their largest and RMS error; on the
+//! decisions to stop; and on the patches by their largest and RMS error over all of them, as far
+//! as the levels apart each GPU had took them. Teacher forcing keeps a level's effect on a patch
+//! from reaching the next through the patch.
 //!
 //! The audio is the decoder's of those patches, a level apart that the sampler amplifies with
 //! them. The decoder's causal convolutions put a patch's error in the audio of its frames and of
 //! the next patch's first, and, measured on the real weights, at most 0.2% of its energy in any
 //! frame after: so the audio of a patch's frames after its first is that patch's own. The audio
-//! is held to being the closer to f32's at half of those spans at least, at their largest error;
-//! and to burn's f16's RMS error over the spans of the patches where none of the GPU's levels is
-//! apart, together, when a run has `CLEAN` such patches. Only a run with fewer is held to the RMS
-//! error over all of the audio. A span's own largest error is not held: what the decoder carries
-//! on from a level apart amplified in the patch before can outweigh burn's error there.
-//!
-//! The CPU's part is kept under the directory `ORACLE_DIR` names, when it is set, and read from
-//! there by later runs: `keeps_the_oracles` runs it alone, touching no GPU.
+//! is held over all of it, and, when a run has `CLEAN` patches whose levels are all the
+//! golden's, by its RMS error over those patches' spans together, where only rounding is apart.
 #![cfg(feature = "device")]
 
 use std::{fs, time::Instant};
 
-use audiovae::Weights;
-use burn::{
-    module::Module,
-    nn::{Linear, LinearConfig},
-    store::{
-        FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
-    },
-    tensor::{Bool, FloatDType, Int, Tensor, TensorData},
-};
 use graph::{
     checkpoint::Checkpoint,
     decode::{self, Row, SUBGROUPS},
@@ -63,15 +45,13 @@ use graph::{
     prefill::TILE,
     prompt::Prompter,
     pth::Pth,
+    vae::{VaeConfig, VaeDecoder, VaeShape},
 };
 use half::f16;
 use serde::{Deserialize, Serialize};
-use testkit::{Fixture, checkpoint_dir, device, kept, oracle_dir};
+use testkit::{Fixture, checkpoint_dir, golden, golden_input};
 use voices::Latent;
-use voxcpm::{
-    Config, Dtypes, LocalEncoder, Model, Noise, Params, Prompt, Sampling, SeededNoise,
-    SpeechDecoder, Tokenizer,
-};
+use voxcpm::{Params, Sampling};
 use vulkan::Context;
 
 /// Patches sampled after the voice's patches alone.
@@ -100,234 +80,53 @@ fn config_json() -> String {
     fs::read_to_string(checkpoint_dir().join("config.json")).unwrap()
 }
 
-fn config() -> Config {
-    Config::from_json(&config_json()).unwrap()
-}
-
-fn golden() -> Fixture {
-    Fixture::open(concat!(
+/// The name of the voice voxcpm's golden was made with.
+fn voice_name() -> String {
+    let golden = Fixture::open(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../voxcpm/tests/fixtures/voxcpm_checkpoint.safetensors"
-    ))
+    ));
+    golden.metadata()["voice"].clone()
 }
 
-/// The voice voxcpm's golden was made with, by its name.
-fn voice() -> (String, Latent) {
+/// The voice voxcpm's golden was made with.
+fn voice() -> Latent {
     let Some(dir) = std::env::var_os("VOICES_DIR").filter(|dir| !dir.is_empty()) else {
         panic!("VOICES_DIR is not set; point it at a voices directory");
     };
     let dir = std::path::absolute(dir).unwrap();
-    let name = golden().metadata()["voice"].clone();
-    let latent = Latent::read(&voices::latent_path(&dir, &name)).unwrap_or_else(|e| panic!("{e}"));
-    (name, latent)
+    let path = voices::latent_path(&dir, &voice_name());
+    Latent::read(&path).unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// What voxcpm's model gives on the CPU for a prompt, in f32 and in burn's f16, the second each
-/// patch after the first's patch before.
-#[derive(Serialize, Deserialize)]
-struct Oracle {
-    /// The prompt, as voxcpm's `Prompt` holds it.
+/// A generation burn's CPU backend ran in f32, from `SeededNoise::new(SEED)`: its prompt, as
+/// voxcpm's `Prompt` holds it, the noise each patch was sampled from, `[feat_dim][patch_size]`,
+/// and each patch, `[patch_size][feat_dim]`.
+#[derive(Deserialize)]
+struct Input {
     tokens: Vec<u32>,
     prompt: Vec<f32>,
     audio: Vec<bool>,
-    /// The noise each patch is sampled from, `[feat_dim][patch_size]`.
     noise: Vec<Vec<f32>>,
-    /// Each patch, `[patch_size][feat_dim]`.
-    patches: [Vec<Vec<f32>>; 2],
-    /// The stop logits each patch was sampled beside.
-    stop: [Vec<[f32; 2]>; 2],
-    /// The base LM's output at the position each patch is sampled after, the scalar quantizer's
-    /// input.
-    base: [Vec<Vec<f32>>; 2],
-    /// The quantizer's levels there, integers.
-    levels: [Vec<Vec<f32>>; 2],
+    patches: Vec<Vec<f32>>,
 }
 
-impl Oracle {
+impl Input {
     fn len(&self) -> usize {
         self.tokens.len()
     }
 }
 
-fn floats<const D: usize>(t: Tensor<D>) -> Vec<f32> {
-    t.cast(FloatDType::F32).into_data().iter::<f32>().collect()
-}
-
 /// The voice's patches alone as the prompt, and `GENERATED` patches after it whatever the stop
-/// head says.
-fn voice_oracle() -> Oracle {
-    let (name, voice) = voice();
-    kept(&format!("patch-{name}-{GENERATED}-{SEED}"), || {
-        let frames = voice.frames.as_flattened().to_vec();
-        let len = frames.len() / (64 * 4);
-        let prompt = Prompt {
-            tokens: vec![0; len],
-            patches: frames,
-            audio: vec![true; len],
-        };
-        compute_oracle(&prompt, GENERATED, false)
-    })
+/// head said.
+fn voice_input() -> Input {
+    golden_input(&format!("input-patch-{}-{GENERATED}-{SEED}", voice_name()))
 }
 
 /// The prompt the service builds for the golden's line in its voice, and the patches after it
-/// until the stop head says to stop, as the service stops.
-fn line_oracle() -> Oracle {
-    let (name, voice) = voice();
-    kept(&format!("line-{name}-{SEED}"), || {
-        let dir = checkpoint_dir();
-        let tokenizer = fs::read_to_string(dir.join("tokenizer.json")).unwrap();
-        let tokenizer = Tokenizer::from_json(&tokenizer).unwrap();
-        let text = golden().metadata()["text"].clone();
-        let tokens = tokenizer.encode(&format!("{}{text}", voice.text));
-        let prompt = Prompt::cloning(&tokens, voice.frames.as_flattened(), &config()).unwrap();
-        compute_oracle(&prompt, Params::default().max_patches, true)
-    })
-}
-
-fn dtypes(dtype: FloatDType) -> Dtypes {
-    Dtypes {
-        lm: dtype,
-        local_encoder: dtype,
-        local_dit: dtype,
-        audio_decoder: FloatDType::F32,
-    }
-}
-
-/// Up to `most` patches after `prompt`, `until_stop` after the first the stop head says to stop
-/// after.
-fn compute_oracle(prompt: &Prompt, most: usize, until_stop: bool) -> Oracle {
-    let config = config();
-    let weights = checkpoint_dir().join("model.safetensors");
-    let cpu = device();
-    let (patch_size, feat_dim) = (config.patch_size, config.feat_dim);
-    let sampling = Sampling::default();
-    let tensor = |values: &[f32], shape: [usize; 3]| {
-        Tensor::<3>::from_data(TensorData::new(values.to_vec(), shape), &cpu)
-    };
-    let start = Instant::now();
-    let mut draws = SeededNoise::new(SEED);
-    let (mut noise, mut patches, mut stop) = (vec![], [vec![], vec![]], [vec![], vec![]]);
-    let mut base = [vec![], vec![]];
-    let mut levels = [vec![], vec![]];
-    for (run, dtype) in [FloatDType::F32, FloatDType::F16].into_iter().enumerate() {
-        let model =
-            Model::load(&config, &weights, &dtypes(dtype), &cpu).unwrap_or_else(|e| panic!("{e}"));
-        let mut generation = model.start(prompt, most).unwrap();
-        for i in 0..most {
-            if run == 0 {
-                noise.push(draws.next(feat_dim * patch_size));
-            } else if i == noise.len() {
-                break;
-            }
-            let step = generation.sample(tensor(&noise[i], [1, feat_dim, patch_size]), &sampling);
-            let logits = floats(step.stop_logits.clone());
-            patches[run].push(floats(step.patch.clone()));
-            stop[run].push([logits[0], logits[1]]);
-            if run == 0 && until_stop && step.stops() {
-                break;
-            }
-            let before = &patches[0][i];
-            generation.advance(tensor(before, [1, patch_size, feat_dim]));
-        }
-        drop(generation);
-        drop(model);
-        let fed = &patches[0][..noise.len() - 1];
-        [base[run], levels[run]] = quantizer(&config, prompt, fed, most, dtype);
-    }
-    eprintln!(
-        "{} positions of prompt and {} patches after it on the CPU, f32 and f16: {:.1} s",
-        prompt.len(),
-        noise.len(),
-        start.elapsed().as_secs_f64()
-    );
-    Oracle {
-        tokens: prompt.tokens.clone(),
-        prompt: prompt.patches.clone(),
-        audio: prompt.audio.clone(),
-        noise,
-        patches,
-        stop,
-        base,
-        levels,
-    }
-}
-
-/// The layers of VoxCPM2's around the base LM that the quantizer's input and levels need, under
-/// their names in the checkpoint.
-#[derive(Module, Debug)]
-struct Heads {
-    enc_to_lm_proj: Linear,
-    fsq_layer: Quantizer,
-}
-
-#[derive(Module, Debug)]
-struct Quantizer {
-    in_proj: Linear,
-}
-
-/// The base LM's outputs and the scalar quantizer's levels at the position before each patch,
-/// the prompt's last and then `fed`'s, as voxcpm's model computes them in `dtype` with caches for
-/// `most` patches after the prompt, which keeps them to itself: the prompt embedded as
-/// `run_prompt` embeds it, the local encoder and enc_to_lm_proj over all its patches at once and
-/// the base LM's embedding table at its tokens, and each of `fed` by the encoder and the
-/// projection; the base LM over the prompt at once and then a position at a time; and the
-/// quantizer over its outputs as they come.
-fn quantizer(
-    config: &Config,
-    prompt: &Prompt,
-    fed: &[Vec<f32>],
-    most: usize,
-    dtype: FloatDType,
-) -> [Vec<Vec<f32>>; 2] {
-    let weights = checkpoint_dir().join("model.safetensors");
-    let cpu = device();
-    let (patch_size, feat_dim) = (config.patch_size, config.feat_dim);
-    let lm = &config.lm_config;
-    let hidden = lm.hidden_size;
-    let len = prompt.len();
-    let encoder = LocalEncoder::load(config, &weights, dtype, &cpu).unwrap();
-    let base = minicpm4::Model::load(lm, &weights, "base_lm.", dtype, &cpu).unwrap();
-    let mut heads = Heads {
-        enc_to_lm_proj: LinearConfig::new(config.encoder_config.hidden_dim, hidden).init(&cpu),
-        fsq_layer: Quantizer {
-            in_proj: LinearConfig::new(hidden, config.scalar_quantization_latent_dim).init(&cpu),
-        },
-    };
-    let adapter = PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype.into()));
-    let mut store = SafetensorsStore::from_file(&weights).with_from_adapter(adapter);
-    heads
-        .load_from(&mut store)
-        .unwrap_or_else(|e| panic!("{e}"));
-    let scale = f64::from(config.scalar_quantization_scale);
-    let embed = |patches: Vec<f32>, len: usize| {
-        let shape = [1, len, patch_size, feat_dim];
-        let patches = Tensor::<4>::from_data(TensorData::new(patches, shape), &cpu);
-        heads
-            .enc_to_lm_proj
-            .forward(encoder.forward(patches).cast(dtype))
-    };
-    let tokens: Vec<i64> = prompt.tokens.iter().map(|&t| i64::from(t)).collect();
-    let tokens = Tensor::<2, Int>::from_data(TensorData::new(tokens, [1, len]), &cpu);
-    let audio = TensorData::new(prompt.audio.clone(), [1, len, 1]);
-    let audio = Tensor::<3, Bool>::from_data(audio, &cpu).expand([1, len, hidden]);
-    let x = base
-        .embed(tokens)
-        .mask_where(audio, embed(prompt.patches.clone(), len));
-    let mut cache = base.cache(1, len + most);
-    let mut outputs = vec![base.forward_cached(x, &mut cache)];
-    for patch in fed {
-        outputs.push(base.forward_cached(embed(patch.clone(), 1), &mut cache));
-    }
-    let mut found = [vec![], vec![]];
-    for out in outputs {
-        let levels = heads.fsq_layer.in_proj.forward(out.clone());
-        let levels = levels.tanh().mul_scalar(scale).round();
-        let [_, rows, _] = out.dims();
-        let last = |x: Tensor<3>| floats(x.narrow(1, rows - 1, 1));
-        found[1].push(last(levels));
-        found[0].push(last(out));
-    }
-    found
+/// until the stop head said to stop, as the service stops.
+fn line_input() -> Input {
+    golden_input(&format!("input-line-{}-{SEED}", voice_name()))
 }
 
 /// `[rows][columns]` as `[columns][rows]`.
@@ -338,20 +137,20 @@ fn transposed(values: &[f32], rows: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The patch step on the GPU for `oracle`'s prompt and patches, recorded and loaded, the LM side's
+/// The patch step on the GPU for `input`'s prompt and patches, recorded and loaded, the LM side's
 /// kernels at `subgroup` and the local stacks' at the device's tuning at that subgroup size (the
 /// device's default when `None`); and the tensors of the base LM's output and the quantizer's
 /// levels, made outputs for the host to read.
 fn patch_step(
     ctx: &Context,
     kernels: &mut Kernels,
-    oracle: &Oracle,
+    input: &Input,
     subgroup: Option<u32>,
 ) -> (PatchStep, [TensorId; 2], decode::Tuning) {
     let json = config_json();
     let side_config: lm_side::Config = serde_json::from_str(&json).unwrap();
     let config: PatchConfig = serde_json::from_str(&json).unwrap();
-    let capacity = (oracle.len() + oracle.noise.len()).next_multiple_of(32);
+    let capacity = (input.len() + input.noise.len()).next_multiple_of(32);
     let shape = LmSideShape::new(&side_config, capacity).unwrap();
     let report = ctx.report().clone();
     let lm_default = decode::Tuning::for_device(&report).unwrap_or_else(|e| panic!("{e}"));
@@ -388,6 +187,7 @@ fn patch_step(
 
 /// What the GPU gives for each patch: the patch `[patch_size][feat_dim]`, the stop logits, the
 /// base LM's output before it and the quantizer's levels.
+#[derive(Serialize, Deserialize)]
 struct Run {
     patches: Vec<Vec<f32>>,
     stop: Vec<[f32; 2]>,
@@ -395,12 +195,12 @@ struct Run {
     levels: Vec<Vec<f32>>,
 }
 
-/// Samples each of `oracle`'s patches on `step`, whose caches hold its prompt but the last
-/// position, after the patch before, its `stale`-th before rather than f32's last.
-fn sample(step: &mut PatchStep, probes: [TensorId; 2], oracle: &Oracle, stale: usize) -> Run {
+/// Samples each of `input`'s patches on `step`, whose caches hold its prompt but the last
+/// position, after the patch before, its `stale`-th before rather than the last.
+fn sample(step: &mut PatchStep, probes: [TensorId; 2], input: &Input, stale: usize) -> Run {
     let sampling = Sampling::default();
-    let len = oracle.len();
-    let patch = oracle.prompt.len() / len;
+    let len = input.len();
+    let patch = input.prompt.len() / len;
     let mut out = Run {
         patches: vec![],
         stop: vec![],
@@ -408,10 +208,10 @@ fn sample(step: &mut PatchStep, probes: [TensorId; 2], oracle: &Oracle, stale: u
         levels: vec![],
     };
     let mut elapsed = 0.0;
-    for (i, noise) in oracle.noise.iter().enumerate() {
+    for (i, noise) in input.noise.iter().enumerate() {
         let before = match i.checked_sub(stale) {
-            Some(at) => &oracle.patches[0][at],
-            None => &oracle.prompt[(len - 1) * patch..],
+            Some(at) => &input.patches[at],
+            None => &input.prompt[(len - 1) * patch..],
         };
         let start = Instant::now();
         let sampled = step
@@ -436,8 +236,8 @@ fn sample(step: &mut PatchStep, probes: [TensorId; 2], oracle: &Oracle, stale: u
     }
     eprintln!(
         "{} patches at {:.1} ms each from submission to fence (smoke, not a measurement)",
-        oracle.noise.len(),
-        elapsed * 1e3 / oracle.noise.len() as f64
+        input.noise.len(),
+        elapsed * 1e3 / input.noise.len() as f64
     );
     out
 }
@@ -448,6 +248,12 @@ struct Distance {
     max_abs: f64,
     /// RMS of the differences over RMS of the reference.
     relative_rms: f64,
+}
+
+impl Distance {
+    fn within(self, tolerance: Distance) -> bool {
+        self.max_abs <= tolerance.max_abs && self.relative_rms <= tolerance.relative_rms
+    }
 }
 
 impl std::fmt::Debug for Distance {
@@ -476,62 +282,43 @@ fn distance(got: &[f32], want: &[f32]) -> Distance {
     }
 }
 
-/// The GPU's largest error and relative RMS error against f32 over `got`, each over burn's f16's
-/// over `burn`.
-fn margins(name: &str, got: &[f32], burn: &[f32], want: &[f32]) -> [f64; 2] {
-    let (ours, theirs) = (distance(got, want), distance(burn, want));
-    eprintln!("{name}: GPU {ours:?}; burn f16 {theirs:?}");
-    [
-        ours.max_abs / theirs.max_abs,
-        ours.relative_rms / theirs.relative_rms,
-    ]
-}
-
-/// The levels of each position that differ from f32's.
+/// The levels of each position that differ from the golden's.
 fn flips(levels: &[Vec<f32>], want: &[Vec<f32>]) -> Vec<usize> {
     let differ = |(a, b): (&Vec<f32>, &Vec<f32>)| a.iter().zip(b).filter(|(a, b)| a != b).count();
     levels.iter().zip(want).map(differ).collect()
 }
 
-/// The patches where none of the GPU's levels is apart from f32's that a run must have for the
-/// GPU to be held to being the closer at each of them.
-const CLEAN: usize = 4;
+/// How far a run of the patch step may be from its golden.
+struct Tolerance {
+    /// The quantizer's input.
+    base: Distance,
+    /// The levels apart.
+    flips: usize,
+    stop: Distance,
+    /// The patches, over all of them.
+    patches: Distance,
+}
 
-/// How the GPU compares with burn's f16, both against f32.
+/// How a run compares with its golden.
 #[derive(Debug)]
 struct Verdict {
-    /// The quantizer's input: largest error and relative RMS error over burn's.
-    base: [f64; 2],
-    /// The levels apart from f32's, the GPU's and burn's.
-    flips: [usize; 2],
-    /// The stop logits' largest error and relative RMS error over burn's.
-    stop: [f64; 2],
-    /// The patches' relative RMS error over burn's, over all of them.
-    patches: f64,
-    /// How many patches of how many are closer to f32's than burn's are at their largest error,
-    /// and how many of those where none of the GPU's levels is apart.
-    closer: [usize; 2],
-    clean: [usize; 2],
-    /// Whether the GPU and f32 decide alike whether to stop, wherever f32's margin between
-    /// going on and stopping is wider than the GPU's error in the logits.
+    base: Distance,
+    flips: usize,
+    stop: Distance,
+    patches: Distance,
+    /// Whether the run and the golden decide alike whether to stop, wherever the golden's margin
+    /// between going on and stopping is wider than the run's distance from it in the logits.
     decides_alike: bool,
 }
 
 impl Verdict {
-    /// The criteria it fails. The patches are held to their error over all of them only where
-    /// too few are clear of levels apart for the GPU to be held to being the closer at those.
-    fn fails(&self) -> Vec<&'static str> {
-        let within = |m: f64| m <= 1.25;
-        let patches = if self.clean[1] >= CLEAN {
-            self.clean[0] == self.clean[1]
-        } else {
-            within(self.patches)
-        };
+    /// The criteria it fails.
+    fn fails(&self, tolerance: &Tolerance) -> Vec<&'static str> {
         [
-            ("quantizer input", self.base.into_iter().all(within)),
-            ("levels apart", self.flips[0] <= self.flips[1]),
-            ("stop logits", self.stop.into_iter().all(within)),
-            ("patches", 2 * self.closer[0] >= self.closer[1] && patches),
+            ("quantizer input", self.base.within(tolerance.base)),
+            ("levels apart", self.flips <= tolerance.flips),
+            ("stop logits", self.stop.within(tolerance.stop)),
+            ("patches", self.patches.within(tolerance.patches)),
             ("stop decisions", self.decides_alike),
         ]
         .into_iter()
@@ -541,91 +328,52 @@ impl Verdict {
     }
 }
 
-fn judge(oracle: &Oracle, run: &Run) -> Verdict {
-    let [want, burn] = &oracle.patches;
-    let gpu_flips = flips(&run.levels, &oracle.levels[0]);
-    let burn_flips = flips(&oracle.levels[1], &oracle.levels[0]);
-    let (mut closer, mut clean) = (0, [0, 0]);
+fn judge(want: &Run, run: &Run) -> Verdict {
+    let apart = flips(&run.levels, &want.levels);
     for i in 0..run.patches.len() {
-        let (ours, theirs) = (
-            distance(&run.patches[i], &want[i]),
-            distance(&burn[i], &want[i]),
-        );
-        let nearer = ours.max_abs < theirs.max_abs;
-        closer += usize::from(nearer);
-        if gpu_flips[i] == 0 {
-            clean[0] += usize::from(nearer);
-            clean[1] += 1;
-        }
         eprintln!(
-            "patch {i}: levels apart GPU {}, burn f16 {}; GPU {ours:?}, burn f16 {theirs:?}; stop \
-             logits f32 {:?}, GPU {:?}, burn f16 {:?}",
-            gpu_flips[i], burn_flips[i], oracle.stop[0][i], run.stop[i], oracle.stop[1][i],
+            "patch {i}: levels apart {}; {:?}; stop logits {:?}, the golden's {:?}",
+            apart[i],
+            distance(&run.patches[i], &want.patches[i]),
+            run.stop[i],
+            want.stop[i],
         );
     }
     let all = |v: &[Vec<f32>]| v.concat();
-    let base = margins(
-        "the quantizer's input",
-        &all(&run.base),
-        &all(&oracle.base[1]),
-        &all(&oracle.base[0]),
-    );
-    let [stop, burn_stop, want_stop] =
-        [&run.stop, &oracle.stop[1], &oracle.stop[0]].map(|s| s.concat());
-    let stop_margins = margins("stop logits", &stop, &burn_stop, &want_stop);
-    let patches = margins("patches", &all(&run.patches), &all(burn), &all(want))[1];
+    let [stop, want_stop] = [&run.stop, &want.stop].map(|s| s.concat());
     let error = distance(&stop, &want_stop).max_abs as f32;
     let decides_alike = want_stop.chunks(2).zip(stop.chunks(2)).all(|(w, g)| {
         let margin = w[1] - w[0];
         margin.abs() <= 2.0 * error || (margin > 0.0) == (g[1] > g[0])
     });
     let verdict = Verdict {
-        base,
-        flips: [gpu_flips.iter().sum(), burn_flips.iter().sum()],
-        stop: stop_margins,
-        patches,
-        closer: [closer, run.patches.len()],
-        clean,
+        base: distance(&all(&run.base), &all(&want.base)),
+        flips: apart.iter().sum(),
+        stop: distance(&stop, &want_stop),
+        patches: distance(&all(&run.patches), &all(&want.patches)),
         decides_alike,
     };
-    eprintln!("{verdict:.2?}");
+    eprintln!("against the golden: {verdict:?}");
     verdict
 }
 
-#[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
-            ORACLE_DIR a directory to keep the oracles in"]
-fn keeps_the_oracles() {
-    if oracle_dir().is_none() {
-        eprintln!("ORACLE_DIR is not set: nothing to keep the oracles in");
-        return;
-    }
-    voice_oracle();
-    line_audio(&line_oracle());
-}
-
-/// The patch step over `oracle`, the voice's patches alone, its prompt run through the patch
+/// The patch step over `input`, the voice's patches alone, its prompt run through the patch
 /// step a position at a time.
-fn patches_after_a_voice(oracle: &Oracle, subgroup: Option<u32>, stale: usize) -> Verdict {
+fn patches_after_a_voice(input: &Input, subgroup: Option<u32>, stale: usize) -> Run {
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let (mut step, probes, _) = patch_step(&ctx, &mut kernels, oracle, subgroup);
+    let (mut step, probes, _) = patch_step(&ctx, &mut kernels, input, subgroup);
     let sampling = Sampling::default();
-    let patch = oracle.prompt.len() / oracle.len();
+    let patch = input.prompt.len() / input.len();
     let silence = vec![0.0; patch];
-    for (t, cond) in oracle
-        .prompt
-        .chunks(patch)
-        .take(oracle.len() - 1)
-        .enumerate()
-    {
+    for (t, cond) in input.prompt.chunks(patch).take(input.len() - 1).enumerate() {
         let cond = transposed(cond, 4);
         step.run(t, &cond, &silence, sampling.temperature, sampling.cfg_value)
             .unwrap_or_else(|e| panic!("{e}"));
     }
-    let run = sample(&mut step, probes, oracle, stale);
+    let run = sample(&mut step, probes, input, stale);
     assert_no_validation_messages(&ctx);
-    judge(oracle, &run)
+    run
 }
 
 /// The subgroup sizes the device can require: 32, as on NVIDIA, also on the Radeon.
@@ -642,10 +390,11 @@ struct Checked {
     verdict: Verdict,
 }
 
-/// Asserts that each run passes every criterion, or with a defect fails the defect's.
-fn assert_checked(runs: &[Checked]) {
+/// Asserts that each run passes every criterion of `tolerance`, or with a defect fails the
+/// defect's.
+fn assert_checked(runs: &[Checked], tolerance: &Tolerance) {
     for run in runs {
-        let (subgroup, fails) = (run.subgroup, run.verdict.fails());
+        let (subgroup, fails) = (run.subgroup, run.verdict.fails(tolerance));
         match &run.defect {
             None => assert!(
                 fails.is_empty(),
@@ -661,27 +410,52 @@ fn assert_checked(runs: &[Checked]) {
     }
 }
 
+/// The patch step's tolerance after the voice: against burn's CPU in f32, the largest error and
+/// relative RMS error of any run on the Radeon 8060S and the RTX 4070 Ti SUPER were 3.45e-2 and
+/// 4.19e-3 over the quantizer's input, 5.90e-2 and 7.55e-3 over the stop logits and 4.02e-1 and
+/// 2.00e-2 over the patches, with up to 222 levels apart; the golden's were 3.12e-2 and 3.78e-3,
+/// 5.74e-2 and 7.55e-3, and 4.02e-1 and 2.00e-2, with 208.
+const AFTER_A_VOICE: Tolerance = Tolerance {
+    base: Distance {
+        max_abs: 8.3e-2,
+        relative_rms: 1.0e-2,
+    },
+    flips: 537,
+    stop: Distance {
+        max_abs: 1.5e-1,
+        relative_rms: 1.9e-2,
+    },
+    patches: Distance {
+        max_abs: 1.01,
+        relative_rms: 5.0e-2,
+    },
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn patches_sample_as_voxcpm_generates_on_the_cpu() {
-    let oracle = voice_oracle();
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn patches_sample_as_their_golden() {
+    let input = voice_input();
+    let name = format!("patch-{}-{GENERATED}-{SEED}", voice_name());
+    let want = golden(&name, || patches_after_a_voice(&input, None, 1));
     let mut runs = vec![];
     for subgroup in subgroups() {
+        let run = patches_after_a_voice(&input, Some(subgroup), 1);
         runs.push(Checked {
             subgroup,
             defect: None,
-            verdict: patches_after_a_voice(&oracle, Some(subgroup), 1),
+            verdict: judge(&want, &run),
         });
+        let run = patches_after_a_voice(&input, Some(subgroup), 2);
         runs.push(Checked {
             subgroup,
             defect: Some((
                 "each patch after the one two before".into(),
                 "quantizer input",
             )),
-            verdict: patches_after_a_voice(&oracle, Some(subgroup), 2),
+            verdict: judge(&want, &run),
         });
     }
-    assert_checked(&runs);
+    assert_checked(&runs, &AFTER_A_VOICE);
 }
 
 /// How a prompt is run.
@@ -694,29 +468,29 @@ enum Prompting {
     Shifted,
 }
 
-/// The prompt and the patch step over `oracle`, its prompt run at once.
-fn patches_after_a_prompt(oracle: &Oracle, subgroup: Option<u32>, how: Prompting) -> Verdict {
+/// The prompt and the patch step over `input`, its prompt run at once.
+fn patches_after_a_prompt(input: &Input, subgroup: Option<u32>, how: Prompting) -> Run {
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let (mut step, probes, tuning) = patch_step(&ctx, &mut kernels, oracle, subgroup);
+    let (mut step, probes, tuning) = patch_step(&ctx, &mut kernels, input, subgroup);
     let prompter = Prompter::new(&ctx, &mut kernels, &mut step, 2 * TILE, &tuning, true)
         .unwrap_or_else(|e| panic!("{e}"));
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     let prompt = graph::prompt::Prompt {
-        tokens: &oracle.tokens,
-        patches: &oracle.prompt,
-        audio: &oracle.audio,
+        tokens: &input.tokens,
+        patches: &input.prompt,
+        audio: &input.audio,
     };
     let start = Instant::now();
     let (x, audio_x) = prompter
         .embeddings(&mut step, &checkpoint, prompt)
         .unwrap_or_else(|e| panic!("{e}"));
     let embedded = start.elapsed().as_secs_f64() * 1e3;
-    let ran = oracle.len() - 1;
+    let ran = input.len() - 1;
     let audio = match how {
         Prompting::QuantizedText => vec![true; ran],
-        _ => oracle.audio[..ran].to_vec(),
+        _ => input.audio[..ran].to_vec(),
     };
     let at = Row {
         position: usize::from(how == Prompting::Shifted),
@@ -735,19 +509,44 @@ fn patches_after_a_prompt(oracle: &Oracle, subgroup: Option<u32>, how: Prompting
     eprintln!(
         "{} positions of prompt: embedded in {embedded:.1} ms and run in {ran:.1} ms on the host, \
          {:.1} ms on the GPU of which {:.2} between the LMs (smoke, not a measurement)",
-        oracle.len(),
+        input.len(),
         ms(""),
         ms("fsq_layer") + ms("select_rows") + ms("fusion_concat_proj")
     );
-    let run = sample(&mut step, probes, oracle, 1);
+    let run = sample(&mut step, probes, input, 1);
     assert_no_validation_messages(&ctx);
-    judge(oracle, &run)
+    run
 }
 
+/// The patch step's tolerance after the line's prompt: against f32, the largest error and
+/// relative RMS error of any run were 5.31e-3 and 1.28e-3 over the quantizer's input, 1.30e-1 and
+/// 3.59e-3 over the stop logits and 1.46e-1 and 7.10e-3 over the patches, with up to 37 levels
+/// apart; the golden's were 5.31e-3 and 1.28e-3, 1.22e-1 and 3.59e-3, and 8.84e-2 and 4.94e-3,
+/// with 37.
+const AFTER_A_PROMPT: Tolerance = Tolerance {
+    base: Distance {
+        max_abs: 1.33e-2,
+        relative_rms: 3.2e-3,
+    },
+    flips: 92,
+    stop: Distance {
+        max_abs: 3.2e-1,
+        relative_rms: 9.0e-3,
+    },
+    patches: Distance {
+        max_abs: 2.93e-1,
+        relative_rms: 1.51e-2,
+    },
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn the_prompt_runs_as_voxcpm_runs_it_on_the_cpu() {
-    let oracle = line_oracle();
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and GOLDEN_DIR the goldens"]
+fn the_prompt_runs_as_its_golden() {
+    let input = line_input();
+    let name = format!("line-{}-{SEED}", voice_name());
+    let want = golden(&name, || {
+        patches_after_a_prompt(&input, None, Prompting::AsVoxcpm)
+    });
     // The quantizer's output taken at text positions leaves the base LM as it is, and moves the
     // residual LM's state, so the patches; the prompt one position on moves both.
     let defects = [
@@ -756,50 +555,22 @@ fn the_prompt_runs_as_voxcpm_runs_it_on_the_cpu() {
     ];
     let mut runs = vec![];
     for subgroup in subgroups() {
+        let run = patches_after_a_prompt(&input, Some(subgroup), Prompting::AsVoxcpm);
         runs.push(Checked {
             subgroup,
             defect: None,
-            verdict: patches_after_a_prompt(&oracle, Some(subgroup), Prompting::AsVoxcpm),
+            verdict: judge(&want, &run),
         });
         for (how, criterion) in defects {
+            let run = patches_after_a_prompt(&input, Some(subgroup), how);
             runs.push(Checked {
                 subgroup,
                 defect: Some((format!("{how:?}"), criterion)),
-                verdict: patches_after_a_prompt(&oracle, Some(subgroup), how),
+                verdict: judge(&want, &run),
             });
         }
     }
-    assert_checked(&runs);
-}
-
-/// The audio voxcpm decodes on the CPU, after the voice's last frames and in the service's chunks,
-/// of `oracle`'s patches in f32 and of burn's f16's, the decoder in f32 for both.
-fn line_audio(oracle: &Oracle) -> [Vec<f32>; 2] {
-    let (name, voice) = voice();
-    kept(&format!("line-audio-{name}-{SEED}"), || {
-        let decoder = cpu_decoder();
-        let frames = voice.frames.as_flattened();
-        oracle
-            .patches
-            .each_ref()
-            .map(|patches| cpu_speech(&decoder, frames, patches))
-    })
-}
-
-fn cpu_decoder() -> audiovae::Decoder {
-    let weights = Weights::open(checkpoint_dir().join("audiovae.pth")).unwrap();
-    audiovae::Decoder::load(&config().audio_vae(), &weights, FloatDType::F32, &device()).unwrap()
-}
-
-/// `patches`' audio as the service decodes it on the CPU, after `voice`'s last frames.
-fn cpu_speech(decoder: &audiovae::Decoder, voice: &[f32], patches: &[Vec<f32>]) -> Vec<f32> {
-    let chunk = Params::default().decode_chunk_frames;
-    let mut speech = SpeechDecoder::new(decoder, voice, 64, chunk);
-    let shape = [patches.len(), 4, 64];
-    speech.push(Tensor::from_data(
-        TensorData::new(patches.concat(), shape),
-        &device(),
-    ))
+    assert_checked(&runs, &AFTER_A_PROMPT);
 }
 
 /// The generator for the checkpoint, as the service would run it, with caches for `capacity`
@@ -829,29 +600,29 @@ fn generator(ctx: &Context, kernels: &mut Kernels, capacity: usize, subgroup: u3
 
 /// A request's patches, `[patch_size][feat_dim]` each, the quantizer's levels each was sampled
 /// after, and its audio.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Speech {
     patches: Vec<Vec<f32>>,
     levels: Vec<Vec<f32>>,
     audio: Vec<f32>,
 }
 
-/// `oracle`'s line spoken by `generator`, each patch from its `noise`: sampled after f32's
-/// `stale`-th before, as teacher forcing does, or after its own when `stale` is `None`; the
-/// frames waiting decoded at once after each patch whose number `early` has, counting from 1.
+/// `input`'s line spoken by `generator` after `voice`, each patch from its `noise`: sampled after
+/// `input`'s `stale`-th before, as teacher forcing does, or after its own when `stale` is `None`;
+/// the frames waiting decoded at once after each patch whose number `early` has, counting from 1.
 fn speak(
     generator: &mut Generator,
-    oracle: &Oracle,
+    input: &Input,
+    voice: &Latent,
     noise: &[Vec<f32>],
     stale: Option<usize>,
     early: &[usize],
 ) -> Speech {
-    let (_, voice) = voice();
     let sampling = Sampling::default();
     let prompt = graph::prompt::Prompt {
-        tokens: &oracle.tokens,
-        patches: &oracle.prompt,
-        audio: &oracle.audio,
+        tokens: &input.tokens,
+        patches: &input.prompt,
+        audio: &input.audio,
     };
     let start = Instant::now();
     generator
@@ -868,7 +639,7 @@ fn speak(
     for (i, noise) in noise.iter().enumerate() {
         if let Some(before) = stale.and_then(|stale| i.checked_sub(stale)) {
             generator
-                .sample_after(0, &oracle.patches[0][before])
+                .sample_after(0, &input.patches[before])
                 .unwrap_or_else(|e| panic!("{e}"));
         }
         let stepped = generator
@@ -910,28 +681,38 @@ fn speak(
     }
 }
 
-/// How the GPU's audio compares with burn's f16's, both against f32's, in spans of each patch's
-/// frames after its first.
+/// The patches where none of a run's levels is apart from the golden's that it must have for its
+/// audio to be held over their spans.
+const CLEAN: usize = 4;
+
+/// How far the generator's audio may be from its golden: over all of it, and in relative RMS
+/// error over the spans of the patches where no level is apart.
+struct AudioTolerance {
+    all: Distance,
+    clean_rms: f64,
+}
+
+/// How a run's audio compares with its golden's.
 #[derive(Debug)]
 struct AudioVerdict {
-    /// How many spans of how many are closer to f32's than burn's are at their largest error.
-    closer: [usize; 2],
-    /// The patches where none of the GPU's levels is apart.
+    all: Distance,
+    /// The patches where none of the run's levels is apart from the golden's, and the relative
+    /// RMS error over their spans together.
     clean: usize,
-    /// The relative RMS error over burn's over those patches' spans together, and over all of
-    /// the audio.
-    rms: [f64; 2],
+    clean_rms: f64,
 }
 
 impl AudioVerdict {
-    /// The criteria it fails. The audio is held over the spans of the patches clear of levels
-    /// apart where a run has enough of them, and over all of it only where it has fewer.
-    fn fails(&self) -> Vec<&'static str> {
+    /// The criteria it fails. The spans of the patches clear of levels apart are held where a
+    /// run has enough of them.
+    fn fails(&self, tolerance: &AudioTolerance) -> Vec<&'static str> {
         let enough = self.clean >= CLEAN;
         [
-            ("audio closer", 2 * self.closer[0] >= self.closer[1]),
-            ("clean audio", !enough || self.rms[0] <= 1.25),
-            ("all audio", enough || self.rms[1] <= 1.25),
+            ("all audio", self.all.within(tolerance.all)),
+            (
+                "clean audio",
+                !enough || self.clean_rms <= tolerance.clean_rms,
+            ),
         ]
         .into_iter()
         .filter(|&(_, holds)| !holds)
@@ -940,87 +721,85 @@ impl AudioVerdict {
     }
 }
 
-/// The GPU's `speech` against f32's, beside burn's f16's, by its levels at each patch against
-/// f32's; each span printed when `table`.
-fn judge_audio(
-    name: &str,
-    speech: &Speech,
-    oracle: &Oracle,
-    [want, burn]: [&[f32]; 2],
-    table: bool,
-) -> AudioVerdict {
+/// `speech` against its golden, `want`, by its levels at each patch against the golden's, in spans
+/// of each patch's frames after its first; each span printed when `table`.
+fn judge_audio(name: &str, speech: &Speech, want: &Speech, table: bool) -> AudioVerdict {
     let (audio, levels) = (&speech.audio[..], &speech.levels[..]);
-    let patches = oracle.noise.len();
-    if audio.len() != want.len() || levels.len() != patches {
+    let patches = want.levels.len();
+    if audio.len() != want.audio.len() || levels.len() != patches {
         eprintln!(
             "{name}: {} samples of {} and the levels of {} patches of {patches}",
             audio.len(),
-            want.len(),
+            want.audio.len(),
             levels.len()
         );
+        let infinite = Distance {
+            max_abs: f64::INFINITY,
+            relative_rms: f64::INFINITY,
+        };
         return AudioVerdict {
-            closer: [0, patches],
+            all: infinite,
             clean: 0,
-            rms: [f64::INFINITY; 2],
+            clean_rms: f64::INFINITY,
         };
     }
-    let gpu_flips = flips(levels, &oracle.levels[0]);
-    let burn_flips = flips(&oracle.levels[1], &oracle.levels[0]);
-    let frame = want.len() / (4 * patches);
-    let (mut closer, mut clean) = (0, [vec![], vec![], vec![]]);
-    for i in 0..patches {
+    let apart = flips(levels, &want.levels);
+    let frame = want.audio.len() / (4 * patches);
+    let (mut ours, mut theirs) = (vec![], vec![]);
+    for (i, &apart) in apart.iter().enumerate() {
         let span = (4 * i + 1) * frame..(4 * i + 4) * frame;
-        let [ours, theirs] =
-            [audio, burn].map(|got| distance(&got[span.clone()], &want[span.clone()]));
-        closer += usize::from(ours.max_abs < theirs.max_abs);
-        if gpu_flips[i] == 0 {
-            for (kept, of) in clean.iter_mut().zip([audio, burn, want]) {
-                kept.extend_from_slice(&of[span.clone()]);
-            }
+        if apart == 0 {
+            ours.extend_from_slice(&audio[span.clone()]);
+            theirs.extend_from_slice(&want.audio[span.clone()]);
         }
         if table {
             eprintln!(
-                "{name}, patch {i}'s frames after its first: levels apart GPU {}, burn f16 {}; \
-                 GPU {ours:?}, burn f16 {theirs:?}",
-                gpu_flips[i], burn_flips[i]
+                "{name}, patch {i}'s frames after its first: levels apart {apart}; {:?}",
+                distance(&audio[span.clone()], &want.audio[span])
             );
         }
     }
-    let [ours, theirs, wanted] = &clean;
+    let clean = apart.iter().filter(|&&apart| apart == 0).count();
     let verdict = AudioVerdict {
-        closer: [closer, patches],
-        clean: gpu_flips.iter().filter(|&&apart| apart == 0).count(),
-        rms: [
-            margins(
-                &format!("{name} where no level is apart"),
-                ours,
-                theirs,
-                wanted,
-            )[1],
-            margins(name, audio, burn, want)[1],
-        ],
+        all: distance(audio, &want.audio),
+        clean,
+        clean_rms: distance(&ours, &theirs).relative_rms,
     };
-    eprintln!("{name}: {verdict:.2?}");
+    eprintln!("{name}: {verdict:?}");
     verdict
 }
 
+/// The audio's tolerance: against burn's CPU in f32, the largest error and relative RMS error of
+/// any run on the Radeon 8060S and the RTX 4070 Ti SUPER were 4.05e-3 and 1.41e-2 over all of it,
+/// and the relative RMS error 1.98e-3 over the spans of the patches where no level was apart from
+/// f32's; the golden's were 2.58e-3 and 9.34e-3, and 1.64e-3.
+const AUDIO: AudioTolerance = AudioTolerance {
+    all: Distance {
+        max_abs: 8.3e-3,
+        relative_rms: 3.0e-2,
+    },
+    clean_rms: 4.5e-3,
+};
+
 #[test]
-#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint and VOICES_DIR a voices directory"]
-fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
-    let oracle = line_oracle();
-    let [want, burn] = line_audio(&oracle);
-    let patches = oracle.noise.len();
-    let samples = patches * 4 * 1920;
-    assert_eq!(want.len(), samples);
-    let decoder = cpu_decoder();
-    let (_, voice) = voice();
+#[ignore = "needs VOXCPM2_DIR to name the VoxCPM2 checkpoint, VOICES_DIR a voices directory and \
+            GOLDEN_DIR the goldens"]
+fn speech_comes_out_as_its_golden() {
+    let input = line_input();
+    let voice = voice();
     let ctx = context();
     let mut kernels = Kernels::from_env(&ctx).unwrap_or_else(|e| panic!("{e}"));
-    let capacity = (oracle.len() + Params::default().max_patches).next_multiple_of(32);
+    let capacity = (input.len() + Params::default().max_patches).next_multiple_of(32);
+    let want = golden(&format!("speech-{}-{SEED}", voice_name()), || {
+        let lm = decode::Tuning::for_device(ctx.report()).unwrap_or_else(|e| panic!("{e}"));
+        let mut generator = generator(&ctx, &mut kernels, capacity, lm.subgroup);
+        speak(&mut generator, &input, &voice, &input.noise, Some(1), &[])
+    });
+    assert_eq!(want.audio.len(), input.noise.len() * 4 * 1920);
     let mut failed = vec![];
     for subgroup in subgroups() {
         let mut generator = generator(&ctx, &mut kernels, capacity, subgroup);
-        let fails = speech_at(&mut generator, &oracle, &decoder, &voice, [&want, &burn]);
+        let fails = speech_at(&ctx, &mut kernels, &mut generator, &input, &voice, &want);
         assert_no_validation_messages(&ctx);
         if let Err(fails) = fails {
             failed.push(format!("wave{subgroup}: {fails}"));
@@ -1029,34 +808,66 @@ fn speech_comes_out_as_voxcpm_speaks_it_on_the_cpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// The voice's last frames the service primes its decoder with before a speech,
+/// nanovllm-voxcpm's `n_decode_pad_frames`.
+const CONTEXT_FRAMES: usize = 12;
+
+/// `patches`' audio as the service decodes it on the GPU, in its chunks after `voice`'s last
+/// [`CONTEXT_FRAMES`] frames, whose own audio is left out.
+fn decoded(ctx: &Context, kernels: &mut Kernels, voice: &[f32], patches: &[Vec<f32>]) -> Vec<f32> {
+    let json: serde_json::Value = serde_json::from_str(&config_json()).unwrap();
+    let config: VaeConfig = serde_json::from_value(json["audio_vae_config"].clone()).unwrap();
+    let chunk = Params::default().decode_chunk_frames.get();
+    let shape = VaeShape::new(&config, chunk, 1).unwrap_or_else(|e| panic!("{e}"));
+    let mut decoder =
+        VaeDecoder::new(ctx, kernels, &shape, false).unwrap_or_else(|e| panic!("{e}"));
+    let weights = Pth::open(checkpoint_dir().join("audiovae.pth")).unwrap();
+    decoder
+        .load(|name| weights.floats(&format!("decoder.{name}")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let latent = shape.latent;
+    let context = (voice.len() / latent).min(CONTEXT_FRAMES);
+    let mut frames = voice[voice.len() - context * latent..].to_vec();
+    frames.extend(patches.concat());
+    let mut audio = Vec::new();
+    for chunk in frames.chunks(chunk * latent) {
+        audio.extend(decoder.push(0, chunk).unwrap_or_else(|e| panic!("{e}")));
+    }
+    audio.split_off(context * shape.hop())
+}
+
 /// The speech test on `generator`, the failures it finds, if any.
 fn speech_at(
+    ctx: &Context,
+    kernels: &mut Kernels,
     generator: &mut Generator,
-    oracle: &Oracle,
-    decoder: &audiovae::Decoder,
+    input: &Input,
     voice: &Latent,
-    [want, burn]: [&[f32]; 2],
+    want: &Speech,
 ) -> Result<(), String> {
-    let patches = oracle.noise.len();
-    let mut next_noise = oracle.noise.clone();
+    let mut next_noise = input.noise.clone();
     next_noise.rotate_left(1);
-    // Each patch after f32's patch before: it stops where f32 does, and its audio is as near
-    // f32's as burn's f16's patches' is, decoded by the same decoder.
-    let forced = speak(generator, oracle, &oracle.noise, Some(1), &[]);
-    // Defect: each patch after f32's two before, which moves the levels.
-    let stale = speak(generator, oracle, &oracle.noise, Some(2), &[]);
-    // Defect: each patch from the next one's noise, which leaves the levels as they are.
-    let noisy = speak(generator, oracle, &next_noise, Some(1), &[]);
-    // Each patch after its own, as the service generates.
-    let free = speak(generator, oracle, &oracle.noise, None, &[]);
-    // Decoding the frames waiting after the patches a stream decodes early at.
-    let early = speak(generator, oracle, &oracle.noise, None, &[1, 2, 4, 8]);
-
-    let judge = |name: &str, speech: &Speech, table: bool| {
-        judge_audio(name, speech, oracle, [want, burn], table)
+    let speak = |generator: &mut Generator, noise: &[Vec<f32>], stale, early: &[usize]| {
+        speak(generator, input, voice, noise, stale, early)
     };
-    let verdict = judge("audio", &forced, true);
-    let mut fails: Vec<String> = verdict.fails().into_iter().map(String::from).collect();
+    // Each patch after the input's patch before: it stops where the golden does, and its audio
+    // is the golden's but for rounding and the levels apart.
+    let forced = speak(generator, &input.noise, Some(1), &[]);
+    // Defect: each patch after the input's two before, which moves the levels.
+    let stale = speak(generator, &input.noise, Some(2), &[]);
+    // Defect: each patch from the next one's noise, which leaves the levels as they are.
+    let noisy = speak(generator, &next_noise, Some(1), &[]);
+    // Each patch after its own, as the service generates.
+    let free = speak(generator, &input.noise, None, &[]);
+    // Decoding the frames waiting after the patches a stream decodes early at.
+    let early = speak(generator, &input.noise, None, &[1, 2, 4, 8]);
+
+    let verdict = judge_audio("audio", &forced, want, true);
+    let mut fails: Vec<String> = verdict
+        .fails(&AUDIO)
+        .into_iter()
+        .map(String::from)
+        .collect();
     // Defect: the audio 5% louder, as a decoder off in its gain would make it.
     let louder = Speech {
         audio: forced.audio.iter().map(|a| 1.05 * a).collect(),
@@ -1068,32 +879,34 @@ fn speech_at(
         ("audio 5% louder", &louder, "clean audio"),
     ];
     for (defect, speech, criterion) in defects {
-        if !judge(defect, speech, false).fails().contains(&criterion) {
+        let verdict = judge_audio(defect, speech, want, false);
+        if !verdict.fails(&AUDIO).contains(&criterion) {
             fails.push(format!("{defect} passes {criterion}"));
         }
     }
 
-    // Run free, it stops where f32 does too, and its audio is what the service's decoder makes
-    // of its patches on the CPU, to f32 rounding, which f16 storage does not reach.
-    let cpu = cpu_speech(decoder, voice.frames.as_flattened(), &free.patches);
-    let d = distance(&free.audio, &cpu);
-    eprintln!("run free, against the CPU's decoder over its patches: {d:?}");
+    // Run free, its audio is what the GPU's decoder makes of its patches after the voice's last
+    // frames, in the service's chunks, as chunks decode as the whole does.
+    let frames = voice.frames.as_flattened();
+    let d = distance(&free.audio, &decoded(ctx, kernels, frames, &free.patches));
+    eprintln!(
+        "run free, {} patches; against the decoder over its patches: {d:?}",
+        free.patches.len()
+    );
     // The audio VAE carries its state from chunk to chunk, so audio decoded early in chunks
     // of fewer frames is the same audio.
     if early.audio.len() == free.audio.len() {
         let early = distance(&early.audio, &free.audio);
         eprintln!("decoded early, against run free: {early:?}");
     }
-    // Defect: the CPU's decoder not primed with the voice's last frames.
-    let unprimed = cpu_speech(decoder, &[], &free.patches);
-    let unprimed = distance(&free.audio, &unprimed);
-    eprintln!("run free, against the CPU's decoder not primed: {unprimed:?}");
+    // Defect: the decoder not primed with the voice's last frames.
+    let unprimed = distance(&free.audio, &decoded(ctx, kernels, &[], &free.patches));
+    eprintln!("run free, against the decoder not primed: {unprimed:?}");
 
     // Every check is made before any fails, so that a run reports the free run's too.
     let checks = [
-        ("stops", forced.patches.len() == patches),
-        ("run free, stops", free.patches.len() == patches),
-        ("run free, audio", d.max_abs <= 1e-4),
+        ("stops", forced.patches.len() == want.patches.len()),
+        ("run free, audio", d.max_abs <= 1e-6),
         ("early, same patches", early.patches == free.patches),
         ("early, same audio", early.audio == free.audio),
         ("audio not primed fails", unprimed.max_abs > 1e-4),
@@ -1104,9 +917,10 @@ fn speech_at(
         return Ok(());
     }
     Err(format!(
-        "{fails:?}: {} patches of {patches}, {} run free; {verdict:.2?}; run free {d:?}, not \
-         primed {unprimed:?}",
+        "{fails:?}: {} patches of {}, {} run free; {verdict:?}; run free {d:?}, not primed \
+         {unprimed:?}",
         forced.patches.len(),
+        want.patches.len(),
         free.patches.len()
     ))
 }
