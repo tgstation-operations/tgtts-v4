@@ -9,6 +9,7 @@ publish = false
 fancy-regex.workspace = true
 rustfft.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 voices = { path = "../voices" }
 
 [build-dependencies]

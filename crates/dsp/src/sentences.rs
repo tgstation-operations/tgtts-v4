@@ -30,28 +30,36 @@ macro_rules! regex {
     };
 }
 
+/// What `re` gave, or nothing where fancy-regex gave up on the text past its backtracking limit,
+/// which is logged, since the text then splits as pysbd may not.
+fn ran<T>(re: &Regex, result: Result<T, fancy_regex::Error>) -> Option<T> {
+    result
+        .inspect_err(|e| tracing::warn!(pattern = re.as_str(), "segmenting sentences: {e}"))
+        .ok()
+}
+
 /// `re.sub(pattern, replacement, text)` with a `$`-style replacement. Text fancy-regex gives up
-/// on, past its backtracking limit, is left as it is.
+/// on is left as it is.
 fn sub(re: &Regex, text: &str, replacement: &str) -> String {
-    re.try_replacen(text, 0, replacement)
-        .map_or_else(|_| text.to_owned(), |s| s.into_owned())
+    ran(re, re.try_replacen(text, 0, replacement))
+        .map_or_else(|| text.to_owned(), |s| s.into_owned())
 }
 
 /// `re.sub(pattern, function, text)`.
 fn sub_with(re: &Regex, text: &str, f: impl Fn(&Captures<str>) -> String) -> String {
-    re.try_replacen(text, 0, |caps: &Captures<str>| f(caps))
-        .map_or_else(|_| text.to_owned(), |s| s.into_owned())
+    ran(re, re.try_replacen(text, 0, |caps: &Captures<str>| f(caps)))
+        .map_or_else(|| text.to_owned(), |s| s.into_owned())
 }
 
 /// `re.search(pattern, text)`.
 fn search(re: &Regex, text: &str) -> bool {
-    re.is_match(text).unwrap_or(false)
+    ran(re, re.is_match(text)).unwrap_or(false)
 }
 
 /// `re.findall(pattern, text)` for a pattern without groups.
 fn findall<'t>(re: &Regex, text: &'t str) -> Vec<&'t str> {
     re.find_iter(text)
-        .map_while(Result::ok)
+        .map_while(|m| ran(re, m))
         .map(|m| m.as_str())
         .collect()
 }
@@ -237,12 +245,10 @@ fn post_process_segment(text: &str) -> Vec<String> {
     .fold(text.to_owned(), |text, (from, to)| text.replace(from, to));
     if search(&QUOTATION_AT_END_OF_SENTENCE, &text) {
         // re.split, whose pieces pysbd keeps unstripped.
+        let split = &SPLIT_SPACE_QUOTATION_AT_END_OF_SENTENCE;
         let mut pieces = Vec::new();
         let mut start = 0;
-        for m in SPLIT_SPACE_QUOTATION_AT_END_OF_SENTENCE
-            .find_iter(&text)
-            .map_while(Result::ok)
-        {
+        for m in split.find_iter(&text).map_while(|m| ran(split, m)) {
             pieces.push(text[start..m.start()].to_owned());
             start = m.end();
         }
