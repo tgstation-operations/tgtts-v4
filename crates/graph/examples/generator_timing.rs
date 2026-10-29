@@ -1,7 +1,6 @@
-//! Times VoxCPM2's generation on the GPU at batch 1, a request at a time, as the service's
-//! requests run: the prompt it builds for a line in a voice, from the request to its first patch,
-//! then each patch after it and each chunk of audio, from submission to fence on the host and
-//! per dispatch from GPU timestamps.
+//! Times VoxCPM2's generation on the GPU, a request at a time: the prompt the service builds for a
+//! line in a voice, from the request to its first patch, then each patch after it and each chunk
+//! of audio, from submission to fence on the host and per dispatch from GPU timestamps.
 //!
 //! ```text
 //! cargo run --release -p graph --example generator_timing -- [OPTIONS]

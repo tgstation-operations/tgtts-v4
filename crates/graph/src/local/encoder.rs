@@ -1,4 +1,4 @@
-//! VoxCPM2's local encoder, as voxcpm's `LocalEncoder` computes it for one patch: the patch's
+//! VoxCPM2's local encoder, as upstream's `VoxCPMLocEnc` computes it for one patch: the patch's
 //! frames projected, after a learned token, through a bidirectional stack whose output at that
 //! token, after the final norm, is the patch's embedding. It embeds a patch for each of several
 //! rows at once, a sequence to each.

@@ -1,4 +1,4 @@
-//! VoxCPM2's patch sampler, as voxcpm's `Cfm::sample` computes it: Euler steps along the flow
+//! VoxCPM2's patch sampler, as upstream's `UnifiedCFM` computes it: Euler steps along the flow
 //! the local DiT predicts, from noise at time 1 to a patch at time 0, with classifier-free
 //! guidance as CFG-Zero* has it. It samples a patch for each of several rows, requests apart
 //! from each other, at once: every step runs the DiT once over each row's two sequences, the
@@ -10,14 +10,14 @@
 //! it, each row's after the one before:
 //!
 //! - `mu`, `[MU_TOKENS][hidden]` in f16: `lm_to_dit_proj` of the base LM's last hidden state,
-//!   then `res_to_dit_proj` of the residual LM's, as voxcpm's model joins them;
+//!   then `res_to_dit_proj` of the residual LM's, as upstream's `VoxCPM2Model` joins them;
 //! - `cond`, `[feat_dim][patch_size]` in f32: the patch before, as the sampler gave it;
 //! - `noise`, `[feat_dim][patch_size]` in f32: standard normal, as voxcpm's `Noise` draws it;
 //! - the temperature and the guidance scale.
 //!
-//! It hands back each row's patch, `[feat_dim][patch_size]` in f32, the layout voxcpm's sampler
-//! gives and the local encoder ([`super::encoder`]) takes; voxcpm's model hands its LMs the patch
-//! transposed.
+//! It hands back each row's patch, `[feat_dim][patch_size]` in f32, the layout upstream's sampler
+//! gives and the local encoder ([`super::encoder`]) takes; upstream's model hands its LMs the
+//! patch transposed.
 
 use vulkan::{Context, F16, SpecValue, Timing};
 
@@ -41,9 +41,8 @@ pub const MU_TOKENS: usize = 2;
 const TIME_AT: usize = MU_TOKENS;
 const COND_AT: usize = TIME_AT + 1;
 
-/// The `timesteps + 1` times upstream's sampler steps through, as voxcpm's `schedule`: evenly
-/// spaced from 1 to 0, as torch's `linspace` computes them in f32, then swayed towards 1 by
-/// `t + cos(pi t / 2) - 1`.
+/// The `timesteps + 1` times upstream's sampler steps through: evenly spaced from 1 to 0, as
+/// torch's `linspace` computes them in f32, then swayed towards 1 by `t + cos(pi t / 2) - 1`.
 pub fn schedule(timesteps: usize) -> Vec<f32> {
     let steps = timesteps + 1;
     let step = (0.0 - 1.0) / timesteps as f32;
@@ -60,7 +59,7 @@ pub fn schedule(timesteps: usize) -> Vec<f32> {
 }
 
 /// The time and the step length of each step the DiT runs at, in `timesteps` steps, as
-/// voxcpm's `solve_euler` steps them in f32: the first 4% of the steps, but at least one, stay
+/// upstream's `solve_euler` steps them in f32: the first 4% of the steps, but at least one, stay
 /// where they are, and run nothing.
 pub fn euler_steps(timesteps: usize) -> Vec<(f32, f32)> {
     let t_span = schedule(timesteps.max(1));
@@ -365,8 +364,8 @@ pub fn load_sampler(
     Ok(())
 }
 
-/// Upstream's `SinusoidalPosEmb` at scale 1000, in f32 and in the order voxcpm's operations
-/// round in f32: the sines, then the cosines, of `1000 t` at each frequency.
+/// Upstream's `SinusoidalPosEmb` at scale 1000, in f32 and in the order its operations round in
+/// f32: the sines, then the cosines, of `1000 t` at each frequency.
 fn time_embedding(t: f32, hidden: usize) -> Vec<f64> {
     let half = hidden / 2;
     let rate = -(10000f64.ln() / (half - 1) as f64) as f32;

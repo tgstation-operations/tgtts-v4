@@ -1,5 +1,5 @@
-//! A prompt run into a slot of the patch step's caches, as voxcpm's `run_prompt` runs it, all but
-//! its last position, which the step of the first patch after it runs as the patch before
+//! A prompt run into a slot of the patch step's caches, as upstream's `_inference` runs it, but
+//! for its last position, which the step of the first patch after it runs as the patch before
 //! ([`patch`](crate::patch)): a prompt that ends in audio, as the service's do.
 //!
 //! A position is a text token or a patch of audio latents. A token's embedding is its row of the
@@ -342,10 +342,9 @@ impl Prompt<'_> {
 }
 
 /// What a generator keeps of the voices for the next prompts in them, up to a number of bytes:
-/// for each voice, the embeddings of its prompts'
-/// patches, on the host, which the service's prompts hold twice; and on the GPU, the LMs' keys
-/// and values over the first prompt in it up to its last run of audio, the voice as reference
-/// audio and the text after it. The LMs are causal, so a prompt that begins with the same
+/// for each voice, the embeddings of its prompts' patches, on the host, which the service's
+/// prompts hold twice; and on the GPU, the LMs' keys and values over the first prompt in it up to
+/// its last run of audio, the voice as reference audio and the text after it. The LMs are causal, so a prompt that begins with the same
 /// positions has the same keys and values over them, and runs only the positions after those.
 /// A voice is told by the bits of its latent frames, and the voices used longest ago make room
 /// for others.

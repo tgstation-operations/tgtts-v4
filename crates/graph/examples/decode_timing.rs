@@ -1,8 +1,8 @@
-//! Times the base LM's decode step on the GPU at batch 1, and says what a step's wall time is made
-//! of: the GPU's time from timestamps, and the host's around it, which is writing the input,
-//! submitting, the queue's delay before the GPU starts, waking on the fence after it ends, and
-//! reading the output. The delay and the wake are placed on the host's clock where the device
-//! offers calibrated timestamps. In order, after the streaming-read floor and the weights' load:
+//! Times the base LM's decode step on the GPU, and says what a step's wall time is made of: the
+//! GPU's time from timestamps, and the host's around it, which is writing the input, submitting,
+//! the queue's delay before the GPU starts, waking on the fence after it ends, and reading the
+//! output. The delay and the wake are placed on the host's clock where the device offers
+//! calibrated timestamps. In order, after the streaming-read floor and the weights' load:
 //!
 //! - the warm-up from the load, step by step, which shows the GPU's clocks ramping up;
 //! - steps back to back, once per fence spin of `--spins-us`, which tells the host's wake from

@@ -3,9 +3,9 @@
 //! condition and the stop logits, and the sampler samples the patch from noise. The host writes
 //! the patch before, the noise and the position, and reads the patch and the stop logits.
 //!
-//! The stop logits come out beside the patch they were sampled with, as voxcpm's `Step` gives
-//! them, so the submission that samples a patch says whether it is the last, and nothing runs
-//! past it. The step for the first patch after a prompt that ends in audio runs the prompt's last
+//! The stop logits come out beside the patch they were sampled with, as upstream's `_inference`
+//! gives them, so the submission that samples a patch says whether it is the last, and nothing
+//! runs past it. The step for the first patch after a prompt that ends in audio runs the prompt's last
 //! position too, its patch as the patch before: the prompt's other positions are what a prefill
 //! leaves in the caches.
 //!

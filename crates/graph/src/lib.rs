@@ -1,21 +1,25 @@
 //! A step of a model as a graph of GPU dispatches at fixed shapes, recorded once and submitted
-//! every step: the layer above the `vulkan` crate's driver, toward a runtime of its own. Its tests
-//! on the real weights hold it to goldens of its own output, testkit's.
+//! every step: the layer above the `vulkan` crate's driver. Its tests on the real weights hold it
+//! to goldens of its own output, testkit's.
 //!
 //! - [`graph`]: the step as data, the ops over its tensors in order; one arena laid out from
 //!   their lifetimes ([`graph::plan`]), and the barriers the order needs ([`graph::barriers`]).
-//! - [`kernels`]: the hand-written GLSL kernels it dispatches, compiled ahead of time by
-//!   `nix build .#glsl-kernels`, and their pipelines.
+//! - [`kernels`]: the kernels it dispatches, GLSL and MLIR compiled ahead of time by
+//!   `nix build .#glsl-kernels` and `nix build .#gpu-kernels`, and their pipelines.
 //! - [`step`]: a graph allocated and recorded into one command buffer.
-//! - [`decode`]: MiniCPM-4's decode step at batch 1, as VoxCPM2's base LM runs it, with its
-//!   weights read from the checkpoint ([`checkpoint`]).
+//! - [`decode`]: MiniCPM-4's decode step for a batch of requests, as VoxCPM2's base LM runs it,
+//!   with its weights read from the checkpoint ([`checkpoint`]).
+//! - [`prefill`]: a prompt run through a MiniCPM-4 stack at once, into a decode step's cache.
 //! - [`lm_side`]: VoxCPM2's LM side of a patch, both LMs and the layers around them, from the
 //!   local encoder's output to the DiT's condition and the stop logits.
-//! - [`local`]: VoxCPM2's patch sampler with its local DiT, and its local encoder, at batch 1.
+//! - [`local`]: VoxCPM2's patch sampler with its local DiT, and its local encoder, over several
+//!   requests at once.
 //! - [`patch`]: a patch of VoxCPM2's generation as one step: the local encoder, the LM side and
 //!   the sampler.
 //! - [`prompt`]: a prompt run into the patch step's caches.
-//! - [`generator`]: VoxCPM2's text-to-speech from a prompt to audio, a request at a time.
+//! - [`vae`]: VoxCPM2's audio VAE decoder, a chunk of latent frames at a time, with its weights
+//!   read from `audiovae.pth` ([`pth`]).
+//! - [`generator`]: VoxCPM2's text-to-speech from a prompt to audio, several requests at once.
 //!
 //! The tests that need a GPU are built with the `device` feature: `nix run .#device-tests` runs
 //! them under the validation layer.

@@ -83,7 +83,7 @@ pub struct Shape {
 
 impl Shape {
     /// The shape of the stack `config` describes, with its first `layers` layers and a cache of
-    /// `capacity` positions. Refuses what VoxCPM2 does not use, as minicpm4 does.
+    /// `capacity` positions. Refuses what VoxCPM2 does not use.
     pub fn new(config: &LmConfig, layers: usize, capacity: usize) -> Result<Self, Error> {
         let unsupported = |why: String| Err(Error::Shape(why));
         if config.use_mup {
@@ -141,7 +141,8 @@ impl Shape {
     }
 
     /// LongRoPE's cosines and sines for positions below the capacity, `[capacity][head_dim / 2]`
-    /// each: computed in f32 in the order minicpm4's `Rope::new` took, so they round as its did.
+    /// each: computed in f32 in the order upstream's `MiniCPMLongRoPE` takes, so they round as its
+    /// do.
     pub fn rope_tables(&self) -> (Vec<f32>, Vec<f32>) {
         let dim = self.head_dim;
         let theta = self.rope_theta;
@@ -942,7 +943,7 @@ mod tests {
             barriers[1..].iter().all(|&b| b),
             "every op reads the one before"
         );
-        // The base LM's weights as the brief counts them: about 1.32 billion f16 parameters.
+        // The base LM's weights: about 1.32 billion f16 parameters.
         assert_eq!(s.weight_bytes(), 2_642_644_992);
         // The arena holds one layer's intermediates at a time, not 28 layers' worth.
         let partials = 16 * 32 * 128 * 4;

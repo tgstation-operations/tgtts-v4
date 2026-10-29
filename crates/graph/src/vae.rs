@@ -1,6 +1,6 @@
 //! VoxCPM2's audio VAE decoder, streamed a chunk of latent frames at a time: latent frames in,
-//! `decoder_rates.product()` samples of audio per frame out, each causal convolution carrying its last inputs from one chunk into the
-//! next, so that chunked audio is the whole decode's.
+//! `decoder_rates.product()` samples of audio per frame out, each causal convolution carrying its
+//! last inputs from one chunk into the next, so that chunked audio is the whole decode's.
 //!
 //! A chunk is a step recorded once for at most [`VaeShape::chunk`] frames and submitted for every
 //! chunk, its length read from a buffer the host writes before each: the depthwise convolution on
