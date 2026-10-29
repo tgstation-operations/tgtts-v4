@@ -12,7 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use dsp::quantity::Gain;
+use dsp::quantity::{Gain, Level};
 use rusqlite::{Connection, TransactionBehavior, params};
 use tracing::{error, warn};
 
@@ -110,8 +110,8 @@ pub struct Row {
     /// The length of the text in characters.
     pub text_length: usize,
     pub audio_seconds: Option<f64>,
-    /// The RMS level of the audio served, in dBFS.
-    pub rms_dbfs: Option<f64>,
+    /// The RMS level of the audio served.
+    pub rms_dbfs: Option<Level>,
     pub timings: Timings,
     pub patches: Option<usize>,
     /// How the model came to the first patch, where it ran.
@@ -286,7 +286,7 @@ fn insert<'a>(
                 leveling.map(|l| l.reduction),
                 leveling.map(|l| l.limited),
                 row.cache_takes.map(|t| t as i64),
-                row.rms_dbfs,
+                row.rms_dbfs.map(Level::value),
                 row.start.map(|s| ms(s.waited)),
                 row.start.map(|s| s.prompt as i64),
                 row.start.map(|s| s.prefilled as i64),
@@ -313,7 +313,7 @@ mod tests {
             cache_takes: Some(3),
             text_length: 13,
             audio_seconds: Some(1.25),
-            rms_dbfs: Some(-21.5),
+            rms_dbfs: Some(Level::new(-21.5)),
             timings: Timings {
                 queue: Duration::from_micros(1500),
                 handoff: Duration::ZERO,
@@ -451,7 +451,7 @@ mod tests {
         drop(old);
         let metrics = Metrics::open(&path, 16).unwrap();
         let mut silent = row(0);
-        silent.rms_dbfs = Some(f64::NEG_INFINITY);
+        silent.rms_dbfs = Some(Level::new(f64::NEG_INFINITY));
         metrics.record(silent);
         drop(metrics);
         let written = rows(&path);

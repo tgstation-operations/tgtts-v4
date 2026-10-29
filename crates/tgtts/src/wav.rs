@@ -3,7 +3,11 @@
 
 use std::{error, fmt};
 
-use dsp::{quantity::SampleRate, radio::Pcm, segment::Segment};
+use dsp::{
+    quantity::{Level, SampleRate},
+    radio::Pcm,
+    segment::Segment,
+};
 
 const PCM: u16 = 1;
 const FLOAT: u16 = 3;
@@ -54,12 +58,12 @@ impl Audio {
 
     /// The RMS level of all the samples, in dB from full scale: 0 for a full-scale square wave,
     /// -3 for a full-scale sine, and negative infinity for digital silence or no samples at all.
-    pub fn rms_dbfs(&self) -> f64 {
+    pub fn rms_dbfs(&self) -> Level {
         let energy: f64 = self.samples.iter().map(|&s| f64::from(s).powi(2)).sum();
         if energy == 0.0 {
-            return f64::NEG_INFINITY;
+            return Level::new(f64::NEG_INFINITY);
         }
-        10.0 * (energy / self.samples.len() as f64).log10()
+        Level::new(10.0 * (energy / self.samples.len() as f64).log10())
     }
 }
 
@@ -252,15 +256,20 @@ mod tests {
         let sine: Vec<f32> = (0..48000)
             .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 48000.0).sin())
             .collect();
-        assert!((audio(sine).rms_dbfs() + 3.0103).abs() < 1e-4);
+        assert!((audio(sine).rms_dbfs().value() + 3.0103).abs() < 1e-4);
         assert_eq!(
-            audio(vec![0.5, -0.5, 0.5, -0.5]).rms_dbfs(),
+            audio(vec![0.5, -0.5, 0.5, -0.5]).rms_dbfs().value(),
             20.0 * 0.5f64.log10()
         );
-        let lsb = audio(vec![1.0 / 32768.0, -1.0 / 32768.0]).rms_dbfs();
+        let lsb = audio(vec![1.0 / 32768.0, -1.0 / 32768.0])
+            .rms_dbfs()
+            .value();
         assert!((lsb + 90.309).abs() < 1e-3, "{lsb}");
-        assert_eq!(audio(vec![0.0; 12000]).rms_dbfs(), f64::NEG_INFINITY);
-        assert_eq!(audio(Vec::new()).rms_dbfs(), f64::NEG_INFINITY);
+        assert_eq!(
+            audio(vec![0.0; 12000]).rms_dbfs().value(),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(audio(Vec::new()).rms_dbfs().value(), f64::NEG_INFINITY);
     }
 
     /// The header ffmpeg 8.1 writes for pcm_f32le to a pipe: unknown sizes, an 18-byte format

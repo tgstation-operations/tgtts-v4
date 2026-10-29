@@ -1098,7 +1098,9 @@ fn records_metrics_without_the_text() {
     let most = levels().most_gain(VOICE, target);
     let speech_leveling = dsp::loudness::normalize(&finished, target, ceiling, most);
     assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);
-    let speech_rms = wav::Audio::from_segment(&speech_leveling.segment).rms_dbfs();
+    let speech_rms = wav::Audio::from_segment(&speech_leveling.segment)
+        .rms_dbfs()
+        .value();
     let speech_leveling = Some((
         speech_leveling.gain.value(),
         speech_leveling.reduction,

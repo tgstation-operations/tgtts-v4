@@ -37,7 +37,7 @@ use axum::{
 use dsp::{
     limiter::Limiter,
     pitch::Shifter,
-    quantity::{self, Gain, QuarterTones, Ratio},
+    quantity::{self, Gain, Level, QuarterTones, Ratio},
     radio,
     resample::resample,
     segment::Segment,
@@ -197,8 +197,8 @@ struct Out {
 struct Ended {
     seconds: f64,
     first: Option<Duration>,
-    /// The RMS level of its audio, in dBFS.
-    rms_dbfs: f64,
+    /// The RMS level of its audio.
+    rms_dbfs: Level,
 }
 
 impl Out {
@@ -241,7 +241,7 @@ impl Out {
         Ok(Ended {
             seconds,
             first: self.first,
-            rms_dbfs: 10.0 * (self.energy / self.samples.max(1) as f64).log10(),
+            rms_dbfs: Level::new(10.0 * (self.energy / self.samples.max(1) as f64).log10()),
         })
     }
 }
@@ -289,7 +289,7 @@ struct Finished {
     kept: Option<Vec<f32>>,
     radio: Option<Out>,
     leveling: Leveling,
-    rms_dbfs: f64,
+    rms_dbfs: Level,
 }
 
 impl Chain {
@@ -342,7 +342,7 @@ impl Chain {
                 reduction: self.limiter.reduction(),
                 limited: self.limiter.fraction(),
             },
-            rms_dbfs: 10.0 * energy.log10(),
+            rms_dbfs: Level::new(10.0 * energy.log10()),
             out: self.out.take(),
             kept: self.kept.take(),
             radio,
@@ -408,7 +408,7 @@ impl Chain {
 }
 
 /// How a speech or blips job came out: each variant's end, by its routes.
-type Outcomes = Vec<(Vec<Route>, Result<Ended, Failure>, Option<f64>)>;
+type Outcomes = Vec<(Vec<Route>, Result<Ended, Failure>, Option<Level>)>;
 
 /// The outs of a job's variants.
 #[derive(Default)]
@@ -777,7 +777,7 @@ impl Service {
         mut out: Out,
         audio: Audio,
         trace: &mut Trace,
-    ) -> (Vec<Route>, Result<Ended, Failure>, Option<f64>) {
+    ) -> (Vec<Route>, Result<Ended, Failure>, Option<Level>) {
         let routes = out.routes.clone();
         let service = self.clone();
         let made = self

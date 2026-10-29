@@ -26,7 +26,7 @@ use axum::{
 };
 use dsp::{
     loudness::Normalized,
-    quantity::{self, Gain, QuarterTones, SampleRate, TruePeak},
+    quantity::{self, Gain, Level, QuarterTones, SampleRate, TruePeak},
     radio,
     resample::resample,
     segment::Segment,
@@ -416,7 +416,7 @@ struct Trace {
     start: Option<Start>,
     leveling: Option<Leveling>,
     /// The level of the audio served, as the metrics record it.
-    rms_dbfs: Option<f64>,
+    rms_dbfs: Option<Level>,
 }
 
 impl Service {
@@ -499,7 +499,7 @@ impl Service {
                 cache_hit = trace.cache_hit,
                 cache_takes = trace.cache_takes,
                 seconds = served.seconds,
-                rms_dbfs = trace.rms_dbfs,
+                rms_dbfs = trace.rms_dbfs.map(Level::value),
                 queue_ms = ms(t.queue),
                 handoff_ms = ms(t.handoff),
                 synthesis_ms = ms(t.synthesis),
