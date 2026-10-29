@@ -25,7 +25,7 @@ use vulkan::{Context, Memory, Residence, SpecValue, Timing};
 
 use crate::{
     Error,
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Bindings, Graph, Kind, Pipeline, Tensor},
     kernels::{KernelInfo, Kernels, read, write},
     step::{Region, Step},
 };
@@ -205,22 +205,22 @@ pub enum Fill {
 pub struct VaeGraph {
     pub graph: Graph,
     pub shape: VaeShape,
-    /// frames_before, frames and the stream, as u32.
-    pub chunk: TensorId,
+    /// frames_before, frames and the stream.
+    pub chunk: Tensor<u32>,
     /// `[chunk][latent]`.
-    pub latents: TensorId,
-    /// `[chunk * hop]` samples, f32.
-    pub audio: TensorId,
+    pub latents: Tensor<f32>,
+    /// `[chunk * hop]` samples.
+    pub audio: Tensor<f32>,
     /// Each convolution's ring of its last inputs, `[streams][rows][channels]`, and how many rows
     /// it holds.
-    pub rings: Vec<(TensorId, usize)>,
-    pub constants: Vec<(TensorId, Fill)>,
+    pub rings: Vec<(Tensor<f32>, usize)>,
+    pub constants: Vec<(Tensor<f32>, Fill)>,
 }
 
 /// A tensor of activations: `[up * frames][channels]`, of a chunk of frames.
 #[derive(Clone, Copy, Debug)]
 struct Activations {
-    id: TensorId,
+    id: Tensor<f32>,
     up: usize,
     channels: usize,
 }
@@ -229,9 +229,9 @@ struct Activations {
 /// convolution, which reads the ring it writes, and the op after the convolution needs one anyway.
 struct Keep {
     x: Activations,
-    ring: TensorId,
+    ring: Tensor<f32>,
     reach: usize,
-    prologue: Option<TensorId>,
+    prologue: Option<Tensor<f32>>,
     label: String,
 }
 
@@ -239,11 +239,11 @@ struct Keep {
 struct Builder {
     g: Graph,
     shape: VaeShape,
-    chunk: TensorId,
+    chunk: Tensor<u32>,
     /// Bound where a kernel's binding goes unused.
-    unused: TensorId,
-    rings: Vec<(TensorId, usize)>,
-    constants: Vec<(TensorId, Fill)>,
+    unused: Tensor<f32>,
+    rings: Vec<(Tensor<f32>, usize)>,
+    constants: Vec<(Tensor<f32>, Fill)>,
     keep: Option<Keep>,
 }
 
@@ -253,12 +253,12 @@ fn u(v: usize) -> SpecValue {
 
 impl Builder {
     fn activations(&mut self, name: String, up: usize, channels: usize) -> Activations {
-        let bytes = 4 * self.shape.chunk * up * channels;
-        let id = self.g.untyped(name, bytes as u64, Kind::Intermediate);
+        let shape = [self.shape.chunk * up, channels];
+        let id = self.g.tensor(name, &shape, Kind::Intermediate);
         Activations { id, up, channels }
     }
 
-    fn constant(&mut self, bytes: usize, fill: Fill) -> TensorId {
+    fn constant(&mut self, shape: &[usize], fill: Fill) -> Tensor<f32> {
         let name = match &fill {
             Fill::Plain(n)
             | Fill::Pointwise(n)
@@ -267,18 +267,18 @@ impl Builder {
             | Fill::Output(n)
             | Fill::Snake { alpha: n, .. } => n.clone(),
         };
-        let id = self.g.untyped(name, bytes as u64, Kind::Constant);
+        let id = self.g.tensor(name, shape, Kind::Constant);
         self.constants.push((id, fill));
         id
     }
 
-    fn snake(&mut self, alpha: String, condition: Option<String>, channels: usize) -> TensorId {
-        self.constant(16 * channels, Fill::Snake { alpha, condition })
+    fn snake(&mut self, alpha: String, condition: Option<String>, channels: usize) -> Tensor<f32> {
+        self.constant(&[channels, 4], Fill::Snake { alpha, condition })
     }
 
-    fn ring(&mut self, name: String, reach: usize, channels: usize) -> TensorId {
-        let bytes = 4 * self.shape.streams * reach * channels;
-        let id = self.g.untyped(name, bytes as u64, Kind::State);
+    fn ring(&mut self, name: String, reach: usize, channels: usize) -> Tensor<f32> {
+        let shape = [self.shape.streams, reach, channels];
+        let id = self.g.tensor(name, &shape, Kind::State);
         self.rings.push((id, reach));
         id
     }
@@ -307,7 +307,7 @@ impl Builder {
         }
     }
 
-    fn op(&mut self, label: String, pipeline: Pipeline, bindings: &[TensorId], groups: [u32; 3]) {
+    fn op(&mut self, label: String, pipeline: Pipeline, bindings: impl Bindings, groups: [u32; 3]) {
         self.g.op(label, pipeline, bindings, groups);
         if let Some(keep) = self.keep.take() {
             self.emit_keep(keep);
@@ -319,9 +319,9 @@ impl Builder {
         &mut self,
         label: String,
         x: Activations,
-        ring: TensorId,
+        ring: Tensor<f32>,
         reach: usize,
-        prologue: Option<TensorId>,
+        prologue: Option<Tensor<f32>>,
     ) {
         if let Some(keep) = self.keep.replace(Keep {
             x,
@@ -337,13 +337,13 @@ impl Builder {
     fn emit_keep(&mut self, keep: Keep) {
         let pipeline = self.pipeline(&VAE_KEEP, keep.x, keep.reach, keep.prologue.is_some(), &[]);
         let groups = (keep.reach * keep.x.channels).div_ceil(WORKGROUP as usize) as u32;
-        let bindings = [
+        let bindings = (
             self.chunk,
             keep.x.id,
             keep.ring,
             keep.prologue.unwrap_or(self.unused),
-        ];
-        self.g.op(keep.label, pipeline, &bindings, [groups, 1, 1]);
+        );
+        self.g.op(keep.label, pipeline, bindings, [groups, 1, 1]);
     }
 
     /// A depthwise causal convolution of kernel 7 over `x`, of the weights under `prefix`, with
@@ -362,8 +362,8 @@ impl Builder {
                 "{label}: {c} channels in tiles of {DEPTHWISE_COLUMNS}"
             )));
         }
-        let w = self.constant(4 * KERNEL * c, Fill::Plain(format!("{prefix}.weight")));
-        let bias = self.constant(4 * c, Fill::Plain(format!("{prefix}.bias")));
+        let w = self.constant(&[c, KERNEL], Fill::Plain(format!("{prefix}.weight")));
+        let bias = self.constant(&[c], Fill::Plain(format!("{prefix}.bias")));
         let (prologue, epilogue) = match snakes {
             Some((before, after)) => (
                 Some(self.snake(before, None, c)),
@@ -385,7 +385,7 @@ impl Builder {
             (self.shape.chunk * x.up).div_ceil(DEPTHWISE_ROWS) as u32,
             1,
         ];
-        let bindings = [
+        let bindings = (
             self.chunk,
             x.id,
             ring,
@@ -394,8 +394,8 @@ impl Builder {
             bias,
             epilogue.unwrap_or(self.unused),
             out.id,
-        ];
-        self.op(label.into(), pipeline, &bindings, groups);
+        );
+        self.op(label.into(), pipeline, bindings, groups);
         self.keep(format!("{label}.keep"), x, ring, reach, prologue);
         Ok(out)
     }
@@ -407,9 +407,9 @@ impl Builder {
         label: &str,
         x: Activations,
         taps: usize,
-        (w, bias): (TensorId, TensorId),
+        (w, bias): (Tensor<f32>, Tensor<f32>),
         n: usize,
-        prologue: Option<TensorId>,
+        prologue: Option<Tensor<f32>>,
         residual: Option<Activations>,
         out: Activations,
     ) -> Result<(), Error> {
@@ -439,7 +439,7 @@ impl Builder {
                 (11, u(wn)),
             ],
         );
-        let bindings = [
+        let bindings = (
             self.chunk,
             x.id,
             ring.unwrap_or(self.unused),
@@ -448,9 +448,9 @@ impl Builder {
             bias,
             residual.map_or(self.unused, |r| r.id),
             out.id,
-        ];
+        );
         let groups = [(n / bn) as u32, rows.div_ceil(bm) as u32, 1];
-        self.op(label.into(), pipeline, &bindings, groups);
+        self.op(label.into(), pipeline, bindings, groups);
         if let Some(ring) = ring {
             self.keep(format!("{label}.keep"), x, ring, reach, prologue);
         }
@@ -467,10 +467,10 @@ impl Builder {
         residual: Option<Activations>,
     ) -> Result<Activations, Error> {
         let w = self.constant(
-            4 * x.channels * channels,
+            &[x.channels, channels],
             Fill::Pointwise(format!("{prefix}.weight")),
         );
-        let bias = self.constant(4 * channels, Fill::Plain(format!("{prefix}.bias")));
+        let bias = self.constant(&[channels], Fill::Plain(format!("{prefix}.bias")));
         let out = self.activations(format!("{label}.out"), x.up, channels);
         self.gemm(label, x, 1, (w, bias), channels, None, residual, out)?;
         Ok(out)
@@ -488,11 +488,11 @@ impl Builder {
             c_in,
         );
         let w = self.constant(
-            4 * 2 * c_in * stride * c,
+            &[2 * c_in, stride * c],
             Fill::Transposed(format!("{prefix}.1.weight"), stride),
         );
         let bias = self.constant(
-            4 * stride * c,
+            &[stride * c],
             Fill::Repeated(format!("{prefix}.1.bias"), stride),
         );
         let label = format!("block{i}");
@@ -535,18 +535,10 @@ impl Builder {
 /// The decoder's step of `shape`.
 pub fn vae_graph(shape: &VaeShape) -> Result<VaeGraph, Error> {
     let mut g = Graph::default();
-    let chunk = g.untyped("chunk", 12, Kind::Param);
-    let unused = g.untyped("unused", 16, Kind::Constant);
-    let latents = g.untyped(
-        "latents",
-        (4 * shape.chunk * shape.latent) as u64,
-        Kind::Input,
-    );
-    let audio = g.untyped(
-        "audio",
-        (shape.chunk * shape.hop() * 4) as u64,
-        Kind::Output,
-    );
+    let chunk = g.tensor("chunk", &[3], Kind::Param);
+    let unused = g.tensor("unused", &[4], Kind::Constant);
+    let latents = g.tensor("latents", &[shape.chunk, shape.latent], Kind::Input);
+    let audio = g.tensor("audio", &[shape.chunk * shape.hop()], Kind::Output);
     let mut b = Builder {
         g,
         shape: shape.clone(),
@@ -570,10 +562,10 @@ pub fn vae_graph(shape: &VaeShape) -> Result<VaeGraph, Error> {
     let c = x.channels;
     let prologue = b.snake(format!("model.{last}.alpha"), None, c);
     let w = b.constant(
-        4 * KERNEL * c,
+        &[KERNEL, c],
         Fill::Output(format!("model.{}.weight", last + 1)),
     );
-    let bias = b.constant(4, Fill::Plain(format!("model.{}.bias", last + 1)));
+    let bias = b.constant(&[1], Fill::Plain(format!("model.{}.bias", last + 1)));
     let reach = KERNEL - 1;
     let ring = b.ring("out.ring".into(), reach, c);
     let pipeline = b.pipeline(&VAE_OUT, x, reach, true, &[]);
@@ -581,7 +573,7 @@ pub fn vae_graph(shape: &VaeShape) -> Result<VaeGraph, Error> {
     b.op(
         "out".into(),
         pipeline,
-        &[chunk, x.id, ring, prologue, w, bias, audio],
+        (chunk, x.id, ring, prologue, w, bias, audio),
         [groups, 1, 1],
     );
     b.emit_keep(Keep {
@@ -633,7 +625,7 @@ impl VaeDecoder {
             .rings
             .iter()
             .fold(1, |period, &(_, reach)| lcm(period, reach as u32));
-        let ring = |&(t, _): &(TensorId, usize)| tensors.graph.tensors[t.0].bytes;
+        let ring = |&(t, _): &(Tensor<f32>, usize)| tensors.graph.info(t).bytes;
         let largest = tensors.rings.iter().map(ring).max().unwrap_or(0);
         let zeros = ctx.memory_in(largest / shape.streams as u64, Residence::Device)?;
         Ok(VaeDecoder {
@@ -721,12 +713,13 @@ impl VaeDecoder {
                     values.collect()
                 }
             };
-            let bytes = self.tensors.graph.tensors[t.0].bytes;
-            if 4 * values.len() as u64 != bytes {
+            let tensor = self.tensors.graph.info(t);
+            if values.len() != tensor.len() {
                 return Err(Error::Checkpoint(format!(
-                    "{}: {} values for {bytes} bytes",
-                    self.tensors.graph.tensors[t.0].name,
-                    values.len()
+                    "{}: {} values for {}",
+                    tensor.name,
+                    values.len(),
+                    tensor.len()
                 )));
             }
             self.step.write(t, &values)?;
@@ -779,9 +772,9 @@ impl VaeDecoder {
             .rings
             .iter()
             .map(|&(ring, _)| {
-                let bytes = self.tensors.graph.tensors[ring.0].bytes / streams as u64;
+                let bytes = self.tensors.graph.info(ring).bytes / streams as u64;
                 Region {
-                    tensor: ring,
+                    tensor: ring.id(),
                     offset: stream as u64 * bytes,
                     other: 0,
                     bytes,
@@ -861,10 +854,12 @@ mod tests {
                 .flat_map(|(i, op)| {
                     let access = op.pipeline.kernel.bindings.iter().map(|b| b.access);
                     let bound = op.bindings.iter().zip(access);
-                    bound.filter(|&(&t, _)| t == ring).map(move |(_, a)| (i, a))
+                    bound
+                        .filter(|&(&t, _)| t == ring.id())
+                        .map(move |(_, a)| (i, a))
                 })
                 .collect();
-            let name = &graph.tensors[ring.0].name;
+            let name = &graph.info(ring).name;
             let [(read, Access::Read), (kept, Access::Write)] = uses[..] else {
                 panic!("{name}: {uses:?}");
             };
@@ -882,13 +877,9 @@ mod tests {
             let g = vae_graph(&shape(25, streams)).unwrap();
             // 1 + 6 blocks of a transposed convolution and three residual units + 1.
             assert_eq!(g.rings.len(), 26);
-            let values: u64 = g
-                .rings
-                .iter()
-                .map(|&(t, _)| g.graph.tensors[t.0].bytes / 4)
-                .sum();
+            let values: usize = g.rings.iter().map(|&(t, _)| g.graph.info(t).len()).sum();
             // As the audiovae crate's DecodeStream counted what it kept of a batch item.
-            assert_eq!(values, streams as u64 * 161_856);
+            assert_eq!(values, streams * 161_856);
             assert_eq!(g.graph.ops.len(), 3 + 6 * 11 + 2);
             let declared = (5, SpecValue::U32(streams as u32));
             assert!(
