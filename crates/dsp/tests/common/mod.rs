@@ -1,6 +1,6 @@
 //! Reading the dsp fixtures, which hold PCM as F32 and doubles as the I64 of their bits, since
 //! the generators' safetensors writer has neither I16 nor F64. The tensors are read from the
-//! file's bytes: testkit's readers go through burn, whose integers are 32-bit.
+//! file's bytes, which keep the I64s whole.
 
 #![allow(dead_code)]
 

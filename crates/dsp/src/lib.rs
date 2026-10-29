@@ -1,5 +1,6 @@
 //! Signal processing for the service, on PCM in memory: what the Python service did with pydub,
-//! librosa and scipy, reproduced closely enough that a voice sounds as it did.
+//! librosa and scipy, reproduced closely enough that a voice sounds as it did, and the loudness
+//! meter and limiter the service levels every route with.
 
 pub mod blips;
 pub mod float;

@@ -35,8 +35,8 @@ pub struct Normalized {
 /// `segment` brought to an integrated loudness of `target` LUFS by a gain of at most `most` dB,
 /// and its true peak held at or under `ceiling` dBTP by the [limiter](crate::limiter). Where the
 /// limiter takes enough off to lower the loudness, the gain is raised and the limiter run again
-/// until the loudness is within 0.05 LU of the target, or the gain is `most`. Anything quieter
-/// than [`FLOOR`], silence among it, is left as it is.
+/// until the loudness is within 0.05 LU of the target or the gain is `most`, 8 runs at most.
+/// Anything quieter than [`FLOOR`], silence among it, is left as it is.
 pub fn normalize(segment: &Segment, target: f64, ceiling: f64, most: f64) -> Normalized {
     let samples: Vec<f64> = (segment.samples.iter())
         .map(|&s| f64::from(s) / 32768.0)
