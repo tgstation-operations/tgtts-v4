@@ -18,7 +18,7 @@ pub mod time;
 pub use graph::{Error, Pipeline};
 
 /// The rate everything here runs at, in Hz.
-const RATE: f64 = dsp::RATE as f64;
+const RATE: f64 = dsp::RATE.value() as f64;
 
 /// An effect on a stream of audio, given a chunk at a time.
 ///

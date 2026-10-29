@@ -141,7 +141,7 @@ pub fn gibberish(speech: &Pcm, assets: &Assets, spans: &[(f64, f64)]) -> Segment
 fn duck(speech: &[f64], spans: &[(f64, f64)], noise: &[f64]) -> Vec<f64> {
     let total = speech.len();
     let rate = f64::from(RATE);
-    let ms = |ms: u32| (f64::from(ms * RATE) / 1000.0) as i64;
+    let ms = |ms: u32| (f64::from(ms * RATE.value()) / 1000.0) as i64;
     let (pre, post, fade) = (ms(60), ms(80), ms(25));
     let mut windows: Vec<(i64, i64)> = spans
         .iter()

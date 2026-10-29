@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use dsp::quantity::SampleRate;
 use effects::{
     Pipeline, Processor,
     convolve::{Impulses, Response},
@@ -259,7 +260,7 @@ impl Fixture {
     fn impulses(&self) -> Impulses {
         let (_, synth) = self.tensor("synth");
         Impulses {
-            synth: Arc::new(Response::new(&synth, 2, self.synth_rate)),
+            synth: Arc::new(Response::new(&synth, 2, SampleRate::new(self.synth_rate))),
         }
     }
 }

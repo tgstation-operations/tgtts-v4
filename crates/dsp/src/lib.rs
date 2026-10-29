@@ -15,9 +15,11 @@ pub mod segment;
 pub mod sentences;
 pub mod speech;
 
+use quantity::SampleRate;
+
 /// The rate the service works at, in Hz: the model's, every voice's, and the one the game's
 /// filters are written for.
-pub const RATE: u32 = 48000;
+pub const RATE: SampleRate = SampleRate::new(48000);
 
 /// The random draws the old service made with Python's `random` module, which the service makes
 /// from a generator of its own and a test replays.

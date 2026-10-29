@@ -18,6 +18,7 @@ use std::{
 };
 
 use common::{Message, Reply, Server, VOICE, call};
+use dsp::quantity::SampleRate;
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
@@ -156,7 +157,11 @@ fn tone(rate: u32, frames: usize, frequency: f32, amplitude: f32) -> Vec<i16> {
 }
 
 fn write_wav(path: &Path, rate: u32, channels: u16, samples: &[i16]) {
-    std::fs::write(path, wav::write_pcm16(rate, channels, samples)).unwrap();
+    std::fs::write(
+        path,
+        wav::write_pcm16(SampleRate::new(rate), channels, samples),
+    )
+    .unwrap();
 }
 
 /// Four voices, two of whose names run together as another pair's do.
@@ -290,7 +295,7 @@ fn levels() -> Levels {
         let mut tone: Vec<f64> = said(text).iter().map(|&s| f64::from(s)).collect();
         tone.resize(tone.len() + TAIL, 0.0);
         Level {
-            loudness_lufs: dsp::loudness::integrated(&tone, 48000),
+            loudness_lufs: dsp::loudness::integrated(&tone, SampleRate::new(48000)),
             lines: 1,
             radio: None,
         }
@@ -1299,7 +1304,7 @@ fn streamed_speech_is_as_long_and_as_loud_as_the_whole_files() {
         let decoded = tgtts::opus::decode(&streamed.body).unwrap().samples;
         assert_eq!(decoded.len(), whole.frames(48000));
         let streamed: Vec<f64> = decoded.iter().map(|&s| f64::from(s)).collect();
-        let streamed = dsp::loudness::integrated(&streamed, 48000);
+        let streamed = dsp::loudness::integrated(&streamed, SampleRate::new(48000));
         let whole = loudness(&whole);
         assert!(
             (streamed - whole).abs() < 0.3,
@@ -1476,7 +1481,7 @@ fn streams_the_effects_and_the_clicks() {
     };
     let integrated = |samples: &[f32]| {
         let samples: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
-        dsp::loudness::integrated(&samples, 48000)
+        dsp::loudness::integrated(&samples, SampleRate::new(48000))
     };
     for (effects, text) in [
         r#"[[{"effect": "lowpass", "frequency_hz": 750}, {"effect": "gain", "gain_db": -6}]]"#,
@@ -1531,9 +1536,9 @@ fn with_radio_peaks(mut levels: Levels, assets: &std::path::Path) -> Levels {
         let gain = 10f64.powf((LOUDNESS.target - level.loudness_lufs) / 20.0);
         let mut x: Vec<f64> = said(text).iter().map(|&s| f64::from(s) * gain).collect();
         x.resize(x.len() + TAIL, 0.0);
-        let limited = dsp::limiter::limit(&x, 48000, LOUDNESS.ceiling).samples;
+        let limited = dsp::limiter::limit(&x, SampleRate::new(48000), LOUDNESS.ceiling).samples;
         let speech = wav::Audio {
-            rate: 48000,
+            rate: SampleRate::new(48000),
             channels: 1,
             samples: limited.iter().map(|&s| s as f32).collect(),
         };
@@ -1589,7 +1594,7 @@ fn streams_the_radio_when_asked() {
     assert_eq!(streamed.samples.len(), radio_frames(speech));
     let streamed: Vec<f64> = streamed.samples.iter().map(|&s| f64::from(s)).collect();
     let (streamed, whole) = (
-        dsp::loudness::integrated(&streamed, 48000),
+        dsp::loudness::integrated(&streamed, SampleRate::new(48000)),
         loudness(&whole),
     );
     assert!(

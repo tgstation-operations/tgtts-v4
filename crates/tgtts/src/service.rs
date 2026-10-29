@@ -24,7 +24,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dsp::{loudness::Normalized, radio, resample::resample, segment::Segment};
+use dsp::{
+    loudness::Normalized, quantity::SampleRate, radio, resample::resample, segment::Segment,
+};
 use effects::{
     Pipeline,
     convolve::{self, Impulses},
@@ -73,7 +75,7 @@ const STARTS: [&str; 2] = ["on1.wav", "on2.wav"];
 const ENDS: [&str; 4] = ["off1.wav", "off2.wav", "off3.wav", "off4.wav"];
 
 /// The rate the effects run at.
-const RATE: f64 = dsp::RATE as f64;
+const RATE: f64 = dsp::RATE.value() as f64;
 
 /// The most quarter tones speech is shifted by either way. The old frontend took any integer,
 /// though a few octaves up would only have run it out of memory; the game asks for 24 at most.
@@ -826,7 +828,7 @@ impl Service {
             // A graph that fails is served unfiltered, since failing would drop the whole
             // message.
             Treatment::Filter(graph) => {
-                let graph = graph.replace("%SAMPLE_RATE%", &audio.rate.to_string());
+                let graph = graph.replace("%SAMPLE_RATE%", &audio.rate.value().to_string());
                 let identifier = &params.identifier;
                 if let Some(reason) = ffmpeg::refusal(&graph) {
                     warn!(%identifier, "serving unfiltered, the filter graph has {reason}: {graph}");
@@ -1065,7 +1067,7 @@ impl Sounds {
     }
 
     /// A start and an end click drawn from `rng`, at `rate` and in `channels` channels.
-    fn clicks(&self, rate: u32, channels: u16, rng: &mut impl Rng) -> (Vec<f32>, Vec<f32>) {
+    fn clicks(&self, rate: SampleRate, channels: u16, rng: &mut impl Rng) -> (Vec<f32>, Vec<f32>) {
         let start = &self.starts[rng.random_range(0..self.starts.len())];
         let end = &self.ends[rng.random_range(0..self.ends.len())];
         (matched(start, rate, channels), matched(end, rate, channels))
@@ -1073,7 +1075,7 @@ impl Sounds {
 }
 
 /// `click`'s samples at `rate` and in `channels` channels.
-fn matched(click: &Audio, rate: u32, channels: u16) -> Vec<f32> {
+fn matched(click: &Audio, rate: SampleRate, channels: u16) -> Vec<f32> {
     let from = usize::from(click.channels.max(1));
     let mono: Vec<f32> = click
         .samples

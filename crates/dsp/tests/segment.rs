@@ -3,7 +3,10 @@
 mod common;
 
 use common::{Tensors, first_difference};
-use dsp::segment::{Error, Segment};
+use dsp::{
+    quantity::SampleRate,
+    segment::{Error, Segment},
+};
 
 const CROSSFADE_TOO_LONG: i64 = 1;
 const TOO_MANY_MISSING_FRAMES: i64 = 2;
@@ -34,7 +37,7 @@ fn matches_pydub() {
     let segments: Vec<Segment> = (0..fx.int("cases"))
         .map(|case| {
             Segment::new(
-                fx.int(&format!("{case}/rate")) as u32,
+                SampleRate::new(fx.int(&format!("{case}/rate")) as u32),
                 fx.pcm(&format!("{case}/input")),
             )
         })
@@ -90,7 +93,7 @@ fn matches_pydub() {
     }
     for duration in [250, 1, 33] {
         for rate in [48000, 44100, 11025, 3001] {
-            let silent = Segment::silent(duration, rate);
+            let silent = Segment::silent(duration, SampleRate::new(rate));
             assert!(silent.samples.iter().all(|&s| s == 0));
             let frames = fx.int(&format!("silent/{duration}/{rate}"));
             assert_eq!(
@@ -104,6 +107,6 @@ fn matches_pydub() {
 
 #[test]
 fn reverses() {
-    let seg = Segment::new(8000, vec![1, -2, 3]);
+    let seg = Segment::new(SampleRate::new(8000), vec![1, -2, 3]);
     assert_eq!(seg.reverse().samples, [3, -2, 1]);
 }

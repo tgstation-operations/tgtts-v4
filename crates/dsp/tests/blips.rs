@@ -10,13 +10,14 @@ use dsp::{
     Random,
     blips::{self, Error},
     float::{from_pcm, to_pcm},
+    quantity::SampleRate,
     resample::resample,
     segment::{self, Segment},
 };
 use voices::{BlipSet, Blips, Voices};
 
 /// The made-up voice's rate.
-const RATE: u32 = 16000;
+const RATE: SampleRate = SampleRate::new(16000);
 const KEYS: [&str; 10] = ["a", "b", "c", "h", "l", "o", "1", "2", "Deska", "Gwah"];
 const CROSSFADE_TOO_LONG: i64 = 1;
 
@@ -74,13 +75,13 @@ impl Voice {
     }
 
     /// The voice of `samples` at `rate`.
-    fn of(test: &str, rate: u32, samples: BTreeMap<&str, Vec<i16>>) -> Self {
+    fn of(test: &str, rate: SampleRate, samples: BTreeMap<&str, Vec<i16>>) -> Self {
         let samples = samples
             .into_iter()
             .map(|(key, sample)| (("male".to_owned(), "1".to_owned(), key.to_owned()), sample))
             .collect();
         let set = BlipSet {
-            sample_rate: rate,
+            sample_rate: rate.value(),
             samples,
         };
         let path = std::env::temp_dir().join(format!("dsp-{test}-{}.blips", std::process::id()));
@@ -264,7 +265,7 @@ fn silent_sentences_take_no_time() {
 
 /// A blip loud from its first sample to its last, `ms` long, which stripping leaves whole.
 fn loud(ms: u32) -> Vec<i16> {
-    (0..RATE * ms / 1000)
+    (0..RATE.value() * ms / 1000)
         .map(|i| if i % 2 == 0 { 8000 } else { -8000 })
         .collect()
 }

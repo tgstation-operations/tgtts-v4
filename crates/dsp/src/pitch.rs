@@ -11,7 +11,7 @@ use std::{collections::VecDeque, f64::consts::PI, sync::Arc};
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
-use crate::resample::Resampler;
+use crate::{quantity::SampleRate, resample::Resampler};
 
 const N_FFT: usize = 2048;
 const HOP: usize = N_FFT / 4;
@@ -26,7 +26,7 @@ const HALF: usize = N_FFT / 2;
 /// # Panics
 ///
 /// If `bins_per_octave` is 0.
-pub fn pitch_shift(y: &[f32], sr: u32, n_steps: f64, bins_per_octave: u32) -> Vec<f32> {
+pub fn pitch_shift(y: &[f32], sr: SampleRate, n_steps: f64, bins_per_octave: u32) -> Vec<f32> {
     let mut shifter = Shifter::new(sr, n_steps, bins_per_octave);
     let mut shifted = Vec::with_capacity(y.len());
     shifter.process(y, &mut shifted);
@@ -50,7 +50,7 @@ type Column = Vec<Complex<f32>>;
 pub struct Shifter {
     /// The time stretch, librosa's `rate`.
     rate: f64,
-    sr: u32,
+    sr: SampleRate,
     window: Vec<f64>,
     forward: Arc<dyn Fft<f64>>,
     inverse: Arc<dyn Fft<f64>>,
@@ -87,7 +87,7 @@ impl Shifter {
     /// # Panics
     ///
     /// If `bins_per_octave` is 0.
-    pub fn new(sr: u32, n_steps: f64, bins_per_octave: u32) -> Self {
+    pub fn new(sr: SampleRate, n_steps: f64, bins_per_octave: u32) -> Self {
         assert!(bins_per_octave > 0, "bins_per_octave of 0");
         let rate = 2f64.powf(-n_steps / f64::from(bins_per_octave));
         let (from, to) = resampling(sr, rate);
@@ -326,7 +326,7 @@ impl Shifter {
 }
 
 /// The rates librosa resamples a stretch by `rate` back from and to, at `sr` Hz.
-fn resampling(sr: u32, rate: f64) -> (f64, f64) {
+fn resampling(sr: SampleRate, rate: f64) -> (f64, f64) {
     (f64::from(sr) / rate, f64::from(sr))
 }
 
@@ -364,7 +364,7 @@ mod tests {
 
     /// librosa's `stft(y)`, as the shifter makes its columns.
     fn stft(y: &[f32]) -> Vec<Column> {
-        let mut shifter = Shifter::new(48000, 0.0, 24);
+        let mut shifter = Shifter::new(SampleRate::new(48000), 0.0, 24);
         shifter.input.extend_from_slice(y);
         shifter.input.resize(shifter.input.len() + HALF, 0.0);
         while shifter.made < 1 + y.len() / HOP {
@@ -375,7 +375,7 @@ mod tests {
 
     /// librosa's `phase_vocoder(D, rate=rate)`, as the shifter makes its frames.
     fn phase_vocoder(spectrum: &[Column], rate: f64) -> Vec<Column> {
-        let mut shifter = Shifter::new(48000, 0.0, 24);
+        let mut shifter = Shifter::new(SampleRate::new(48000), 0.0, 24);
         shifter.rate = rate;
         shifter.columns = spectrum.iter().cloned().collect();
         shifter.made = spectrum.len();

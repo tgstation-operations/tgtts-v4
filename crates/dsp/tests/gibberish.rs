@@ -6,6 +6,7 @@ mod common;
 use common::{Tensors, assert_pcm_close};
 use dsp::{
     Random, gibberish,
+    quantity::SampleRate,
     radio::{Assets, Pcm},
 };
 use serde_json::Value;
@@ -121,7 +122,7 @@ fn pairs_the_masked_words_letters_with_their_times() {
 /// The fixture's clicks and static.
 fn assets(fx: &Tensors) -> Assets {
     let clip = |stem: &str| Pcm {
-        rate: fx.int(&format!("{stem}/rate")) as u32,
+        rate: SampleRate::new(fx.int(&format!("{stem}/rate")) as u32),
         channels: fx.int(&format!("{stem}/channels")) as u16,
         samples: fx.pcm(&format!("{stem}/samples")),
     };
@@ -131,7 +132,7 @@ fn assets(fx: &Tensors) -> Assets {
 
 fn speech(fx: &Tensors, name: &str) -> Pcm {
     Pcm {
-        rate: fx.int(&format!("{name}/rate")) as u32,
+        rate: SampleRate::new(fx.int(&format!("{name}/rate")) as u32),
         channels: 1,
         samples: fx.pcm(&format!("{name}/input")),
     }

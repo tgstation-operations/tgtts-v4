@@ -108,6 +108,8 @@ pub fn level(speech: &Segment) -> Segment {
 
 #[cfg(test)]
 mod tests {
+    use dsp::quantity::SampleRate;
+
     use super::*;
 
     #[test]
@@ -137,9 +139,9 @@ mod tests {
 
     #[test]
     fn levels_the_peak_at_a_tenth_of_a_decibel_down() {
-        let speech = Segment::new(48000, [0, 1000, -2000, 500].repeat(2400));
+        let speech = Segment::new(SampleRate::new(48000), [0, 1000, -2000, 500].repeat(2400));
         assert_eq!(level(&speech).max(), 32393);
-        let silence = Segment::new(48000, vec![0; 4]);
+        let silence = Segment::new(SampleRate::new(48000), vec![0; 4]);
         assert_eq!(level(&silence), silence);
     }
 
@@ -149,9 +151,12 @@ mod tests {
         let noise: Vec<i16> = (0..7680)
             .map(|i: i32| ((i * 7919) % 97 - 48) as i16)
             .collect();
-        let noise = Segment::new(48000, noise);
+        let noise = Segment::new(SampleRate::new(48000), noise);
         assert_eq!(level(&noise), noise);
-        let louder = Segment::new(48000, noise.samples.iter().map(|&s| s * 4).collect());
+        let louder = Segment::new(
+            SampleRate::new(48000),
+            noise.samples.iter().map(|&s| s * 4).collect(),
+        );
         assert_eq!(level(&louder).max(), 32393);
     }
 }

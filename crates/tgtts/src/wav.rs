@@ -3,7 +3,7 @@
 
 use std::{error, fmt};
 
-use dsp::{radio::Pcm, segment::Segment};
+use dsp::{quantity::SampleRate, radio::Pcm, segment::Segment};
 
 const PCM: u16 = 1;
 const FLOAT: u16 = 3;
@@ -16,7 +16,7 @@ const UNKNOWN_SIZE: u32 = u32::MAX;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Audio {
     /// Frames per second.
-    pub rate: u32,
+    pub rate: SampleRate,
     /// Samples per frame.
     pub channels: u16,
     /// The samples, a frame's channels in turn.
@@ -74,16 +74,16 @@ fn to_i16(sample: f32) -> i16 {
 }
 
 /// A WAV file of 16-bit PCM.
-pub fn write_pcm16(rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+pub fn write_pcm16(rate: SampleRate, channels: u16, samples: &[i16]) -> Vec<u8> {
     let data = samples.iter().flat_map(|s| s.to_le_bytes());
-    write(PCM, 16, rate, channels, samples.len() * 2, data)
+    write(PCM, 16, rate.value(), channels, samples.len() * 2, data)
 }
 
 /// A WAV file of `audio` as 32-bit floats.
 pub fn write_float(audio: &Audio) -> Vec<u8> {
     let data = audio.samples.iter().flat_map(|s| s.to_le_bytes());
     let len = audio.samples.len() * 4;
-    write(FLOAT, 32, audio.rate, audio.channels, len, data)
+    write(FLOAT, 32, audio.rate.value(), audio.channels, len, data)
 }
 
 fn write(
@@ -150,7 +150,7 @@ pub fn read(bytes: &[u8]) -> Result<Audio, Error> {
                 return Err(Error::NoFormat);
             }
             return Ok(Audio {
-                rate,
+                rate: SampleRate::new(rate),
                 channels,
                 samples,
             });
@@ -217,15 +217,15 @@ mod tests {
     #[test]
     fn pcm16_round_trips() {
         let samples = [0, 1, -1, i16::MAX, i16::MIN, 12345];
-        let audio = read(&write_pcm16(22050, 2, &samples)).unwrap();
-        assert_eq!((audio.rate, audio.channels), (22050, 2));
+        let audio = read(&write_pcm16(SampleRate::new(22050), 2, &samples)).unwrap();
+        assert_eq!((audio.rate, audio.channels), (SampleRate::new(22050), 2));
         assert_eq!(audio.to_pcm().samples, samples);
     }
 
     #[test]
     fn floats_round_trip() {
         let audio = Audio {
-            rate: 48000,
+            rate: SampleRate::new(48000),
             channels: 1,
             samples: vec![0.0, 0.5, -1.0, 1.5, f32::MIN_POSITIVE],
         };
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn floats_clip_to_pcm() {
         let audio = Audio {
-            rate: 8000,
+            rate: SampleRate::new(8000),
             channels: 1,
             samples: vec![1.0, -1.0, 2.0, -2.0, 0.5 / 32768.0, 1.5 / 32768.0],
         };
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn measures_the_rms_level() {
         let audio = |samples: Vec<f32>| Audio {
-            rate: 48000,
+            rate: SampleRate::new(48000),
             channels: 2,
             samples,
         };
@@ -273,13 +273,13 @@ mod tests {
         bytes.extend(0.25f32.to_le_bytes());
         bytes.extend((-0.5f32).to_le_bytes());
         let audio = read(&bytes).unwrap();
-        assert_eq!((audio.rate, audio.channels), (48000, 1));
+        assert_eq!((audio.rate, audio.channels), (SampleRate::new(48000), 1));
         assert_eq!(audio.samples, [0.25, -0.5]);
     }
 
     #[test]
     fn refuses_other_formats() {
-        let mut bytes = write_pcm16(8000, 1, &[0; 4]);
+        let mut bytes = write_pcm16(SampleRate::new(8000), 1, &[0; 4]);
         bytes[34] = 8;
         assert_eq!(read(&bytes), Err(Error::Unsupported { format: 1, bits: 8 }));
         assert_eq!(read(b"RIFF\0\0\0\0WAVE"), Err(Error::NoData));

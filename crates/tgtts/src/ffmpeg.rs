@@ -200,6 +200,8 @@ impl error::Error for Error {}
 mod tests {
     use std::f32::consts::TAU;
 
+    use dsp::quantity::SampleRate;
+
     use super::*;
 
     fn ffmpeg() -> Ffmpeg {
@@ -211,7 +213,7 @@ mod tests {
             .map(|i| 0.5 * (TAU * 440.0 * i as f32 / rate as f32).sin())
             .collect();
         Audio {
-            rate,
+            rate: SampleRate::new(rate),
             channels: 1,
             samples,
         }
@@ -219,14 +221,18 @@ mod tests {
 
     #[tokio::test]
     async fn filters_to_float_at_the_graphs_rate() {
-        let input = wav::write_pcm16(48000, 1, &sine(48000, 4800).to_pcm().samples);
+        let input = wav::write_pcm16(
+            SampleRate::new(48000),
+            1,
+            &sine(48000, 4800).to_pcm().samples,
+        );
         let louder = ffmpeg()
             .filter(input.clone(), "volume=2", &[])
             .await
             .unwrap();
         assert_eq!(
             (louder.rate, louder.channels, louder.frames()),
-            (48000, 1, 4800)
+            (SampleRate::new(48000), 1, 4800)
         );
         let peak = louder.samples.iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!((peak - 1.0).abs() < 1e-3, "peak {peak}");
@@ -235,18 +241,29 @@ mod tests {
             .filter(input, "aresample=44100,pan=stereo|c0=c0|c1=c0", &[])
             .await
             .unwrap();
-        assert_eq!((resampled.rate, resampled.channels), (44100, 2));
+        assert_eq!(
+            (resampled.rate, resampled.channels),
+            (SampleRate::new(44100), 2)
+        );
     }
 
     #[tokio::test]
     async fn gives_the_graph_its_further_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let impulse = dir.path().join("impulse.wav");
-        std::fs::write(&impulse, wav::write_pcm16(48000, 1, &[16384, 0, 0, 0])).unwrap();
-        let input = wav::write_pcm16(48000, 1, &sine(48000, 480).to_pcm().samples);
+        std::fs::write(
+            &impulse,
+            wav::write_pcm16(SampleRate::new(48000), 1, &[16384, 0, 0, 0]),
+        )
+        .unwrap();
+        let input = wav::write_pcm16(
+            SampleRate::new(48000),
+            1,
+            &sine(48000, 480).to_pcm().samples,
+        );
         let graph = "[0] [1] afir=dry=1:wet=1";
         let output = ffmpeg().filter(input, graph, &[&impulse]).await.unwrap();
-        assert_eq!((output.rate, output.channels), (48000, 1));
+        assert_eq!((output.rate, output.channels), (SampleRate::new(48000), 1));
         assert!(output.frames() >= 480);
     }
 
@@ -286,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_what_ffmpeg_said() {
-        let input = wav::write_pcm16(48000, 1, &[0; 480]);
+        let input = wav::write_pcm16(SampleRate::new(48000), 1, &[0; 480]);
         let Err(Error::Failed { status, stderr }) =
             ffmpeg().filter(input, "nosuchfilter=1", &[]).await
         else {
@@ -296,7 +313,7 @@ mod tests {
         assert!(stderr.contains("nosuchfilter"), "{stderr}");
 
         let missing = Ffmpeg::new("/nonexistent/ffmpeg");
-        let input = wav::write_pcm16(48000, 1, &[0; 480]);
+        let input = wav::write_pcm16(SampleRate::new(48000), 1, &[0; 480]);
         let result = missing.filter(input, "volume=2", &[]).await;
         assert!(matches!(result, Err(Error::Spawn(..))));
     }

@@ -154,7 +154,7 @@ mod tests {
 
     fn audio(n: f32) -> Arc<Audio> {
         Arc::new(Audio {
-            rate: 48000,
+            rate: dsp::RATE,
             channels: 1,
             samples: vec![n],
         })

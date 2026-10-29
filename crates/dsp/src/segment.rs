@@ -7,6 +7,8 @@
 
 use std::ops::Range;
 
+use crate::quantity::SampleRate;
+
 /// pydub's `db_to_float(-120)`, the gain a fade starts or ends at.
 const FADE_FLOOR_DB: f64 = -120.0;
 
@@ -17,7 +19,7 @@ const FULL_SCALE: f64 = 32768.0;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
     /// Frames per second.
-    pub rate: u32,
+    pub rate: SampleRate,
     /// The samples.
     pub samples: Vec<i16>,
 }
@@ -43,12 +45,12 @@ pub enum Error {
 
 impl Segment {
     /// A segment of `samples` at `rate` frames per second.
-    pub fn new(rate: u32, samples: Vec<i16>) -> Self {
+    pub fn new(rate: SampleRate, samples: Vec<i16>) -> Self {
         Self { rate, samples }
     }
 
     /// `AudioSegment.silent(duration, rate)`: `duration` ms of zeros.
-    pub fn silent(duration: u32, rate: u32) -> Self {
+    pub fn silent(duration: u32, rate: SampleRate) -> Self {
         let frames = (f64::from(rate) * (f64::from(duration) / 1000.0)) as usize;
         Self::new(rate, vec![0; frames])
     }

@@ -2,6 +2,7 @@
 
 use std::{f64::consts::TAU, sync::Arc};
 
+use dsp::quantity::SampleRate;
 use effects::{
     Pipeline, Processor,
     convolve::{Impulses, Response},
@@ -33,7 +34,7 @@ fn impulses() -> Impulses {
         })
         .collect();
     Impulses {
-        synth: Arc::new(Response::new(&samples, 2, 44100)),
+        synth: Arc::new(Response::new(&samples, 2, SampleRate::new(44100))),
     }
 }
 

@@ -146,10 +146,12 @@ fn read(path: &Path) -> io::Result<Segment> {
 mod tests {
     use std::{collections::HashSet, sync::Arc, thread};
 
+    use dsp::quantity::SampleRate;
+
     use super::*;
 
     fn speech(n: i16) -> Segment {
-        Segment::new(48000, vec![n, -n, n])
+        Segment::new(SampleRate::new(48000), vec![n, -n, n])
     }
 
     #[test]
@@ -192,7 +194,7 @@ mod tests {
             let lookup = cache.lookup("v", "hello", &mut rng).unwrap();
             assert_eq!(lookup.takes, TAKES);
             let take = lookup.take.unwrap();
-            assert_eq!(take.rate, 48000);
+            assert_eq!(take.rate, SampleRate::new(48000));
             seen.insert(take.samples[0]);
         }
         assert_eq!(seen, HashSet::from([1, 2, 3, 4, 5]));
@@ -205,7 +207,7 @@ mod tests {
         assert_eq!(names, ["0.wav", "1.wav", "2.wav", "3.wav", "4.wav"]);
         assert_eq!(
             fs::read(entry.join("0.wav")).unwrap(),
-            wav::write_pcm16(48000, 1, &[1, -1, 1])
+            wav::write_pcm16(SampleRate::new(48000), 1, &[1, -1, 1])
         );
         let other = cache.lookup("v", "other", &mut rng).unwrap();
         assert_eq!((other.takes, other.take), (0, None));

@@ -7,6 +7,7 @@ use common::Tensors;
 use dsp::{
     float,
     pitch::{Shifter, pitch_shift},
+    quantity::SampleRate,
 };
 
 /// librosa inverts its float32 spectrogram in float32, through pocketfft, where this inverts
@@ -28,7 +29,7 @@ fn matches_librosa() {
         let input = float::from_pcm(&fx.pcm(&name("input")));
         let steps = fx.f64s(&name("steps"))[0];
         let bins = fx.int(&name("bins_per_octave")) as u32;
-        let actual = pitch_shift(&input, 48000, steps, bins);
+        let actual = pitch_shift(&input, SampleRate::new(48000), steps, bins);
         let expected = fx.f32s(&name("output"));
         assert_eq!(actual.len(), expected.len(), "{case}");
 
@@ -61,7 +62,7 @@ fn matches_librosa() {
 /// `input` through a shifter by `steps` of `bins` to the octave, `chunk` samples at a time,
 /// and the most samples its output fell behind the input past the first quarter second.
 fn streamed(input: &[f32], steps: f64, bins: u32, chunk: usize) -> (Vec<f32>, usize) {
-    let mut shifter = Shifter::new(48000, steps, bins);
+    let mut shifter = Shifter::new(SampleRate::new(48000), steps, bins);
     let (mut output, mut taken, mut lag) = (Vec::new(), 0, 0);
     for piece in input.chunks(chunk) {
         shifter.process(piece, &mut output);
@@ -103,7 +104,7 @@ fn a_stream_gives_what_the_whole_does() {
         .collect();
     cases.extend([(voice.clone(), 5.0, 24), (voice, -12.0, 24)]);
     for (input, steps, bins) in &cases {
-        let whole = bits(&pitch_shift(input, 48000, *steps, *bins));
+        let whole = bits(&pitch_shift(input, SampleRate::new(48000), *steps, *bins));
         for chunk in [1, 480, 4096] {
             let (output, _) = streamed(input, *steps, *bins, chunk);
             assert!(

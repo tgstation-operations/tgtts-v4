@@ -8,10 +8,11 @@ use std::f64::consts::PI;
 use common::Tensors;
 use dsp::{
     loudness::{CEILING, FLOOR, integrated, normalize, true_peak},
+    quantity::SampleRate,
     segment::Segment,
 };
 
-const RATE: u32 = 48000;
+const RATE: SampleRate = SampleRate::new(48000);
 
 /// ffmpeg gates through a histogram of 0.01 LU bins, which floors its integrated loudness: it
 /// came out 0.0060 to 0.0068 LU under this meter's.

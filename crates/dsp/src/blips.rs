@@ -16,6 +16,7 @@ use crate::{
     RATE, Random,
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
+    quantity::SampleRate,
     segment::{self, Segment},
     sentences,
 };
@@ -35,8 +36,8 @@ pub enum Error {
     #[error("{0}")]
     Segment(#[from] segment::Error),
     /// The voice's samples are at this rate, not the service's.
-    #[error("the voice's blips are at {0} Hz, not {RATE} Hz")]
-    Rate(u32),
+    #[error("the voice's blips are at {} Hz, not {} Hz", .0.value(), RATE.value())]
+    Rate(SampleRate),
 }
 
 /// The blips of `text` in the voice whose samples `blips` holds, at its `base` and `number`,
@@ -51,8 +52,9 @@ pub fn message(
     pitch: i32,
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
-    if blips.sample_rate() != RATE {
-        return Err(Error::Rate(blips.sample_rate()));
+    let rate = SampleRate::new(blips.sample_rate());
+    if rate != RATE {
+        return Err(Error::Rate(rate));
     }
     let mut samples = Vec::new();
     for text in sentences::segment(text) {
@@ -84,7 +86,7 @@ pub fn sentence(
     pitch: i32,
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
-    let rate = blips.sample_rate();
+    let rate = SampleRate::new(blips.sample_rate());
     if !text.contains(char::is_alphanumeric) {
         return Ok(Segment::new(rate, Vec::new()));
     }
@@ -132,7 +134,7 @@ pub fn sentence(
 /// semitones either way.
 fn detune(
     blip: Vec<f32>,
-    rate: u32,
+    rate: SampleRate,
     base_pitch: f64,
     spread: f64,
     random: &mut impl Random,

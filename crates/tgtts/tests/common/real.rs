@@ -38,7 +38,7 @@ pub fn params() -> Params {
 /// The frames the clip `name` in `assets` takes at 48 kHz.
 fn frames_at_48k(assets: &Path, name: &str) -> usize {
     let clip = wav::read(&std::fs::read(assets.join(name)).unwrap()).unwrap();
-    super::resampled(clip.frames(), clip.rate, 48000)
+    super::resampled(clip.frames(), clip.rate.value(), 48000)
 }
 
 /// Serves `model`, which `prepare` readies with the voices while the health check answers 503,

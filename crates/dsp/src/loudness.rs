@@ -4,7 +4,7 @@
 
 use std::f64::consts::PI;
 
-use crate::{limiter::limit, segment::Segment};
+use crate::{limiter::limit, quantity::SampleRate, segment::Segment};
 
 /// EBU R128's highest true peak, in dBTP.
 pub const CEILING: f64 = -1.0;
@@ -83,10 +83,10 @@ pub fn normalize(segment: &Segment, target: f64, ceiling: f64, most: f64) -> Nor
 /// -70 LUFS and then those more than 10 LU under the loudness of the rest, or `-inf` where no
 /// block is left. Samples shorter than a block are measured as one block of their own length,
 /// where the standard has no measure for them.
-pub fn integrated(samples: &[f64], rate: u32) -> f64 {
+pub fn integrated(samples: &[f64], rate: SampleRate) -> f64 {
     let weighted = k_weighted(samples, rate);
     // Rounded as libebur128 rounds them, the standard asking only for the nearest sample.
-    let step = (rate as usize + 5) / 10;
+    let step = (rate.value() as usize + 5) / 10;
     let block = 4 * step;
     let blocks: Vec<f64> = if weighted.is_empty() {
         Vec::new()
@@ -142,13 +142,13 @@ fn mean_square(samples: &[f64]) -> f64 {
 
 /// `samples` through BS.1770-4's two-stage pre-filter at `rate`, its coefficients derived as
 /// libebur128 derives them, which gives the standard's own at 48 kHz.
-fn k_weighted(samples: &[f64], rate: u32) -> Vec<f64> {
+fn k_weighted(samples: &[f64], rate: SampleRate) -> Vec<f64> {
     let [shelf, high_pass] = k_weighting(rate);
     biquad(&biquad(samples, shelf), high_pass)
 }
 
 /// The two stages of the pre-filter at `rate`, each as `[b0, b1, b2, a1, a2]`.
-fn k_weighting(rate: u32) -> [[f64; 5]; 2] {
+fn k_weighting(rate: SampleRate) -> [[f64; 5]; 2] {
     let rate = f64::from(rate);
     let (f0, gain, q) = (1681.974450955533, 3.999843853973347, 0.7071752369554196);
     let k = (PI * f0 / rate).tan();
@@ -265,7 +265,7 @@ mod tests {
             ],
             [1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621],
         ];
-        for (stage, table) in k_weighting(48000).iter().zip(tables) {
+        for (stage, table) in k_weighting(SampleRate::new(48000)).iter().zip(tables) {
             for (c, t) in stage.iter().zip(table) {
                 assert!((c - t).abs() < 1e-13, "{c} for {t}");
             }

@@ -13,6 +13,7 @@ use rustfft::num_complex::Complex;
 use crate::{
     RATE,
     float::{Float, to_pcm},
+    quantity::SampleRate,
     resample::{Resampler, resample},
     segment::Segment,
 };
@@ -21,7 +22,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pcm {
     /// Frames per second.
-    pub rate: u32,
+    pub rate: SampleRate,
     /// Samples per frame.
     pub channels: u16,
     /// The samples, a frame's channels in turn.
@@ -150,7 +151,7 @@ fn finished(speech: Vec<f64>, assets: &Assets) -> (Segment, f64) {
 }
 
 /// The static after the speech, in samples: 0.1 s.
-const TAIL: usize = (RATE / 10) as usize;
+const TAIL: usize = (RATE.value() / 10) as usize;
 
 /// The peaks [`radio`] scales speech by, each to a level of its own.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -182,7 +183,7 @@ pub fn peaks(speech: &Pcm, assets: &Assets) -> Peaks {
 pub struct Stream {
     assets: Assets,
     peaks: Peaks,
-    rate: u32,
+    rate: SampleRate,
     channels: u16,
     /// From the speech's rate to 8 kHz, where it is not 8 kHz, and back up.
     down: Option<Resampler<f32>>,
@@ -203,14 +204,14 @@ pub struct Stream {
 impl Stream {
     /// The radio of speech at `rate` Hz in `channels` channels, with `assets`' clicks and
     /// static, scaling by `peaks`.
-    pub fn new(assets: &Assets, peaks: Peaks, rate: u32, channels: u16) -> Self {
+    pub fn new(assets: &Assets, peaks: Peaks, rate: SampleRate, channels: u16) -> Self {
         let (b, a) = bandpass();
         Self {
             assets: assets.clone(),
             peaks,
             rate,
             channels,
-            down: (rate != 8000).then(|| Resampler::new(f64::from(rate), 8000.0)),
+            down: (rate.value() != 8000).then(|| Resampler::new(f64::from(rate), 8000.0)),
             up: Some(Resampler::new(8000.0, f64::from(RATE))),
             taken: 0,
             narrowed: 0,

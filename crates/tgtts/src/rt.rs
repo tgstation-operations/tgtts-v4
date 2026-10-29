@@ -327,8 +327,11 @@ impl Rt {
         };
         let config = Config::from_json(&read("config.json")?)?;
         let rate = config.audio_vae().out_sample_rate;
-        if rate != RATE {
-            let reason = format!("out_sample_rate {rate} where the service works at {RATE} Hz");
+        if rate != RATE.value() {
+            let reason = format!(
+                "out_sample_rate {rate} where the service works at {} Hz",
+                RATE.value()
+            );
             return Err(reason.into());
         }
         let tokenizer = Tokenizer::from_json(&read("tokenizer.json")?)?;

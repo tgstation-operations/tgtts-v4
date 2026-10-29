@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use dsp::quantity::SampleRate;
 use effects::{
     Pipeline,
     convolve::{Impulses, Response},
@@ -12,7 +13,7 @@ fn check(json: &str) -> Result<(), String> {
     let value = serde_json::from_str(json).unwrap();
     let graphs = schema::parse(&value).map_err(|e| e.to_string())?;
     let impulses = Impulses {
-        synth: Arc::new(Response::new(&[1.0, 0.5], 1, 48000)),
+        synth: Arc::new(Response::new(&[1.0, 0.5], 1, SampleRate::new(48000))),
     };
     Pipeline::new(&graphs, &impulses)
         .map(drop)

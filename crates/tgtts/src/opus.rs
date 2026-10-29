@@ -10,10 +10,12 @@ use std::{
     ptr::NonNull,
 };
 
+use dsp::quantity::SampleRate;
+
 use crate::ogg::{self, Writer};
 
 /// The rate Opus encodes and decodes at here, the service's.
-pub const RATE: u32 = 48000;
+pub const RATE: SampleRate = SampleRate::new(48000);
 /// The samples per channel of a frame, 20 ms: the longest of Opus's usual frames, the fewest
 /// bits spent on each frame's own overhead.
 const FRAME: usize = 960;
@@ -80,7 +82,7 @@ impl Encoder {
         // destroyed when dropped.
         let encoder = unsafe {
             opus_encoder_create(
-                RATE as i32,
+                RATE.value() as i32,
                 c_int::from(channels),
                 OPUS_APPLICATION_AUDIO,
                 &mut error,
@@ -162,7 +164,7 @@ impl Stream {
         head.push(1);
         head.push(channels);
         head.extend_from_slice(&pre_skip.to_le_bytes());
-        head.extend_from_slice(&RATE.to_le_bytes());
+        head.extend_from_slice(&RATE.value().to_le_bytes());
         head.extend_from_slice(&0i16.to_le_bytes());
         head.push(0);
         // SAFETY: libopus's version is a static C string.
@@ -261,7 +263,8 @@ pub fn decode(ogg: &[u8]) -> Result<Decoded, Error> {
     let mut error = OPUS_OK;
     // SAFETY: the arguments are in range or refused with an error; the decoder is destroyed
     // below.
-    let decoder = unsafe { opus_decoder_create(RATE as i32, c_int::from(channels), &mut error) };
+    let decoder =
+        unsafe { opus_decoder_create(RATE.value() as i32, c_int::from(channels), &mut error) };
     let decoder = NonNull::new(decoder).ok_or(Error::Opus(error))?;
     let count = usize::from(channels);
     let mut samples = Vec::new();
@@ -345,7 +348,7 @@ mod tests {
 
     fn sine(frames: usize, channels: usize) -> Vec<f32> {
         (0..frames * channels)
-            .map(|i| 0.5 * (TAU * 440.0 * (i / channels) as f32 / RATE as f32).sin())
+            .map(|i| 0.5 * (TAU * 440.0 * (i / channels) as f32 / RATE.value() as f32).sin())
             .collect()
     }
 
@@ -372,7 +375,7 @@ mod tests {
 
     #[test]
     fn decodes_what_it_encodes_in_time_and_near_the_waveform() {
-        let audio = sine(RATE as usize, 1);
+        let audio = sine(RATE.value() as usize, 1);
         let decoded = decode(&encode(&audio, 1, 64000, 1).unwrap()).unwrap();
         // A tone at 64 kb/s comes back within a few percent, and in step: a sample's lag
         // would put it far off.
@@ -403,7 +406,7 @@ mod tests {
     /// length, trimmed at both ends, and the same waveform.
     #[test]
     fn ffmpeg_reads_it_as_it_is_meant() {
-        let audio = sine(RATE as usize + 123, 1);
+        let audio = sine(RATE.value() as usize + 123, 1);
         let ogg = encode(&audio, 1, 64000, 42).unwrap();
         let mut ffmpeg = Command::new("ffmpeg")
             .args([

@@ -17,8 +17,8 @@ const BLOCK: usize = 1024;
 
 /// `audio` encoded as Ogg Vorbis, its last granule position its length in frames.
 pub fn encode(audio: &Audio) -> Result<Vec<u8>, Error> {
-    let format = || Error::Format(audio.rate, audio.channels);
-    let rate = NonZeroU32::new(audio.rate).ok_or_else(format)?;
+    let format = || Error::Format(audio.rate.value(), audio.channels);
+    let rate = NonZeroU32::new(audio.rate.value()).ok_or_else(format)?;
     let channels = u8::try_from(audio.channels)
         .ok()
         .and_then(NonZeroU8::new)
@@ -65,6 +65,8 @@ impl error::Error for Error {}
 mod tests {
     use std::f32::consts::TAU;
 
+    use dsp::quantity::SampleRate;
+
     use super::*;
 
     fn sine(rate: u32, channels: u16, frames: usize) -> Audio {
@@ -72,7 +74,7 @@ mod tests {
             .map(|i| 0.5 * (TAU * 440.0 * (i / usize::from(channels)) as f32 / rate as f32).sin())
             .collect();
         Audio {
-            rate,
+            rate: SampleRate::new(rate),
             channels,
             samples,
         }
@@ -112,7 +114,7 @@ mod tests {
     #[test]
     fn refuses_what_vorbis_cannot_hold() {
         let none = Audio {
-            rate: 48000,
+            rate: SampleRate::new(48000),
             channels: 0,
             samples: Vec::new(),
         };

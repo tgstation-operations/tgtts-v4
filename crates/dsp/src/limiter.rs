@@ -4,7 +4,7 @@
 
 use std::{collections::VecDeque, f64::consts::PI};
 
-use crate::loudness::INTERPOLATOR;
+use crate::{loudness::INTERPOLATOR, quantity::SampleRate};
 
 /// How long before a peak the gain starts to come down, in seconds: long enough that the gain's
 /// fall spreads over several periods of a voice, which keeps it from distorting the waveform, and
@@ -27,7 +27,7 @@ const BETWEEN: usize = 7;
 const UNITY: f64 = 1e-3;
 
 /// `samples`, at `rate` Hz and full scale at 1, through a [`Limiter`] whole.
-pub fn limit(samples: &[f64], rate: u32, ceiling: f64) -> Limited {
+pub fn limit(samples: &[f64], rate: SampleRate, ceiling: f64) -> Limited {
     let mut limiter = Limiter::new(rate, ceiling);
     let mut out = Vec::with_capacity(samples.len());
     limiter.process(samples, &mut out);
@@ -89,7 +89,7 @@ pub struct Limiter {
 impl Limiter {
     /// A limiter for audio at `rate` Hz, full scale at 1, holding its true peak at or under
     /// `ceiling` dBTP.
-    pub fn new(rate: u32, ceiling: f64) -> Self {
+    pub fn new(rate: SampleRate, ceiling: f64) -> Self {
         let lookahead = (LOOKAHEAD * f64::from(rate)).round() as usize;
         let smoothing = lookahead / 2;
         // Held over the interpolators' reach each side of a peak too, the gain is flat over all

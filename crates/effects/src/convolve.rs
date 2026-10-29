@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use dsp::quantity::SampleRate;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::{Processor, schema::Impulse};
@@ -30,7 +31,7 @@ impl Response {
     /// # Panics
     ///
     /// If `channels` is 0 or the impulse is silent.
-    pub fn new(samples: &[f32], channels: usize, rate: u32) -> Self {
+    pub fn new(samples: &[f32], channels: usize, rate: SampleRate) -> Self {
         assert!(channels > 0, "an impulse of no channels");
         let mono: Vec<f64> = samples
             .chunks_exact(channels)

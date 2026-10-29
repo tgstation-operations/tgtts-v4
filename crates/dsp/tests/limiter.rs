@@ -9,9 +9,10 @@ use common::Tensors;
 use dsp::{
     limiter::{Limiter, limit},
     loudness::{CEILING, true_peak},
+    quantity::SampleRate,
 };
 
-const RATE: u32 = 48000;
+const RATE: SampleRate = SampleRate::new(48000);
 
 /// How far over the ceiling the waveform's peak may come out of the limiter, by the reading below:
 /// the limiter's own interpolator, of 32 taps a phase, reads the bursts of cases 21 and 23, whose
@@ -91,7 +92,7 @@ fn leaves_what_is_under_the_ceiling_alone() {
 #[test]
 fn takes_down_only_what_a_peak_needs() {
     let mut x = tone(-20.0, 3.0);
-    let click = RATE as usize;
+    let click = RATE.value() as usize;
     x[click] = 1.5;
     let limited = limit(&x, RATE, CEILING);
     let over = true_peak(&x) - CEILING;

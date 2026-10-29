@@ -7,6 +7,7 @@ use std::{env, fs};
 use common::{Tensors, assert_pcm_close, read_wav};
 use dsp::{
     float::to_pcm,
+    quantity::SampleRate,
     radio::{self, Assets, Pcm},
 };
 
@@ -18,7 +19,7 @@ const MAX_DIFFERING: f64 = 0.001;
 
 fn clip(fx: &Tensors, stem: &str) -> Pcm {
     Pcm {
-        rate: fx.int(&format!("{stem}/rate")) as u32,
+        rate: SampleRate::new(fx.int(&format!("{stem}/rate")) as u32),
         channels: fx.int(&format!("{stem}/channels")) as u16,
         samples: fx.pcm(&format!("{stem}/samples")),
     }
@@ -55,12 +56,12 @@ fn check(fx: &Tensors, [on, off, noise]: [Pcm; 3]) {
     for case in 0..fx.int("cases") {
         let name = case.to_string();
         let speech = Pcm {
-            rate: fx.int(&format!("{name}/rate")) as u32,
+            rate: SampleRate::new(fx.int(&format!("{name}/rate")) as u32),
             channels: fx.int(&format!("{name}/channels")) as u16,
             samples: fx.pcm(&format!("{name}/input")),
         };
         let actual = radio::radio(&speech, &assets);
-        assert_eq!(actual.rate, 48000);
+        assert_eq!(actual.rate, SampleRate::new(48000));
         let expected = fx.pcm(&format!("{name}/output"));
         assert_pcm_close(
             &name,
@@ -78,7 +79,7 @@ fn averages_any_number_of_channels() {
     let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
     let assets = Assets::new(&on, &off, &noise);
     let mono = Pcm {
-        rate: 48000,
+        rate: SampleRate::new(48000),
         channels: 1,
         samples: fx.pcm("0/input"),
     };
@@ -99,7 +100,7 @@ fn loops_the_static_under_speech_longer_than_it() {
     let [on, off, noise] = ASSETS.map(|s| clip(&fx, s));
     let assets = Assets::new(&on, &off, &noise);
     let speech = Pcm {
-        rate: 48000,
+        rate: SampleRate::new(48000),
         channels: 1,
         samples: fx.pcm("0/input").repeat(8),
     };
@@ -125,7 +126,7 @@ fn around_silence(assets: &Assets, len: usize) -> Vec<i16> {
 
 fn silence(len: usize) -> Pcm {
     Pcm {
-        rate: 48000,
+        rate: SampleRate::new(48000),
         channels: 1,
         samples: vec![0; len],
     }
@@ -191,7 +192,7 @@ fn the_real_assets_match_the_old_service() {
     let assets = ASSETS.map(|stem| {
         let (rate, channels, samples) = read_wav(&dir.join(format!("{stem}.wav")));
         Pcm {
-            rate,
+            rate: SampleRate::new(rate),
             channels,
             samples,
         }
@@ -211,7 +212,7 @@ fn a_stream_at_the_wholes_peaks_is_the_whole() {
     let assets = Assets::new(&on, &off, &noise);
     let mut speeches: Vec<Pcm> = (0..fx.int("cases"))
         .map(|case| Pcm {
-            rate: fx.int(&format!("{case}/rate")) as u32,
+            rate: SampleRate::new(fx.int(&format!("{case}/rate")) as u32),
             channels: fx.int(&format!("{case}/channels")) as u16,
             samples: fx.pcm(&format!("{case}/input")),
         })
@@ -225,7 +226,7 @@ fn a_stream_at_the_wholes_peaks_is_the_whole() {
             .flat_map(|&s| std::iter::repeat_n(s, channels))
             .collect();
         speeches.push(Pcm {
-            rate,
+            rate: SampleRate::new(rate),
             channels: channels as u16,
             samples,
         });
@@ -246,7 +247,7 @@ fn a_stream_at_the_wholes_peaks_is_the_whole() {
             assert!(
                 streamed == whole,
                 "{} Hz in {} channels, {} frames, in chunks of {frames}",
-                speech.rate,
+                speech.rate.value(),
                 speech.channels,
                 speech.samples.len() / channels
             );
