@@ -46,6 +46,7 @@ use voices::Voices;
 use self::stream::{Chain, Jobs};
 use crate::{
     ffmpeg::{self, Ffmpeg},
+    filters,
     handoff::{Handoff, Missing, Source},
     levels::Levels,
     metrics::{Leveling, Metrics, Row, Timings},
@@ -188,6 +189,7 @@ pub struct Service {
     voices: Voices,
     synthesizer: OnceLock<Arc<dyn Synthesizer>>,
     ffmpeg: Ffmpeg,
+    unknown_filters: filters::Unknown,
     sounds: Sounds,
     metrics: Option<Metrics>,
     logging: Logging,
@@ -208,6 +210,7 @@ impl Service {
             voices: setup.voices,
             synthesizer: setup.synthesizer.map_or_else(OnceLock::new, OnceLock::from),
             ffmpeg: setup.ffmpeg,
+            unknown_filters: filters::Unknown::default(),
             sounds: setup.sounds,
             metrics: setup.metrics,
             logging: setup.logging,
@@ -296,7 +299,7 @@ struct Body {
 enum Treatment {
     /// The effects it gives.
     Effects(Pipeline),
-    /// The ffmpeg filter graph the game sent before it sent effects.
+    /// The ffmpeg filter graph the game sent before it sent effects, where none take its place.
     Filter(String),
     None,
 }
@@ -703,8 +706,8 @@ impl Service {
 
     /// What the request's speech or blips go through: its effects if it gives them, checked
     /// before anything is made for it, or else as the old frontend did, the game's filter graph
-    /// if there is one, stripped of double quotes, and the "silicon" effect only if there is
-    /// not.
+    /// if there is one, stripped of double quotes, as the effects in its place where
+    /// [`filters`] has them, and the "silicon" effect only if there is not.
     fn treatment(&self, params: &Params, body: &Body) -> Result<Treatment, Failure> {
         if let Some(effects) = &body.effects {
             let refuse = |e: effects::Error| Failure::new(StatusCode::BAD_REQUEST, e);
@@ -716,6 +719,10 @@ impl Service {
         } else {
             let graph = params.filter.replace('"', "");
             if !graph.is_empty() {
+                if let Some(pipeline) = filters::pipeline(&graph, &self.sounds.impulses) {
+                    return Ok(Treatment::Effects(pipeline));
+                }
+                self.unknown_filters.note(&graph);
                 return Ok(Treatment::Filter(graph));
             }
         }

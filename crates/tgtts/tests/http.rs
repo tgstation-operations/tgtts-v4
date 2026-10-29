@@ -6,10 +6,11 @@ mod common;
 use std::{
     collections::BTreeMap,
     f32::consts::TAU,
+    io,
     ops::Deref,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Once,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -315,6 +316,18 @@ fn serve_fake(
     voice_levels: Levels,
     ready: bool,
 ) -> Harness {
+    serve_fake_with(fake, limits, loudness, voice_levels, ready, "ffmpeg")
+}
+
+/// [`serve_fake`], with the ffmpeg at `ffmpeg`.
+fn serve_fake_with(
+    fake: Fake,
+    limits: Limits,
+    loudness: Loudness,
+    voice_levels: Levels,
+    ready: bool,
+    ffmpeg: &str,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (voices, assets) = (dir.path().join("voices"), dir.path().join("assets"));
     write_voices(&voices);
@@ -327,7 +340,7 @@ fn serve_fake(
         token: String::new(),
         voices: Voices::open(&voices).unwrap(),
         synthesizer: ready.then(|| fake.clone() as Arc<dyn Synthesizer>),
-        ffmpeg: Ffmpeg::new("ffmpeg"),
+        ffmpeg: Ffmpeg::new(ffmpeg),
         sounds: Sounds::open(&assets).unwrap(),
         metrics: Some(Metrics::open(&metrics, 1024).unwrap()),
         logging: Logging::new(LevelFilter::INFO, move |level| {
@@ -572,7 +585,7 @@ fn runs_the_games_filters() {
         assert_eq!(reply.status, 200, "{filter}: {}", reply.text());
         assert!(reply.frames(48000) > 0);
     }
-    // Served unfiltered: a graph ffmpeg refuses, as it does the fishing spot capsule's, and one
+    // Served unfiltered: a graph ffmpeg refuses, as it would the fishing spot capsule's, and one
     // with a filter the game's graphs do not use.
     for filter in [
         "acompressor=threshold=0.3:ratio=40",
@@ -629,6 +642,154 @@ fn runs_the_effects_the_game_sends() {
     .speech(&h);
     ignored.assert_ogg(48000);
     assert_eq!(ignored.frames(48000), speech);
+}
+
+/// Stuttering through a gas mask, as the game sends it for ffmpeg and as effects.
+const STUTTER_IN_A_GAS_MASK: (&str, &str) = (
+    "tremolo=f=10:d=0.8,rubberband=tempo=0.5,lowpass=f=750,volume=2",
+    r#"[[{"effect": "tremolo", "rate_hz": 10, "depth": 0.8}, {"effect": "tempo", "ratio": 0.5}],
+        [{"effect": "lowpass", "frequency_hz": 750}, {"effect": "gain", "gain_db": 6.021}]]"#,
+);
+
+/// Each message is served by the effects it gives, or else by its filter, whichever the game
+/// sends: the effects in place of the filters it knows, made and streamed alike.
+#[test]
+fn takes_effects_or_a_filter_and_effects_over_a_filter() {
+    let h = harness(Fake::default(), limits());
+    let (filter, effects) = STUTTER_IN_A_GAS_MASK;
+    let by_filter = Message {
+        filter,
+        ..Message::default()
+    };
+    let by_effects = Message {
+        effects,
+        ..Message::default()
+    };
+    let parrot = "rubberband=pitch=1.5";
+    let both = Message {
+        filter: parrot,
+        effects,
+        ..Message::default()
+    };
+    for blips in [false, true] {
+        let reply = |message: &Message| match blips {
+            false => message.speech(&h),
+            true => message.blips(&h),
+        };
+        let served = reply(&by_effects);
+        served.assert_ogg(48000);
+        assert_eq!(reply(&by_filter).body, served.body, "blips {blips}");
+        assert_eq!(reply(&both).body, served.body, "blips {blips}");
+        let parroted = Message {
+            filter: parrot,
+            ..Message::default()
+        };
+        assert_ne!(reply(&parroted).body, served.body, "blips {blips}");
+    }
+
+    let streamed = |message: &Message| {
+        let (id, streams) = job(&h.post("/stream", &message.job(&["tts"])));
+        assert_eq!(status(&h, &id, 30.0)["done"], true);
+        tgtts::opus::decode(&play(&h, &streams["tts"]).body).unwrap()
+    };
+    assert_eq!(streamed(&by_filter).samples, streamed(&by_effects).samples);
+    assert_eq!(h.fake.streamed.load(Ordering::SeqCst), 2);
+}
+
+/// A filter the service knows runs as its effects with no ffmpeg to run, as though the game had
+/// sent them, and one it does not know is given to ffmpeg, which serves it unfiltered where
+/// there is none.
+#[test]
+fn runs_the_filters_it_knows_without_ffmpeg() {
+    let h = serve_fake_with(
+        Fake::default(),
+        limits(),
+        LOUDNESS,
+        levels(),
+        true,
+        "/nonexistent/ffmpeg",
+    );
+    let (filter, effects) = STUTTER_IN_A_GAS_MASK;
+    let unknown = "volume=0.5";
+    for blips in [false, true] {
+        let reply = |message: Message| match blips {
+            false => message.speech(&h),
+            true => message.blips(&h),
+        };
+        let as_effects = reply(Message {
+            effects,
+            ..Message::default()
+        });
+        let unfiltered = reply(Message::default());
+        assert_ne!(as_effects.body, unfiltered.body);
+        let known = reply(Message {
+            filter,
+            ..Message::default()
+        });
+        assert_eq!(known.body, as_effects.body, "blips {blips}");
+        let given_ffmpeg = reply(Message {
+            filter: unknown,
+            ..Message::default()
+        });
+        assert_eq!(given_ffmpeg.body, unfiltered.body, "blips {blips}");
+    }
+
+    let h = harness(Fake::default(), limits());
+    let filtered = Message {
+        filter: unknown,
+        ..Message::default()
+    };
+    assert_ne!(filtered.speech(&h).body, Message::default().speech(&h).body);
+}
+
+/// What the services of these tests have logged since the first call.
+fn logged() -> &'static Mutex<Vec<u8>> {
+    static LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static SUBSCRIBED: Once = Once::new();
+    struct Log;
+    impl io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            LOG.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    SUBSCRIBED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| Log)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+    &LOG
+}
+
+/// Each filter graph ffmpeg runs is logged as it first comes, to show what the game sends that
+/// has no effects in its place, and one that has is not.
+#[test]
+fn logs_each_filter_it_gives_ffmpeg_once() {
+    let log = logged();
+    let h = harness(Fake::default(), limits());
+    let (known, _) = STUTTER_IN_A_GAS_MASK;
+    let unknown = ["volume=0.25", "volume=0.75"];
+    for filter in [known, unknown[0], unknown[1], unknown[0], known] {
+        let message = Message {
+            filter,
+            ..Message::default()
+        };
+        assert_eq!(message.speech(&h).status, 200);
+        assert_eq!(message.blips(&h).status, 200);
+    }
+    let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    let logged = |filter: &str| {
+        let line = format!("no effects in its place: {filter}");
+        log.lines().filter(|l| l.ends_with(&line)).count()
+    };
+    assert_eq!(unknown.map(logged), [1, 1], "{log}");
+    assert_eq!(logged(known), 0, "{log}");
 }
 
 #[test]
@@ -831,7 +992,7 @@ fn ffprobe_reads_every_route() {
         },
         Message {
             identifier: "filter",
-            filter: "lowpass=f=750,volume=2",
+            filter: "volume=0.5",
             ..Message::default()
         },
     ];

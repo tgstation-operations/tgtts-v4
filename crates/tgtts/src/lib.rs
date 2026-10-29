@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod ffmpeg;
+pub mod filters;
 pub mod handoff;
 pub mod levels;
 pub mod load;
