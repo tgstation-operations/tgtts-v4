@@ -5,11 +5,10 @@
   gpuKernels,
   glslKernels,
 }:
-# tgtts and tgtts-gains as the servers run them: on the rt device alone, built without burn. Each
-# loads the Vulkan loader from the store, which finds the host driver's ICD under
-# /run/opengl-driver, as NixOS puts it, runs ffmpeg from the store, and runs the store's kernels
-# unless TGTTS_GLSL_KERNELS_DIR and TGTTS_MLIR_KERNELS_DIR, which override the configuration
-# file, name others.
+# tgtts and tgtts-gains as the servers run them. Each loads the Vulkan loader from the store, which
+# finds the host driver's ICD under /run/opengl-driver, as NixOS puts it, runs ffmpeg from the
+# store, and runs the store's kernels unless TGTTS_GLSL_KERNELS_DIR and TGTTS_MLIR_KERNELS_DIR,
+# which override the configuration file, name others.
 let
   inherit (pkgs) lib;
 
@@ -47,7 +46,7 @@ pkgs.stdenv.mkDerivation {
   dontConfigure = true;
   buildPhase = ''
     runHook preBuild
-    cargo build --release --frozen -p tgtts --no-default-features --features rt --bins
+    cargo build --release --frozen -p tgtts --bins
     runHook postBuild
   '';
   installPhase = ''

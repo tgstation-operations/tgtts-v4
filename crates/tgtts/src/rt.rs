@@ -1,12 +1,10 @@
-//! VoxCPM2 on tts-rs's own Vulkan runtime as the service's [`Synthesizer`]: the device `rt`,
-//! built with the feature of the same name, on the `graph` crate's generator, which records the
-//! model's work once and submits it a step at a time, a patch of each request under way, rather
-//! than on burn. A thread of its own owns the GPU and generates there on an [`Engine`], the
-//! requests in the order they come and as many at once as the engine holds, the generator
-//! sixteen. The service talks to it as to the burn devices: the prompt is built on the caller's
-//! thread, and the speech comes back whole, or for a stream a run of audio at a time as it is
-//! decoded too. Each patch is sampled from noise drawn from the request's seed as burn's are, so
-//! that a seed gives the same noise on every device.
+//! VoxCPM2 on tts-rs's own Vulkan runtime as the service's [`Synthesizer`], on the `graph`
+//! crate's generator, which records the model's work once and submits it a step at a time, a
+//! patch of each request under way. A thread of its own owns the GPU and generates there on an
+//! [`Engine`], the requests in the order they come and as many at once as the engine holds, the
+//! generator sixteen. The prompt is built on the caller's thread, and the speech comes back
+//! whole, or for a stream a run of audio at a time as it is decoded too. Each patch is sampled
+//! from noise drawn from the request's seed.
 //!
 //! The generator keeps what a prompt computes of its voice for the next prompts in it, within
 //! `prompt_cache_bytes`, so that a request in a voice it keeps runs only its own text and the
@@ -15,17 +13,14 @@
 
 use std::{
     collections::VecDeque,
-    mem,
+    fs, mem,
+    path::Path,
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-#[cfg(feature = "rt")]
-use std::{fs, path::Path};
 
-#[cfg(feature = "rt")]
 use dsp::RATE;
-#[cfg(feature = "rt")]
 use graph::{
     generator::{Generator, Settings},
     kernels::Kernels,
@@ -33,9 +28,7 @@ use graph::{
 };
 use tracing::{debug, error, info};
 use voices::{Latent, Voices};
-use voxcpm_core::{Config, Prompt, Tokenizer};
-#[cfg(feature = "rt")]
-use voxcpm_core::{Noise, Params, Sampling, SeededNoise};
+use voxcpm_core::{Config, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer};
 
 use crate::synth::{self, Sink, Speech, Start, Synthesizer};
 
@@ -57,22 +50,18 @@ const BABBLE_MS_PER_CHAR: usize = 500;
 /// once a chunk's worth waits: its first audio after its first patch, then as much again each
 /// time, so that what it has given stays ahead of what a player has played of it while the
 /// chunks grow to their size.
-#[cfg(feature = "rt")]
 const RAMP: [usize; 4] = [1, 2, 4, 8];
 
 /// The positions each slot of the generator's caches holds: a prompt of the longest voice, 188
 /// patches twice, and the longest message the game sends, 1024 characters, with the patches
 /// after it.
-#[cfg(feature = "rt")]
 const CAPACITY: usize = 2048;
 
 /// The most positions of a prompt one submission runs: a median voice's prompt at once.
-#[cfg(feature = "rt")]
 const MAX_ROWS: usize = 512;
 
 /// The requests the generator generates at once: the most rows the LM side's batches were timed
 /// at.
-#[cfg(feature = "rt")]
 const SLOTS: usize = 16;
 
 /// A request as the thread that generates takes it.
@@ -325,7 +314,6 @@ impl Rt {
     /// # Errors
     ///
     /// If the checkpoint cannot be read or the GPU cannot run it.
-    #[cfg(feature = "rt")]
     pub fn load(
         dir: &Path,
         glsl_kernels: &Path,
@@ -451,7 +439,6 @@ impl Rt {
 }
 
 /// The generator, with the noise of the request in each of its slots.
-#[cfg(feature = "rt")]
 struct Generating {
     ctx: vulkan::Context,
     generator: Generator,
@@ -464,7 +451,6 @@ struct Generating {
     streamed: Vec<Option<usize>>,
 }
 
-#[cfg(feature = "rt")]
 impl Engine for Generating {
     fn slots(&self) -> usize {
         self.generator.slots()
@@ -558,7 +544,6 @@ impl Engine for Generating {
 }
 
 /// Whatever the validation layer, where it is on, has reported on `ctx`, as an error.
-#[cfg(feature = "rt")]
 fn validated(ctx: &vulkan::Context) -> Result<(), synth::Error> {
     let messages = ctx.validation_messages();
     if messages.is_empty() {
@@ -1002,12 +987,10 @@ mod tests {
     }
 
     /// The four of the real model's DiT time constants that an f64 rounded once to f16 puts an
-    /// ulp below where rounding through f32 does, as the build with burn writes them. Tested
-    /// here, as only a build without burn has half without std, where it rounds once; graph's
-    /// tests take burn.
-    #[cfg(feature = "rt")]
+    /// ulp below where rounding through f32 does, as half rounds without std, as tgtts builds it:
+    /// written as rounding through f32 writes them.
     #[test]
-    fn writes_the_time_constants_as_the_build_with_burn_does() {
+    fn writes_the_time_constants_rounded_through_f32() {
         for (value, bits) in [
             (0x4036_fa00_e1ad_d5dd, 0x4dbf),
             (0xc011_fa00_5296_9974, 0xc47f),

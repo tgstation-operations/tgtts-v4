@@ -25,8 +25,7 @@ use std::{
 };
 
 use tgtts::{
-    config::Config,
-    device,
+    config::{self, Config},
     levels::{self, Levels},
     load,
     service::Sounds,
@@ -97,7 +96,7 @@ fn main() -> ExitCode {
         }
     };
     tracing_subscriber::registry()
-        .with(device::log_filter(config.log_level))
+        .with(config::log_filter(config.log_level))
         .with(tracing_subscriber::fmt::layer())
         .init();
     let requests = requests.unwrap_or(config.synthesis_limit);
@@ -128,12 +127,7 @@ fn run(
     let mut lines = path.as_os_str().to_owned();
     lines.push(".lines");
     let mut log = OpenOptions::new().create(true).append(true).open(&lines)?;
-    let device = device::open(
-        config.device,
-        &config.dtypes,
-        config.autotune_cache_dir.as_deref(),
-    )?;
-    let model = load::synthesizer(config, &device)?;
+    let model = load::synthesizer(config)?;
     let sounds = Sounds::open(&config.assets_dir)?;
     let measure = levels::Measure {
         model: &*model,

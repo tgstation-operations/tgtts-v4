@@ -12,7 +12,6 @@ use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
     levels::Levels,
-    load::{Batching, PREFILL_GRAPHS, PREFILL_POSITIONS, PROMPT_CACHE_BYTES},
     service::{Limits, Logging, Loudness, Setup, Sounds},
     synth::Synthesizer,
     wav,
@@ -33,20 +32,6 @@ pub fn params() -> Params {
     Params {
         max_patches: 12,
         ..Params::default()
-    }
-}
-
-/// How the model batches: as the service does by default, but for the one request a test sends
-/// at a time.
-pub fn batching() -> Batching {
-    Batching {
-        window: Duration::from_millis(100),
-        requests: 1,
-        graphs: true,
-        prefill_positions: PREFILL_POSITIONS,
-        prefill_graphs: PREFILL_GRAPHS.to_vec(),
-        prefill_batch: None,
-        prompt_cache_bytes: PROMPT_CACHE_BYTES,
     }
 }
 

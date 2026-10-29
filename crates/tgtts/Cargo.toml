@@ -5,26 +5,13 @@ license.workspace = true
 version.workspace = true
 publish = false
 
-[features]
-default = ["burn"]
-# The model on burn: on the CPU, and on the GPUs of the two features below.
-burn = ["dep:burn", "dep:voxcpm"]
-# The model on a Vulkan GPU, with what autotune chose there kept for the next start.
-vulkan = ["burn", "burn/persistence", "dep:gpu", "gpu/vulkan"]
-# The model on an NVIDIA GPU through CUDA, likewise.
-cuda = ["burn", "burn/persistence", "dep:gpu", "gpu/cuda"]
-# The model on tts-rs's own runtime on a Vulkan GPU, rather than on burn.
-rt = ["dep:graph", "dep:vulkan"]
-
 [dependencies]
 axum = { workspace = true, features = ["http1", "query", "tokio"] }
 blake3.workspace = true
-burn = { workspace = true, features = ["flex"], optional = true }
 dsp = { path = "../dsp" }
 effects = { path = "../effects" }
 futures-util.workspace = true
-gpu = { path = "../gpu", optional = true }
-graph = { path = "../graph", optional = true }
+graph = { path = "../graph" }
 rand = { workspace = true, features = ["thread_rng"] }
 # The SQLite built in, so the binary needs no library at run time.
 rusqlite = { workspace = true, features = ["bundled"] }
@@ -47,15 +34,15 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "std", "tracing-log"] }
 vorbis_rs.workspace = true
 voices = { path = "../voices" }
-voxcpm = { path = "../voxcpm", optional = true }
 voxcpm-core = { path = "../voxcpm-core" }
-vulkan = { path = "../vulkan", optional = true }
+vulkan = { path = "../vulkan" }
 
 [build-dependencies]
 pkg-config.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+testkit = { path = "../testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 # The HTTP client the game's rust-g makes its requests with.
 ureq.workspace = true

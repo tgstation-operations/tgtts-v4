@@ -3,7 +3,6 @@
   rustToolchain,
   fmt,
   ffmpeg,
-  tracelLlvm,
 }:
 pkgs.writeShellApplication {
   name = "audit";
@@ -129,13 +128,13 @@ pkgs.writeShellApplication {
       return "$status"
     }
 
-    # tgtts as it is deployed, on the rt device alone, builds nothing of burn.
+    # tgtts builds nothing of burn.
     burn_free() {
       local packages
-      packages=$(cargo tree --locked -p tgtts --no-default-features --features rt \
-        -e normal,build --prefix none --format '{p}') || return 1
+      packages=$(cargo tree --locked -p tgtts -e normal,build --prefix none --format '{p}') ||
+        return 1
       if grep -E '^(burn|cubecl)' <<<"$packages"; then
-        echo "audit: tgtts without its burn feature still builds the packages above" >&2
+        echo "audit: tgtts builds the packages above" >&2
         return 1
       fi
     }
@@ -147,20 +146,9 @@ pkgs.writeShellApplication {
     stage statix statix_files
     stage vendor-pins vendor_pins
     stage burn-free burn_free
-    # Each crate's default features, those of the CPU: a GPU feature compiles
-    # wgpu into every crate it reaches, and its tests need the GPU. The GPU
-    # code is linted on its own.
     stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
-    stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts --all-targets \
-      --features gpu/vulkan,tgtts/vulkan,tgtts/rt -- -D warnings
-    # cubecl's CUDA runtime links the LLVM its build script finds there.
-    stage clippy-cuda env XDG_DATA_HOME=${tracelLlvm} cargo clippy --locked -p gpu -p tgtts \
-      --all-targets --features gpu/nvrtc,tgtts/cuda -- -D warnings
-    stage clippy-burn-free cargo clippy --locked -p tgtts --all-targets --no-default-features \
-      --features rt -- -D warnings
     stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
     stage test cargo test --locked --workspace
-    stage test-burn-free cargo test --locked -p tgtts --no-default-features --features rt
 
     if [ "''${#failed[@]}" -gt 0 ]; then
       echo "audit: FAILED: ''${failed[*]}" >&2

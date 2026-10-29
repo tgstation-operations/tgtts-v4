@@ -3,7 +3,6 @@ let
   rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
   # The game's voice filters use rubberband, which only ffmpeg-full builds in by default.
   ffmpeg = pkgs.ffmpeg-headless.override { withRubberband = true; };
-  tracelLlvm = import ./tracel-llvm.nix { inherit pkgs; };
   mlir = import ./mlir.nix { inherit pkgs llvm-project; };
   gpuKernels = import ./gpu-kernels.nix { inherit pkgs mlir; };
   glslKernels = import ./glsl-kernels.nix { inherit pkgs; };
@@ -16,7 +15,6 @@ let
         rustToolchain
         fmt
         ffmpeg
-        tracelLlvm
         ;
     };
   };
@@ -61,14 +59,6 @@ in
         ffmpeg
         gpuKernels
         glslKernels
-        ;
-    };
-    cuda-trial = import ./cuda-trial.nix {
-      inherit
-        pkgs
-        rustToolchain
-        ffmpeg
-        tracelLlvm
         ;
     };
   };

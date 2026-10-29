@@ -6,7 +6,6 @@ use std::{env, error::Error, future::IntoFuture, path::PathBuf, process::ExitCod
 use tgtts::{
     cache::Cache,
     config::{self, Config},
-    device,
     ffmpeg::Ffmpeg,
     levels::Levels,
     load,
@@ -41,14 +40,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (level, reload) = reload::Layer::new(device::log_filter(config.log_level));
+    let (level, reload) = reload::Layer::new(config::log_filter(config.log_level));
     tracing_subscriber::registry()
         .with(level)
         .with(tracing_subscriber::fmt::layer())
-        .with(device::Tunings)
         .init();
     let set_level = move |level: LevelFilter| {
-        if let Err(e) = reload.modify(|filter| *filter = device::log_filter(level)) {
+        if let Err(e) = reload.modify(|filter| *filter = config::log_filter(level)) {
             error!("setting the log level: {e}");
         }
     };
@@ -79,8 +77,6 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         Some(path) => Some(Metrics::open(path, METRICS_QUEUE)?),
         None => None,
     };
-    let autotune_dir = config.autotune_cache_dir.as_deref();
-    let device = device::open(config.device, &config.dtypes, autotune_dir)?;
     let service = Service::new(Setup {
         token,
         voices,
@@ -110,7 +106,7 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         // A thread of its own, which shutting down does not wait for as it would for the
         // runtime's blocking pool.
         thread::spawn(move || {
-            let model = load::synthesizer(&config, &device);
+            let model = load::synthesizer(&config);
             let _ = loaded.send(model.map(|model| ready.ready(model)));
         });
         let serve = axum::serve(listener, service::router(service))

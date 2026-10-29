@@ -5,10 +5,10 @@
   gpuKernels,
   glslKernels,
 }:
-# tgtts and tgtts-gains built with the rt device, the test of that device on the real model as
-# test-rt, and stream_timing, which times a running tgtts's streams, built release for a first run
-# on an NVIDIA host. Each program loads the Vulkan loader from the store, which finds the host
-# driver's ICD under /run/opengl-driver, as NixOS puts it, and runs ffmpeg from the store. Each
+# tgtts and tgtts-gains, the test of its model on the real weights as test-rt, and stream_timing,
+# which times a running tgtts's streams, built release for a first run on an NVIDIA host. Each
+# program loads the Vulkan loader from the store, which finds the host driver's ICD under
+# /run/opengl-driver, as NixOS puts it, and runs ffmpeg from the store. Each
 # runs the store's kernels unless the environment names others: TGTTS_GLSL_KERNELS_DIR and
 # TGTTS_MLIR_KERNELS_DIR, which override the configuration file tgtts and tgtts-gains read, and
 # the test's GLSL_KERNELS and VULKAN_KERNELS.
@@ -51,11 +51,8 @@ pkgs.stdenv.mkDerivation {
   dontConfigure = true;
   buildPhase = ''
     runHook preBuild
-    cargo build --release --frozen -p tgtts --features tgtts/rt --bins --example stream_timing
-    # Where ORACLE_DIR keeps none, the test computes the CPU's speech on burn's CPU backend,
-    # which takes minutes on rayon and SIMD, and far longer without.
-    cargo test --release --frozen -p tgtts --features tgtts/rt,burn/rayon,burn/simd --test rt \
-      --no-run --message-format=json |
+    cargo build --release --frozen -p tgtts --bins --example stream_timing
+    cargo test --release --frozen -p tgtts --test rt --no-run --message-format=json |
       jq -r 'select(.target.kind == ["test"]) | .executable // empty' >$NIX_BUILD_TOP/tests
     runHook postBuild
   '';
