@@ -10,7 +10,7 @@
 //! size of [`SUBGROUPS`]; the rest are GLSL. A run of positions takes the program of the fewest
 //! rows that hold it, the rows past it padding that nothing reads.
 
-use vulkan::{Context, SpecValue};
+use vulkan::{Context, F16, SpecValue};
 
 use crate::{
     Error,
@@ -447,11 +447,11 @@ impl Prefill {
     }
 
     /// Runs the stack over `x`, the hidden states `[len][hidden]` of positions `start` to
-    /// `start + len - 1` as f16 bits, in `decoder`, the one the programs were recorded over:
-    /// writes their keys and values into its cache's first slot there, each attending over the
-    /// slot up to it. Returns their outputs after the final norm, `[len][hidden]` as f16 bits. A
-    /// run of more than [`max_rows`](Self::max_rows) positions runs in pieces.
-    pub fn run(&self, decoder: &mut Decoder, start: usize, x: &[u16]) -> Result<Vec<u16>, Error> {
+    /// `start + len - 1`, in `decoder`, the one the programs were recorded over: writes their
+    /// keys and values into its cache's first slot there, each attending over the slot up to it.
+    /// Returns their outputs after the final norm, `[len][hidden]`. A run of more than
+    /// [`max_rows`](Self::max_rows) positions runs in pieces.
+    pub fn run(&self, decoder: &mut Decoder, start: usize, x: &[F16]) -> Result<Vec<F16>, Error> {
         let hidden = self.hidden;
         let len = x.len() / hidden;
         if len == 0 || !x.len().is_multiple_of(hidden) || start + len > self.capacity {
@@ -469,7 +469,7 @@ impl Prefill {
         }
         let max_rows = self.max_rows;
         let mut out = Vec::with_capacity(x.len());
-        let mut padded = vec![0u16; max_rows * hidden];
+        let mut padded = vec![F16::ZERO; max_rows * hidden];
         for (i, piece) in x.chunks(max_rows * hidden).enumerate() {
             let rows = piece.len() / hidden;
             let at = start + i * max_rows;
@@ -477,7 +477,7 @@ impl Prefill {
             step.write(self.run, &[at as u32, rows as u32, 0])?;
             step.write(self.x, &padded)?;
             step.run(self.programs[rows.div_ceil(TILE) - 1])?;
-            let all: Vec<u16> = step.read(self.out)?;
+            let all: Vec<F16> = step.read(self.out)?;
             out.extend_from_slice(&all[..piece.len()]);
         }
         Ok(out)

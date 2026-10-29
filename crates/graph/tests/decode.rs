@@ -14,10 +14,9 @@ use graph::{
     decode::{Batch, Decoder, LmConfig, Row, SUBGROUPS, Shape, Tuning},
     kernels::Kernels,
 };
-use half::f16;
 use serde_json::Value;
 use testkit::{Fixture, checkpoint_dir, golden};
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
@@ -113,9 +112,8 @@ fn config() -> Value {
     serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
 }
 
-/// The prompt's embeddings in the base LM's table, rounded to f16: `[positions][hidden]` as
-/// f16 bits.
-fn embeddings() -> Vec<u16> {
+/// The prompt's embeddings in the base LM's table, rounded to f16: `[positions][hidden]`.
+fn embeddings() -> Vec<F16> {
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     let ids: Vec<usize> = prompt_ids().iter().map(|&id| id as usize).collect();
@@ -125,7 +123,7 @@ fn embeddings() -> Vec<u16> {
 }
 
 /// The golden of `layers` of `stack` over `x`: their outputs at the device's default tuning.
-fn golden_of(stack: Stack, layers: usize, x: &[u16]) -> Vec<f32> {
+fn golden_of(stack: Stack, layers: usize, x: &[F16]) -> Vec<f32> {
     golden(&format!("decode-{stack:?}-{layers}"), || {
         gpu(stack, layers, x, 0, None)
     })
@@ -134,7 +132,7 @@ fn golden_of(stack: Stack, layers: usize, x: &[u16]) -> Vec<f32> {
 /// The GPU's outputs for the same layers of `stack` over the embeddings `x`, every position one at
 /// a time, each at its position plus `shift` in the cache, with the kernels at `subgroup` (the
 /// device's default when `None`).
-fn gpu(stack: Stack, layers: usize, x: &[u16], shift: usize, subgroup: Option<u32>) -> Vec<f32> {
+fn gpu(stack: Stack, layers: usize, x: &[F16], shift: usize, subgroup: Option<u32>) -> Vec<f32> {
     gpu_rows(stack, layers, x, shift, subgroup, 1).remove(0)
 }
 
@@ -144,7 +142,7 @@ fn gpu(stack: Stack, layers: usize, x: &[u16], shift: usize, subgroup: Option<u3
 fn gpu_rows(
     stack: Stack,
     layers: usize,
-    x: &[u16],
+    x: &[F16],
     shift: usize,
     subgroup: Option<u32>,
     rows: usize,
@@ -185,7 +183,7 @@ fn gpu_rows(
     let mut got = vec![Vec::with_capacity(len * hidden); rows];
     for t in 0..len + 2 * (rows - 1) {
         let mut placed = vec![None; rows];
-        let mut input = vec![0u16; rows * hidden];
+        let mut input = vec![F16::ZERO; rows * hidden];
         for r in 0..rows {
             let Some(i) = t.checked_sub(2 * r).filter(|&i| i < len) else {
                 continue;
@@ -204,7 +202,7 @@ fn gpu_rows(
         for r in (0..rows).filter(|r| (2 * r..2 * r + len).contains(&t)) {
             let row = (r + t) % rows;
             let out = &out[row * hidden..(row + 1) * hidden];
-            got[r].extend(out.iter().map(|&h| f16::from_bits(h).to_f32()));
+            got[r].extend(out.iter().map(|h| h.to_f32()));
         }
     }
     assert_no_validation_messages(&ctx);
@@ -276,15 +274,15 @@ fn one_layer_recorded_again_with_its_rows_cut_otherwise_decodes_the_same() {
         .unwrap_or_else(|e| panic!("{e}"));
     // Hidden states of about the embeddings' scale, from a fixed xorshift sequence.
     let mut state = 0x9e37_79b9_u32;
-    let x: Vec<u16> = (0..positions * shape.hidden)
+    let x: Vec<F16> = (0..positions * shape.hidden)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            f16::from_f64((f64::from(state) / f64::from(u32::MAX) - 0.5) * 0.2).to_bits()
+            F16::from_f64((f64::from(state) / f64::from(u32::MAX) - 0.5) * 0.2)
         })
         .collect();
-    let run = |decoder: &mut Decoder| -> Vec<u16> {
+    let run = |decoder: &mut Decoder| -> Vec<F16> {
         x.chunks(shape.hidden)
             .enumerate()
             .flat_map(|(t, x)| decoder.step(t, x).unwrap_or_else(|e| panic!("{e}")))

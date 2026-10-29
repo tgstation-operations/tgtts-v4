@@ -10,8 +10,8 @@ use std::{
     thread,
 };
 
-use half::{bf16, f16};
 use serde::Deserialize;
+use vulkan::{BF16, F16};
 
 use crate::Error;
 
@@ -100,8 +100,9 @@ impl Checkpoint {
         Error::Checkpoint(format!("{}: {name}: {why}", self.path.display()))
     }
 
-    /// Tensor `name` as f16 bits, rounded to nearest even from bf16 or f32, and its shape.
-    pub fn f16(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), Error> {
+    /// Tensor `name` as f16, rounded to nearest even from bf16 or f32 ([`F16::from_bf16`],
+    /// [`F16::from_f32`]), and its shape.
+    pub fn f16(&self, name: &str) -> Result<(Vec<usize>, Vec<F16>), Error> {
         let (entry, width) = self.entry(name)?;
         let [start, end] = entry.data_offsets;
         let elements = (end - start) as usize / width;
@@ -109,8 +110,8 @@ impl Checkpoint {
         self.file
             .read_exact_at(&mut bytes, self.data + start)
             .map_err(|e| self.bad(name, e.to_string()))?;
-        let mut out = vec![0u16; elements];
-        let convert = |src: &[u8], dst: &mut [u16]| convert(&entry.dtype, src, dst);
+        let mut out = vec![F16::ZERO; elements];
+        let convert = |src: &[u8], dst: &mut [F16]| convert(&entry.dtype, src, dst);
         let threads = thread::available_parallelism().map_or(1, |t| t.get());
         let chunk = elements.div_ceil(threads).max(1 << 16);
         thread::scope(|s| {
@@ -121,15 +122,15 @@ impl Checkpoint {
         Ok((entry.shape.clone(), out))
     }
 
-    /// Rows `rows` of the 2-D tensor `name` as f16 bits, converted as [`f16`](Self::f16) converts
+    /// Rows `rows` of the 2-D tensor `name` as f16, converted as [`f16`](Self::f16) converts
     /// them, one after another: a lookup in an embedding table, which reads those rows alone.
-    pub fn gather_f16(&self, name: &str, rows: &[usize]) -> Result<Vec<u16>, Error> {
+    pub fn gather_f16(&self, name: &str, rows: &[usize]) -> Result<Vec<F16>, Error> {
         let (entry, width) = self.entry(name)?;
         let &[count, columns] = entry.shape.as_slice() else {
             return Err(self.bad(name, format!("shape {:?}, not 2-D", entry.shape)));
         };
         let mut bytes = vec![0u8; columns * width];
-        let mut out = vec![0u16; rows.len() * columns];
+        let mut out = vec![F16::ZERO; rows.len() * columns];
         for (&row, dst) in rows.iter().zip(out.chunks_mut(columns)) {
             if row >= count {
                 return Err(self.bad(name, format!("row {row} of {count}")));
@@ -145,7 +146,7 @@ impl Checkpoint {
 
     /// The 2-D tensors `names` as f16, joined along their rows, as upstream's projections are
     /// joined to run as one; and the joined shape.
-    pub fn rows_f16(&self, names: &[String]) -> Result<([usize; 2], Vec<u16>), Error> {
+    pub fn rows_f16(&self, names: &[String]) -> Result<([usize; 2], Vec<F16>), Error> {
         let mut rows = 0;
         let mut columns = None;
         let mut out = Vec::new();
@@ -168,24 +169,22 @@ impl Checkpoint {
     }
 }
 
-/// `src`, values of `dtype` as the checkpoint stores them, as f16 bits into `dst`.
-fn convert(dtype: &str, src: &[u8], dst: &mut [u16]) {
+/// `src`, values of `dtype` as the checkpoint stores them, as f16 into `dst`.
+fn convert(dtype: &str, src: &[u8], dst: &mut [F16]) {
     match dtype {
         "BF16" => {
             for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                let v = bf16::from_bits(u16::from_le_bytes(*s)).to_f32();
-                *d = f16::from_f32(v).to_bits();
+                *d = F16::from_bf16(BF16::from_le_bytes(*s));
             }
         }
         "F16" => {
             for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                *d = u16::from_le_bytes(*s);
+                *d = F16::from_le_bytes(*s);
             }
         }
         _ => {
             for (d, s) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
-                let v = f32::from_le_bytes(*s);
-                *d = f16::from_f32(v).to_bits();
+                *d = F16::from_f32(f32::from_le_bytes(*s));
             }
         }
     }
@@ -197,10 +196,11 @@ mod tests {
 
     #[test]
     fn a_gather_reads_the_rows_the_whole_tensor_holds() {
-        let rows: Vec<f32> = (0..12).map(|i| i as f32 / 3.0 - 1.7).collect();
+        // Quarters, which bfloat16 holds exactly: the upper halves of their f32s.
+        let rows: Vec<f32> = (0..12).map(|i| i as f32 / 4.0 - 1.5).collect();
         let data: Vec<u8> = rows
             .iter()
-            .flat_map(|&v| bf16::from_f32(v).to_bits().to_le_bytes())
+            .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes())
             .collect();
         let header = format!(
             r#"{{"table":{{"dtype":"BF16","shape":[3,4],"data_offsets":[0,{}]}}}}"#,

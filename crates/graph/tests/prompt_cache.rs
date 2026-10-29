@@ -23,7 +23,7 @@ use graph::{
 use testkit::checkpoint_dir;
 use voices::{Latent, Voices};
 use voxcpm::{Config, Noise, Sampling, SeededNoise, Tokenizer};
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 /// Patches sampled after each prompt.
 const PATCHES: usize = 8;
@@ -351,8 +351,8 @@ fn the_cache_keeps_what_fits_and_drops_the_voice_used_longest_ago() {
 /// The slots of the caches a prompt is run into below.
 const SLOTS: usize = 4;
 
-/// The bits of each slot of each of both LMs' caches, `[cache][slot]`.
-fn caches(gpu: &mut Gpu) -> Vec<Vec<Vec<u16>>> {
+/// Each slot of each of both LMs' caches, `[cache][slot]`.
+fn caches(gpu: &mut Gpu) -> Vec<Vec<Vec<F16>>> {
     let (graph, step) = gpu.step.parts_mut();
     let side = &graph.side;
     [&side.base, &side.residual]
@@ -360,17 +360,17 @@ fn caches(gpu: &mut Gpu) -> Vec<Vec<Vec<u16>>> {
         .flat_map(|stack| &stack.layers)
         .flat_map(|l| [l.k_cache, l.v_cache])
         .map(|t| {
-            let bits: Vec<u16> = step
+            let held: Vec<F16> = step
                 .read(graph.side_ids[t.0])
                 .unwrap_or_else(|e| panic!("{e}"));
-            let slot = bits.len() / side.batch.slots;
-            bits.chunks(slot).map(<[u16]>::to_vec).collect()
+            let slot = held.len() / side.batch.slots;
+            held.chunks(slot).map(<[F16]>::to_vec).collect()
         })
         .collect()
 }
 
 /// The slots whose bits differ between two readings of [`caches`].
-fn changed(before: &[Vec<Vec<u16>>], after: &[Vec<Vec<u16>>]) -> Vec<usize> {
+fn changed(before: &[Vec<Vec<F16>>], after: &[Vec<Vec<F16>>]) -> Vec<usize> {
     (0..SLOTS)
         .filter(|&s| before.iter().zip(after).any(|(b, a)| b[s] != a[s]))
         .collect()

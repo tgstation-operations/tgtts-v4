@@ -47,12 +47,11 @@ use graph::{
     pth::Pth,
     vae::{VaeConfig, VaeDecoder, VaeShape},
 };
-use half::f16;
 use serde::{Deserialize, Serialize};
 use testkit::{Fixture, checkpoint_dir, golden, golden_input};
 use voices::Latent;
 use voxcpm::{Params, Sampling};
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 /// Patches sampled after the voice's patches alone.
 const GENERATED: usize = 24;
@@ -225,8 +224,8 @@ fn sample(step: &mut PatchStep, probes: [TensorId; 2], input: &Input, stale: usi
             .unwrap_or_else(|e| panic!("{e}"));
         elapsed += start.elapsed().as_secs_f64();
         let read = |t: TensorId| -> Vec<f32> {
-            let bits: Vec<u16> = step.graph_step().read(t).unwrap();
-            bits.iter().map(|&h| f16::from_bits(h).to_f32()).collect()
+            let values: Vec<F16> = step.graph_step().read(t).unwrap();
+            values.iter().map(|h| h.to_f32()).collect()
         };
         let levels = read(probes[1]).iter().map(|&l| (l * 9.0).round()).collect();
         out.patches.push(transposed(&sampled.patch, 64));

@@ -10,7 +10,7 @@
 //! as it does alone.
 
 use serde::Deserialize;
-use vulkan::{Context, SpecValue, Timing};
+use vulkan::{Context, F16, SpecValue, Timing};
 
 use crate::{
     Error,
@@ -498,8 +498,8 @@ pub fn load_lm_side(
 /// What the LM side gives for a patch: what the next is sampled with.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Conditioning {
-    /// The DiT's condition `[2 * dit]` as f16 bits.
-    pub mu: Vec<u16>,
+    /// The DiT's condition `[2 * dit]`.
+    pub mu: Vec<F16>,
     /// The stop head's logits, of going on and of stopping after the next patch.
     pub stop_logits: [f32; 2],
 }
@@ -548,31 +548,31 @@ impl LmSide {
     }
 
     /// Runs the LM side at batch 1 over `enc`, the local encoder's output for the patch at
-    /// `position` as f16 bits, writing both LMs' keys and values into their caches there;
-    /// returns what the next patch is sampled with.
-    pub fn step(&mut self, position: usize, enc: &[u16]) -> Result<Conditioning, Error> {
+    /// `position`, writing both LMs' keys and values into their caches there; returns what the
+    /// next patch is sampled with.
+    pub fn step(&mut self, position: usize, enc: &[F16]) -> Result<Conditioning, Error> {
         let mut rows = self.step_rows(&[Some(Row { position, slot: 0 })], enc)?;
         Ok(rows.remove(0).expect("a row that runs"))
     }
 
     /// Runs the LM side over `enc`, the local encoder's outputs `[rows][encoder]` for the
-    /// batch's rows as f16 bits, each where `rows` says or spare: writes each row's keys and
-    /// values into its slot of both LMs' caches at its position. Returns what each row's next
-    /// patch is sampled with, none for a spare row.
+    /// batch's rows, each where `rows` says or spare: writes each row's keys and values into its
+    /// slot of both LMs' caches at its position. Returns what each row's next patch is sampled
+    /// with, none for a spare row.
     pub fn step_rows(
         &mut self,
         rows: &[Option<Row>],
-        enc: &[u16],
+        enc: &[F16],
     ) -> Result<Vec<Option<Conditioning>>, Error> {
         let t = &self.tensors;
         let words = t.batch.placement(rows, t.shape.base.capacity)?;
         self.step.write(t.enc, enc)?;
         self.step.write(t.position, &words)?;
         self.step.submit()?;
-        let logits: Vec<u16> = self.step.read(t.stop_logits)?;
-        let mu: Vec<u16> = self.step.read(t.mu)?;
+        let logits: Vec<F16> = self.step.read(t.stop_logits)?;
+        let mu: Vec<F16> = self.step.read(t.mu)?;
         let width = mu.len() / rows.len();
-        let logit = |i: usize| half::f16::from_bits(logits[i]).to_f32();
+        let logit = |i: usize| logits[i].to_f32();
         Ok(rows
             .iter()
             .enumerate()

@@ -19,7 +19,7 @@
 //! gives and the local encoder ([`super::encoder`]) takes; voxcpm's model hands its LMs the patch
 //! transposed.
 
-use vulkan::{Context, SpecValue, Timing};
+use vulkan::{Context, F16, SpecValue, Timing};
 
 use super::{
     CFM_NOISE, CLUSTER, DIT_EULER, LOCAL_EMBED, PatchConfig, Stack, Tuning, groups, identity,
@@ -292,7 +292,7 @@ impl Sampler {
     /// documentation lays it out.
     pub fn sample(
         &mut self,
-        mu: &[u16],
+        mu: &[F16],
         cond: &[f32],
         noise: &[f32],
         sampling: &[[f32; 2]],
@@ -353,22 +353,15 @@ pub fn load_sampler(
     // time MLP sees zero at every step.
     let constant = delta.forward(&time_embedding(0.0, hidden));
     for (&token, &(time_at, _)) in t.times.iter().zip(&t.steps) {
-        let values: Vec<u16> = time
+        let values: Vec<F16> = time
             .forward(&time_embedding(time_at, hidden))
             .iter()
             .zip(&constant)
-            .map(|(a, b)| time_constant(a + b))
+            .map(|(a, b)| F16::from_f64(a + b))
             .collect();
         step.write(at(token), &values)?;
     }
     Ok(())
-}
-
-/// The bits of `value` as a time token holds it, an f16 rounded through f32 in every build:
-/// half's f16::from_f64 rounds an f64 to f32 first where half is built with std and the CPU has
-/// F16C, and once where not, and half has std only in builds where something else asks for it.
-pub fn time_constant(value: f64) -> u16 {
-    half::f16::from_f32(value as f32).to_bits()
 }
 
 /// Upstream's `SinusoidalPosEmb` at scale 1000, in f32 and in the order voxcpm's operations
@@ -400,10 +393,7 @@ impl TimeMlp {
                     values.len()
                 )));
             }
-            Ok(values
-                .into_iter()
-                .map(|h| half::f16::from_bits(h).to_f64())
-                .collect())
+            Ok(values.into_iter().map(|h| f64::from(h.to_f32())).collect())
         };
         let layer = |i: usize| -> Result<(Vec<f64>, Vec<f64>), Error> {
             Ok((

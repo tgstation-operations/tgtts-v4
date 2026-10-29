@@ -82,6 +82,8 @@ unsafe impl Element for F16 {
 }
 
 impl F16 {
+    pub const ZERO: F16 = F16(0);
+
     pub const fn from_bits(bits: u16) -> Self {
         F16(bits)
     }

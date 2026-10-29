@@ -7,7 +7,7 @@
 //! in f32, and gives each row's embedding, `[hidden]` in f16, which the LM side projects with
 //! `enc_to_lm_proj`.
 
-use vulkan::{Context, SpecValue, Timing};
+use vulkan::{Context, F16, SpecValue, Timing};
 
 use super::{LOCAL_EMBED, LOCAL_ROWS, PatchConfig, Stack, Tuning, groups, identity, write_weight};
 use crate::{
@@ -199,8 +199,8 @@ impl Encoder {
     }
 
     /// The embedding of each row's patch of `patches`, laid out as the module's documentation
-    /// says, as f16 bits.
-    pub fn encode(&mut self, patches: &[f32]) -> Result<Vec<u16>, Error> {
+    /// says.
+    pub fn encode(&mut self, patches: &[f32]) -> Result<Vec<F16>, Error> {
         self.step.write(self.tensors.patch, patches)?;
         self.step.submit()?;
         self.step.read(self.tensors.out)

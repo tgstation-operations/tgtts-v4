@@ -15,7 +15,7 @@ pub mod encoder;
 
 use Access::{Read, Write};
 use serde::Deserialize;
-use vulkan::{DeviceReport, SpecValue};
+use vulkan::{DeviceReport, F16, SpecValue};
 
 use crate::{
     Error,
@@ -699,7 +699,7 @@ fn read_weight(
     checkpoint: &Checkpoint,
     t: TensorId,
     names: &[String],
-) -> Result<Vec<u16>, Error> {
+) -> Result<Vec<F16>, Error> {
     let values = match names {
         [name] => checkpoint.f16(name)?.1,
         _ => checkpoint.rows_f16(names)?.1,
@@ -718,7 +718,7 @@ fn read_weight(
 /// row-major, a row of tiles' one after another: as `mma.glsl` reads a weight, so that each
 /// subgroup reads its rows' columns in one stream. The rows and columns are multiples of
 /// [`TILE`], as [`Stack::new`] has them.
-pub fn tiled(values: &[u16], k: usize) -> Vec<u16> {
+pub fn tiled(values: &[F16], k: usize) -> Vec<F16> {
     let n = values.len() / k;
     let mut out = Vec::with_capacity(values.len());
     for rows in 0..n / TILE {
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn tiles_hold_16_rows_of_16_columns_and_follow_each_other_along_the_rows() {
         let (n, k) = (2 * TILE, 3 * TILE);
-        let values: Vec<u16> = (0..n * k).map(|v| v as u16).collect();
+        let values: Vec<F16> = (0..n * k).map(|v| F16::from_bits(v as u16)).collect();
         let tiles = tiled(&values, k);
         assert_eq!(tiles.len(), values.len());
         for row in 0..n {

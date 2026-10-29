@@ -26,7 +26,7 @@ use graph::{
     kernels::{Kernels, STREAM_READ},
     local::{PatchConfig, Tuning, dit::Sampler, encoder::Encoder},
 };
-use vulkan::{Context, Residence, SpecValue, Timing, memory::STAGING_BYTES};
+use vulkan::{Context, F16, Residence, SpecValue, Timing, memory::STAGING_BYTES};
 
 fn arg(name: &str, default: usize) -> usize {
     let args: Vec<String> = std::env::args().collect();
@@ -242,9 +242,9 @@ fn main() {
 
     let hidden = config.dit_config.stack.hidden_dim;
     let len = config.feat_dim * config.patch_size;
-    let mu: Vec<u16> = uniform(rows * 2 * hidden, 1, 1.7)
+    let mu: Vec<F16> = uniform(rows * 2 * hidden, 1, 1.7)
         .iter()
-        .map(|&v| half::f16::from_f32(v).to_bits())
+        .map(|&v| F16::from_f32(v))
         .collect();
     let cond = uniform(rows * len, 2, 1.0);
     let sampling = vec![[1.0, 2.0]; rows];

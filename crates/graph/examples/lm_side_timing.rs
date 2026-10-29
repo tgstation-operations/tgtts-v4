@@ -28,7 +28,7 @@ use graph::{
     lm_side::{self, LmSide, LmSideShape},
 };
 use stream_read::stream_read;
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 mod stream_read;
 
@@ -63,7 +63,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 /// A local encoder output of about the real ones' scale, from a fixed xorshift sequence.
-fn input(width: usize, seed: u32) -> Vec<u16> {
+fn input(width: usize, seed: u32) -> Vec<F16> {
     let mut state = seed | 1;
     (0..width)
         .map(|_| {
@@ -71,7 +71,7 @@ fn input(width: usize, seed: u32) -> Vec<u16> {
             state ^= state >> 17;
             state ^= state << 5;
             let v = f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0;
-            half::f16::from_f64(v).to_bits()
+            F16::from_f64(v)
         })
         .collect()
 }
@@ -169,7 +169,7 @@ fn main() {
             step.arena_bytes() / 1024,
             start.elapsed().as_secs_f64()
         );
-        let enc: Vec<u16> = (0..rows as u32)
+        let enc: Vec<F16> = (0..rows as u32)
             .flat_map(|r| input(shape.encoder, r + 1))
             .collect();
         let placed = |i: usize| -> Vec<Option<Row>> {

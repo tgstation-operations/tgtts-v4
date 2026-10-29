@@ -16,7 +16,7 @@
 
 use std::mem;
 
-use vulkan::{Context, Timing};
+use vulkan::{Context, F16, Timing};
 
 use crate::{
     Error,
@@ -406,9 +406,9 @@ impl PatchStep {
         self.step.write(t.sampling, &sampling)?;
         self.step.run(*program)?;
         self.last = index;
-        let logits: Vec<u16> = self.step.read(t.stop_logits)?;
+        let logits: Vec<F16> = self.step.read(t.stop_logits)?;
         let patches: Vec<f32> = self.step.read(t.patch)?;
-        let logit = |i: usize| half::f16::from_bits(logits[i]).to_f32();
+        let logit = |i: usize| logits[i].to_f32();
         Ok(rows
             .iter()
             .enumerate()

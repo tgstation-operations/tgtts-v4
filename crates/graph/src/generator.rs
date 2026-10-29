@@ -11,9 +11,8 @@
 
 use std::{fs, iter, mem, path::Path};
 
-use half::f16;
 use serde::Deserialize;
-use vulkan::{Context, Timing};
+use vulkan::{Context, F16, Timing};
 
 use crate::{
     Error,
@@ -354,14 +353,11 @@ impl Generator {
             .ok_or_else(|| no_request(slot))?;
         let graph = self.step.last_run();
         let tensor = graph.side_ids[graph.side.levels.0];
-        let halves: Vec<u16> = self.step.graph_step().read(tensor)?;
+        let levels: Vec<F16> = self.step.graph_step().read(tensor)?;
         let shape = &graph.side.shape;
         let unit = shape.levels as f32;
-        let row = &halves[row * shape.latent..(row + 1) * shape.latent];
-        Ok(row
-            .iter()
-            .map(|&h| (f16::from_bits(h).to_f32() * unit).round())
-            .collect())
+        let row = &levels[row * shape.latent..(row + 1) * shape.latent];
+        Ok(row.iter().map(|&h| (h.to_f32() * unit).round()).collect())
     }
 
     /// What the generator keeps of the voices.

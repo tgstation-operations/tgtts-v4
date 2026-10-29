@@ -19,7 +19,7 @@ use graph::{
     kernels::Kernels,
     prefill::{Prefill, TILE},
 };
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 fn arg(name: &str, default: usize) -> usize {
     let args: Vec<String> = std::env::args().collect();
@@ -53,7 +53,7 @@ fn median(v: &[f64]) -> f64 {
 }
 
 /// `len` hidden states of the base LM's embeddings' scale, from a fixed xorshift sequence.
-fn prompt(len: usize, hidden: usize) -> Vec<u16> {
+fn prompt(len: usize, hidden: usize) -> Vec<F16> {
     let mut state = 0x9e37_79b9_u32;
     (0..len * hidden)
         .map(|_| {
@@ -61,7 +61,7 @@ fn prompt(len: usize, hidden: usize) -> Vec<u16> {
             state ^= state >> 17;
             state ^= state << 5;
             let v = f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0;
-            half::f16::from_f64(v * 0.05).to_bits()
+            F16::from_f64(v * 0.05)
         })
         .collect()
 }

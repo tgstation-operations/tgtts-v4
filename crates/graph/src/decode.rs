@@ -11,7 +11,7 @@
 //! batch and however the kernels are cut, so that it comes out bit for bit as it does alone.
 
 use serde::Deserialize;
-use vulkan::{Context, DeviceReport, SpecValue, Submission, Timing};
+use vulkan::{Context, DeviceReport, F16, SpecValue, Submission, Timing};
 
 use crate::{
     Error,
@@ -841,34 +841,34 @@ impl Decoder {
         )
     }
 
-    /// Runs the stack over `x`, the hidden state of `position` as f16 bits, writing its keys and
-    /// values into the cache there and attending over the cache up to it; returns the output
-    /// after the final norm, as f16 bits.
-    pub fn step(&mut self, position: usize, x: &[u16]) -> Result<Vec<u16>, Error> {
+    /// Runs the stack over `x`, the hidden state of `position`, writing its keys and values into
+    /// the cache there and attending over the cache up to it; returns the output after the final
+    /// norm.
+    pub fn step(&mut self, position: usize, x: &[F16]) -> Result<Vec<F16>, Error> {
         self.set_input(position, x)?;
         self.start()?.wait()?;
         self.output()
     }
 
-    /// Writes the input of the next run at batch 1: `x`, the hidden state of `position` as f16
-    /// bits, and the position.
-    pub fn set_input(&mut self, position: usize, x: &[u16]) -> Result<(), Error> {
+    /// Writes the input of the next run at batch 1: `x`, the hidden state of `position`, and the
+    /// position.
+    pub fn set_input(&mut self, position: usize, x: &[F16]) -> Result<(), Error> {
         self.set_rows(&[Some(Row { position, slot: 0 })], x)
     }
 
-    /// Runs the stack over `x`, the hidden states `[rows][hidden]` of the batch's rows as f16
-    /// bits, each where `rows` says or spare: writes each row's keys and values into its slot of
-    /// the cache at its position and attends over the slot up to it. Returns the outputs after
-    /// the final norm, `[rows][hidden]` as f16 bits, a spare row's meaningless.
-    pub fn step_rows(&mut self, rows: &[Option<Row>], x: &[u16]) -> Result<Vec<u16>, Error> {
+    /// Runs the stack over `x`, the hidden states `[rows][hidden]` of the batch's rows, each where
+    /// `rows` says or spare: writes each row's keys and values into its slot of the cache at its
+    /// position and attends over the slot up to it. Returns the outputs after the final norm,
+    /// `[rows][hidden]`, a spare row's meaningless.
+    pub fn step_rows(&mut self, rows: &[Option<Row>], x: &[F16]) -> Result<Vec<F16>, Error> {
         self.set_rows(rows, x)?;
         self.start()?.wait()?;
         self.output()
     }
 
-    /// Writes the input of the next run: `x`, the rows' hidden states as f16 bits, and where
-    /// each runs, as [`step_rows`](Self::step_rows) takes them.
-    pub fn set_rows(&mut self, rows: &[Option<Row>], x: &[u16]) -> Result<(), Error> {
+    /// Writes the input of the next run: `x`, the rows' hidden states, and where each runs, as
+    /// [`step_rows`](Self::step_rows) takes them.
+    pub fn set_rows(&mut self, rows: &[Option<Row>], x: &[F16]) -> Result<(), Error> {
         let t = &self.tensors;
         let words = t.batch.placement(rows, t.shape.capacity)?;
         self.step.write(t.x, x)?;
@@ -880,8 +880,8 @@ impl Decoder {
         self.step.start()
     }
 
-    /// The output of the last run, after the final norm, as f16 bits: `[rows][hidden]`.
-    pub fn output(&self) -> Result<Vec<u16>, Error> {
+    /// The output of the last run, after the final norm: `[rows][hidden]`.
+    pub fn output(&self) -> Result<Vec<F16>, Error> {
         self.step.read(self.tensors.out)
     }
 

@@ -15,11 +15,10 @@ use graph::{
     kernels::Kernels,
     prefill::{Prefill, TILE},
 };
-use half::f16;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use testkit::{Fixture, checkpoint_dir, golden, golden_input};
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
@@ -101,8 +100,8 @@ fn config() -> Value {
     serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
 }
 
-fn f16s(bits: &[u16]) -> Vec<f32> {
-    bits.iter().map(|&h| f16::from_bits(h).to_f32()).collect()
+fn f32s(values: &[F16]) -> Vec<f32> {
+    values.iter().map(|h| h.to_f32()).collect()
 }
 
 /// The decode steps run after the prompt: several, since at any one position which of two runs
@@ -150,9 +149,8 @@ fn residual_lm() -> Stack {
     }
 }
 
-/// The base LM's embeddings of `len` tokens of the game's lines, rounded to f16, `[len][hidden]`
-/// as f16 bits.
-fn embedded(len: usize) -> Vec<u16> {
+/// The base LM's embeddings of `len` tokens of the game's lines, rounded to f16, `[len][hidden]`.
+fn embedded(len: usize) -> Vec<F16> {
     let checkpoint = Checkpoint::open(checkpoint_dir().join("model.safetensors"))
         .unwrap_or_else(|e| panic!("{e}"));
     let ids: Vec<usize> = prompt_ids(len).iter().map(|&id| id as usize).collect();
@@ -163,7 +161,7 @@ fn embedded(len: usize) -> Vec<u16> {
 
 /// The golden of `stack` over the hidden states `x`, the prompt `runs` and `max_rows` as the
 /// test runs them: its run at the device's default tuning.
-fn golden_of(stack: &Stack, x: &[u16], runs: &[usize], max_rows: usize) -> Run {
+fn golden_of(stack: &Stack, x: &[F16], runs: &[usize], max_rows: usize) -> Run {
     let len: usize = runs.iter().sum();
     let name = format!(
         "prefill-{}{}-{len}",
@@ -178,7 +176,7 @@ fn golden_of(stack: &Stack, x: &[u16], runs: &[usize], max_rows: usize) -> Run {
 /// in programs of up to `max_rows` rows.
 fn gpu(
     stack: &Stack,
-    x: &[u16],
+    x: &[F16],
     runs: &[usize],
     shift: usize,
     subgroup: Option<u32>,
@@ -240,7 +238,7 @@ fn gpu(
             by_kernel.values().sum::<f64>(),
             longest.fold(0.0, f64::max),
         );
-        outputs.extend(f16s(&out));
+        outputs.extend(f32s(&out));
         done += run;
     }
     let s = decoder.shape().clone();
@@ -248,15 +246,15 @@ fn gpu(
     let mut cache = Vec::with_capacity(layers * 2 * s.kv_heads * len * s.head_dim);
     for layer in &tensors.layers {
         for t in [layer.k_cache, layer.v_cache] {
-            let held: Vec<u16> = step.read(t).unwrap_or_else(|e| panic!("{e}"));
+            let held: Vec<F16> = step.read(t).unwrap_or_else(|e| panic!("{e}"));
             for head in held.chunks(s.capacity * s.head_dim) {
-                cache.extend(f16s(&head[shift * s.head_dim..(shift + len) * s.head_dim]));
+                cache.extend(f32s(&head[shift * s.head_dim..(shift + len) * s.head_dim]));
             }
         }
     }
     for (t, x) in x.chunks(hidden).enumerate().skip(len) {
         let out = decoder.step(shift + t, x).unwrap_or_else(|e| panic!("{e}"));
-        outputs.extend(f16s(&out));
+        outputs.extend(f32s(&out));
     }
     assert_no_validation_messages(&ctx);
     Run { outputs, cache }
@@ -302,7 +300,7 @@ fn a_prefill_runs_on_the_decoder_it_was_recorded_for_alone() {
     let (mut ours, mut other) = (decoder(&mut kernels), decoder(&mut kernels));
     let prefill = Prefill::new(&ctx, &mut kernels, &mut ours, TILE, &tuning, false)
         .unwrap_or_else(|e| panic!("{e}"));
-    let x = vec![0u16; 100 * shape.hidden];
+    let x = vec![F16::ZERO; 100 * shape.hidden];
     assert!(matches!(
         prefill.run(&mut other, 0, &x),
         Err(Error::Shape(_))
@@ -315,7 +313,10 @@ fn a_prefill_runs_on_the_decoder_it_was_recorded_for_alone() {
         .run(&mut ours, 0, &x)
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(out.len(), x.len());
-    assert!(out.iter().all(|&h| h == 0), "zero weights give zero");
+    assert!(
+        out.iter().all(|&h| h == F16::ZERO),
+        "zero weights give zero"
+    );
     assert_no_validation_messages(&ctx);
 }
 
@@ -411,7 +412,8 @@ fn the_residual_lm_prefills_as_its_golden() {
     // What VoxCPM2 feeds its residual LM at positions of text, rounded to f16: fusion_concat_proj
     // over the base LM's outputs, beside audio embeddings that are zero there, as burn's CPU
     // computed it in f32.
-    let x: Vec<u16> = golden_input(&format!("input-prefill-residual_lm.8-{len}"));
+    let bits: Vec<u16> = golden_input(&format!("input-prefill-residual_lm.8-{len}"));
+    let x: Vec<F16> = bits.into_iter().map(F16::from_bits).collect();
     let want = golden_of(&stack, &x, &runs, 2 * TILE);
     let got = gpu(&stack, &x, &runs, 0, None, 2 * TILE);
     assert!(check("the residual LM", &got, &want, &RESIDUAL_LM));

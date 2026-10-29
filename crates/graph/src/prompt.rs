@@ -25,7 +25,7 @@ use std::{
     iter,
 };
 
-use vulkan::{Buffer, Context, Residence, SpecValue};
+use vulkan::{Buffer, Context, F16, Residence, SpecValue};
 
 use crate::{
     Error,
@@ -361,9 +361,8 @@ pub struct PromptCache {
 
 #[derive(Debug, Default)]
 struct Voice {
-    /// The embedding of each patch as the base LM takes it, `[hidden]` as f16 bits, by the
-    /// patch's bits.
-    embeddings: HashMap<Vec<u32>, Vec<u16>>,
+    /// The embedding of each patch as the base LM takes it, `[hidden]`, by the patch's bits.
+    embeddings: HashMap<Vec<u32>, Vec<F16>>,
     prefix: Option<Prefix>,
     /// When it was last used, on the cache's clock.
     used: u64,
@@ -560,8 +559,8 @@ impl Prompter {
         self.tensors.max_rows
     }
 
-    /// The embedding of `patch`, `[patch_size][feat_dim]`, as the base LM takes it, as f16 bits.
-    pub fn embed(&self, step: &mut PatchStep, patch: &[f32]) -> Result<Vec<u16>, Error> {
+    /// The embedding of `patch`, `[patch_size][feat_dim]`, as the base LM takes it.
+    pub fn embed(&self, step: &mut PatchStep, patch: &[f32]) -> Result<Vec<F16>, Error> {
         let (_, recorded) = step.parts_mut();
         let cond = transposed(patch, self.patch_size);
         recorded.write(self.tensors.patch, &cond)?;
@@ -647,15 +646,15 @@ impl Prompter {
         Ok(len - shared)
     }
 
-    /// The embeddings of `prompt`'s positions but its last, `[len - 1][hidden]` as f16 bits, and
-    /// those of its audio positions, zero at text: a token's read from `checkpoint`, a patch's
-    /// from the GPU, once for each distinct patch.
+    /// The embeddings of `prompt`'s positions but its last, `[len - 1][hidden]`, and those of its
+    /// audio positions, zero at text: a token's read from `checkpoint`, a patch's from the GPU,
+    /// once for each distinct patch.
     pub fn embeddings(
         &self,
         step: &mut PatchStep,
         checkpoint: &Checkpoint,
         prompt: Prompt<'_>,
-    ) -> Result<(Vec<u16>, Vec<u16>), Error> {
+    ) -> Result<(Vec<F16>, Vec<F16>), Error> {
         check(prompt)?;
         self.embeddings_from(step, checkpoint, prompt, 0, &mut HashMap::new())
     }
@@ -669,13 +668,13 @@ impl Prompter {
         checkpoint: &Checkpoint,
         prompt: Prompt<'_>,
         from: usize,
-        known: &mut HashMap<Vec<u32>, Vec<u16>>,
-    ) -> Result<(Vec<u16>, Vec<u16>), Error> {
+        known: &mut HashMap<Vec<u32>, Vec<F16>>,
+    ) -> Result<(Vec<F16>, Vec<F16>), Error> {
         let (len, hidden) = (prompt.len(), self.hidden);
         let patch = prompt.patches.len() / len;
         let ran = from..len - 1;
-        let mut x = vec![0u16; ran.len() * hidden];
-        let mut audio_x = vec![0u16; ran.len() * hidden];
+        let mut x = vec![F16::ZERO; ran.len() * hidden];
+        let mut audio_x = vec![F16::ZERO; ran.len() * hidden];
         let row = |p: usize| (p - from) * hidden..(p - from + 1) * hidden;
         let text: Vec<usize> = ran.clone().filter(|&p| !prompt.audio[p]).collect();
         let tokens: Vec<usize> = text.iter().map(|&p| prompt.tokens[p] as usize).collect();
@@ -696,16 +695,16 @@ impl Prompter {
         Ok((x, audio_x))
     }
 
-    /// Runs the positions from `at` on whose embeddings are `x`, `[len][hidden]` as f16 bits,
-    /// those of audio as `audio` says, through both LMs into `step`'s caches: `audio_x` holds the
-    /// embeddings of the audio positions, zero at text. A run of more than
-    /// [`max_rows`](Self::max_rows) positions runs in pieces.
+    /// Runs the positions from `at` on whose embeddings are `x`, `[len][hidden]`, those of audio
+    /// as `audio` says, through both LMs into `step`'s caches: `audio_x` holds the embeddings of
+    /// the audio positions, zero at text. A run of more than [`max_rows`](Self::max_rows)
+    /// positions runs in pieces.
     pub fn run_rows(
         &self,
         step: &mut PatchStep,
         at: Row,
-        x: &[u16],
-        audio_x: &[u16],
+        x: &[F16],
+        audio_x: &[F16],
         audio: &[bool],
     ) -> Result<(), Error> {
         let (hidden, max_rows) = (self.hidden, self.tensors.max_rows);
@@ -729,8 +728,8 @@ impl Prompter {
         }
         let (_, recorded) = step.parts_mut();
         let t = &self.tensors;
-        let mut padded = vec![0u16; max_rows * hidden];
-        let mut padded_audio = vec![0u16; max_rows * hidden];
+        let mut padded = vec![F16::ZERO; max_rows * hidden];
+        let mut padded_audio = vec![F16::ZERO; max_rows * hidden];
         let mut flags = vec![0u32; max_rows];
         for first in (0..len).step_by(max_rows) {
             let rows = (len - first).min(max_rows);

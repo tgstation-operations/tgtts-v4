@@ -25,10 +25,9 @@ use graph::{
     },
     step::Step,
 };
-use half::f16;
 use testkit::{Fixture, checkpoint_dir};
 use voxcpm::Sampling;
-use vulkan::{Context, executable::count_mnemonics};
+use vulkan::{Context, F16, executable::count_mnemonics};
 
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
@@ -126,7 +125,7 @@ fn cases(config: &PatchConfig) -> Vec<Case> {
             };
             let mu = uniform(2 * hidden, seed, 1.7);
             Case {
-                mu: mu.iter().map(|&v| f16::from_f32(v).to_f32()).collect(),
+                mu: mu.iter().map(|&v| F16::from_f32(v).to_f32()).collect(),
                 cond: transposed(&patches[at - 1], config.patch_size),
                 noise: noise[at].clone(),
                 sampling,
@@ -135,8 +134,8 @@ fn cases(config: &PatchConfig) -> Vec<Case> {
         .collect()
 }
 
-fn f16_bits(values: &[f32]) -> Vec<u16> {
-    values.iter().map(|&v| f16::from_f32(v).to_bits()).collect()
+fn halves(values: &[f32]) -> Vec<F16> {
+    values.iter().map(|&v| F16::from_f32(v)).collect()
 }
 
 /// How far one run's outputs are from another's.
@@ -230,7 +229,7 @@ fn gpu(ctx: &Context, cases: &[Case], timesteps: usize, rows: usize, tuning: &Tu
         let sampling: Vec<[f32; 2]> = run.iter().map(|case| case.sampling).collect();
         let patches = sampler
             .sample(
-                &f16_bits(&all(|case| &case.mu)),
+                &halves(&all(|case| &case.mu)),
                 &all(|case| &case.cond),
                 &all(|case| &case.noise),
                 &sampling,
@@ -457,11 +456,7 @@ fn embed(
             .flat_map(|patch| transposed(patch, config.patch_size))
             .collect();
         let out = encoder.encode(&laid_out).unwrap_or_else(|e| panic!("{e}"));
-        got.extend(
-            out[..hidden * chunk.len()]
-                .iter()
-                .map(|&h| f16::from_bits(h).to_f32()),
-        );
+        got.extend(out[..hidden * chunk.len()].iter().map(|h| h.to_f32()));
     }
     got
 }
@@ -542,7 +537,7 @@ fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     let at = |ids: &[TensorId], t: TensorId| ids[t.0];
     let all =
         |part: fn(&Case) -> &[f32]| -> Vec<f32> { cases.iter().flat_map(part).copied().collect() };
-    step.write(at(&dit, sampler.mu), &f16_bits(&all(|case| &case.mu)))
+    step.write(at(&dit, sampler.mu), &halves(&all(|case| &case.mu)))
         .unwrap();
     step.write(at(&dit, sampler.cond), &all(|case| &case.cond))
         .unwrap();
@@ -558,8 +553,8 @@ fn the_sampler_and_the_encoder_load_into_a_graph_they_are_spliced_into() {
     step.submit().unwrap_or_else(|e| panic!("{e}"));
     let got: Vec<f32> = step.read(at(&dit, sampler.patch)).unwrap();
     assert_eq!(got, alone, "the spliced sampler's patches");
-    let got: Vec<u16> = step.read(at(&local, enc.out)).unwrap();
-    let got: Vec<f32> = got.iter().map(|&h| f16::from_bits(h).to_f32()).collect();
+    let got: Vec<F16> = step.read(at(&local, enc.out)).unwrap();
+    let got: Vec<f32> = got.iter().map(|h| h.to_f32()).collect();
     assert_eq!(got, embedded, "the spliced encoder's embeddings");
     assert_no_validation_messages(&ctx);
 }

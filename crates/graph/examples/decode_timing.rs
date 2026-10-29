@@ -49,7 +49,7 @@ use graph::{
     kernels::Kernels,
 };
 use stream_read::stream_read;
-use vulkan::{Calibration, Context};
+use vulkan::{Calibration, Context, F16};
 
 mod stream_read;
 
@@ -105,7 +105,7 @@ fn monotonic_ns() -> f64 {
 }
 
 /// A hidden state of the base LM's scale, from a fixed xorshift sequence.
-fn input(hidden: usize, seed: u32) -> Vec<u16> {
+fn input(hidden: usize, seed: u32) -> Vec<F16> {
     let mut state = seed | 1;
     (0..hidden)
         .map(|_| {
@@ -113,7 +113,7 @@ fn input(hidden: usize, seed: u32) -> Vec<u16> {
             state ^= state >> 17;
             state ^= state << 5;
             let v = f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0;
-            half::f16::from_f64(v * 0.1).to_bits()
+            F16::from_f64(v * 0.1)
         })
         .collect()
 }
@@ -164,7 +164,7 @@ struct Bench {
     decoder: Option<Decoder>,
     /// Where each row runs.
     rows: Vec<Option<Row>>,
-    inputs: Vec<Vec<u16>>,
+    inputs: Vec<Vec<F16>>,
     next: usize,
 }
 
@@ -199,10 +199,7 @@ impl Bench {
         let t3 = monotonic_ns();
         let out = decoder.output().unwrap_or_else(|e| panic!("{e}"));
         let t4 = monotonic_ns();
-        assert!(
-            out.iter()
-                .all(|&h| half::f16::from_bits(h).to_f32().is_finite())
-        );
+        assert!(out.iter().all(|h| h.to_f32().is_finite()));
         let step = decoder.graph_step();
         let gpu = step.elapsed().unwrap_or_else(|e| panic!("{e}")).nanoseconds;
         let ends = calibration.map(|c| {

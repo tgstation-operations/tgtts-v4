@@ -10,7 +10,6 @@ publish = false
 device = []
 
 [dependencies]
-half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 vulkan = { path = "../vulkan" }

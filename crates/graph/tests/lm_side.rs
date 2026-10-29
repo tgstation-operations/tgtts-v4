@@ -21,10 +21,9 @@ use graph::{
     lm_side::{self, Conditioning, LmSide, LmSideShape, lm_side_batch_graph, load_lm_side},
     step::Step,
 };
-use half::f16;
 use serde::Deserialize;
 use testkit::{checkpoint_dir, golden, golden_input};
-use vulkan::Context;
+use vulkan::{Context, F16};
 
 fn context() -> Context {
     let ctx = Context::new().unwrap_or_else(|e| panic!("{e}"));
@@ -139,10 +138,10 @@ fn run_batch<T>(
 fn row_inputs(
     placed: &[Option<Row>],
     which: &[Option<usize>],
-    inputs: &[&[u16]],
+    inputs: &[&[F16]],
     width: usize,
-) -> Vec<u16> {
-    let mut x = vec![0u16; placed.len() * width];
+) -> Vec<F16> {
+    let mut x = vec![F16::ZERO; placed.len() * width];
     for (b, (row, request)) in placed.iter().zip(which).enumerate() {
         if let (Some(row), Some(i)) = (row, request) {
             let at = row.position * width;
@@ -203,7 +202,8 @@ fn gpu(
         })
         .collect();
     let width = shape.encoder;
-    let inputs = vec![input.enc.as_slice(); rows];
+    let enc: Vec<F16> = input.enc.iter().map(|&h| F16::from_bits(h)).collect();
+    let inputs = vec![enc.as_slice(); rows];
     let got = run_batch(&requests, rows, |placed, which| {
         let enc = row_inputs(placed, which, &inputs, width);
         side.step_rows(placed, &enc)
@@ -214,7 +214,7 @@ fn gpu(
         .map(|patches| {
             let (mut mu, mut stop) = (vec![], vec![]);
             for out in &patches[input.prompt - 1..] {
-                mu.extend(out.mu.iter().map(|&h| f16::from_bits(h).to_f32()));
+                mu.extend(out.mu.iter().map(|h| h.to_f32()));
                 stop.extend(out.stop_logits);
             }
             (mu, stop)
@@ -394,16 +394,16 @@ const REQUESTS: [Request; 6] = [
     },
 ];
 
-/// Local encoder outputs of about the real ones' scale, `[len][width]` as f16 bits, from a
-/// fixed xorshift sequence for each seed.
-fn made_up(len: usize, width: usize, seed: u32) -> Vec<u16> {
+/// Local encoder outputs of about the real ones' scale, `[len][width]`, from a fixed xorshift
+/// sequence for each seed.
+fn made_up(len: usize, width: usize, seed: u32) -> Vec<F16> {
     let mut state = seed.wrapping_mul(0x9e37_79b9) | 1;
     (0..len * width)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            f16::from_f64(f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0).to_bits()
+            F16::from_f64(f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0)
         })
         .collect()
 }
@@ -418,10 +418,10 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
         .unwrap_or_else(|e| panic!("{e}"));
     let shape = LmSideShape::new(&config, 64).unwrap();
     let width = shape.encoder;
-    let encs: Vec<Vec<u16>> = (0..REQUESTS.len())
+    let encs: Vec<Vec<F16>> = (0..REQUESTS.len())
         .map(|i| made_up(REQUESTS[i].len, width, i as u32 + 1))
         .collect();
-    let inputs: Vec<&[u16]> = encs.iter().map(Vec::as_slice).collect();
+    let inputs: Vec<&[F16]> = encs.iter().map(Vec::as_slice).collect();
     let batch = Batch { rows: 4, slots: 6 };
     let report = ctx.report().clone();
     for subgroup in SUBGROUPS
@@ -550,9 +550,9 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
             step.write(tensors.position, &words).unwrap();
             step.write(wrong, &swapped).unwrap();
             step.submit().unwrap();
-            let mu: Vec<u16> = step.read(tensors.mu).unwrap();
-            let logits: Vec<u16> = step.read(tensors.stop_logits).unwrap();
-            let logit = |i: usize| f16::from_bits(logits[i]).to_f32();
+            let mu: Vec<F16> = step.read(tensors.mu).unwrap();
+            let logits: Vec<F16> = step.read(tensors.stop_logits).unwrap();
+            let logit = |i: usize| logits[i].to_f32();
             let condition = mu.len() / batch.rows;
             let rows = placed.iter().enumerate();
             rows.map(|(b, row)| {
