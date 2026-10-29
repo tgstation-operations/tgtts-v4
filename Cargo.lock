@@ -1140,7 +1140,7 @@ dependencies = [
  "ureq",
  "voices",
  "vorbis_rs",
- "voxcpm-core",
+ "voxcpm",
  "vulkan",
 ]
 
@@ -1424,21 +1424,13 @@ name = "voxcpm"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "rand",
+ "rand_distr",
  "safetensors",
+ "serde",
  "serde_json",
  "testkit",
  "voices",
- "voxcpm-core",
-]
-
-[[package]]
-name = "voxcpm-core"
-version = "0.1.0"
-dependencies = [
- "rand",
- "rand_distr",
- "serde",
- "serde_json",
 ]
 
 [[package]]

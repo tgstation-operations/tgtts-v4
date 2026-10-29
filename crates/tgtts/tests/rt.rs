@@ -25,7 +25,7 @@ use tgtts::{
     synth::{Speech, Synthesizer},
 };
 use voices::Voices;
-use voxcpm_core::Params;
+use voxcpm::Params;
 
 /// voxcpm's golden line and voice: run free from the seed, the generator stops after its 24th
 /// patch, where voxcpm in f32 on the CPU did.

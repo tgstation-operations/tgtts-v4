@@ -28,7 +28,7 @@ use graph::{
 };
 use tracing::{debug, error, info};
 use voices::{Latent, Voices};
-use voxcpm_core::{Config, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer};
+use voxcpm::{Config, Noise, Params, Prompt, Sampling, SeededNoise, Tokenizer};
 
 use crate::synth::{self, Sink, Speech, Start, Synthesizer};
 

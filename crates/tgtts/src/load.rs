@@ -5,7 +5,7 @@ use std::{error::Error, sync::Arc, time::Instant};
 
 use tracing::info;
 use voices::Voices;
-use voxcpm_core::Params;
+use voxcpm::Params;
 
 use crate::{config::Config, rt::Rt, synth::Synthesizer};
 
