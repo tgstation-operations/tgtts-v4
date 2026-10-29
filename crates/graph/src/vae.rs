@@ -1,6 +1,5 @@
-//! VoxCPM2's audio VAE decoder, streamed a chunk of latent frames at a time, as the `audiovae`
-//! crate's `DecodeStream` decodes them: latent frames in, `decoder_rates.product()` samples of
-//! audio per frame out, each causal convolution carrying its last inputs from one chunk into the
+//! VoxCPM2's audio VAE decoder, streamed a chunk of latent frames at a time: latent frames in,
+//! `decoder_rates.product()` samples of audio per frame out, each causal convolution carrying its last inputs from one chunk into the
 //! next, so that chunked audio is the whole decode's.
 //!
 //! A chunk is a step recorded once for at most [`VaeShape::chunk`] frames and submitted for every
@@ -16,9 +15,8 @@
 //! ring for each stream, and the host says which stream a chunk is of in the buffer it writes
 //! before each, so that each stream comes out bit for bit as it does alone.
 //!
-//! Everything is stored in f32, as the service runs the `audiovae` crate's decoder: storing
-//! activations and weights in f16 took the audio from 115 dB of the CPU's f32 decode to 59, to
-//! save less than a sixth of a chunk's time.
+//! Everything is stored in f32: storing activations and weights in f16 took the audio from 115 dB
+//! of the CPU's f32 decode to 59, to save less than a sixth of a chunk's time.
 
 use std::iter;
 
@@ -117,7 +115,7 @@ pub struct VaeShape {
 
 impl VaeShape {
     /// The decoder `config` describes, of `streams` streams in chunks of at most `chunk` frames.
-    /// Refuses what VoxCPM2 does not use, as the `audiovae` crate does.
+    /// Refuses what VoxCPM2 does not use.
     pub fn new(config: &VaeConfig, chunk: usize, streams: usize) -> Result<Self, Error> {
         let unsupported = |why: String| Err(Error::Shape(why));
         if !config.depthwise
@@ -856,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rings_carry_what_the_audiovae_crates_stream_keeps_for_each_stream() {
+    fn the_rings_carry_what_a_decode_stream_keeps_for_each_stream() {
         for streams in [1, 3] {
             let g = vae_graph(&shape(25, streams)).unwrap();
             // 1 + 6 blocks of a transposed convolution and three residual units + 1.
@@ -866,7 +864,7 @@ mod tests {
                 .iter()
                 .map(|&(t, _)| g.graph.tensors[t.0].bytes / 4)
                 .sum();
-            // As audiovae's DecodeStream counts what it keeps of a batch item.
+            // As the audiovae crate's DecodeStream counted what it kept of a batch item.
             assert_eq!(values, streams as u64 * 161_856);
             assert_eq!(g.graph.ops.len(), 3 + 6 * 11 + 2);
             let declared = (5, SpecValue::U32(streams as u32));

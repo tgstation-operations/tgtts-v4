@@ -141,7 +141,7 @@ impl Shape {
     }
 
     /// LongRoPE's cosines and sines for positions below the capacity, `[capacity][head_dim / 2]`
-    /// each: computed in f32 in the order minicpm4's `Rope::new` takes, so they round as its do.
+    /// each: computed in f32 in the order minicpm4's `Rope::new` took, so they round as its did.
     pub fn rope_tables(&self) -> (Vec<f32>, Vec<f32>) {
         let dim = self.head_dim;
         let theta = self.rope_theta;

@@ -9,8 +9,8 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
 
 - `nix run .#fmt` formats the tree: rustfmt, nixfmt and ruff.
 - `nix run .#audit` is the gate: formatting, ASCII, the Nix lints, the vendored
-  upstreams' pins, that tgtts builds nothing of burn, clippy with warnings
-  denied, rustdoc and the full test suite.
+  upstreams' pins, that nothing builds burn, clippy with warnings denied,
+  rustdoc and the full test suite.
 - `nix run .#fixtures [NAME...]` runs the generators `fixtures/<NAME>.py`, all
   of them by default, which write what upstream VoxCPM computes for the tests to
   compare against. A rerun writes the same bytes.
@@ -18,13 +18,15 @@ Every tool comes from the Nix flake: `direnv allow` once, or `nix develop`.
   at a VoxCPM2 checkpoint and run `cargo test -- --ignored`.
 - The gate runs nothing on a GPU.
 - `nix run .#device-tests` runs the Vulkan runtime's tests on the GPU, under
-  the Khronos validation layer, the start of a GPU path of its own; the burn
-  code stays the oracle it is checked against. Its kernels are MLIR compiled
-  ahead of time to SPIR-V, from `kernels/gpu`: `nix build .#gpu-kernels`, which
-  builds LLVM first where the store does not have it. The decode step's kernels
-  are GLSL, from `kernels/glsl`: `nix build .#glsl-kernels`. With
-  `-- --include-ignored` and `VOXCPM2_DIR`, the `graph` crate's decode step runs
-  on the real weights against minicpm4 on the CPU.
+  the Khronos validation layer. Its kernels are MLIR compiled ahead of time to
+  SPIR-V, from `kernels/gpu`: `nix build .#gpu-kernels`, which builds LLVM first
+  where the store does not have it. The decode step's kernels are GLSL, from
+  `kernels/glsl`: `nix build .#glsl-kernels`. With `-- --include-ignored`,
+  `VOXCPM2_DIR`, `VOICES_DIR` and `GOLDEN_DIR`, the `graph` crate's tests run the
+  model on the real weights, held to goldens of what the GPU gave there once
+  burn's CPU model had shown it right, and to invariants such as a request run
+  beside others coming out bit for bit as it does alone. `GOLDEN_CAPTURE=1`
+  captures the goldens again, on a tree whose output is known right.
 - `vendor/` pins the upstreams the GPU kernels and their toolchain follow, as
   git submodules that nothing builds from; `vendor/README.md` lists them.
 

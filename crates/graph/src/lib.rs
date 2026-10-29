@@ -1,6 +1,6 @@
 //! A step of a model as a graph of GPU dispatches at fixed shapes, recorded once and submitted
-//! every step: the layer above the `vulkan` crate's driver, toward a runtime of its own. burn's
-//! CPU backend stays the oracle it is checked against.
+//! every step: the layer above the `vulkan` crate's driver, toward a runtime of its own. Its tests
+//! on the real weights hold it to goldens of its own output, testkit's.
 //!
 //! - [`graph`]: the step as data, the ops over its tensors in order; one arena laid out from
 //!   their lifetimes ([`graph::plan`]), and the barriers the order needs ([`graph::barriers`]).

@@ -100,8 +100,7 @@ impl Checkpoint {
         Error::Checkpoint(format!("{}: {name}: {why}", self.path.display()))
     }
 
-    /// Tensor `name` as f16 bits, rounded to nearest even from bf16 or f32 as burn's cast
-    /// does, and its shape.
+    /// Tensor `name` as f16 bits, rounded to nearest even from bf16 or f32, and its shape.
     pub fn f16(&self, name: &str) -> Result<(Vec<usize>, Vec<u16>), Error> {
         let (entry, width) = self.entry(name)?;
         let [start, end] = entry.data_offsets;

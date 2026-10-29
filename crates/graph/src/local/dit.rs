@@ -366,8 +366,7 @@ pub fn load_sampler(
 
 /// The bits of `value` as a time token holds it, an f16 rounded through f32 in every build:
 /// half's f16::from_f64 rounds an f64 to f32 first where half is built with std and the CPU has
-/// F16C, and once where not, and half has std only in builds where something else asks for it,
-/// as burn does.
+/// F16C, and once where not, and half has std only in builds where something else asks for it.
 pub fn time_constant(value: f64) -> u16 {
     half::f16::from_f32(value as f32).to_bits()
 }

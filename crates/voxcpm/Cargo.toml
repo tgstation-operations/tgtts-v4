@@ -6,11 +6,6 @@ version.workspace = true
 publish = false
 
 [dependencies]
-audiovae = { path = "../audiovae" }
-burn = { workspace = true, features = ["safetensors", "std", "store"] }
-minicpm4 = { path = "../minicpm4" }
-regex.workspace = true
-voices = { path = "../voices" }
 voxcpm-core = { path = "../voxcpm-core" }
 
 [dev-dependencies]
@@ -18,3 +13,4 @@ crc32fast.workspace = true
 safetensors.workspace = true
 serde_json.workspace = true
 testkit = { path = "../testkit" }
+voices = { path = "../voices" }

@@ -3,8 +3,8 @@ use serde::Deserialize;
 /// The `audio_vae_config` of a VoxCPM2 `config.json`.
 ///
 /// Fields the JSON leaves out take the defaults of upstream's `AudioVAEConfig`, and a field
-/// upstream does not have is refused rather than ignored. Building the `audiovae` crate's
-/// `Encoder` or `Decoder` refuses the values it does not implement.
+/// upstream does not have is refused rather than ignored. Building the GPU's decoder refuses the
+/// values it does not implement.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioVaeConfig {

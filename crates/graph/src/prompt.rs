@@ -342,8 +342,8 @@ impl Prompt<'_> {
     }
 }
 
-/// What a generator keeps of the voices for the next prompts in them, up to a number of bytes,
-/// as voxcpm's `PromptCache` keeps it on burn: for each voice, the embeddings of its prompts'
+/// What a generator keeps of the voices for the next prompts in them, up to a number of bytes:
+/// for each voice, the embeddings of its prompts'
 /// patches, on the host, which the service's prompts hold twice; and on the GPU, the LMs' keys
 /// and values over the first prompt in it up to its last run of audio, the voice as reference
 /// audio and the text after it. The LMs are causal, so a prompt that begins with the same

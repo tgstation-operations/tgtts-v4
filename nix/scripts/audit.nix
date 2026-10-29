@@ -128,13 +128,12 @@ pkgs.writeShellApplication {
       return "$status"
     }
 
-    # tgtts builds nothing of burn.
+    # Nothing builds burn or cubecl, which tts-rs left.
     burn_free() {
       local packages
-      packages=$(cargo tree --locked -p tgtts -e normal,build --prefix none --format '{p}') ||
-        return 1
+      packages=$(cargo tree --locked --workspace -e all --prefix none --format '{p}') || return 1
       if grep -E '^(burn|cubecl)' <<<"$packages"; then
-        echo "audit: tgtts builds the packages above" >&2
+        echo "audit: the workspace builds the packages above" >&2
         return 1
       fi
     }

@@ -14,7 +14,6 @@ ash = "0.38.0"
 axum = { version = "0.8.9", default-features = false }
 blake3 = "1.8.7"
 bon = "3.10.3"
-burn = { version = "0.22.1", default-features = false }
 crc32fast = "1.5.3"
 fancy-regex = "0.20.0"
 futures-util = { version = "0.3.34", default-features = false }
@@ -23,7 +22,6 @@ libc = "0.2.191"
 pkg-config = "0.3.34"
 rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }
 rand_distr = { version = "0.6.0", default-features = false }
-regex = "1.13.1"
 rusqlite = { version = "0.41.0", default-features = false }
 rustfft = "6.4.1"
 safetensors = "0.8.0"
@@ -38,7 +36,3 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false }
 ureq = { version = "2.12.1", default-features = false }
 vorbis_rs = { version = "0.5.6", default-features = false }
-
-# burn as the tgstation fork carries it, pinned by revision: changes to its GPU kernels land there first.
-[patch.crates-io]
-burn = { git = "https://git.scriptis.net/scriptis/burn.git", rev = "56d3f4d28b541dd7dda76a3d15bd8ee1723c68cd" }

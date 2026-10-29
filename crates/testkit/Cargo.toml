@@ -6,10 +6,6 @@ version.workspace = true
 publish = false
 
 [dependencies]
-# Every model crate takes this crate as a dev-dependency, so test builds get burn's threads
-# and gemm's AVX-512 kernels through it, and the service keeps the workspace's features. gemm
-# picks those kernels at run time, so the tests still run without AVX-512.
-burn = { workspace = true, features = ["flex", "rayon", "x86-v4"] }
 half.workspace = true
 safetensors.workspace = true
 serde.workspace = true

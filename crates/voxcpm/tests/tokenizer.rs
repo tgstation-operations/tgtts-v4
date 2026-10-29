@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use safetensors::SafeTensors;
 use serde_json::{Value, json};
-use testkit::{checkpoint_dir, device, fixture};
+use testkit::{checkpoint_dir, fixture};
 use voices::Latent;
 use voxcpm::Tokenizer;
 use voxcpm_core::Error;
@@ -17,8 +17,7 @@ fn encodes_as_upstream() {
     let fixture = fixture!("voxcpm_tokenizer");
     let texts: Vec<String> = serde_json::from_str(&fixture.metadata()["texts"]).unwrap();
     for (i, text) in texts.iter().enumerate() {
-        let expected = fixture.int_tensor::<1>(&format!("ids.{i}"), &device());
-        let expected: Vec<i64> = expected.into_data().iter().collect();
+        let (_, expected) = fixture.ints(&format!("ids.{i}"));
         let ids: Vec<i64> = tokenizer.encode(text).into_iter().map(i64::from).collect();
         assert_eq!(ids, expected, "{text:?}");
     }
@@ -101,8 +100,7 @@ fn encodes_every_transcript_and_message_as_upstream() {
     let list = |key| -> Vec<String> { serde_json::from_str(&golden.metadata()[key]).unwrap() };
     let (stems, messages) = (list("stems"), list("messages"));
     for (i, message) in messages.iter().enumerate() {
-        let expected = golden.int_tensor::<1>(&format!("messages.{i}"), &device());
-        let expected: Vec<i64> = expected.into_data().iter().collect();
+        let (_, expected) = golden.ints(&format!("messages.{i}"));
         let ids: Vec<i64> = tokenizer
             .encode(message)
             .into_iter()

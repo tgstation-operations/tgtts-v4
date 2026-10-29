@@ -1,4 +1,4 @@
-//! The configuration of a MiniCPM-4 stack, as the `minicpm4` crate loads it.
+//! The configuration of a MiniCPM-4 stack.
 
 use serde::Deserialize;
 
@@ -6,8 +6,9 @@ use serde::Deserialize;
 /// `config.json` gives the base LM's as `lm_config`, and the other stacks are derived from it
 /// by [`residual_lm`](Self::residual_lm) and [`local`](Self::local).
 ///
-/// A field upstream does not know is refused rather than ignored, and loading refuses values
-/// VoxCPM2 does not use: muP scaling, and RoPE other than LongRoPE at its native length.
+/// A field upstream does not know is refused rather than ignored, and the GPU's stacks refuse
+/// values VoxCPM2 does not use as they are built: muP scaling, and RoPE other than LongRoPE at
+/// its native length.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
