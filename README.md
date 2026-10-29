@@ -1,4 +1,4 @@
-# tts-rs
+# tgtts-v4
 
 Text-to-speech for /tg/station, in Rust, to replace the Python services the
 game's TTS subsystem talks to today.
@@ -37,8 +37,8 @@ the radio and the game's voice effects, or the ffmpeg filters it sent before
 them. It reads a TOML file named as its argument, and `TGTTS_<KEY>` in the
 environment overrides any key; the keys are listed in
 `crates/tgtts/src/config.rs`. The token is read from a file, so that a secret
-manager can provide it. The model runs on tts-rs's own runtime on a Vulkan GPU.
-To serve locally, write a `tgtts.toml` such as
+manager can provide it. The model runs on tgtts-v4's own runtime on a Vulkan
+GPU. To serve locally, write a `tgtts.toml` such as
 
 ```toml
 token_file = "token"
