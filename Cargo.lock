@@ -1426,7 +1426,6 @@ dependencies = [
  "crc32fast",
  "rand",
  "rand_distr",
- "safetensors",
  "serde",
  "serde_json",
  "testkit",

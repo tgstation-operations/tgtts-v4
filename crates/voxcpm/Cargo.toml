@@ -13,6 +13,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 crc32fast.workspace = true
-safetensors.workspace = true
 testkit = { path = "../testkit" }
 voices = { path = "../voices" }

@@ -1,6 +1,5 @@
 use std::{fs, path::PathBuf};
 
-use safetensors::SafeTensors;
 use serde_json::{Value, json};
 use testkit::{checkpoint_dir, fixture};
 use voices::Latent;
@@ -107,14 +106,10 @@ fn encodes_every_transcript_and_message_as_upstream() {
             .collect();
         assert_eq!(ids, expected, "{message:?}");
     }
-    // Read past burn, which would hold the checksums as i32.
-    let bytes = fs::read(golden.path()).unwrap();
-    let file = SafeTensors::deserialize(&bytes).unwrap();
     let rows = |name| -> Vec<i64> {
-        let rows = file.tensor(name).unwrap();
-        assert_eq!(rows.shape(), [stems.len(), 3]);
-        let values = rows.data().as_chunks().0.iter();
-        values.map(|value| i64::from_le_bytes(*value)).collect()
+        let (shape, rows) = golden.ints(name);
+        assert_eq!(shape, [stems.len(), 3]);
+        rows
     };
     let (transcripts, prompts) = (rows("transcripts"), rows("prompts"));
     let voices = voices_dir();
