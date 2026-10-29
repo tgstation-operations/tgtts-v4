@@ -10,7 +10,7 @@ use std::{
     error, fmt,
 };
 
-use dsp::quantity::TruePeak;
+use dsp::quantity::{self, Level, TruePeak};
 
 use crate::{
     Processor, RATE,
@@ -418,7 +418,7 @@ fn lengthen(node: &Node, fed: Length, impulses: &Impulses) -> Length {
 /// The processor for `node`, which is not a mix and has been checked.
 fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
     match *node {
-        Node::Gain { gain_db } => Box::new(Gain::new(gain_db)),
+        Node::Gain { gain_db } => Box::new(Gain::new(quantity::Gain::new(gain_db))),
         Node::Lowpass { frequency_hz, q } => Box::new(Biquad::new(Shape::Lowpass, frequency_hz, q)),
         Node::Highpass { frequency_hz, q } => {
             Box::new(Biquad::new(Shape::Highpass, frequency_hz, q))
@@ -427,17 +427,29 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             frequency_hz,
             gain_db,
             q,
-        } => Box::new(Biquad::new(Shape::Peak(gain_db), frequency_hz, q)),
+        } => Box::new(Biquad::new(
+            Shape::Peak(quantity::Gain::new(gain_db)),
+            frequency_hz,
+            q,
+        )),
         Node::Lowshelf {
             frequency_hz,
             gain_db,
             q,
-        } => Box::new(Biquad::new(Shape::Lowshelf(gain_db), frequency_hz, q)),
+        } => Box::new(Biquad::new(
+            Shape::Lowshelf(quantity::Gain::new(gain_db)),
+            frequency_hz,
+            q,
+        )),
         Node::Highshelf {
             frequency_hz,
             gain_db,
             q,
-        } => Box::new(Biquad::new(Shape::Highshelf(gain_db), frequency_hz, q)),
+        } => Box::new(Biquad::new(
+            Shape::Highshelf(quantity::Gain::new(gain_db)),
+            frequency_hz,
+            q,
+        )),
         Node::Compressor {
             threshold_db,
             ratio,
@@ -446,16 +458,16 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             makeup_db,
             knee_db,
         } => Box::new(Compressor::new(
-            threshold_db,
+            Level::new(threshold_db),
             ratio,
             attack_ms,
             release_ms,
-            makeup_db,
-            knee_db,
+            quantity::Gain::new(makeup_db),
+            quantity::Gain::new(knee_db),
         )),
         Node::Limiter { ceiling_db } => Box::new(Limiter::new(TruePeak::new(ceiling_db))),
         Node::Saturate { amount } => Box::new(Saturate::new(amount)),
-        Node::Clip { ceiling_db } => Box::new(Clip::new(ceiling_db)),
+        Node::Clip { ceiling_db } => Box::new(Clip::new(Level::new(ceiling_db))),
         Node::Crush { rate_hz, mix } => Box::new(Crush::new(rate_hz, mix)),
         Node::Pitch {
             semitones,
@@ -484,7 +496,7 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             Box::new(Echo::new(taps.iter().map(|tap| (tap.delay_ms, tap.weight))))
         }
         Node::Convolve { impulse } => Box::new(Convolve::new(impulses.get(impulse).clone())),
-        Node::Noise { level_db } => Box::new(Noise::new(level_db)),
+        Node::Noise { level_db } => Box::new(Noise::new(Level::new(level_db))),
         Node::Mix { .. } => unreachable!("a mix is a step of its own"),
     }
 }

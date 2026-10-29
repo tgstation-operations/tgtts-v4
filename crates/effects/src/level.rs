@@ -2,6 +2,8 @@
 
 use std::f64::consts::TAU;
 
+use dsp::quantity::{self, Level, Ratio};
+
 use crate::{Processor, RATE};
 
 /// A fixed gain.
@@ -9,9 +11,9 @@ use crate::{Processor, RATE};
 pub struct Gain(f32);
 
 impl Gain {
-    /// A gain of `db`.
-    pub fn new(db: f64) -> Self {
-        Self(10f64.powf(db / 20.0) as f32)
+    /// A gain of `gain`.
+    pub fn new(gain: quantity::Gain) -> Self {
+        Self(Ratio::of(gain).value() as f32)
     }
 }
 
@@ -59,11 +61,11 @@ pub struct Noise {
 }
 
 impl Noise {
-    /// Noise at `level` dBFS RMS.
-    pub fn new(level: f64) -> Self {
+    /// Noise at an RMS of `level`.
+    pub fn new(level: Level) -> Self {
         Self {
             // Uniform noise over [-a, a] has an RMS of a / sqrt(3).
-            amplitude: 3f64.sqrt() * 10f64.powf(level / 20.0),
+            amplitude: 3f64.sqrt() * Ratio::of_level(level).value(),
             state: 0x9E37_79B9_7F4A_7C15,
         }
     }

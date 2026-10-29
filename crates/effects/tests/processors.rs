@@ -2,7 +2,7 @@
 
 use std::{f64::consts::TAU, sync::Arc};
 
-use dsp::quantity::{SampleRate, TruePeak};
+use dsp::quantity::{self, Level, SampleRate, TruePeak};
 use effects::{
     Pipeline, Processor,
     convolve::{Impulses, Response},
@@ -109,25 +109,34 @@ fn biquads_follow_the_cookbook() {
         0.05,
     );
     near(
-        gain_at(&mut Biquad::new(Shape::Peak(12.0), 2000.0, 1.0), 2000.0),
+        gain_at(
+            &mut Biquad::new(Shape::Peak(quantity::Gain::new(12.0)), 2000.0, 1.0),
+            2000.0,
+        ),
         12.0,
         0.05,
     );
     near(
-        gain_at(&mut Biquad::new(Shape::Lowshelf(-10.0), 500.0, 0.5), 30.0),
+        gain_at(
+            &mut Biquad::new(Shape::Lowshelf(quantity::Gain::new(-10.0)), 500.0, 0.5),
+            30.0,
+        ),
         -10.0,
         0.1,
     );
     near(
         gain_at(
-            &mut Biquad::new(Shape::Highshelf(6.0), 2000.0, 0.7),
+            &mut Biquad::new(Shape::Highshelf(quantity::Gain::new(6.0)), 2000.0, 0.7),
             18000.0,
         ),
         6.0,
         0.2,
     );
     near(
-        gain_at(&mut Biquad::new(Shape::Peak(-10.0), 33.0, 0.44), 33.0),
+        gain_at(
+            &mut Biquad::new(Shape::Peak(quantity::Gain::new(-10.0)), 33.0, 0.44),
+            33.0,
+        ),
         -10.0,
         0.1,
     );
@@ -157,11 +166,15 @@ fn wobble_lifts_the_lows_and_boosts_the_highs() {
 
 #[test]
 fn levels() {
-    near(gain_at(&mut Gain::new(-6.0), 440.0), -6.0, 1e-4);
+    near(
+        gain_at(&mut Gain::new(quantity::Gain::new(-6.0)), 440.0),
+        -6.0,
+        1e-4,
+    );
     let y = run(&mut Tremolo::new(10.0, 0.8), &vec![1.0; 48000]);
     near(f64::from(y[0]), 1.0, 1e-6);
     near(f64::from(y[2400]), 0.2, 1e-4);
-    let y = run(&mut Noise::new(-40.0), &vec![0.0; 48000]);
+    let y = run(&mut Noise::new(Level::new(-40.0)), &vec![0.0; 48000]);
     near(db(rms(&y)), -40.0, 0.1);
     assert!(y.iter().all(|s| s.abs() < 0.0174));
     // acontrast's curve, folding back over full scale.
@@ -171,7 +184,7 @@ fn levels() {
         near(f64::from(*y), expected, 2e-3);
     }
     assert_eq!(
-        run(&mut Clip::new(-6.0), &[0.2, 0.9, -1.5]),
+        run(&mut Clip::new(Level::new(-6.0)), &[0.2, 0.9, -1.5]),
         [0.2, 0.5011872, -0.5011872]
     );
 }
@@ -194,7 +207,14 @@ fn compressor_follows_its_curve() {
     // On a constant, the level it detects is the constant's.
     let gain = |level: f64, knee: f64| {
         let x = vec![10f64.powf(level / 20.0) as f32; 24000];
-        let mut compressor = Compressor::new(-20.0, 4.0, 5.0, 50.0, 3.0, knee);
+        let mut compressor = Compressor::new(
+            Level::new(-20.0),
+            4.0,
+            5.0,
+            50.0,
+            quantity::Gain::new(3.0),
+            quantity::Gain::new(knee),
+        );
         let y = run(&mut compressor, &x);
         db(f64::from(y[23999] / x[23999]))
     };

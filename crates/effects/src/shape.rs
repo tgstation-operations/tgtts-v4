@@ -2,6 +2,8 @@
 
 use std::f64::consts::{PI, TAU};
 
+use dsp::quantity::{Level, Ratio};
+
 use crate::{Processor, RATE};
 
 /// A sine waveshaper, as ffmpeg's acontrast: `sin(pi/2 x + amount * 2/15 * sin(2 pi x))`, which
@@ -31,9 +33,9 @@ impl Processor for Saturate {
 pub struct Clip(f32);
 
 impl Clip {
-    /// Clipping at `ceiling` dBFS.
-    pub fn new(ceiling: f64) -> Self {
-        Self(10f64.powf(ceiling / 20.0) as f32)
+    /// Clipping at `ceiling`.
+    pub fn new(ceiling: Level) -> Self {
+        Self(Ratio::of_level(ceiling).value() as f32)
     }
 }
 

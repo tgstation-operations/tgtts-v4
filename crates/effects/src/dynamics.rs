@@ -1,6 +1,9 @@
 //! Dynamics: a compressor, and [`dsp::limiter`]'s true-peak limiter.
 
-use dsp::{limiter, quantity::TruePeak};
+use dsp::{
+    limiter,
+    quantity::{Gain, Level, TruePeak},
+};
 
 use crate::{Processor, RATE};
 
@@ -19,22 +22,22 @@ pub struct Compressor {
 }
 
 impl Compressor {
-    /// Compression by `ratio` above `threshold` dBFS, over a knee of `knee` dB, following the
-    /// level within `attack` and `release` ms, with `makeup` dB after.
+    /// Compression by `ratio` above `threshold`, over a knee of `knee`, following the level within
+    /// `attack` and `release` ms, with `makeup` after.
     pub fn new(
-        threshold: f64,
+        threshold: Level,
         ratio: f64,
         attack: f64,
         release: f64,
-        makeup: f64,
-        knee: f64,
+        makeup: Gain,
+        knee: Gain,
     ) -> Self {
         let coefficient = |ms: f64| (-1.0 / (ms / 1000.0 * RATE)).exp();
         Self {
-            threshold,
+            threshold: threshold.value(),
             slope: 1.0 / ratio - 1.0,
-            knee,
-            makeup,
+            knee: knee.value(),
+            makeup: makeup.value(),
             attack: coefficient(attack),
             release: coefficient(release),
             power: 0.0,

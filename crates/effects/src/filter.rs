@@ -2,6 +2,8 @@
 
 use std::f64::consts::TAU;
 
+use dsp::quantity::Gain;
+
 use crate::{Processor, RATE};
 
 /// A biquad's shape, as Robert Bristow-Johnson's "Cookbook formulae for audio EQ biquad filter
@@ -12,12 +14,12 @@ pub enum Shape {
     Lowpass,
     /// Second-order highpass.
     Highpass,
-    /// Peaking equalizer, with its gain in dB.
-    Peak(f64),
-    /// Low shelf, with its gain in dB.
-    Lowshelf(f64),
-    /// High shelf, with its gain in dB.
-    Highshelf(f64),
+    /// Peaking equalizer, with its gain.
+    Peak(Gain),
+    /// Low shelf, with its gain.
+    Lowshelf(Gain),
+    /// High shelf, with its gain.
+    Highshelf(Gain),
 }
 
 /// A biquad, in transposed direct form II, kept in f64: at a few tens of Hz an f32 state rounds
@@ -35,7 +37,7 @@ impl Biquad {
         let w0 = TAU * frequency / RATE;
         let (sin, cos) = w0.sin_cos();
         let alpha = sin / (2.0 * q);
-        let amplitude = |gain: f64| 10f64.powf(gain / 40.0);
+        let amplitude = |gain: Gain| 10f64.powf(gain.value() / 40.0);
         let (b, a) = match shape {
             Shape::Lowpass => (
                 [(1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0],
