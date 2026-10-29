@@ -11,8 +11,6 @@ mod params;
 mod prompt;
 mod tokenizer;
 
-use std::fmt;
-
 pub use crate::{
     audio_vae::AudioVaeConfig,
     config::{CfmConfig, Config, DitConfig, EncoderConfig},
@@ -23,27 +21,18 @@ pub use crate::{
 };
 
 /// Why a config, a tokenizer or a prompt was refused.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// `config.json` is not a config upstream would read.
+    #[error("VoxCPM2 config: {0}")]
     Config(serde_json::Error),
     /// The config asks for something tts-rs does not implement.
+    #[error("unsupported VoxCPM2 config: {0}")]
     Unsupported(String),
     /// `tokenizer.json` is not one this crate implements.
+    #[error("tokenizer.json: {0}")]
     Tokenizer(String),
     /// A request the model cannot serve.
+    #[error("cannot generate from {0}")]
     Request(String),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(e) => write!(f, "VoxCPM2 config: {e}"),
-            Self::Unsupported(what) => write!(f, "unsupported VoxCPM2 config: {what}"),
-            Self::Tokenizer(what) => write!(f, "tokenizer.json: {what}"),
-            Self::Request(what) => write!(f, "cannot generate from {what}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
