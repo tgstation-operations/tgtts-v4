@@ -5,7 +5,7 @@
 //! little-endian `[frames, 64]`. A `.blips` pickles `{base: {number: {key: io.BytesIO}}}`, each
 //! BytesIO a WAV. Neither holds a tensor, so [`pickle`] evaluates them whole.
 
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use crate::{
     BlipSet, LATENT_DIM, Latent, archive,
@@ -181,37 +181,15 @@ fn wav_header(rate: u32, data_len: usize) -> Option<Vec<u8>> {
 }
 
 /// A voice file that could not be read, and why.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The zip archive is not one torch.save writes for these files.
+    #[error("archive: {0}")]
     Archive(String),
     /// The pickle uses what [`pickle`] refuses.
-    Pickle(pickle::Error),
+    #[error("{PICKLE}: {0}")]
+    Pickle(#[from] pickle::Error),
     /// The pickle is not a latent or a blips set as the service wrote them.
+    #[error("{0}")]
     Content(String),
-}
-
-impl From<pickle::Error> for Error {
-    fn from(error: pickle::Error) -> Self {
-        Self::Pickle(error)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Archive(reason) => write!(f, "archive: {reason}"),
-            Self::Pickle(error) => write!(f, "{PICKLE}: {error}"),
-            Self::Content(reason) => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Pickle(error) => Some(error),
-            _ => None,
-        }
-    }
 }

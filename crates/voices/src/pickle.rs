@@ -6,7 +6,7 @@
 //! refused with its offset. Nothing is imported or called: the only objects it makes are
 //! [`Value`]s.
 
-use std::{collections::BTreeMap, fmt, mem};
+use std::{collections::BTreeMap, mem};
 
 /// What a pickle evaluates to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,8 @@ pub enum Global {
 }
 
 /// A pickle refused, at the offset of the opcode that was.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("pickle offset {offset}: {kind}")]
 pub struct Error {
     /// Where the opcode is in the pickle.
     pub offset: usize,
@@ -50,11 +51,13 @@ pub struct Error {
 }
 
 /// Why a pickle was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ErrorKind {
     /// An opcode this does not implement.
+    #[error("opcode {0:#04x} is not supported")]
     Opcode(u8),
     /// A global other than the two this knows.
+    #[error("global {module}.{name} is not allowed")]
     Global {
         /// The module it names.
         module: String,
@@ -62,27 +65,13 @@ pub enum ErrorKind {
         name: String,
     },
     /// The pickle ends inside the opcode, or before a STOP.
+    #[error("truncated")]
     Truncated,
     /// The opcode is applied to what it cannot be, or the pickle is otherwise not one the
     /// voice files hold.
+    #[error("{0}")]
     Invalid(String),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pickle offset {}: ", self.offset)?;
-        match &self.kind {
-            ErrorKind::Opcode(opcode) => write!(f, "opcode {opcode:#04x} is not supported"),
-            ErrorKind::Global { module, name } => {
-                write!(f, "global {module}.{name} is not allowed")
-            }
-            ErrorKind::Truncated => f.write_str("truncated"),
-            ErrorKind::Invalid(reason) => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// Evaluates `pickle`, refusing anything but what the voice files hold.
 pub fn load(pickle: &[u8]) -> Result<Value, Error> {
