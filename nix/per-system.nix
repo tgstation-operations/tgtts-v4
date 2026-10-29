@@ -44,15 +44,7 @@ in
         glslKernels
         ;
     };
-    vk-trial = import ./vk-trial.nix {
-      inherit
-        pkgs
-        rustToolchain
-        gpuKernels
-        glslKernels
-        ;
-    };
-    rt-trial = import ./rt-trial.nix {
+    gpu-trial = import ./gpu-trial.nix {
       inherit
         pkgs
         rustToolchain

@@ -18,7 +18,8 @@ pkgs.writeShellApplication {
   text = ''
     # device-tests [CARGO_TEST_ARGS...]: the vulkan and graph crates' tests on the GPU, the GPU
     # kernels among them, each failing on any message of the validation layer. The graph crate's
-    # on the real weights are ignored unless --include-ignored, with VOXCPM2_DIR set.
+    # on the real weights are ignored unless --include-ignored, with VOXCPM2_DIR, VOICES_DIR and
+    # GOLDEN_DIR set.
     cd "$(git rev-parse --show-toplevel)"
     export CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true CARGO_BUILD_FINGERPRINT=content \
       CARGO_UNSTABLE_RUSTDOC_DEPINFO=true
