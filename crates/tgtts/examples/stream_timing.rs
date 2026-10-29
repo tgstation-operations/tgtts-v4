@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use argh::FromArgs;
 use tgtts::ogg;
 
 /// The lines it asks for, from a word to a long sentence.
@@ -39,65 +40,46 @@ const LINES: [&str; 8] = [
 /// The samples a second of the streams.
 const RATE: f64 = 48000.0;
 
+/// Times a running service's streams as a player gets them, the token in TOKEN.
+#[derive(FromArgs)]
 struct Options {
+    /// the service's address
+    #[argh(positional, arg_name = "BASE")]
     base: String,
-    token: String,
+    /// the jobs made, 24 by default
+    #[argh(option, arg_name = "N", default = "24", from_str_fn(count))]
     jobs: usize,
+    /// the jobs made at a time, 1 by default
+    #[argh(option, arg_name = "N", default = "1", from_str_fn(count))]
     at_once: usize,
+    /// the voices the jobs are spread over, all by default
+    #[argh(option, arg_name = "N", from_str_fn(count))]
     voices: Option<usize>,
+    /// play each job's radio too
+    #[argh(switch)]
     radio: bool,
+    /// play each job's radio too, streamed as its speech is
+    #[argh(switch)]
     streamed_radio: bool,
+    /// time the whole-file route's replies instead
+    #[argh(switch)]
     whole: bool,
 }
 
-fn main() -> ExitCode {
-    let usage = || {
-        eprintln!(
-            "usage: TOKEN=... stream_timing BASE [--jobs N] [--at-once N] [--voices N] [--radio] \
-             [--streamed-radio] [--whole]"
-        );
-        ExitCode::from(2)
-    };
-    let mut args = env::args().skip(1);
-    let Some(base) = args.next() else {
-        return usage();
-    };
-    let mut options = Options {
-        base,
-        token: env::var("TOKEN").unwrap_or_default(),
-        jobs: 24,
-        at_once: 1,
-        voices: None,
-        radio: false,
-        streamed_radio: false,
-        whole: false,
-    };
-    while let Some(arg) = args.next() {
-        let mut count = || {
-            args.next()
-                .and_then(|n| n.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-        };
-        match arg.as_str() {
-            "--jobs" => match count() {
-                Some(n) => options.jobs = n,
-                None => return usage(),
-            },
-            "--at-once" => match count() {
-                Some(n) => options.at_once = n,
-                None => return usage(),
-            },
-            "--voices" => match count() {
-                Some(n) => options.voices = Some(n),
-                None => return usage(),
-            },
-            "--radio" => options.radio = true,
-            "--streamed-radio" => (options.radio, options.streamed_radio) = (true, true),
-            "--whole" => options.whole = true,
-            _ => return usage(),
-        }
+/// `value` as a count of at least 1.
+fn count(value: &str) -> Result<usize, String> {
+    match value.parse() {
+        Ok(0) => Err("not at least 1".to_owned()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
     }
-    match run(&options) {
+}
+
+fn main() -> ExitCode {
+    let mut options: Options = argh::from_env();
+    options.radio |= options.streamed_radio;
+    let token = env::var("TOKEN").unwrap_or_default();
+    match run(&options, &token) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("stream_timing: {e}");
@@ -118,10 +100,10 @@ struct Timed {
     buffer_ms: f64,
 }
 
-fn run(options: &Options) -> Result<(), Failure> {
+fn run(options: &Options, token: &str) -> Result<(), Failure> {
     let all: Vec<String> = serde_json::from_str(
         &ureq::get(&format!("{}/tts-voices", options.base))
-            .set("Authorization", &options.token)
+            .set("Authorization", token)
             .call()?
             .into_string()?,
     )?;
@@ -141,7 +123,7 @@ fn run(options: &Options) -> Result<(), Failure> {
                 while let Some(job) = work.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                     let voice = voices[(job * 7919) % voices.len()];
                     let line = format!("{} {job}, {run}.", LINES[job % LINES.len()]);
-                    let _ = timed.send((job, voice, one(options, job, voice, &line)));
+                    let _ = timed.send((job, voice, one(options, token, job, voice, &line)));
                 }
             });
         }
@@ -195,7 +177,13 @@ fn run(options: &Options) -> Result<(), Failure> {
 
 /// A job of `line` in `voice`, its streams played; or with `--whole`, the whole-file route's
 /// reply timed.
-fn one(options: &Options, job: usize, voice: &str, line: &str) -> Result<Vec<Timed>, Failure> {
+fn one(
+    options: &Options,
+    token: &str,
+    job: usize,
+    voice: &str,
+    line: &str,
+) -> Result<Vec<Timed>, Failure> {
     let made = Instant::now();
     let identifier = format!("timing-{job}");
     if options.whole {
@@ -205,7 +193,7 @@ fn one(options: &Options, job: usize, voice: &str, line: &str) -> Result<Vec<Tim
             encode(voice)
         );
         let reply = ureq::get(&url)
-            .set("Authorization", &options.token)
+            .set("Authorization", token)
             .set("Content-Type", "application/json")
             .send_string(&serde_json::json!({ "text": line }).to_string())?;
         let seconds: f64 = reply.header("audio-length").unwrap_or("0").parse()?;
@@ -233,7 +221,7 @@ fn one(options: &Options, job: usize, voice: &str, line: &str) -> Result<Vec<Tim
     });
     let reply: serde_json::Value = serde_json::from_str(
         &ureq::post(&format!("{}/stream", options.base))
-            .set("Authorization", &options.token)
+            .set("Authorization", token)
             .set("Content-Type", "application/json")
             .send_string(&job.to_string())?
             .into_string()?,

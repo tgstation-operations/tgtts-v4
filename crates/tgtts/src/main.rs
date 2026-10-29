@@ -3,6 +3,7 @@
 
 use std::{env, error::Error, future::IntoFuture, path::PathBuf, process::ExitCode, thread};
 
+use argh::FromArgs;
 use tgtts::{
     cache::Cache,
     config::{self, Config},
@@ -23,16 +24,17 @@ use voices::Voices;
 /// How many metrics rows may wait to be written before more are dropped.
 const METRICS_QUEUE: usize = 1024;
 
+/// Serves the game's TTS routes, configured by the TOML file CONFIG, any key of which TGTTS_<KEY>
+/// in the environment overrides.
+#[derive(FromArgs)]
+struct Args {
+    /// the configuration, a TOML file
+    #[argh(positional, arg_name = "CONFIG")]
+    config: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    let file = match &args[..] {
-        [] => None,
-        [file] => Some(PathBuf::from(file)),
-        _ => {
-            eprintln!("usage: tgtts [CONFIG]");
-            return ExitCode::from(2);
-        }
-    };
+    let Args { config: file } = argh::from_env();
     let config = match Config::load(file.as_deref(), |key| env::var(key).ok()) {
         Ok(config) => config,
         Err(e) => {

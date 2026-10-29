@@ -24,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use argh::FromArgs;
 use tgtts::{
     config::{self, Config},
     levels::{self, Levels},
@@ -34,6 +35,47 @@ use tracing::error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use voices::Voices;
 
+/// Measures how loud each voice comes out of the model, for the service's voice_levels_file, into
+/// the table LEVELS, on the model the service loads from the TOML file CONFIG and the
+/// environment; or with --report and LEVELS alone, loads no model and prints what LEVELS.lines
+/// says.
+#[derive(FromArgs)]
+struct Args {
+    /// the service's configuration, or with --report the table
+    #[argh(positional, arg_name = "CONFIG")]
+    config: PathBuf,
+    /// the table, which a run that finds it goes on with
+    #[argh(positional, arg_name = "LEVELS")]
+    levels: Option<PathBuf>,
+    /// the lines asked for at once, the service's synthesis_limit by default
+    #[argh(option, arg_name = "N", from_str_fn(count))]
+    requests: Option<usize>,
+    /// where each voice's first line is kept as 16-bit WAV, as the model said it
+    #[argh(option, arg_name = "DIR")]
+    keep: Option<PathBuf>,
+    /// how long lines are asked for, after which those asked for are measured
+    #[argh(option, arg_name = "S", from_str_fn(seconds))]
+    seconds: Option<Duration>,
+    /// print what LEVELS.lines says
+    #[argh(switch)]
+    report: bool,
+}
+
+/// `value` as a count of at least 1.
+fn count(value: &str) -> Result<usize, String> {
+    match value.parse() {
+        Ok(0) => Err("not at least 1".to_owned()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `value` as a time of at least 0 s.
+fn seconds(value: &str) -> Result<Duration, String> {
+    let seconds = value.parse::<f64>().map_err(|e| e.to_string())?;
+    Duration::try_from_secs_f64(seconds).map_err(|e| e.to_string())
+}
+
 fn main() -> ExitCode {
     let usage = || {
         eprintln!(
@@ -42,31 +84,10 @@ fn main() -> ExitCode {
         );
         ExitCode::from(2)
     };
-    let (mut positional, mut requests, mut keep, mut until) = (Vec::new(), None, None, None);
-    let mut report = false;
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--requests" => match args.next().and_then(|n| n.parse::<usize>().ok()) {
-                Some(n) if n > 0 => requests = Some(n),
-                _ => return usage(),
-            },
-            "--keep" => match args.next() {
-                Some(dir) => keep = Some(PathBuf::from(dir)),
-                None => return usage(),
-            },
-            "--report" => report = true,
-            "--seconds" => match args.next().and_then(|s| s.parse::<f64>().ok()) {
-                Some(s) if s >= 0.0 && s.is_finite() => {
-                    until = Some(Instant::now() + Duration::from_secs_f64(s));
-                }
-                _ => return usage(),
-            },
-            _ => positional.push(PathBuf::from(arg)),
-        }
-    }
-    if report {
-        let [levels] = &positional[..] else {
+    let args: Args = argh::from_env();
+    let until = args.seconds.map(|seconds| Instant::now() + seconds);
+    if args.report {
+        let (levels, None) = (&args.config, &args.levels) else {
             return usage();
         };
         let mut lines = levels.as_os_str().to_owned();
@@ -85,7 +106,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    let [config, levels] = &positional[..] else {
+    let (config, Some(levels)) = (&args.config, &args.levels) else {
         return usage();
     };
     let config = match Config::load(Some(config), |key| env::var(key).ok()) {
@@ -99,8 +120,8 @@ fn main() -> ExitCode {
         .with(config::log_filter(config.log_level))
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let requests = requests.unwrap_or(config.synthesis_limit);
-    match run(&config, levels, requests, keep.as_deref(), until) {
+    let requests = args.requests.unwrap_or(config.synthesis_limit);
+    match run(&config, levels, requests, args.keep.as_deref(), until) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
