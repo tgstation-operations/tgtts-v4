@@ -10,7 +10,7 @@ use vulkan::{Context, Residence, SpecValue, memory::STAGING_BYTES};
 /// 16 loads per invocation in workgroups of 256, each the best of nine dispatches after one.
 pub fn stream_read(ctx: &Context, kernels: &mut Kernels, subgroup: u32, bytes: u64) -> f64 {
     let mut data = ctx
-        .buffer_in(bytes, Residence::Device)
+        .buffer_in::<u32>((bytes / 4) as usize, Residence::Device)
         .unwrap_or_else(|e| panic!("{e}"));
     // Words that do not repeat, filled a staging buffer at a time.
     let mut state = 0x2545_f491_u32;
@@ -24,7 +24,7 @@ pub fn stream_read(ctx: &Context, kernels: &mut Kernels, subgroup: u32, bytes: u
                 state
             })
             .collect();
-        data.write_at(4 * at, &words)
+        data.write_at(at as usize, &words)
             .unwrap_or_else(|e| panic!("{e}"));
     }
     let workgroup = 256;
@@ -42,8 +42,8 @@ pub fn stream_read(ctx: &Context, kernels: &mut Kernels, subgroup: u32, bytes: u
         let kernel = kernels.get(&pipeline).unwrap_or_else(|e| panic!("{e}"));
         let groups = bytes / 16 / u64::from(workgroup * loads);
         let mut out = ctx
-            .buffer_in(
-                4 * groups * u64::from(workgroup / subgroup),
+            .buffer_in::<u32>(
+                (groups * u64::from(workgroup / subgroup)) as usize,
                 Residence::Readback,
             )
             .unwrap_or_else(|e| panic!("{e}"));

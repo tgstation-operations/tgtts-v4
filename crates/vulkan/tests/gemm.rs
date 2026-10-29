@@ -13,7 +13,7 @@ use std::{ffi::CString, path::PathBuf, thread};
 use half::f16;
 use serde_json::Value;
 use vulkan::{
-    Context, DeviceReport, Kernel, KernelDesc,
+    Context, DeviceReport, Element, F16, Kernel, KernelDesc,
     executable::count_mnemonics,
     report::{component_type_name, scope_name},
     select::Features,
@@ -455,13 +455,31 @@ struct Run {
 
 /// Runs the GEMM `reps` times over `a` and `b`, and returns C and each dispatch's GPU time.
 fn run(ctx: &Context, gemm: &Gemm, a: &[f16], b: &[f16], reps: usize) -> Run {
-    let buffer = |len: usize| ctx.buffer(len as u64).unwrap_or_else(|e| panic!("{e}"));
-    let (mut ab, mut bb) = (buffer(2 * a.len()), buffer(2 * b.len()));
-    let mut cb = buffer(gemm.acc.bytes() * gemm.shape.m * gemm.shape.n);
-    ab.write(&a.iter().map(|v| v.to_bits()).collect::<Vec<u16>>())
-        .unwrap();
-    bb.write(&b.iter().map(|v| v.to_bits()).collect::<Vec<u16>>())
-        .unwrap();
+    match gemm.acc {
+        Acc::F16 => run_into(ctx, gemm, a, b, reps, |h: F16| f64::from(h.to_f32())),
+        Acc::F32 => run_into(ctx, gemm, a, b, reps, |v: f32| f64::from(v)),
+    }
+}
+
+/// [`run`] into C of elements of `C`, each read as `widen` reads it.
+fn run_into<C: Element>(
+    ctx: &Context,
+    gemm: &Gemm,
+    a: &[f16],
+    b: &[f16],
+    reps: usize,
+    widen: impl Fn(C) -> f64,
+) -> Run {
+    let halves = |values: &[f16]| {
+        let mut buffer = ctx.buffer(values.len()).unwrap_or_else(|e| panic!("{e}"));
+        let values: Vec<F16> = values.iter().map(|v| F16::from_bits(v.to_bits())).collect();
+        buffer.write(&values).unwrap();
+        buffer
+    };
+    let (mut ab, mut bb) = (halves(a), halves(b));
+    let mut cb = ctx
+        .buffer::<C>(gemm.shape.m * gemm.shape.n)
+        .unwrap_or_else(|e| panic!("{e}"));
     let nanoseconds = (0..reps)
         .map(|_| {
             ctx.dispatch(&gemm.kernel, &mut [&mut ab, &mut bb, &mut cb], gemm.grid)
@@ -469,20 +487,7 @@ fn run(ctx: &Context, gemm: &Gemm, a: &[f16], b: &[f16], reps: usize) -> Run {
                 .nanoseconds
         })
         .collect();
-    let c = match gemm.acc {
-        Acc::F16 => cb
-            .read::<u16>()
-            .unwrap()
-            .into_iter()
-            .map(|h| f16::from_bits(h).to_f64())
-            .collect(),
-        Acc::F32 => cb
-            .read::<f32>()
-            .unwrap()
-            .into_iter()
-            .map(f64::from)
-            .collect(),
-    };
+    let c = cb.read().unwrap().into_iter().map(widen).collect();
     Run { c, nanoseconds }
 }
 

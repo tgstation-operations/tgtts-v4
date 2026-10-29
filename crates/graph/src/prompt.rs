@@ -25,7 +25,7 @@ use std::{
     iter,
 };
 
-use vulkan::{Buffer, Context, F16, Residence, SpecValue};
+use vulkan::{Context, F16, Memory, Residence, SpecValue};
 
 use crate::{
     Error,
@@ -376,7 +376,7 @@ struct Prefix {
     patches: Vec<u32>,
     audio: Vec<bool>,
     /// Laid out as [`cache_regions`] lays out as many positions as it holds.
-    kept: Buffer,
+    kept: Memory,
 }
 
 impl Prefix {
@@ -631,7 +631,7 @@ impl Prompter {
             let patch = prompt.patches.len() / len;
             let prefix = Prefix::bytes_of(bytes, patch, held);
             if 4 * key.len() + kept.bytes() + prefix <= cache.budget {
-                let mut buffer = cache.ctx.buffer_in(bytes, Residence::Device)?;
+                let mut buffer = cache.ctx.memory_in(bytes, Residence::Device)?;
                 recorded.copy_out(&regions, &mut buffer)?;
                 let patches = &prompt.patches[..held * patch];
                 kept.prefix = Some(Prefix {

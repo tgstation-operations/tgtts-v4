@@ -17,11 +17,17 @@
 //! host can map where a discrete GPU has it (through a resizable BAR), in memory the host does
 //! not cache otherwise, [`Residence::Readback`] in host-cached memory where the device has that.
 
-use std::{ptr::NonNull, sync::Arc};
+use std::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+    sync::Arc,
+};
 
 use ash::vk;
 
 use crate::{
+    Element,
     context::Inner,
     error::{Error, Result, VkCall},
     report::{MemoryHeap, MemoryType},
@@ -137,42 +143,11 @@ pub fn choose_memory_type(
         })
 }
 
-/// Element types a buffer may be read and written as: plain values with no padding and
-/// no invalid bit patterns, so any bytes are a valid value.
-///
-/// # Safety
-///
-/// Implement only for types for which every bit pattern of their size is a valid value
-/// and which have no padding.
-pub unsafe trait Plain: Copy + 'static {}
-
-// SAFETY: primitive integers and floats have no padding and accept every bit pattern.
-unsafe impl Plain for u8 {}
-// SAFETY: as above.
-unsafe impl Plain for i8 {}
-// SAFETY: as above.
-unsafe impl Plain for u16 {}
-// SAFETY: as above.
-unsafe impl Plain for i16 {}
-// SAFETY: as above.
-unsafe impl Plain for u32 {}
-// SAFETY: as above.
-unsafe impl Plain for i32 {}
-// SAFETY: as above.
-unsafe impl Plain for u64 {}
-// SAFETY: as above.
-unsafe impl Plain for i64 {}
-// SAFETY: as above.
-unsafe impl Plain for f32 {}
-// SAFETY: as above.
-unsafe impl Plain for f64 {}
-// SAFETY: a transparent u16.
-unsafe impl Plain for crate::F16 {}
-
-/// A storage buffer in the memory its [`Residence`] chooses, mapped for as long as it lives when
-/// that is host memory. One buffer is one allocation; suballocation waits until a model's hundreds
-/// of tensors make the driver's allocation-count limit matter.
-pub struct Buffer {
+/// A storage buffer whose element type its type leaves out: what a recording holds beside buffers
+/// of other element types, and what an arena of tensors of several is. The host reaches it as a
+/// [`Buffer`] of what it holds. One is one allocation; suballocation waits until a model's
+/// hundreds of tensors make the driver's allocation-count limit matter.
+pub struct Memory {
     pub(crate) ctx: Arc<Inner>,
     pub(crate) raw: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -183,20 +158,69 @@ pub struct Buffer {
     residence: Residence,
 }
 
-// SAFETY: the mapped pointer is owned by this buffer alone, and access through it follows
+// SAFETY: the mapped pointer is owned by this memory alone, and access through it follows
 // Rust's borrow rules (`&self` reads, `&mut self` writes); the GPU writes only during a
-// dispatch, which holds the buffer mutably borrowed until the GPU has finished.
-unsafe impl Send for Buffer {}
+// dispatch, which holds the memory mutably borrowed until the GPU has finished.
+unsafe impl Send for Memory {}
 // SAFETY: as above.
-unsafe impl Sync for Buffer {}
+unsafe impl Sync for Memory {}
 
-impl std::fmt::Debug for Buffer {
+impl std::fmt::Debug for Memory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Buffer")
+        f.debug_struct("Memory")
             .field("size", &self.size)
             .field("residence", &self.residence)
             .field("memory_type", &self.memory_type)
             .finish_non_exhaustive()
+    }
+}
+
+/// A storage buffer of elements of `E`, in the memory its [`Residence`] chooses, mapped for as
+/// long as it lives when that is host memory: written and read an element at a time, at offsets
+/// and in counts of elements.
+///
+/// What it holds is in its type:
+///
+/// ```compile_fail,E0308
+/// # fn write(ctx: &vulkan::Context) -> vulkan::Result<()> {
+/// let mut halves = ctx.buffer::<vulkan::F16>(4)?;
+/// halves.write(&[1.0f32, 2.0, 3.0, 4.0])?;
+/// # Ok(())
+/// # }
+/// ```
+#[repr(transparent)]
+pub struct Buffer<E> {
+    memory: Memory,
+    element: PhantomData<E>,
+}
+
+impl<E> Deref for Buffer<E> {
+    type Target = Memory;
+
+    fn deref(&self) -> &Memory {
+        &self.memory
+    }
+}
+
+impl<E> DerefMut for Buffer<E> {
+    fn deref_mut(&mut self) -> &mut Memory {
+        &mut self.memory
+    }
+}
+
+impl<E> From<Buffer<E>> for Memory {
+    fn from(buffer: Buffer<E>) -> Memory {
+        buffer.memory
+    }
+}
+
+impl<E: Element> std::fmt::Debug for Buffer<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer")
+            .field("element", &E::TYPE)
+            .field("len", &self.len())
+            .field("memory", &self.memory)
+            .finish()
     }
 }
 
@@ -226,8 +250,8 @@ pub(crate) fn before_later_work() -> [vk::MemoryBarrier2<'static>; 1] {
         )]
 }
 
-impl Buffer {
-    /// A zero-filled storage buffer of `size` bytes (more than zero) in `residence`.
+impl Memory {
+    /// Zero-filled memory of `size` bytes (more than zero) in `residence`.
     pub(crate) fn new(ctx: &Arc<Inner>, size: u64, residence: Residence) -> Result<Self> {
         if size == 0 {
             return Err(Error::Unsupported("a buffer of zero bytes".to_string()));
@@ -246,7 +270,7 @@ impl Buffer {
         let raw = unsafe { device.create_buffer(&info, None) }.call("vkCreateBuffer")?;
         // Owned from here on, so a failure below releases what exists through `Drop`
         // (destroying or freeing a null handle is a no-op).
-        let mut buffer = Buffer {
+        let mut buffer = Memory {
             ctx: Arc::clone(ctx),
             raw,
             memory: vk::DeviceMemory::null(),
@@ -327,33 +351,17 @@ impl Buffer {
         self.residence
     }
 
-    /// Panics unless `len` bytes from `offset` lie inside the buffer.
-    fn check(&self, offset: u64, len: usize) {
-        assert!(
-            offset
-                .checked_add(len as u64)
-                .is_some_and(|end| end <= self.size),
-            "{len} bytes from {offset} do not fit in a buffer of {}",
-            self.size
-        );
-    }
-
-    /// Copies `values` to the start of the buffer. Panics if they do not fit.
-    pub fn write<T: Plain>(&mut self, values: &[T]) -> Result<()> {
-        self.write_at(0, values)
-    }
-
-    /// Copies `values` into the buffer from byte `offset`: in place when the buffer is mapped,
-    /// through a staging buffer when it is not. Panics if they do not fit.
-    pub fn write_at<T: Plain>(&mut self, offset: u64, values: &[T]) -> Result<()> {
-        let len = std::mem::size_of_val(values);
-        self.check(offset, len);
-        // SAFETY: `values` is `len` readable bytes of a `Plain` type, so every byte is
-        // initialized.
-        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), len) };
+    /// Copies `bytes` in from byte `offset`: in place when the memory is mapped, through a
+    /// staging buffer when it is not.
+    ///
+    /// # Safety
+    ///
+    /// The bytes from `offset` lie inside the memory.
+    unsafe fn write_bytes(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let len = bytes.len();
         if let Some(ptr) = self.ptr {
-            // SAFETY: the destination lies inside the mapping (checked above), and cannot
-            // overlap `values`, which is not mapped memory of this buffer while `&mut self` is
+            // SAFETY: the destination lies inside the mapping (the caller's promise), and cannot
+            // overlap `bytes`, which is not mapped memory of this buffer while `&mut self` is
             // held.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -367,14 +375,15 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
-        let mut staging = Buffer::new(
+        let mut staging = Memory::new(
             &self.ctx,
             (len as u64).min(STAGING_BYTES),
             Residence::Readback,
         )?;
         let mut done = 0;
         for chunk in bytes.chunks(STAGING_BYTES as usize) {
-            staging.write_at(0, chunk)?;
+            // SAFETY: the staging memory is at least as large as a chunk.
+            unsafe { staging.write_bytes(0, chunk)? };
             let region = [vk::BufferCopy::default()
                 .src_offset(0)
                 .dst_offset(offset + done)
@@ -404,26 +413,21 @@ impl Buffer {
         Ok(())
     }
 
-    /// The whole buffer as values of `T`, copied out; trailing bytes short of a whole `T` are
-    /// left out.
-    pub fn read<T: Plain>(&self) -> Result<Vec<T>> {
-        self.read_at(0, self.size as usize / size_of::<T>())
-    }
-
-    /// `count` values of `T` from byte `offset`, copied out: in place when the buffer is mapped,
-    /// through a staging buffer when it is not. Panics if they do not fit.
-    pub fn read_at<T: Plain>(&self, offset: u64, count: usize) -> Result<Vec<T>> {
-        let len = count * size_of::<T>();
-        self.check(offset, len);
-        let mut out = Vec::<T>::with_capacity(count);
-        let dst = out.as_mut_ptr().cast::<u8>();
+    /// Copies the `len` bytes from byte `offset` out to `dst`: in place when the memory is mapped,
+    /// through a staging buffer when it is not.
+    ///
+    /// # Safety
+    ///
+    /// The bytes from `offset` lie inside the memory, and `dst` is valid for writes of `len`
+    /// bytes.
+    unsafe fn read_bytes(&self, offset: u64, dst: *mut u8, len: usize) -> Result<()> {
         if let Some(ptr) = self.ptr {
-            // SAFETY: the source lies inside the mapping, `out` has room for `len` bytes, and
-            // the copy is bytewise, so the mapping's alignment does not matter; the GPU does
-            // not write while `&self` is held outside a dispatch.
+            // SAFETY: the source lies inside the mapping and `dst` has room for `len` bytes (the
+            // caller's promises), and the copy is bytewise, so the mapping's alignment does not
+            // matter; the GPU does not write while `&self` is held outside a dispatch.
             unsafe { std::ptr::copy_nonoverlapping(ptr.as_ptr().add(offset as usize), dst, len) };
         } else if len > 0 {
-            let staging = Buffer::new(
+            let staging = Memory::new(
                 &self.ctx,
                 (len as u64).min(STAGING_BYTES),
                 Residence::Readback,
@@ -447,7 +451,7 @@ impl Buffer {
                         .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                         .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-                    // SAFETY: as for `write_at`.
+                    // SAFETY: as for `write_bytes`.
                     unsafe {
                         device.cmd_pipeline_barrier2(
                             cmd,
@@ -460,20 +464,96 @@ impl Buffer {
                         );
                     }
                 })?;
-                // SAFETY: the copy has finished and its writes are visible to the host; `out`
+                // SAFETY: the copy has finished and its writes are visible to the host; `dst`
                 // has room for `len` bytes, of which `done` are written.
                 unsafe { std::ptr::copy_nonoverlapping(staged.as_ptr(), dst.add(done), n) };
                 done += n;
             }
         }
-        // SAFETY: `len` bytes, `count` whole values, were written, and any bytes are a valid
-        // `T` (`Plain`).
+        Ok(())
+    }
+}
+
+impl<E: Element> Buffer<E> {
+    /// `memory` as elements of `E`, as its user laid it out.
+    pub(crate) fn of(memory: Memory) -> Self {
+        Buffer {
+            memory,
+            element: PhantomData,
+        }
+    }
+
+    /// [`of`](Self::of), borrowed.
+    pub(crate) fn of_ref(memory: &Memory) -> &Self {
+        // SAFETY: a `Buffer` is a transparent `Memory`, and any bytes are elements of `E`.
+        unsafe { &*(memory as *const Memory).cast::<Self>() }
+    }
+
+    /// [`of`](Self::of), borrowed mutably.
+    pub(crate) fn of_mut(memory: &mut Memory) -> &mut Self {
+        // SAFETY: as for `of_ref`.
+        unsafe { &mut *(memory as *mut Memory).cast::<Self>() }
+    }
+
+    /// The elements it holds: all of its whole ones.
+    pub fn len(&self) -> usize {
+        (self.memory.size / E::TYPE.bytes()) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The byte at which `count` elements from `at` start. Panics if they do not fit.
+    fn range(&self, at: usize, count: usize) -> u64 {
+        assert!(
+            at.checked_add(count).is_some_and(|end| end <= self.len()),
+            "{count} elements from {at} do not fit in a buffer of {}",
+            self.len()
+        );
+        at as u64 * E::TYPE.bytes()
+    }
+
+    /// Copies `values` to the start of the buffer. Panics if they do not fit.
+    pub fn write(&mut self, values: &[E]) -> Result<()> {
+        self.write_at(0, values)
+    }
+
+    /// Copies `values` into the buffer from element `at`: in place when the buffer is mapped,
+    /// through a staging buffer when it is not. Panics if they do not fit.
+    pub fn write_at(&mut self, at: usize, values: &[E]) -> Result<()> {
+        let offset = self.range(at, values.len());
+        // SAFETY: `values` is readable elements, which have no padding (`Element`), so every byte
+        // is initialized.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values))
+        };
+        // SAFETY: the bytes lie inside (checked above).
+        unsafe { self.memory.write_bytes(offset, bytes) }
+    }
+
+    /// The whole buffer, copied out.
+    pub fn read(&self) -> Result<Vec<E>> {
+        self.read_at(0, self.len())
+    }
+
+    /// `count` elements from element `at`, copied out: in place when the buffer is mapped,
+    /// through a staging buffer when it is not. Panics if they do not fit.
+    pub fn read_at(&self, at: usize, count: usize) -> Result<Vec<E>> {
+        let offset = self.range(at, count);
+        let mut out = Vec::<E>::with_capacity(count);
+        let len = count * size_of::<E>();
+        // SAFETY: the bytes lie inside (checked above), and `out` has room for them.
+        unsafe {
+            self.memory
+                .read_bytes(offset, out.as_mut_ptr().cast::<u8>(), len)?
+        };
+        // SAFETY: `count` whole elements were written, and any bytes are elements (`Element`).
         unsafe { out.set_len(count) };
         Ok(out)
     }
 }
-
-impl Drop for Buffer {
+impl Drop for Memory {
     fn drop(&mut self) {
         // SAFETY: dispatches and copies wait for the GPU before returning, so the buffer is
         // idle; freeing the memory unmaps it.

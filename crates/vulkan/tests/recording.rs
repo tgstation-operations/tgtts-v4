@@ -81,7 +81,7 @@ fn chain(ctx: &Context, kernels: &[Arc<Kernel>], n: usize, timed: bool) -> vulka
     let bytes = 4 * n as u64;
     let after_first = bytes.next_multiple_of(ctx.report().min_storage_buffer_offset_alignment);
     let buffer = |size, residence| {
-        ctx.buffer_in(size, residence)
+        ctx.memory_in(size, residence)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let buffers = vec![
@@ -133,12 +133,14 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
     // The links one at a time, each a submission of its own.
     let x = inputs(n, 1);
     let buffer = |residence| {
-        ctx.buffer_in(4 * n as u64, residence)
+        ctx.buffer_in::<f32>(n, residence)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let mut values = buffer(Residence::Upload);
     values.write(&x).unwrap();
-    let mut sizes = buffer(Residence::Readback);
+    let mut sizes = ctx
+        .buffer_in::<u32>(n, Residence::Readback)
+        .unwrap_or_else(|e| panic!("{e}"));
     let groups = [groups_for(n as u64, WIDTH) as u32, 1, 1];
     for kernel in &kernels {
         let mut next = buffer(Residence::Readback);
@@ -146,7 +148,7 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
             .unwrap_or_else(|e| panic!("{e}"));
         values = next;
     }
-    let one_at_a_time = values.read::<f32>().unwrap();
+    let one_at_a_time = values.read().unwrap();
     assert_eq!(differences(&one_at_a_time, &on_the_cpu(&x)), 0);
 
     let mut recording = chain(&ctx, &kernels, n, false);
@@ -170,7 +172,7 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
                 started.wait().unwrap_or_else(|e| panic!("{e}"));
             }
         }
-        let got = recording.buffer(2).read::<f32>().unwrap();
+        let got = recording.buffer::<f32>(2).read().unwrap();
         if step == 0 {
             assert_eq!(differences(&got, &one_at_a_time), 0, "the first submission");
         }
@@ -178,8 +180,8 @@ fn a_recorded_chain_resubmitted_matches_its_dispatches_run_one_at_a_time() {
         assert_eq!(wrong, 0, "submission {step}: {wrong} of {n} differ");
         assert!(
             recording
-                .buffer(3)
-                .read::<u32>()
+                .buffer::<u32>(3)
+                .read()
                 .unwrap()
                 .iter()
                 .all(|&s| s == SUBGROUP)
@@ -205,7 +207,7 @@ fn programs_over_shared_buffers_run_alternately_each_as_its_own_dispatches_would
     let mut recording = chain(&ctx, &kernels, n, false);
     let out = recording
         .add_buffer(
-            ctx.buffer_in(bytes, Residence::Readback)
+            ctx.buffer_in::<f32>(n, Residence::Readback)
                 .unwrap_or_else(|e| panic!("{e}")),
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -243,7 +245,7 @@ fn programs_over_shared_buffers_run_alternately_each_as_its_own_dispatches_would
             recording.timings().unwrap().is_none(),
             "the chain is untimed"
         );
-        let chained = recording.buffer(2).read::<f32>().unwrap();
+        let chained = recording.buffer::<f32>(2).read().unwrap();
         assert_eq!(differences(&chained, &on_the_cpu(&x)), 0, "step {step}");
         // Twice on some steps: a program may follow itself as well as the other.
         for _ in 0..1 + step % 2 {
@@ -253,7 +255,7 @@ fn programs_over_shared_buffers_run_alternately_each_as_its_own_dispatches_would
         }
         let timings = recording.timings().unwrap().expect("a timed program");
         assert_eq!(timings.len(), 2);
-        let got = recording.buffer(out).read::<f32>().unwrap();
+        let got = recording.buffer::<f32>(out).read().unwrap();
         assert_eq!(differences(&got, &on(&chained)), 0, "step {step}");
     }
     assert!(matches!(
@@ -270,9 +272,9 @@ fn programs_over_shared_buffers_run_alternately_each_as_its_own_dispatches_would
     recording
         .submit_program(second)
         .unwrap_or_else(|e| panic!("{e}"));
-    let scratch: Vec<f32> = recording.buffer(1).read::<f32>().unwrap()[..n].to_vec();
+    let scratch: Vec<f32> = recording.buffer::<f32>(1).read().unwrap()[..n].to_vec();
     let link = |&v: &f32| LINKS[0].0 * v + LINKS[0].1;
-    let got = recording.buffer(out).read::<f32>().unwrap();
+    let got = recording.buffer::<f32>(out).read().unwrap();
     assert_eq!(
         differences(&got, &scratch.iter().map(link).collect::<Vec<_>>()),
         0
@@ -312,7 +314,7 @@ fn a_timed_recording_times_each_dispatch_inside_the_wall_clock() {
         );
     }
     assert_eq!(
-        differences(&recording.buffer(2).read::<f32>().unwrap(), &on_the_cpu(&x)),
+        differences(&recording.buffer::<f32>(2).read().unwrap(), &on_the_cpu(&x)),
         0
     );
     let mut untimed = chain(&ctx, &kernels, n, false);
@@ -383,9 +385,9 @@ fn ranges_copied_out_of_a_recording_and_back_come_back_as_they_were() {
     let x = inputs(n, 1);
     recording.buffer_mut(0).write(&x).unwrap();
     recording.submit().unwrap_or_else(|e| panic!("{e}"));
-    let out = recording.buffer(2).read::<f32>().unwrap();
+    let out = recording.buffer::<f32>(2).read().unwrap();
     let mut kept = ctx
-        .buffer_in(2 * bytes, Residence::Device)
+        .memory_in(2 * bytes, Residence::Device)
         .unwrap_or_else(|e| panic!("{e}"));
     // The input whole and the output but its first two values, both mapped, into the GPU's own
     // memory.
@@ -411,13 +413,13 @@ fn ranges_copied_out_of_a_recording_and_back_come_back_as_they_were() {
     recording.buffer_mut(0).write(&y).unwrap();
     recording.submit().unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
-        differences(&recording.buffer(2).read::<f32>().unwrap(), &on_the_cpu(&y)),
+        differences(&recording.buffer::<f32>(2).read().unwrap(), &on_the_cpu(&y)),
         0
     );
     recording
         .copy_in(&kept, &regions[1..])
         .unwrap_or_else(|e| panic!("{e}"));
-    let back = recording.buffer(2).read::<f32>().unwrap();
+    let back = recording.buffer::<f32>(2).read().unwrap();
     assert_eq!(differences(&back[2..], &out[2..]), 0);
     assert_eq!(differences(&back[..2], &on_the_cpu(&y)[..2]), 0);
     // The program after a copy reads what it copied.
@@ -426,7 +428,7 @@ fn ranges_copied_out_of_a_recording_and_back_come_back_as_they_were() {
         .unwrap_or_else(|e| panic!("{e}"));
     recording.submit().unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
-        differences(&recording.buffer(2).read::<f32>().unwrap(), &out),
+        differences(&recording.buffer::<f32>(2).read().unwrap(), &out),
         0
     );
 
@@ -463,7 +465,10 @@ fn a_binding_outside_its_buffer_is_refused_before_the_driver_sees_it() {
     let kernel = axpb(&ctx, 1.0, 0.0);
     let buffers = || {
         (0..3)
-            .map(|_| ctx.buffer(256).unwrap_or_else(|e| panic!("{e}")))
+            .map(|_| {
+                ctx.memory_in(256, Residence::Upload)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
             .collect::<Vec<_>>()
     };
     let dispatch = |bindings| Dispatch {

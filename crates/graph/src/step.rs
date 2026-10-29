@@ -10,7 +10,7 @@ use std::{
 };
 
 use vulkan::{
-    Binding, Buffer, Context, Dispatch, Recording, Residence, Submission, Timing, memory::Plain,
+    Binding, Context, Dispatch, Element, Memory, Recording, Residence, Submission, Timing,
 };
 
 use crate::{
@@ -108,13 +108,13 @@ impl Step {
     ) -> Result<Self, Error> {
         let layout = Layout::of(graph);
         let mut buffers =
-            vec![ctx.buffer_in(layout.plan.arena_bytes.max(ALIGN), Residence::Device)?];
+            vec![ctx.memory_in(layout.plan.arena_bytes.max(ALIGN), Residence::Device)?];
         let mut places = Vec::with_capacity(graph.tensors.len());
         for (tensor, offset) in graph.tensors.iter().zip(&layout.plan.offsets) {
             places.push(match offset {
                 &Some(offset) => Place { buffer: 0, offset },
                 None => {
-                    buffers.push(ctx.buffer_in(tensor.bytes, tensor.kind.residence())?);
+                    buffers.push(ctx.memory_in(tensor.bytes, tensor.kind.residence())?);
                     Place {
                         buffer: buffers.len() - 1,
                         offset: 0,
@@ -209,7 +209,7 @@ impl Step {
             0 => None,
             bytes => Some(
                 self.recording
-                    .add_buffer(ctx.buffer_in(bytes, Residence::Device)?)?,
+                    .add_buffer(ctx.memory_in(bytes, Residence::Device)?)?,
             ),
         };
         for (t, &(bytes, kind)) in tensors.iter().enumerate().skip(held) {
@@ -218,7 +218,7 @@ impl Step {
                 _ => Place {
                     buffer: self
                         .recording
-                        .add_buffer(ctx.buffer_in(bytes, kind.residence())?)?,
+                        .add_buffer(ctx.memory_in(bytes, kind.residence())?)?,
                     offset: 0,
                 },
             };
@@ -245,13 +245,20 @@ impl Step {
         (buffer, offset)
     }
 
+    /// The buffer tensor `t` of elements of `E` lives in, and the element of it it starts at: an
+    /// arena's offsets are multiples of [`ALIGN`], and so of any element's size.
+    fn element_place<E: Element>(&self, t: TensorId) -> (usize, usize) {
+        let (buffer, offset) = self.place(t);
+        (buffer, (offset / E::TYPE.bytes()) as usize)
+    }
+
     /// Writes `values` into tensor `t`, which they must fill exactly: in place if the host maps
     /// it, through a staging copy if it lives in the GPU's own memory.
     ///
     /// # Panics
     ///
     /// If they do not fill it.
-    pub fn write<T: Plain>(&mut self, t: TensorId, values: &[T]) -> Result<(), Error> {
+    pub fn write<E: Element>(&mut self, t: TensorId, values: &[E]) -> Result<(), Error> {
         let len = self.tensors[t.0].0;
         assert_eq!(
             size_of_val(values) as u64,
@@ -259,25 +266,25 @@ impl Step {
             "tensor {} is {len} bytes",
             t.0
         );
-        let (buffer, offset) = self.place(t);
-        Ok(self.recording.buffer_mut(buffer).write_at(offset, values)?)
+        let (buffer, at) = self.element_place::<E>(t);
+        Ok(self.recording.buffer_mut(buffer).write_at(at, values)?)
     }
 
     /// Tensor `t`'s contents.
-    pub fn read<T: Plain>(&self, t: TensorId) -> Result<Vec<T>, Error> {
-        let (buffer, offset) = self.place(t);
-        let count = self.tensors[t.0].0 as usize / size_of::<T>();
-        Ok(self.recording.buffer(buffer).read_at(offset, count)?)
+    pub fn read<E: Element>(&self, t: TensorId) -> Result<Vec<E>, Error> {
+        let (buffer, at) = self.element_place::<E>(t);
+        let count = (self.tensors[t.0].0 / E::TYPE.bytes()) as usize;
+        Ok(self.recording.buffer::<E>(buffer).read_at(at, count)?)
     }
 
     /// Copies `regions` of tensors into `to`, on the GPU after the last run.
-    pub fn copy_out(&mut self, regions: &[Region], to: &mut Buffer) -> Result<(), Error> {
+    pub fn copy_out(&mut self, regions: &[Region], to: &mut Memory) -> Result<(), Error> {
         let regions = self.regions(regions)?;
         Ok(self.recording.copy_out(&regions, to)?)
     }
 
     /// Copies `regions` of `from` into tensors, on the GPU after the last run.
-    pub fn copy_in(&mut self, from: &Buffer, regions: &[Region]) -> Result<(), Error> {
+    pub fn copy_in(&mut self, from: &Memory, regions: &[Region]) -> Result<(), Error> {
         let regions = self.regions(regions)?;
         Ok(self.recording.copy_in(from, &regions)?)
     }

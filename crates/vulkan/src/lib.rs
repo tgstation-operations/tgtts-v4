@@ -9,10 +9,11 @@
 //!   arithmetic and storage, the Vulkan memory model, and a compute queue with timestamps; and
 //!   `robustBufferAccess2` where the device has it.
 //! - [`DeviceReport`] is what the device says about itself; the `properties` example prints it.
-//! - [`Context::buffer_in`] makes a storage buffer where its [`Residence`] says: in memory for
-//!   the GPU alone, which the host fills and reads through staging copies, or mapped for the host
-//!   to write or read in place ([`memory`] says which memory and why); [`Context::buffer`] is
-//!   the mapped kind the host writes.
+//! - [`Context::buffer_in`] makes a storage [`Buffer`] of [`F16`], `f32` or `u32` elements
+//!   ([`element`]) where its [`Residence`] says: in memory for the GPU alone, which the host fills
+//!   and reads through staging copies, or mapped for the host to write or read in place
+//!   ([`memory`] says which memory and why); [`Context::buffer`] is the mapped kind the host
+//!   writes. [`Context::memory_in`] makes one of no element type, an arena of several.
 //! - [`Context::kernel`] builds a compute pipeline from a SPIR-V blob with an explicit subgroup
 //!   size and specialization constants ([`kernel`]), refusing one whose workgroup memory would
 //!   pass the device's limit ([`spirv::workgroup_memory`]).
@@ -54,6 +55,6 @@ pub use error::{Error, Result};
 pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};
 pub use kernel::{Kernel, KernelDesc, SpecValue};
-pub use memory::{Buffer, Residence};
+pub use memory::{Buffer, Memory, Residence};
 pub use recording::{Binding, Dispatch, Recording, Region, Submission};
 pub use report::DeviceReport;

@@ -10,10 +10,11 @@ use ash::vk;
 use tracing::info;
 
 use crate::{
+    element::Element,
     error::{Error, Result, VkCall},
     instance::Instance,
     kernel::{Kernel, KernelDesc},
-    memory::{Buffer, Residence},
+    memory::{Buffer, Memory, Residence},
     recording::{Dispatch, Recording},
     report::DeviceReport,
     select::{self, Candidate, Features, REQUIRED_EXTENSIONS},
@@ -476,15 +477,23 @@ impl Context {
         self.inner.instance.validation_messages()
     }
 
-    /// A zero-filled storage buffer of `size` bytes, mapped for the host to write in place
-    /// ([`Residence::Upload`]).
-    pub fn buffer(&self, size: u64) -> Result<Buffer> {
-        Buffer::new(&self.inner, size, Residence::Upload)
+    /// A zero-filled storage buffer of `len` elements of `E`, mapped for the host to write in
+    /// place ([`Residence::Upload`]).
+    pub fn buffer<E: Element>(&self, len: usize) -> Result<Buffer<E>> {
+        self.buffer_in(len, Residence::Upload)
     }
 
-    /// A zero-filled storage buffer of `size` bytes in `residence`.
-    pub fn buffer_in(&self, size: u64, residence: Residence) -> Result<Buffer> {
-        Buffer::new(&self.inner, size, residence)
+    /// A zero-filled storage buffer of `len` elements of `E` in `residence`.
+    pub fn buffer_in<E: Element>(&self, len: usize, residence: Residence) -> Result<Buffer<E>> {
+        let size = (len as u64)
+            .checked_mul(E::TYPE.bytes())
+            .ok_or_else(|| Error::Unsupported(format!("a buffer of {len} {}", E::TYPE)))?;
+        Ok(Buffer::of(self.memory_in(size, residence)?))
+    }
+
+    /// A zero-filled storage buffer of `size` bytes in `residence`, of no one element type.
+    pub fn memory_in(&self, size: u64, residence: Residence) -> Result<Memory> {
+        Memory::new(&self.inner, size, residence)
     }
 
     /// A compute pipeline from a SPIR-V module.
@@ -497,7 +506,7 @@ impl Context {
     /// program, to which more over the same buffers may be added.
     pub fn record(
         &self,
-        buffers: Vec<Buffer>,
+        buffers: Vec<Memory>,
         dispatches: &[Dispatch],
         timed: bool,
     ) -> Result<Recording> {
@@ -511,7 +520,7 @@ impl Context {
     pub fn dispatch(
         &self,
         kernel: &Kernel,
-        buffers: &mut [&mut Buffer],
+        buffers: &mut [&mut Memory],
         groups: [u32; 3],
     ) -> Result<Timing> {
         if buffers.len() != kernel.storage_buffers as usize {
@@ -549,7 +558,7 @@ impl Context {
         &self,
         pool: vk::DescriptorPool,
         kernel: &Kernel,
-        buffers: &[&mut Buffer],
+        buffers: &[&mut Memory],
         groups: [u32; 3],
     ) -> Result<Timing> {
         let device = &self.inner.device;

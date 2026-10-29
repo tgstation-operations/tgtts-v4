@@ -23,9 +23,10 @@ use tracing::error;
 
 use crate::{
     context::{FENCE_TIMEOUT_NS, Inner, Timing, check_groups, elapsed_ticks, ticks_to_ns},
+    element::Element,
     error::{Error, Result, VkCall},
     kernel::Kernel,
-    memory::{Buffer, after_earlier_work, before_later_work},
+    memory::{Buffer, Memory, after_earlier_work, before_later_work},
 };
 
 /// A range of one of a recording's buffers, bound to one binding of a kernel.
@@ -119,7 +120,7 @@ pub fn binding_range(
 /// added as they come.
 pub struct Recording {
     ctx: Arc<Inner>,
-    buffers: Vec<Buffer>,
+    buffers: Vec<Memory>,
     pool: vk::CommandPool,
     fence: vk::Fence,
     programs: Vec<Program>,
@@ -166,7 +167,7 @@ impl std::fmt::Debug for Recording {
 impl Recording {
     pub(crate) fn new(
         ctx: &Arc<Inner>,
-        buffers: Vec<Buffer>,
+        buffers: Vec<Memory>,
         dispatches: &[Dispatch],
         timed: bool,
     ) -> Result<Self> {
@@ -199,7 +200,8 @@ impl Recording {
     }
 
     /// Takes `buffer` among those programs bind, and returns its index.
-    pub fn add_buffer(&mut self, buffer: Buffer) -> Result<usize> {
+    pub fn add_buffer(&mut self, buffer: impl Into<Memory>) -> Result<usize> {
+        let buffer = buffer.into();
         if !Arc::ptr_eq(&buffer.ctx, &self.ctx) {
             return Err(Error::Unsupported("a buffer of another context".into()));
         }
@@ -497,42 +499,44 @@ impl Recording {
         self.programs[program].kernels.len()
     }
 
-    /// Buffer `i`, read in place between submissions.
-    pub fn buffer(&self, i: usize) -> &Buffer {
-        &self.buffers[i]
+    /// Buffer `i` as elements of `E`, read in place between submissions. The recording knows no
+    /// element types: its user says what it laid out there.
+    pub fn buffer<E: Element>(&self, i: usize) -> &Buffer<E> {
+        Buffer::of_ref(&self.buffers[i])
     }
 
-    /// Buffer `i`, written in place between submissions.
-    pub fn buffer_mut(&mut self, i: usize) -> &mut Buffer {
-        &mut self.buffers[i]
+    /// Buffer `i` as elements of `E`, written in place between submissions, as
+    /// [`buffer`](Self::buffer) reads it.
+    pub fn buffer_mut<E: Element>(&mut self, i: usize) -> &mut Buffer<E> {
+        Buffer::of_mut(&mut self.buffers[i])
     }
 
     /// The buffers, to be recorded again; the commands are freed.
-    pub fn into_buffers(mut self) -> Result<Vec<Buffer>> {
+    pub fn into_buffers(mut self) -> Result<Vec<Memory>> {
         self.finish()?;
         Ok(std::mem::take(&mut self.buffers))
     }
 
     /// Copies each of `regions` of the buffers into `to`, in a submission of its own after the
     /// last, and waits for it.
-    pub fn copy_out(&mut self, regions: &[Region], to: &mut Buffer) -> Result<()> {
+    pub fn copy_out(&mut self, regions: &[Region], to: &mut Memory) -> Result<()> {
         self.copy(regions, to, true)
     }
 
     /// Copies each of `regions` of `from` into the buffers, as [`copy_out`](Self::copy_out)
     /// copies them out.
-    pub fn copy_in(&mut self, from: &Buffer, regions: &[Region]) -> Result<()> {
+    pub fn copy_in(&mut self, from: &Memory, regions: &[Region]) -> Result<()> {
         self.copy(regions, from, false)
     }
 
-    fn copy(&mut self, regions: &[Region], other: &Buffer, out: bool) -> Result<()> {
+    fn copy(&mut self, regions: &[Region], other: &Memory, out: bool) -> Result<()> {
         if !Arc::ptr_eq(&other.ctx, &self.ctx) {
             return Err(Error::Unsupported("a buffer of another context".into()));
         }
         for r in regions {
             let inside =
                 |offset: u64, size: u64| offset.checked_add(r.bytes).is_some_and(|end| end <= size);
-            let held = self.buffers.get(r.buffer).map(Buffer::size);
+            let held = self.buffers.get(r.buffer).map(Memory::size);
             if r.bytes == 0
                 || !held.is_some_and(|size| inside(r.offset, size))
                 || !inside(r.other, other.size())

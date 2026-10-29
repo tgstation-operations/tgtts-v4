@@ -21,7 +21,7 @@
 use std::iter;
 
 use serde::Deserialize;
-use vulkan::{Buffer, Context, Residence, SpecValue, Timing};
+use vulkan::{Context, Memory, Residence, SpecValue, Timing};
 
 use crate::{
     Error,
@@ -592,7 +592,7 @@ pub struct VaeDecoder {
     /// A multiple of every ring's length.
     period: u32,
     /// Zeros, as many as a stream's largest ring holds.
-    zeros: Buffer,
+    zeros: Memory,
 }
 
 impl VaeDecoder {
@@ -612,7 +612,7 @@ impl VaeDecoder {
             .fold(1, |period, &(_, reach)| lcm(period, reach as u32));
         let ring = |&(t, _): &(TensorId, usize)| tensors.graph.tensors[t.0].bytes;
         let largest = tensors.rings.iter().map(ring).max().unwrap_or(0);
-        let zeros = ctx.buffer_in(largest / shape.streams as u64, Residence::Device)?;
+        let zeros = ctx.memory_in(largest / shape.streams as u64, Residence::Device)?;
         Ok(VaeDecoder {
             step,
             frames_before: vec![0; shape.streams],

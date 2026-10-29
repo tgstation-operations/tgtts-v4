@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use ash::vk;
 use vulkan::{
-    Context, Error, KernelDesc, Residence, SpecValue, groups_for,
+    Context, Error, F16, KernelDesc, Residence, SpecValue, groups_for,
     memory::{STAGING_BYTES, choose_memory_type},
 };
 
@@ -98,13 +98,13 @@ fn run_axpb(
     };
     let kernel = ctx.kernel(AXPB, &desc).unwrap_or_else(|e| panic!("{e}"));
     let n = x.len() as u64;
-    let buffer = |bytes, residence| {
-        ctx.buffer_in(bytes, residence)
-            .unwrap_or_else(|e| panic!("{e}"))
-    };
-    let mut xs = buffer(4 * n, Residence::Upload);
-    let mut ys = buffer(4 * (n + 1), Residence::Readback);
-    let mut ss = buffer(4 * (n + 1), Residence::Readback);
+    let mut xs = ctx.buffer_in::<f32>(x.len(), Residence::Upload).unwrap();
+    let mut ys = ctx
+        .buffer_in::<f32>(x.len() + 1, Residence::Readback)
+        .unwrap();
+    let mut ss = ctx
+        .buffer_in::<u32>(x.len() + 1, Residence::Readback)
+        .unwrap();
     xs.write(x).unwrap();
     let mut sentinel = vec![0f32; x.len()];
     sentinel.push(-12_345.0);
@@ -114,8 +114,8 @@ fn run_axpb(
     let timing = ctx
         .dispatch(&kernel, &mut [&mut xs, &mut ys, &mut ss], [groups, 1, 1])
         .unwrap_or_else(|e| panic!("{e}"));
-    let mut y = ys.read::<f32>().unwrap();
-    let mut s = ss.read::<u32>().unwrap();
+    let mut y = ys.read().unwrap();
+    let mut s = ss.read().unwrap();
     assert_eq!(
         y.pop(),
         Some(-12_345.0),
@@ -178,7 +178,7 @@ fn the_device_offers_what_the_runtime_relies_on() {
     // GPU device-local memory unless it is integrated.
     let integrated = r.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
     for residence in [Residence::Device, Residence::Upload, Residence::Readback] {
-        let buffer = ctx.buffer_in(1 << 20, residence).unwrap();
+        let buffer = ctx.memory_in(1 << 20, residence).unwrap();
         let flags = r.types[buffer.memory_type() as usize].flags;
         let preferred = choose_memory_type(
             &r.types,
@@ -249,15 +249,14 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
     // A quarter of a staging buffer more than one, and not a whole word of it, so that each
     // transfer below takes a whole chunk and a part of one.
     let n = (STAGING_BYTES as usize * 5 / 4 + 12) / 4;
-    let device = |bytes| {
-        ctx.buffer_in(bytes, Residence::Device)
+    let device = || {
+        ctx.buffer_in::<f32>(n, Residence::Device)
             .unwrap_or_else(|e| panic!("{e}"))
     };
-    let (mut xs, mut ys, mut ss) = (
-        device(4 * n as u64),
-        device(4 * n as u64),
-        device(4 * n as u64),
-    );
+    let (mut xs, mut ys) = (device(), device());
+    let mut ss = ctx
+        .buffer_in::<u32>(n, Residence::Device)
+        .unwrap_or_else(|e| panic!("{e}"));
     // Where a discrete GPU has device-local memory the host cannot map, these buffers are in it;
     // an integrated GPU's stay out of its carve-out where they can, as on the Radeon 8060S.
     // Either way they are not mapped, and staging is the host's only way in.
@@ -266,7 +265,7 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
     let has_hidden = r.types.iter().any(|t| {
         t.flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) && !t.flags.intersects(hidden)
     });
-    for b in [&xs, &ys, &ss] {
+    for b in [&*xs, &*ys, &*ss] {
         let flags = r.types[b.memory_type() as usize].flags;
         assert!(
             integrated || flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL),
@@ -278,7 +277,7 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
         );
     }
     assert!(
-        ys.read::<u32>().unwrap().iter().all(|&v| v == 0),
+        ys.read().unwrap().iter().all(|&v| v.to_bits() == 0),
         "a device buffer starts zero-filled"
     );
 
@@ -286,7 +285,7 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
     xs.write(&x).unwrap();
     let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
     assert!(
-        bits(&xs.read::<f32>().unwrap()) == bits(&x),
+        bits(&xs.read().unwrap()) == bits(&x),
         "x does not come back as written"
     );
     let (a, b) = (1.7f32, -0.3f32);
@@ -305,22 +304,27 @@ fn device_memory_is_zeroed_filled_and_read_through_staging_copies() {
     ctx.dispatch(&kernel, &mut [&mut xs, &mut ys, &mut ss], [groups, 1, 1])
         .unwrap_or_else(|e| panic!("{e}"));
     let want: Vec<f32> = x.iter().map(|&v| a * v + b).collect();
-    let got = ys.read::<f32>().unwrap();
+    let got = ys.read().unwrap();
     let wrong = (0..n)
         .filter(|&i| got[i].to_bits() != want[i].to_bits())
         .count();
     assert_eq!(wrong, 0, "{wrong} of {n} elements differ from the CPU");
 
-    // A write and a read across the boundary between two chunks, neither at a whole word.
-    let at = STAGING_BYTES - 5;
-    let bytes: Vec<u8> = (1..=11).collect();
-    let around = |b: &vulkan::Buffer| b.read_at::<u8>(at - 1, 13).unwrap();
-    let before = around(&ys);
-    ys.write_at(at, &bytes).unwrap();
-    let after = around(&ys);
+    // A write and a read across the boundary between two chunks, neither at a whole word: of
+    // halves, at the finest offset an element has.
+    let mut hs = ctx
+        .buffer_in::<F16>(2 * n, Residence::Device)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let at = STAGING_BYTES as usize / 2 - 3;
+    let halves: Vec<F16> = (1..=5).map(|h| F16::from_f32(h as f32)).collect();
+    let around = |b: &vulkan::Buffer<F16>| b.read_at(at - 1, 7).unwrap();
+    hs.write_at(at - 1, &[F16::from_f32(-1.0); 7]).unwrap();
+    let before = around(&hs);
+    hs.write_at(at, &halves).unwrap();
+    let after = around(&hs);
     assert_eq!(after[0], before[0]);
-    assert_eq!(after[1..12], bytes[..]);
-    assert_eq!(after[12], before[12]);
+    assert_eq!(after[1..6], halves[..]);
+    assert_eq!(after[6], before[6]);
     eprintln!(
         "{} MiB through staging each way, in chunks of {} MiB; device memory type {}",
         (4 * n) >> 20,
@@ -371,7 +375,7 @@ fn an_integrated_gpus_buffers_ask_for_none_of_its_carve_out() {
     };
     let size = 64 << 20;
     let _buffers = [Residence::Device, Residence::Upload, Residence::Readback].map(|residence| {
-        ctx.buffer_in(size, residence)
+        ctx.memory_in(size, residence)
             .unwrap_or_else(|e| panic!("{e}"))
     });
     let after = amdgpu_requested_vram_kib().unwrap();
