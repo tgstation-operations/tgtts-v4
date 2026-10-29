@@ -3,7 +3,7 @@
 use crate::{
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
-    quantity::Millis,
+    quantity::{Millis, QuarterTones},
     segment::Segment,
 };
 
@@ -14,11 +14,16 @@ pub const TAIL: Millis = Millis::new(250);
 /// `pitch` quarter tones, as the old frontend finished the model's speech. The shift can take
 /// the peaks of speech leveled to -0.1 dBFS past full scale, which the old frontend's 16 bits
 /// clipped: such a shift is brought down to full scale first, which the loudness after makes up.
-pub fn finish(speech: &Segment, pitch: i32) -> Segment {
+pub fn finish(speech: &Segment, pitch: QuarterTones) -> Segment {
     let mut samples = speech.samples.clone();
     samples.extend(Segment::silent(TAIL, speech.rate).samples);
-    if pitch != 0 {
-        let mut shifted = pitch_shift(&from_pcm(&samples), speech.rate, f64::from(pitch), 24);
+    if pitch != QuarterTones::ZERO {
+        let mut shifted = pitch_shift(
+            &from_pcm(&samples),
+            speech.rate,
+            f64::from(pitch.value()),
+            24,
+        );
         let peak = shifted.iter().fold(0f32, |m, s| m.max(s.abs()));
         if peak > 1.0 {
             shifted.iter_mut().for_each(|s| *s /= peak);

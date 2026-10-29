@@ -18,7 +18,7 @@ use std::{
 };
 
 use common::{Message, Reply, Server, VOICE, call};
-use dsp::quantity::{self, SampleRate, TruePeak};
+use dsp::quantity::{self, QuarterTones, SampleRate, TruePeak};
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
@@ -805,7 +805,7 @@ fn brings_speech_and_blips_to_the_loudness() {
     let cached = std::fs::read(entry.join("0.wav")).unwrap();
     assert_eq!(cached, wav::write_pcm16(dsp::RATE, 1, &take.samples));
     // What is played is the take finished, then brought to the loudness.
-    let finished = dsp::speech::finish(&take, 2);
+    let finished = dsp::speech::finish(&take, QuarterTones::new(2));
     let most = levels().most_gain(VOICE, target);
     let expected = dsp::loudness::normalize(&finished, target, ceiling, most).segment;
     let expected = wav::Audio::from_segment(&expected);
@@ -1094,7 +1094,7 @@ fn records_metrics_without_the_text() {
     let (target, ceiling) = (quantity::Loudness::new(-4.5), TruePeak::new(-1.0));
     let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
     let take = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
-    let finished = dsp::speech::finish(&take, 0);
+    let finished = dsp::speech::finish(&take, QuarterTones::ZERO);
     let most = levels().most_gain(VOICE, target);
     let speech_leveling = dsp::loudness::normalize(&finished, target, ceiling, most);
     assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);

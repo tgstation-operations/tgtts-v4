@@ -16,7 +16,7 @@ use crate::{
     RATE, Random,
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
-    quantity::{Gain, Millis, Ratio, SampleRate},
+    quantity::{Gain, Millis, QuarterTones, Ratio, SampleRate},
     segment::{self, Segment},
     sentences,
 };
@@ -49,7 +49,7 @@ pub fn message(
     blips: &Blips,
     base: &str,
     number: &str,
-    pitch: i32,
+    pitch: QuarterTones,
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
     let rate = SampleRate::new(blips.sample_rate());
@@ -83,7 +83,7 @@ pub fn sentence(
     blips: &Blips,
     base: &str,
     number: &str,
-    pitch: i32,
+    pitch: QuarterTones,
     random: &mut impl Random,
 ) -> Result<Segment, Error> {
     let rate = SampleRate::new(blips.sample_rate());
@@ -108,8 +108,8 @@ pub fn sentence(
             let (base_pitch, random_pitch) = if upper { (1.6, 0.15) } else { (0.0, 0.0) };
             let mut blip = sample(letter.to_lowercase().collect())?;
             blip = detune(blip, rate, base_pitch, 0.2 + random_pitch, random);
-            if pitch != 0 {
-                blip = pitch_shift(&blip, rate, f64::from(pitch), 24);
+            if pitch != QuarterTones::ZERO {
+                blip = pitch_shift(&blip, rate, f64::from(pitch.value()), 24);
             }
             let blip = change_volume(
                 &Segment::new(rate, to_pcm(&blip)),

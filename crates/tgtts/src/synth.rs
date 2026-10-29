@@ -3,7 +3,12 @@
 
 use std::{error, time::Duration};
 
-use dsp::{RATE, loudness::FLOOR, quantity::Gain, segment::Segment};
+use dsp::{
+    RATE,
+    loudness::FLOOR,
+    quantity::{Gain, QuarterTones},
+    segment::Segment,
+};
 use voices::Latent;
 
 /// An error from a synthesizer, which the service reports and fails the request on.
@@ -96,7 +101,7 @@ pub fn to_segment(samples: &[f32]) -> Segment {
 /// Speech quieter than [`FLOOR`] with the silence after it is kept as it is, which the service
 /// serves as the silence it nearly is: leveled, its loudest click would be at full scale.
 pub fn level(speech: &Segment) -> Segment {
-    let finished = dsp::speech::finish(speech, 0);
+    let finished = dsp::speech::finish(speech, QuarterTones::ZERO);
     let samples: Vec<f64> = (finished.samples.iter())
         .map(|&s| f64::from(s) / 32768.0)
         .collect();

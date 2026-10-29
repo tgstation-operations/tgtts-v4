@@ -26,7 +26,7 @@ use axum::{
 };
 use dsp::{
     loudness::Normalized,
-    quantity::{self, Gain, SampleRate, TruePeak},
+    quantity::{self, Gain, QuarterTones, SampleRate, TruePeak},
     radio,
     resample::resample,
     segment::Segment,
@@ -83,7 +83,7 @@ const RATE: f64 = dsp::RATE.value() as f64;
 
 /// The most quarter tones speech is shifted by either way. The old frontend took any integer,
 /// though a few octaves up would only have run it out of memory; the game asks for 24 at most.
-const MAX_PITCH: i32 = 48;
+const MAX_PITCH: QuarterTones = QuarterTones::new(48);
 
 /// The audio routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -590,7 +590,7 @@ impl Service {
         self: &Arc<Self>,
         voice: &str,
         text: &str,
-        pitch: i32,
+        pitch: QuarterTones,
         trace: &mut Trace,
     ) -> Result<Segment, Failure> {
         let spoken = match synth::prepare(text) {
@@ -607,7 +607,7 @@ impl Service {
         &self,
         voice: &str,
         spoken: Segment,
-        pitch: i32,
+        pitch: QuarterTones,
         trace: &mut Trace,
     ) -> Result<Segment, Failure> {
         let loudness = self.loudness;
@@ -731,7 +731,7 @@ impl Service {
         self: &Arc<Self>,
         params: &Params,
         text: &str,
-        pitch: i32,
+        pitch: QuarterTones,
         trace: &mut Trace,
     ) -> Result<Segment, Failure> {
         let or =
@@ -963,12 +963,12 @@ async fn blocking<T: Send + 'static>(
 }
 
 /// The request's pitch in quarter tones, 0 where it is not given.
-fn pitch(pitch: &str) -> Result<i32, Failure> {
+fn pitch(pitch: &str) -> Result<QuarterTones, Failure> {
     if pitch.is_empty() {
-        return Ok(0);
+        return Ok(QuarterTones::ZERO);
     }
     match pitch.parse::<i32>() {
-        Ok(pitch) if pitch.abs() <= MAX_PITCH => Ok(pitch),
+        Ok(pitch) if pitch.abs() <= MAX_PITCH.value() => Ok(QuarterTones::new(pitch)),
         _ => Err(Failure::new(
             StatusCode::BAD_REQUEST,
             format!("pitch {pitch:?}"),

@@ -8,7 +8,7 @@ use std::fs;
 use common::real;
 use dsp::{
     loudness::{CEILING, FLOOR, integrated, normalize},
-    quantity::{Gain, Loudness},
+    quantity::{Gain, Loudness, QuarterTones},
     segment::Segment,
 };
 use tgtts::{levels::Levels, synth, wav};
@@ -48,7 +48,7 @@ fn holds_the_gain_of_a_line_to_its_voices_level_and_the_margin() {
     let levels = Levels::read(&real::dir("VOICE_LEVELS_FILE")).unwrap();
     let mut held = 0;
     for (voice, said) in kept() {
-        let finished = dsp::speech::finish(&synth::level(&said), 0);
+        let finished = dsp::speech::finish(&synth::level(&said), QuarterTones::ZERO);
         let most = levels.most_gain(&voice, TARGET);
         let free = normalize(&finished, TARGET, CEILING, Gain::new(f64::INFINITY));
         let capped = normalize(&finished, TARGET, CEILING, most);
@@ -71,7 +71,7 @@ fn serves_a_line_said_under_the_floor_as_it_was_said() {
     let levels = Levels::read(&real::dir("VOICE_LEVELS_FILE")).unwrap();
     for (voice, said) in kept() {
         let x = |s: &Segment| -> Vec<f64> {
-            let finished = dsp::speech::finish(s, 0);
+            let finished = dsp::speech::finish(s, QuarterTones::ZERO);
             (finished.samples.iter())
                 .map(|&s| f64::from(s) / 32768.0)
                 .collect()
@@ -85,7 +85,7 @@ fn serves_a_line_said_under_the_floor_as_it_was_said() {
         let quiet = Segment::new(said.rate, quiet.collect());
         let take = synth::level(&quiet);
         assert_eq!(take, quiet, "{voice}");
-        let finished = dsp::speech::finish(&take, 0);
+        let finished = dsp::speech::finish(&take, QuarterTones::ZERO);
         let most = levels.most_gain(&voice, TARGET);
         let served = normalize(&finished, TARGET, CEILING, most);
         assert_eq!(served.segment, finished, "{voice}");

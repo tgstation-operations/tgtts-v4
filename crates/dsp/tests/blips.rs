@@ -10,7 +10,7 @@ use dsp::{
     Random,
     blips::{self, Error},
     float::{from_pcm, to_pcm},
-    quantity::{Millis, SampleRate},
+    quantity::{Millis, QuarterTones, SampleRate},
     resample::resample,
     segment::{self, Segment},
 };
@@ -171,7 +171,7 @@ fn sentences_match_the_old_service() {
     for (case, text) in texts(&fixture, "texts").iter().enumerate() {
         let name = case.to_string();
         let mut random = Replay(fx.f64s(&format!("{name}/draws")), 0);
-        let pitch = fx.int(&format!("{name}/pitch")) as i32;
+        let pitch = QuarterTones::new(fx.int(&format!("{name}/pitch")) as i32);
         let actual = blips::sentence(text, &voice.1, "male", "1", pitch, &mut random);
         check(&fx, &name, actual, &random);
     }
@@ -181,7 +181,9 @@ fn sentences_match_the_old_service() {
 fn lowercase_text_sounds() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::new(&fx, "lowercase");
-    let blips = |text| blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let blips = |text| {
+        blips::sentence(text, &voice.1, "male", "1", QuarterTones::ZERO, &mut Still).unwrap()
+    };
     let lowercase = blips("hob");
     assert!(!lowercase.samples.is_empty());
     // A capital at an odd index makes no sound of its own.
@@ -192,7 +194,8 @@ fn lowercase_text_sounds() {
 fn letters_outside_ascii_make_no_sound() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::new(&fx, "non-latin");
-    let blips = |text: &str| blips::sentence(text, &voice.1, "male", "1", 0, &mut Still);
+    let blips =
+        |text: &str| blips::sentence(text, &voice.1, "male", "1", QuarterTones::ZERO, &mut Still);
     let latin = blips("......, Hob!").unwrap();
     assert!(!latin.samples.is_empty());
     // "Privet" and "Kak dela" in Cyrillic.
@@ -211,7 +214,9 @@ fn letters_outside_ascii_make_no_sound() {
 fn a_sentence_starts_at_its_first_sound() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::new(&fx, "first-sound");
-    let blips = |text| blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let blips = |text| {
+        blips::sentence(text, &voice.1, "male", "1", QuarterTones::ZERO, &mut Still).unwrap()
+    };
     assert_eq!(blips("'Hob"), blips("o"));
 }
 
@@ -221,7 +226,7 @@ fn crossfades_are_no_longer_than_either_side() {
     let voice = Voice::new(&fx, "crossfades");
     // The made-up Gwah, stripped of its silence, is shorter than a crossfade.
     for text in ["Ha!", "!.a"] {
-        let blips = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still);
+        let blips = blips::sentence(text, &voice.1, "male", "1", QuarterTones::ZERO, &mut Still);
         assert!(blips.is_ok_and(|b| !b.samples.is_empty()), "{text}");
     }
 }
@@ -230,7 +235,14 @@ fn crossfades_are_no_longer_than_either_side() {
 fn messages_need_a_voice_at_the_service_rate() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::new(&fx, "rate");
-    let message = blips::message("Hob.", &voice.1, "male", "1", 0, &mut Still);
+    let message = blips::message(
+        "Hob.",
+        &voice.1,
+        "male",
+        "1",
+        QuarterTones::ZERO,
+        &mut Still,
+    );
     let samples = message.as_ref().map(|m| m.samples.len());
     assert!(matches!(message, Err(Error::Rate(RATE))), "{samples:?}");
 }
@@ -239,8 +251,24 @@ fn messages_need_a_voice_at_the_service_rate() {
 fn messages_take_the_pitch() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::at_service_rate(&fx, "pitch");
-    let message = blips::message("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
-    let mut expected = blips::sentence("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
+    let message = blips::message(
+        "Hob.",
+        &voice.1,
+        "male",
+        "1",
+        QuarterTones::new(5),
+        &mut Still,
+    )
+    .unwrap();
+    let mut expected = blips::sentence(
+        "Hob.",
+        &voice.1,
+        "male",
+        "1",
+        QuarterTones::new(5),
+        &mut Still,
+    )
+    .unwrap();
     expected
         .samples
         .extend(Segment::silent(Millis::new(250), dsp::RATE).samples);
@@ -251,12 +279,14 @@ fn messages_take_the_pitch() {
 fn silent_sentences_take_no_time() {
     let fx = Tensors::new(&testkit::fixture!("dsp_blips"));
     let voice = Voice::at_service_rate(&fx, "silent");
-    let message = |text| blips::message(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let message =
+        |text| blips::message(text, &voice.1, "male", "1", QuarterTones::ZERO, &mut Still).unwrap();
     assert!(message("...").samples.is_empty());
     // pysbd makes three sentences of this, the second without a sound.
     let mut expected = Vec::new();
     for text in ["Hob.", "b!"] {
-        let sentence = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
+        let sentence =
+            blips::sentence(text, &voice.1, "male", "1", QuarterTones::ZERO, &mut Still).unwrap();
         expected.extend(sentence.samples);
         expected.extend(Segment::silent(Millis::new(250), dsp::RATE).samples);
     }
@@ -277,7 +307,8 @@ fn question_marks_are_faded() {
     samples.insert("Deska", loud(100));
     let voice = Voice::of("faded", RATE, samples);
     // The b, at an odd index, makes no sound.
-    let blips = blips::sentence("?b", &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let blips =
+        blips::sentence("?b", &voice.1, "male", "1", QuarterTones::ZERO, &mut Still).unwrap();
     let peak = blips.max() as i16;
     let ends = [blips.samples[0], blips.samples[blips.samples.len() - 1]];
     assert!(
@@ -292,7 +323,8 @@ fn blips_shorter_than_their_fades_keep_their_length() {
     let mut samples = samples(&fx);
     samples.insert("Deska", loud(5));
     let voice = Voice::of("short", RATE, samples);
-    let blips = blips::sentence("?b", &voice.1, "male", "1", 0, &mut Still).unwrap();
+    let blips =
+        blips::sentence("?b", &voice.1, "male", "1", QuarterTones::ZERO, &mut Still).unwrap();
     assert_eq!(blips.samples.len(), loud(5).len());
 }
 
@@ -343,14 +375,14 @@ fn blips_in_a_real_voice_match_the_old_service() {
     for (case, text) in texts(&fixture, "texts").iter().enumerate() {
         let name = case.to_string();
         let mut random = Replay(fx.f64s(&format!("{name}/draws")), 0);
-        let pitch = fx.int(&format!("{name}/pitch")) as i32;
+        let pitch = QuarterTones::new(fx.int(&format!("{name}/pitch")) as i32);
         let actual = blips::sentence(text, &blips, "male", "1", pitch, &mut random);
         check(&fx, &name, actual, &random);
     }
     for (case, text) in texts(&fixture, "messages").iter().enumerate() {
         let name = format!("message/{case}");
         let mut random = Replay(fx.f64s(&format!("{name}/draws")), 0);
-        let pitch = fx.int(&format!("{name}/pitch")) as i32;
+        let pitch = QuarterTones::new(fx.int(&format!("{name}/pitch")) as i32);
         let actual = blips::message(text, &blips, "male", "1", pitch, &mut random);
         check(&fx, &name, actual, &random);
     }

@@ -21,7 +21,7 @@ use std::{
 };
 
 use dsp::{
-    quantity::{self, Gain, Ratio},
+    quantity::{self, Gain, QuarterTones, Ratio},
     radio,
     segment::Segment,
 };
@@ -387,7 +387,7 @@ impl Measure<'_> {
         let loudness = dsp::loudness::integrated(&samples, dsp::RATE);
         // Today's: the speech leveled, finished and brought to the loudness whole, then put on
         // the radio whole.
-        let finished = dsp::speech::finish(&synth::level(&pcm), 0);
+        let finished = dsp::speech::finish(&synth::level(&pcm), QuarterTones::ZERO);
         let (target, ceiling) = (self.loudness.target, self.loudness.ceiling);
         let whole = dsp::loudness::normalize(&finished, target, ceiling, MOST_GAIN);
         let radio = radio::radio(&mono(&whole.segment.samples), self.radio);

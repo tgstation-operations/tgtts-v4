@@ -37,7 +37,7 @@ use axum::{
 use dsp::{
     limiter::Limiter,
     pitch::Shifter,
-    quantity::{self, Gain, Ratio},
+    quantity::{self, Gain, QuarterTones, Ratio},
     radio,
     resample::resample,
     segment::Segment,
@@ -439,7 +439,7 @@ pub(super) async fn create(State(service): State<Arc<Service>>, body: Bytes) -> 
     if !service.voices.names().any(|name| name == message.voice) {
         return bad(format!("no voice {:?}", message.voice));
     }
-    if message.pitch.abs() > MAX_PITCH {
+    if message.pitch.abs() > MAX_PITCH.value() {
         return bad(format!("pitch {}", message.pitch));
     }
     if let Err(failure) = service.treatment(&message.params(), &message.body()) {
@@ -678,7 +678,12 @@ impl Service {
                 treatment @ (Treatment::Effects(_) | Treatment::None),
             ) => {
                 let routes = speech.as_ref().map(|out| out.routes.clone());
-                let mut chain = self.chain(&params, message.pitch, loudness, treatment);
+                let mut chain = self.chain(
+                    &params,
+                    QuarterTones::new(message.pitch),
+                    loudness,
+                    treatment,
+                );
                 chain.out = speech;
                 let peaks = self.levels.radio(voice).filter(|_| message.streamed_radio);
                 match (radio.take(), peaks) {
@@ -717,7 +722,9 @@ impl Service {
                     (Some(_), Some(take)) => take,
                     (Some(text), None) => self.synthesized(voice, text, None, trace).await?.0,
                 };
-                let finished = self.finish(voice, spoken, message.pitch, trace).await?;
+                let finished = self
+                    .finish(voice, spoken, QuarterTones::new(message.pitch), trace)
+                    .await?;
                 let audio = self.treat(&params, finished, treatment, trace).await?;
                 if let Some(mut out) = speech {
                     let routes = out.routes.clone();
@@ -744,7 +751,12 @@ impl Service {
         let params = message.params();
         let treatment = self.treatment(&params, &message.body())?;
         let made = self
-            .blips(&params, &message.text, message.pitch, trace)
+            .blips(
+                &params,
+                &message.text,
+                QuarterTones::new(message.pitch),
+                trace,
+            )
             .await?;
         let audio = self.treat(&params, made, treatment, trace).await?;
         let mut outcomes = Outcomes::new();
@@ -788,7 +800,7 @@ impl Service {
     fn chain(
         &self,
         params: &Params,
-        pitch: i32,
+        pitch: QuarterTones,
         loudness: quantity::Loudness,
         treatment: Treatment,
     ) -> Chain {
@@ -799,7 +811,8 @@ impl Service {
         };
         Chain {
             gain: Ratio::of(Gain::between(loudness, self.loudness.target)),
-            shifter: (pitch != 0).then(|| Shifter::new(dsp::RATE, f64::from(pitch), 24)),
+            shifter: (pitch != QuarterTones::ZERO)
+                .then(|| Shifter::new(dsp::RATE, f64::from(pitch.value()), 24)),
             limiter: Limiter::new(dsp::RATE, self.loudness.ceiling),
             effects,
             clicks: clicked.then(|| self.sounds.clicks(dsp::RATE, 1, &mut rand::rng())),
@@ -882,7 +895,7 @@ mod tests {
     fn whole(raw: &[f32], pitch: i32) -> (Vec<f32>, f64, f64) {
         let peak = raw.iter().fold(0f32, |m, s| m.max(s.abs()));
         let leveled = synth::level(&synth::to_segment(raw));
-        let finished = dsp::speech::finish(&leveled, pitch);
+        let finished = dsp::speech::finish(&leveled, QuarterTones::new(pitch));
         let (target, most) = (quantity::Loudness::new(-16.0), Gain::new(f64::INFINITY));
         let whole = dsp::loudness::normalize(&finished, target, dsp::loudness::CEILING, most);
         // From the model's samples, the leveling's gain and then the loudness's.

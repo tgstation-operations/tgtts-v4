@@ -8,7 +8,7 @@ use common::{Tensors, assert_pcm_close};
 use dsp::{
     float::from_pcm,
     pitch::pitch_shift,
-    quantity::{Gain, SampleRate},
+    quantity::{Gain, QuarterTones, SampleRate},
     segment::Segment,
     speech,
 };
@@ -22,7 +22,7 @@ fn finishes_as_the_old_frontend() {
     let fx = Tensors::new(&testkit::fixture!("dsp_speech"));
     let input = Segment::new(SampleRate::new(48000), fx.pcm("input"));
     for pitch in fx.ints("pitches") {
-        let actual = speech::finish(&input, pitch as i32);
+        let actual = speech::finish(&input, QuarterTones::new(pitch as i32));
         if pitch == 0 {
             let bytes: Vec<u8> = actual
                 .samples
@@ -94,7 +94,7 @@ fn brings_a_shift_past_full_scale_down_whole() {
     let shifted = shifted(&take, -7);
     let peak = shifted.iter().fold(0f32, |m, s| m.max(s.abs()));
     assert!(peak > 1.1, "{peak}");
-    let finished = speech::finish(&take, -7);
+    let finished = speech::finish(&take, QuarterTones::new(-7));
     let scale = 32767.0 / f64::from(peak);
     for (&out, &s) in finished.samples.iter().zip(&shifted) {
         let apart = f64::from(out) - f64::from(s) * scale;
