@@ -166,6 +166,8 @@ unsafe impl Plain for i64 {}
 unsafe impl Plain for f32 {}
 // SAFETY: as above.
 unsafe impl Plain for f64 {}
+// SAFETY: a transparent u16.
+unsafe impl Plain for crate::F16 {}
 
 /// A storage buffer in the memory its [`Residence`] chooses, mapped for as long as it lives when
 /// that is host memory. One buffer is one allocation; suballocation waits until a model's hundreds

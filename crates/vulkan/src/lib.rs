@@ -35,6 +35,7 @@
 //! `nix run .#device-tests` runs them under the validation layer.
 
 mod context;
+pub mod element;
 mod error;
 pub mod executable;
 mod instance;
@@ -48,6 +49,7 @@ pub mod spirv;
 pub use context::{
     Calibration, Context, Timing, check_groups, elapsed_ticks, groups_for, ticks_to_ns,
 };
+pub use element::{BF16, Element, ElementType, F16};
 pub use error::{Error, Result};
 pub use executable::Executable;
 pub use instance::{Instance, VALIDATION_VAR};
