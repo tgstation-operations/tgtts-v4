@@ -1,10 +1,7 @@
 //! Ogg Vorbis as the old frontend encoded what the game plays, in process: libvorbis set up as
 //! ffmpeg's `-b:a 64k` set it up, aiming at an average of 64 kb/s without managing the bitrate.
 
-use std::{
-    error, fmt,
-    num::{NonZeroU8, NonZeroU32},
-};
+use std::num::{NonZeroU8, NonZeroU32};
 
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder, VorbisError};
 
@@ -40,26 +37,15 @@ pub fn encode(audio: &Audio) -> Result<Vec<u8>, Error> {
 }
 
 /// Why audio could not be encoded.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// It has no frames a second or no channels, or more channels than Vorbis takes.
+    #[error("no Vorbis at {0} Hz in {1} channels")]
     Format(u32, u16),
     /// libvorbis or libogg failed.
+    #[error("encoding Vorbis: {0}")]
     Vorbis(VorbisError),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Format(rate, channels) => {
-                write!(f, "no Vorbis at {rate} Hz in {channels} channels")
-            }
-            Self::Vorbis(e) => write!(f, "encoding Vorbis: {e}"),
-        }
-    }
-}
-
-impl error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

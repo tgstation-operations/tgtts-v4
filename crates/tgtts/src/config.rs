@@ -35,7 +35,7 @@
 
 use std::{
     collections::HashMap,
-    error, fmt, fs,
+    fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -241,16 +241,9 @@ pub fn log_filter(level: LevelFilter) -> Targets {
 }
 
 /// A configuration that could not be read, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
 
 /// Reads the token from `path`: the file's text, without the whitespace around it.
 pub fn read_token(path: &Path) -> Result<String, Error> {

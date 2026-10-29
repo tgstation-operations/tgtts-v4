@@ -2,8 +2,6 @@
 //! table of up to 255 lacing values and the bytes they measure, the granule position of the last
 //! packet that ends on it, and a CRC over all of it.
 
-use std::{error, fmt};
-
 /// A page that goes on with a packet the page before left unfinished.
 const CONTINUED: u8 = 1;
 /// The stream's first page.
@@ -153,16 +151,9 @@ pub fn packets(pages: &[Page]) -> Vec<Vec<u8>> {
 }
 
 /// Why bytes are not Ogg pages.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("Ogg: {0}")]
 pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Ogg: {}", self.0)
-    }
-}
-
-impl error::Error for Error {}
 
 /// The CRC-32 of RFC 3533: polynomial 0x04c11db7, unreflected, from 0, with no final XOR.
 fn crc(bytes: &[u8]) -> u32 {

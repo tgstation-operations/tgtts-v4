@@ -6,9 +6,8 @@
 //! take as it is, and is encoded in process.
 
 use std::{
-    error,
     ffi::OsString,
-    fmt, io,
+    io,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
 };
@@ -166,13 +165,16 @@ fn filters(graph: &str) -> Option<Vec<&str>> {
 }
 
 /// Why ffmpeg gave nothing to use.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The program could not be started.
+    #[error("running {program}: {1}", program = .0.display())]
     Spawn(PathBuf, io::Error),
     /// Its pipes failed.
+    #[error("talking to ffmpeg: {0}")]
     Io(io::Error),
     /// It exited with this status, having written this at the end of its error output.
+    #[error("ffmpeg {status}: {stderr}")]
     Failed {
         /// How it exited.
         status: ExitStatus,
@@ -180,21 +182,9 @@ pub enum Error {
         stderr: String,
     },
     /// What it wrote is not a WAV file that can be read.
+    #[error("ffmpeg's output: {0}")]
     Output(wav::Error),
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Spawn(program, e) => write!(f, "running {}: {e}", program.display()),
-            Self::Io(e) => write!(f, "talking to ffmpeg: {e}"),
-            Self::Failed { status, stderr } => write!(f, "ffmpeg {status}: {stderr}"),
-            Self::Output(e) => write!(f, "ffmpeg's output: {e}"),
-        }
-    }
-}
-
-impl error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

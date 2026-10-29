@@ -4,9 +4,8 @@
 //! page's granule position.
 
 use std::{
-    error,
+    borrow::Cow,
     ffi::{CStr, c_char, c_int},
-    fmt,
     ptr::NonNull,
 };
 
@@ -301,32 +300,25 @@ pub fn decode(ogg: &[u8]) -> Result<Decoded, Error> {
 }
 
 /// Why audio could not be encoded or decoded.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// libopus failed with this code.
+    #[error("Opus: {}", reason(*.0))]
     Opus(i32),
     /// Opus here takes one or two channels.
+    #[error("no Opus stream here in {0} channels")]
     Channels(u8),
+    #[error("{0}")]
     Ogg(ogg::Error),
+    #[error("Ogg Opus: {0}")]
     Malformed(&'static str),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Opus(code) => {
-                // SAFETY: libopus's errors are static C strings, for any code.
-                let reason = unsafe { CStr::from_ptr(opus_strerror(*code)) };
-                write!(f, "Opus: {}", reason.to_string_lossy())
-            }
-            Self::Channels(n) => write!(f, "no Opus stream here in {n} channels"),
-            Self::Ogg(e) => e.fmt(f),
-            Self::Malformed(what) => write!(f, "Ogg Opus: {what}"),
-        }
-    }
+/// libopus's text for the error `code`.
+fn reason(code: c_int) -> Cow<'static, str> {
+    // SAFETY: libopus's errors are static C strings, for any code.
+    unsafe { CStr::from_ptr(opus_strerror(code)) }.to_string_lossy()
 }
-
-impl error::Error for Error {}
 
 fn check(code: c_int) -> Result<(), Error> {
     if code == OPUS_OK {

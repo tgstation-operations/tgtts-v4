@@ -1134,6 +1134,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "testkit",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",

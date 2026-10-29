@@ -1,8 +1,6 @@
 //! WAV as the service reads and writes it: 16-bit PCM and 32-bit float, which is what ffmpeg is
 //! given and gives back, what the cache keeps and what the assets are.
 
-use std::{error, fmt};
-
 use dsp::{
     quantity::{Level, SampleRate},
     radio::Pcm,
@@ -181,14 +179,17 @@ pub fn read(bytes: &[u8]) -> Result<Audio, Error> {
 }
 
 /// Why a WAV file could not be read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// It does not start as a WAV file does.
+    #[error("not a WAV file")]
     NotWav,
     /// It has no format chunk before its data, or the format chunk is short or empty.
+    #[error("WAV file without a usable format chunk")]
     NoFormat,
     /// Its samples are in this format tag at this many bits, which are neither 16-bit PCM nor
     /// 32-bit floats.
+    #[error("WAV samples of format {format} at {bits} bits")]
     Unsupported {
         /// The format tag.
         format: u16,
@@ -196,23 +197,9 @@ pub enum Error {
         bits: u16,
     },
     /// It has no data chunk.
+    #[error("WAV file without data")]
     NoData,
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotWav => f.write_str("not a WAV file"),
-            Self::NoFormat => f.write_str("WAV file without a usable format chunk"),
-            Self::Unsupported { format, bits } => {
-                write!(f, "WAV samples of format {format} at {bits} bits")
-            }
-            Self::NoData => f.write_str("WAV file without data"),
-        }
-    }
-}
-
-impl error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
