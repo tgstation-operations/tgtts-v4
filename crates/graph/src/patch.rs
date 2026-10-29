@@ -22,7 +22,7 @@ use crate::{
     Error,
     checkpoint::Checkpoint,
     decode::{self, Batch, Row},
-    graph::{Graph, Kind, TensorId},
+    graph::{Graph, Kind, Tensor, TensorId},
     kernels::Kernels,
     lm_side::{LmSideGraph, LmSideShape, lm_side_batch_graph, load_lm_side, splice},
     local::{
@@ -44,19 +44,19 @@ pub struct PatchGraph {
     pub side_ids: Vec<TensorId>,
     pub sampler: SamplerGraph,
     pub sampler_ids: Vec<TensorId>,
-    /// The patch before, `[feat_dim][patch_size]` in f32, as the sampler gives a patch.
-    pub cond: TensorId,
-    /// Where the patch before goes in both LMs' caches, [`Batch::words`] u32: at batch 1, the one
+    /// The patch before, `[rows][feat_dim][patch_size]`, as the sampler gives a patch.
+    pub cond: Tensor<f32>,
+    /// Where the patch before goes in both LMs' caches, [`Batch::words`]: at batch 1, the one
     /// position.
-    pub position: TensorId,
+    pub position: Tensor<u32>,
     /// The noise the patch is sampled from, laid out as `cond`.
-    pub noise: TensorId,
-    /// The temperature, then the guidance scale, in f32.
-    pub sampling: TensorId,
+    pub noise: Tensor<f32>,
+    /// The temperature, then the guidance scale, `[rows][2]`.
+    pub sampling: Tensor<f32>,
     /// The patch, laid out as `cond`.
-    pub patch: TensorId,
-    /// The stop head's logits `[2]` f16, of going on and of stopping after the patch.
-    pub stop_logits: TensorId,
+    pub patch: Tensor<f32>,
+    /// The stop head's logits `[rows][2]`, of going on and of stopping after the patch.
+    pub stop_logits: Tensor<F16>,
 }
 
 impl PatchGraph {
@@ -66,19 +66,18 @@ impl PatchGraph {
 
     /// The graph with each of its tensors where `ids` puts it, in `graph`.
     fn moved(self, graph: Graph, ids: &[TensorId]) -> Self {
-        let at = |t: TensorId| ids[t.0];
-        let all = |ids: Vec<TensorId>| ids.into_iter().map(at).collect();
+        let all = |theirs: Vec<TensorId>| theirs.into_iter().map(|t| ids[t.0]).collect();
         PatchGraph {
             graph,
             encoder_ids: all(self.encoder_ids),
             side_ids: all(self.side_ids),
             sampler_ids: all(self.sampler_ids),
-            cond: at(self.cond),
-            position: at(self.position),
-            noise: at(self.noise),
-            sampling: at(self.sampling),
-            patch: at(self.patch),
-            stop_logits: at(self.stop_logits),
+            cond: self.cond.moved(ids),
+            position: self.position.moved(ids),
+            noise: self.noise.moved(ids),
+            sampling: self.sampling.moved(ids),
+            patch: self.patch.moved(ids),
+            stop_logits: self.stop_logits.moved(ids),
             ..self
         }
     }
@@ -109,54 +108,34 @@ pub fn patch_batch_graph(
     let side = lm_side_batch_graph(side, lm, batch)?;
     let sampler = sampler_graph(config, timesteps, batch.rows, local)?;
     let mut g = Graph::default();
-    let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
-    let cond = g.untyped(
-        "cond",
-        bytes(&sampler.graph, sampler.cond.id()),
-        Kind::Input,
-    );
-    let position = g.untyped(
-        "position",
-        bytes(&side.graph, side.position.id()),
-        Kind::Param,
-    );
-    let noise = g.untyped(
-        "noise",
-        bytes(&sampler.graph, sampler.noise.id()),
-        Kind::Input,
-    );
-    let sampling = g.untyped(
-        "sampling",
-        bytes(&sampler.graph, sampler.sampling.id()),
-        Kind::Param,
-    );
-    let patch = g.untyped(
-        "patch",
-        bytes(&sampler.graph, sampler.patch.id()),
-        Kind::Output,
-    );
-    let stop_logits = g.untyped(
-        "stop_logits",
-        bytes(&side.graph, side.stop_logits.id()),
-        Kind::Output,
-    );
-    let enc = g.untyped("enc", bytes(&side.graph, side.enc.id()), Kind::Intermediate);
-    let mu = g.untyped("mu", bytes(&side.graph, side.mu.id()), Kind::Intermediate);
+    let samples = |t: Tensor<f32>| sampler.graph.info(t).shape();
+    let sides = |t: TensorId| side.graph.info(t).shape();
+    let cond = g.tensor("cond", samples(sampler.cond), Kind::Input);
+    let position = g.tensor("position", sides(side.position.id()), Kind::Param);
+    let noise = g.tensor("noise", samples(sampler.noise), Kind::Input);
+    let sampling = g.tensor("sampling", samples(sampler.sampling), Kind::Param);
+    let patch = g.tensor("patch", samples(sampler.patch), Kind::Output);
+    let stop_logits = g.tensor("stop_logits", sides(side.stop_logits.id()), Kind::Output);
+    let enc = g.tensor::<F16>("enc", sides(side.enc.id()), Kind::Intermediate);
+    let mu = g.tensor::<F16>("mu", sides(side.mu.id()), Kind::Intermediate);
     let encoder_ids = splice(
         &mut g,
         &encoder.graph,
         "encoder.",
-        &[(encoder.patch.id(), cond), (encoder.out.id(), enc)],
+        &[
+            (encoder.patch.id(), cond.id()),
+            (encoder.out.id(), enc.id()),
+        ],
     );
     let side_ids = splice(
         &mut g,
         &side.graph,
         "",
         &[
-            (side.enc.id(), enc),
-            (side.position.id(), position),
-            (side.mu.id(), mu),
-            (side.stop_logits.id(), stop_logits),
+            (side.enc.id(), enc.id()),
+            (side.position.id(), position.id()),
+            (side.mu.id(), mu.id()),
+            (side.stop_logits.id(), stop_logits.id()),
         ],
     );
     let sampler_ids = splice(
@@ -164,11 +143,11 @@ pub fn patch_batch_graph(
         &sampler.graph,
         "sampler.",
         &[
-            (sampler.mu.id(), mu),
-            (sampler.cond.id(), cond),
-            (sampler.noise.id(), noise),
-            (sampler.sampling.id(), sampling),
-            (sampler.patch.id(), patch),
+            (sampler.mu.id(), mu.id()),
+            (sampler.cond.id(), cond.id()),
+            (sampler.noise.id(), noise.id()),
+            (sampler.sampling.id(), sampling.id()),
+            (sampler.patch.id(), patch.id()),
         ],
     );
     Ok(PatchGraph {
@@ -205,10 +184,7 @@ fn shared(first: PatchGraph, rest: Vec<PatchGraph>) -> Result<Vec<PatchGraph>, E
     let mut programs = Vec::with_capacity(rest.len());
     for p in rest {
         let theirs = kept(&p.graph);
-        let alike = |(a, b): (&TensorId, &TensorId)| {
-            let (a, b) = (&p.graph.tensors[a.0], &tensors.tensors[b.0]);
-            (&a.name, a.bytes, a.kind) == (&b.name, b.bytes, b.kind)
-        };
+        let alike = |(&a, &b): (&TensorId, &TensorId)| p.graph.info(a) == tensors.info(b);
         if theirs.len() != weights.len() || !theirs.iter().zip(&weights).all(alike) {
             return Err(Error::Shape(format!(
                 "a program of {} rows over other weights or caches",
@@ -601,11 +577,11 @@ pub(crate) mod tests {
             );
             // The patch before is read by the encoder's first op and the sampler's condition, and
             // written by the host alone; the patch is written by the sampler alone.
-            let cond = uses(g, p.cond);
+            let cond = uses(g, p.cond.id());
             assert!(cond.iter().all(|&(_, writes)| !writes), "{cond:?}");
             assert_eq!(cond.first().map(|u| u.0), Some(0));
             assert!(cond.iter().any(|&(i, _)| i >= g.ops.len() - sampler));
-            let patch = uses(g, p.patch);
+            let patch = uses(g, p.patch.id());
             assert!(patch.iter().all(|&(i, _)| i >= g.ops.len() - sampler));
             // The condition is the LM side's, ready before the sampler reads it.
             let mu = p.side.mu.moved(&p.side_ids).id();
@@ -666,8 +642,8 @@ pub(crate) mod tests {
                 }
             }
             let bytes = |t: TensorId| tensors[t.0].bytes;
-            assert_eq!(bytes(p.cond), (rows[i] * 64 * 4 * 4) as u64);
-            assert_eq!(bytes(p.position), (2 * rows[i] * 4) as u64);
+            assert_eq!(bytes(p.cond.id()), (rows[i] * 64 * 4 * 4) as u64);
+            assert_eq!(bytes(p.position.id()), (2 * rows[i] * 4) as u64);
             let first = &all[0];
             let head_at = |p: &PatchGraph| p.side.heads.stop_head.weight.moved(&p.side_ids);
             assert_eq!(head_at(p), head_at(first));
