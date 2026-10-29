@@ -5,7 +5,13 @@ mod common;
 use std::f64::consts::TAU;
 
 use common::{Tensors, assert_pcm_close};
-use dsp::{float::from_pcm, pitch::pitch_shift, quantity::SampleRate, segment::Segment, speech};
+use dsp::{
+    float::from_pcm,
+    pitch::pitch_shift,
+    quantity::{Gain, SampleRate},
+    segment::Segment,
+    speech,
+};
 
 /// The pitch shift's: a sample one off now and then, at most 7 of 19200 here.
 const MAX_DIFFERENCE: i32 = 1;
@@ -68,7 +74,7 @@ fn buzz() -> Segment {
             .sum();
         (8000.0 * (0.6 + 0.4 * (TAU * 2.5 * t).sin()) * buzz) as i16
     });
-    Segment::new(SampleRate::new(48000), x.collect()).normalize(0.1)
+    Segment::new(SampleRate::new(48000), x.collect()).normalize(Gain::new(0.1))
 }
 
 /// `speech` with the silence after it shifted by `pitch` quarter tones, as floats.

@@ -4,7 +4,7 @@ mod common;
 
 use common::{Tensors, first_difference};
 use dsp::{
-    quantity::{Millis, SampleRate},
+    quantity::{Gain, Millis, SampleRate},
     segment::{Error, Segment},
 };
 
@@ -48,12 +48,12 @@ fn matches_pydub() {
         assert_eq!(i64::from(seg.rms()), fx.int(&name("rms")), "{case}");
         assert_eq!(i64::from(seg.max()), fx.int(&name("max")), "{case}");
         assert_eq!(
-            seg.dbfs().to_bits(),
+            seg.dbfs().value().to_bits(),
             fx.f64s(&name("dbfs"))[0].to_bits(),
             "{case}"
         );
         assert_eq!(
-            seg.max_dbfs().to_bits(),
+            seg.max_dbfs().value().to_bits(),
             fx.f64s(&name("max_dbfs"))[0].to_bits(),
             "{case}"
         );
@@ -64,13 +64,17 @@ fn matches_pydub() {
         );
         check(&fx, &name("strip_silence"), seg.strip_silence());
         for (k, db) in fx.f64s(&name("gain")).into_iter().enumerate() {
-            check(&fx, &name(&format!("gain/{k}")), Ok(seg.apply_gain(db)));
+            check(
+                &fx,
+                &name(&format!("gain/{k}")),
+                Ok(seg.apply_gain(Gain::new(db))),
+            );
         }
         for (k, headroom) in fx.f64s(&name("normalize")).into_iter().enumerate() {
             check(
                 &fx,
                 &name(&format!("normalize/{k}")),
-                Ok(seg.normalize(headroom)),
+                Ok(seg.normalize(Gain::new(headroom))),
             );
         }
         for (k, duration) in fx.ints(&name("fade")).into_iter().enumerate() {

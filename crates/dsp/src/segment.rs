@@ -7,10 +7,10 @@
 
 use std::ops::Range;
 
-use crate::quantity::{Millis, SampleRate};
+use crate::quantity::{Gain, Level, Millis, Ratio, SampleRate};
 
-/// pydub's `db_to_float(-120)`, the gain a fade starts or ends at.
-const FADE_FLOOR_DB: f64 = -120.0;
+/// The gain a fade starts or ends at, pydub's `db_to_float(-120)`.
+const FADE_FLOOR_DB: Gain = Gain::new(-120.0);
 
 /// Full scale for 16-bit samples, as pydub's `max_possible_amplitude` has it.
 const FULL_SCALE: f64 = 32768.0;
@@ -86,31 +86,31 @@ impl Segment {
             .map_or(0, u32::from)
     }
 
-    /// `segment.dBFS`: the loudness of the RMS against full scale, `-inf` for silence.
-    pub fn dbfs(&self) -> f64 {
-        ratio_to_db(f64::from(self.rms()) / FULL_SCALE)
+    /// `segment.dBFS`: the level of the RMS against full scale, `-inf` for silence.
+    pub fn dbfs(&self) -> Level {
+        Level::from_full_scale(ratio_to_db(Ratio::new(f64::from(self.rms()) / FULL_SCALE)))
     }
 
-    /// `segment.max_dBFS`: the loudness of the peak against full scale, `-inf` for silence.
-    pub fn max_dbfs(&self) -> f64 {
-        ratio_to_db(f64::from(self.max()) / FULL_SCALE)
+    /// `segment.max_dBFS`: the level of the peak against full scale, `-inf` for silence.
+    pub fn max_dbfs(&self) -> Level {
+        Level::from_full_scale(ratio_to_db(Ratio::new(f64::from(self.max()) / FULL_SCALE)))
     }
 
-    /// `segment.apply_gain(db)`: every sample scaled by `db` dB, clipped and floored as audioop
+    /// `segment.apply_gain(gain)`: every sample raised by `gain`, clipped and floored as audioop
     /// does.
-    pub fn apply_gain(&self, db: f64) -> Self {
-        self.spawn(mul(&self.samples, db_to_float(db)))
+    pub fn apply_gain(&self, gain: Gain) -> Self {
+        self.spawn(mul(&self.samples, Ratio::of(gain).value()))
     }
 
-    /// `pydub.effects.normalize(segment, headroom)`: the peak brought to `headroom` dB below full
+    /// `pydub.effects.normalize(segment, headroom)`: the peak brought to `headroom` below full
     /// scale, silence left as it is.
-    pub fn normalize(&self, headroom: f64) -> Self {
+    pub fn normalize(&self, headroom: Gain) -> Self {
         let peak = self.max();
         if peak == 0 {
             return self.clone();
         }
-        let target_peak = FULL_SCALE * db_to_float(-headroom);
-        self.apply_gain(ratio_to_db(target_peak / f64::from(peak)))
+        let target_peak = FULL_SCALE * Ratio::of(-headroom).value();
+        self.apply_gain(ratio_to_db(Ratio::new(target_peak / f64::from(peak))))
     }
 
     /// `segment.reverse()`.
@@ -177,7 +177,7 @@ impl Segment {
     pub fn fade_in(&self, duration: Millis) -> Result<Self, Error> {
         assert!(duration > Millis::ZERO, "fade of {} ms", duration.value());
         self.fade(
-            0.0,
+            Gain::ZERO,
             FADE_FLOOR_DB,
             Millis::ZERO.min(self.len_ms()),
             duration,
@@ -192,25 +192,25 @@ impl Segment {
     pub fn fade_out(&self, duration: Millis) -> Result<Self, Error> {
         assert!(duration > Millis::ZERO, "fade of {} ms", duration.value());
         let end = self.len_ms();
-        self.fade(FADE_FLOOR_DB, 0.0, end - duration, duration)
+        self.fade(FADE_FLOOR_DB, Gain::ZERO, end - duration, duration)
     }
 
     /// `segment.fade(to_gain, from_gain, start, end)` once pydub has resolved its arguments to a
     /// start and a duration.
     fn fade(
         &self,
-        to_gain: f64,
-        from_gain: f64,
+        to_gain: Gain,
+        from_gain: Gain,
         start: Millis,
         duration: Millis,
     ) -> Result<Self, Error> {
         let end = start + duration;
-        let from_power = db_to_float(from_gain);
+        let from_power = Ratio::of(from_gain).value();
         let mut output = self.slice(None, Some(start))?.samples;
-        if from_gain != 0.0 {
+        if from_gain != Gain::ZERO {
             output = mul(&output, from_power);
         }
-        let gain_delta = db_to_float(to_gain) - from_power;
+        let gain_delta = Ratio::of(to_gain).value() - from_power;
         // Longer fades step the gain once per ms, shorter ones once per frame.
         if duration > Millis::new(100) {
             let scale_step = gain_delta / duration.value() as f64;
@@ -232,8 +232,8 @@ impl Segment {
             }
         }
         let mut after = self.slice(Some(end), None)?.samples;
-        if to_gain != 0.0 {
-            after = mul(&after, db_to_float(to_gain));
+        if to_gain != Gain::ZERO {
+            after = mul(&after, Ratio::of(to_gain).value());
         }
         output.extend(after);
         Ok(self.spawn(output))
@@ -256,9 +256,9 @@ impl Segment {
             }
         }
         let tail = self.slice(Some(-crossfade), None)?;
-        let tail = tail.fade(FADE_FLOOR_DB, 0.0, Millis::ZERO, tail.len_ms())?;
+        let tail = tail.fade(FADE_FLOOR_DB, Gain::ZERO, Millis::ZERO, tail.len_ms())?;
         let head = other.slice(None, Some(crossfade))?;
-        let head = head.fade(0.0, FADE_FLOOR_DB, Millis::ZERO, head.len_ms())?;
+        let head = head.fade(Gain::ZERO, FADE_FLOOR_DB, Millis::ZERO, head.len_ms())?;
         let mut output = self.slice(None, Some(-crossfade))?.samples;
         // `tail * head` overlays head, looped, on `tail[0:]`, with audioop's clipping add.
         let tail = tail.slice(Some(Millis::ZERO), None)?.samples;
@@ -271,7 +271,7 @@ impl Segment {
     /// pydub's `detect_leading_silence` at its defaults: where the first 10 ms chunk no quieter
     /// than -50 dBFS starts, or the length if there is none.
     pub fn leading_silence(&self) -> Result<Millis, Error> {
-        const THRESHOLD: f64 = -50.0;
+        const THRESHOLD: Level = Level::new(-50.0);
         const CHUNK: Millis = Millis::new(10);
         let len = self.len_ms();
         let mut trim = Millis::ZERO;
@@ -294,18 +294,15 @@ impl Segment {
     }
 }
 
-/// pydub's `db_to_float`: the amplitude ratio of `db`.
-pub fn db_to_float(db: f64) -> f64 {
-    10f64.powf(db / 20.0)
-}
-
-/// pydub's `ratio_to_db`: the amplitude ratio `ratio` in dB, `-inf` for zero.
-pub fn ratio_to_db(ratio: f64) -> f64 {
+/// pydub's `ratio_to_db`: the gain of the amplitude ratio `ratio`, `-inf` for zero, through the
+/// natural logarithm where [`Gain::of`] takes the common one.
+pub fn ratio_to_db(ratio: Ratio) -> Gain {
+    let ratio = ratio.value();
     if ratio == 0.0 {
-        return f64::NEG_INFINITY;
+        return Gain::new(f64::NEG_INFINITY);
     }
     // Python's math.log(ratio, 10) divides the two natural logarithms.
-    20.0 * (ratio.ln() / 10f64.ln())
+    Gain::new(20.0 * (ratio.ln() / 10f64.ln()))
 }
 
 /// audioop's `mul`: each sample scaled by `factor`, clipped to the 16-bit range and floored.

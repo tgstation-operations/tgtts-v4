@@ -3,7 +3,7 @@
 
 use std::{error, time::Duration};
 
-use dsp::{RATE, loudness::FLOOR, segment::Segment};
+use dsp::{RATE, loudness::FLOOR, quantity::Gain, segment::Segment};
 use voices::Latent;
 
 /// An error from a synthesizer, which the service reports and fails the request on.
@@ -103,7 +103,7 @@ pub fn level(speech: &Segment) -> Segment {
     if dsp::loudness::integrated(&samples, speech.rate) < FLOOR {
         return speech.clone();
     }
-    speech.normalize(0.1)
+    speech.normalize(Gain::new(0.1))
 }
 
 #[cfg(test)]

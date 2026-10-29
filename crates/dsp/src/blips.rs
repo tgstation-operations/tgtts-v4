@@ -16,7 +16,7 @@ use crate::{
     RATE, Random,
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
-    quantity::{Millis, SampleRate},
+    quantity::{Gain, Millis, Ratio, SampleRate},
     segment::{self, Segment},
     sentences,
 };
@@ -162,5 +162,5 @@ fn fade(blip: &Segment) -> Result<Segment, Error> {
 
 /// The old service's `change_volume`: a gain of the amplitude ratio `multiplier`, through dB.
 fn change_volume(segment: &Segment, multiplier: f64) -> Segment {
-    segment.apply_gain(20.0 * multiplier.log10())
+    segment.apply_gain(Gain::of(Ratio::new(multiplier)))
 }
