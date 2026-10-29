@@ -146,6 +146,9 @@ pkgs.writeShellApplication {
     stage vendor-pins vendor_pins
     stage burn-free burn_free
     stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
+    # The tests that need a GPU are built only with these features: linted, never run.
+    stage clippy-device cargo clippy --locked -p vulkan -p graph --all-targets \
+      --features vulkan/device,graph/device -- -D warnings
     stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
     stage test cargo test --locked --workspace
 
