@@ -13,7 +13,7 @@ use effects::{
     run,
     schema::{self, Graph, Method, Waveform},
     shape::{Clip, Crush, Saturate},
-    spectral::Wobble,
+    spectral::{Robot, Wobble},
     time::{self, Pitch, Speed},
 };
 
@@ -162,6 +162,50 @@ fn wobble_lifts_the_lows_and_boosts_the_highs() {
         .iter()
         .fold((f64::MAX, f64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
     assert!(high - low > 15.0, "{levels:?}");
+}
+
+#[test]
+fn robot_buzzes_at_its_frequency_whatever_the_pitch() {
+    let voice = |pitch: f64| -> Vec<f32> {
+        (0..48000)
+            .map(|i| {
+                let t = f64::from(i) / RATE;
+                let harmonics: f64 = (1..20)
+                    .map(|h| (TAU * pitch * f64::from(h) * t).sin() / f64::from(h))
+                    .sum();
+                (0.1 * harmonics) as f32
+            })
+            .collect()
+    };
+    // How alike `x` is to itself `lag` samples on, over its middle.
+    let alike = |x: &[f32], lag: usize| {
+        let (a, b) = (&x[12000..36000], &x[12000 + lag..36000 + lag]);
+        let dot = |a: &[f32], b: &[f32]| -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum()
+        };
+        dot(a, b) / (dot(a, a) * dot(b, b)).sqrt()
+    };
+    // Each frame holds two of the voice's periods or more.
+    for (pitch, buzz) in [
+        (110.0, 50.0),
+        (233.0, 100.0),
+        (233.0, 187.5),
+        (440.0, 187.5),
+        (1100.0, 1000.0),
+    ] {
+        let x = voice(pitch);
+        let y = run(&mut Robot::new(buzz), &x);
+        assert_eq!(y.len(), x.len());
+        let period = (RATE / buzz).round() as usize;
+        let (buzzing, own) = (alike(&y, period), alike(&x, period));
+        assert!(
+            buzzing > 0.99 && own < 0.5,
+            "{pitch} Hz at {buzz}: {buzzing}, {own}"
+        );
+    }
 }
 
 #[test]

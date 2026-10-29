@@ -11,7 +11,9 @@ capsule asks acompressor for a ratio of 40, which ffmpeg refuses, failing the re
 at 20, ffmpeg's most, while the effects keep 40. The silicon effect, which the service runs on its own, takes
 made-up impulses at the rates, channels and lengths of the real ones, the synthetic one with the
 real one's correlation between its channels and its ratio of energy to magnitude, which sets the
-level afir gives it.
+level afir gives it. The robot is TerraGov Marine Corps's filter for its silicons and combat
+robots, and its pitch track is saved beside its spectrum: the one pitch it buzzes at in place of
+the voice's own.
 
 Four more cases are single effects whose part in a graph is too small for the comparison to see:
 the compressor, the hailer's phaser, the fish tongue's afftfilt and the cult's vibrato, whose pitch
@@ -53,7 +55,7 @@ FLOOR = 1e-10
 PITCH_FRAME = 1920
 VOICED = 0.6
 NEAR = 0.9
-PITCHED = ["vibrato", "cult_slurring"]
+PITCHED = ["vibrato", "cult_slurring", "robot"]
 # The fish tongue's afftfilt is matched sample for sample, its flutter too fast for the spectrum
 # to follow, so the start of what ffmpeg makes of it is saved as it is.
 WOBBLE_SAMPLES = 28800
@@ -358,6 +360,18 @@ CASES = [
                     "swing_hz": 750,
                     "rate_hz": 37.5,
                 },
+            ]
+        ],
+    ),
+    (
+        "robot",
+        "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=1,"
+        "rubberband=pitch=0.8",
+        [
+            [
+                {"effect": "robot", "frequency_hz": 187.5},
+                {"effect": "gain", "gain_db": -3.01},
+                {"effect": "pitch", "semitones": -3.863},
             ]
         ],
     ),

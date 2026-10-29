@@ -224,6 +224,15 @@ pub enum Node {
         /// How often it swings, in Hz.
         rate_hz: f64,
     },
+    /// A robot's voice: its own pitch gone, it buzzes at `frequency_hz`, in [50, 1000], through
+    /// its spectral envelope, as ffmpeg's afftfilt makes it when it gives every bin the same
+    /// phase. Frames of two periods of the buzz, half a frame apart, keep the magnitudes of their
+    /// spectra and lose their phases, so a voice pitched well under the buzz, with fewer than two
+    /// of its periods to a frame, keeps some of its own.
+    Robot {
+        /// The pitch it buzzes at, in Hz, to the nearest whole number of samples a period.
+        frequency_hz: f64,
+    },
     /// The sum of delayed copies, 1 to 16 `taps`; one at 0 ms is the signal itself. The audio
     /// grows by the longest delay.
     Echo {
@@ -423,6 +432,7 @@ impl Node {
                 within("swing_hz", swing_hz, 0.0, center_hz - 20.0)?;
                 within("rate_hz", rate_hz, 0.1, 90.0)
             }
+            Self::Robot { frequency_hz } => within("frequency_hz", frequency_hz, 50.0, 1000.0),
             Self::Echo { ref taps } => {
                 if !(1..=16).contains(&taps.len()) {
                     return Err(format!("{} taps, where 1 to 16 are allowed", taps.len()));

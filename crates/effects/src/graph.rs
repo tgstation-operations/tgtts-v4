@@ -21,7 +21,7 @@ use crate::{
     level::{Gain, Noise, Tremolo},
     schema::{Graph, INPUT, Node, OUTPUT},
     shape::{Clip, Crush, Saturate},
-    spectral::Wobble,
+    spectral::{Robot, Wobble},
     time::{self, Pitch, Speed},
 };
 
@@ -492,6 +492,7 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             swing_hz,
             rate_hz,
         } => Box::new(Wobble::new(center_hz, swing_hz, rate_hz)),
+        Node::Robot { frequency_hz } => Box::new(Robot::new(frequency_hz)),
         Node::Echo { ref taps } => {
             Box::new(Echo::new(taps.iter().map(|tap| (tap.delay_ms, tap.weight))))
         }

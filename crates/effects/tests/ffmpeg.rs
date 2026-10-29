@@ -17,7 +17,7 @@ use serde::Deserialize;
 /// measured and 0.25 dB, rounded up to a tenth. Each is under what the unfiltered input measures,
 /// which the test checks, so an effect that did nothing would fail it. A vibrato moves the
 /// harmonics less than a band is wide, so its case is left to [`PITCH_THRESHOLDS`].
-const THRESHOLDS: [(&str, Option<f32>); 20] = [
+const THRESHOLDS: [(&str, Option<f32>); 21] = [
     ("synthetic", Some(1.7)),
     ("tram", Some(1.6)),
     ("fishing", Some(3.5)),
@@ -33,6 +33,7 @@ const THRESHOLDS: [(&str, Option<f32>); 20] = [
     ("cult_slurring", Some(2.5)),
     ("poly", Some(2.8)),
     ("fish_tongue", Some(5.3)),
+    ("robot", Some(1.7)),
     ("compressor", Some(0.5)),
     ("flanger", Some(0.7)),
     ("vibrato", None),
@@ -41,9 +42,11 @@ const THRESHOLDS: [(&str, Option<f32>); 20] = [
 ];
 
 /// The most the pitch of the cases with a vibrato may differ from ffmpeg's, in cents, where
-/// log-mel bands are too coarse to tell a vibrato from none: 1.3 times what it measured and 5
-/// cents, rounded up, each under what the unfiltered input measures.
-const PITCH_THRESHOLDS: [(&str, f32); 2] = [("vibrato", 14.0), ("cult_slurring", 31.0)];
+/// log-mel bands are too coarse to tell a vibrato from none, and of the robot, whose buzz takes
+/// the place of the voice's pitch: 1.3 times what it measured and 5 cents, rounded up, each under
+/// what the unfiltered input measures.
+const PITCH_THRESHOLDS: [(&str, f32); 3] =
+    [("vibrato", 14.0), ("cult_slurring", 31.0), ("robot", 11.0)];
 
 // The log-mel spectrum, as fixtures/effects.py computes it.
 const RATE: f64 = 48000.0;

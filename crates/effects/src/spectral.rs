@@ -1,5 +1,5 @@
 //! Effects on the spectrum, frame by frame: a short-time Fourier transform run on a stream, the
-//! fish tongue's swinging filter, and the formants moved against a pitch shift.
+//! fish tongue's swinging filter, a robot's voice, and the formants moved against a pitch shift.
 
 use std::{f64::consts::PI, sync::Arc};
 
@@ -7,9 +7,9 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::{Processor, RATE};
 
-/// A short-time Fourier transform on a stream: Hann-windowed frames of `size` every `hop`,
-/// each spectrum changed in turn, windowed again and overlap-added, the output starting where
-/// the input does.
+/// A short-time Fourier transform on a stream: windowed frames of `size` every `hop`, Hann
+/// windows unless it is given others, each spectrum changed in turn, windowed again and
+/// overlap-added, the output starting where the input does.
 struct Stft {
     size: usize,
     hop: usize,
@@ -35,6 +35,13 @@ impl Stft {
         let window: Vec<f64> = (0..size)
             .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f64 / size as f64).cos())
             .collect();
+        Self::windowed(window, hop)
+    }
+
+    /// Frames as long as `window`, which each is windowed by on the way in and again on the way
+    /// out.
+    fn windowed(window: Vec<f64>, hop: usize) -> Self {
+        let size = window.len();
         let scale = (0..size / hop)
             .map(|j| window[j * hop].powi(2))
             .sum::<f64>();
@@ -174,6 +181,50 @@ impl Processor for Wobble {
     fn finish(&mut self, output: &mut Vec<f32>) {
         let change = Self::change(self.center, self.swing, self.rate);
         self.stft.finish(output, change);
+    }
+}
+
+/// A robot's voice as ffmpeg's afftfilt makes it when its expressions give every bin the same
+/// phase, a quarter turn: frames of two periods of the buzz, half a frame apart, keep the
+/// magnitudes of their spectra and lose their phases, so that each frame comes out as a pulse
+/// at its edges and the voice, its own pitch gone, buzzes at the rate the frames come at, its
+/// spectral envelope kept. The windows are afftfilt's, the square roots of symmetric Hann
+/// windows.
+pub struct Robot {
+    stft: Stft,
+}
+
+impl Robot {
+    /// Buzzing at `frequency` Hz, to the nearest whole number of samples a period.
+    pub fn new(frequency: f64) -> Self {
+        let hop = (RATE / frequency).round() as usize;
+        let size = 2 * hop;
+        let window = (0..size)
+            .map(|i| (0.5 - 0.5 * (2.0 * PI * i as f64 / (size - 1) as f64).cos()).sqrt())
+            .collect();
+        Self {
+            stft: Stft::windowed(window, hop),
+        }
+    }
+
+    fn change(_: usize, bins: &mut [Complex<f64>]) {
+        for bin in bins {
+            *bin = Complex::new(0.0, bin.norm());
+        }
+    }
+}
+
+impl Processor for Robot {
+    fn latency(&self) -> usize {
+        self.stft.size
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        self.stft.process(input, output, Self::change);
+    }
+
+    fn finish(&mut self, output: &mut Vec<f32>) {
+        self.stft.finish(output, Self::change);
     }
 }
 
