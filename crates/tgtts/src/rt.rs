@@ -20,7 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dsp::RATE;
+use dsp::{
+    RATE,
+    quantity::{Millis, Patches, SampleRate, Samples},
+};
 use graph::{
     generator::{Generator, Settings},
     kernels::Kernels,
@@ -43,8 +46,8 @@ const WARM_UP_PATCHES: usize = 9;
 /// text to the last patch it may have; this is about nine times as long as it says a line of
 /// that length at the median, where in a gains run all but 2 of the 7191 lines it ended itself
 /// came within seven times.
-const BABBLE_MS: usize = 3000;
-const BABBLE_MS_PER_CHAR: usize = 500;
+const BABBLE_MS: Millis = Millis::new(3000);
+const BABBLE_MS_PER_CHAR: Millis = Millis::new(500);
 
 /// The patches after which a streamed request's frames waiting are decoded at once, rather than
 /// once a chunk's worth waits: its first audio after its first patch, then as much again each
@@ -302,8 +305,10 @@ impl Rt {
         }
         let vae = self.config.audio_vae();
         let hop: usize = vae.decoder_rates.iter().product();
-        let cap = babble_cap(text, self.config.patch_size * hop, vae.out_sample_rate);
-        cap.min(self.max_patches)
+        let samples_per_patch = Samples::new(self.config.patch_size * hop);
+        let rate = SampleRate::new(vae.out_sample_rate);
+        let cap = babble_cap(text, samples_per_patch, rate);
+        cap.value().min(self.max_patches)
     }
 
     /// Loads the VoxCPM2 checkpoint in `dir` onto the GPU the `vulkan` crate chooses, with the
@@ -603,11 +608,11 @@ impl Synthesizer for Rt {
     }
 }
 
-/// The patches of `samples_per_patch` at `rate` Hz that the babble cap lets the speech of `text`
-/// run to.
-fn babble_cap(text: &str, samples_per_patch: usize, rate: u32) -> usize {
-    let ms = BABBLE_MS + BABBLE_MS_PER_CHAR * text.chars().count();
-    (ms * rate as usize / 1000).div_ceil(samples_per_patch)
+/// The patches of `samples_per_patch` at `rate` that the babble cap lets the speech of `text` run
+/// to.
+fn babble_cap(text: &str, samples_per_patch: Samples, rate: SampleRate) -> Patches {
+    let longest = BABBLE_MS + BABBLE_MS_PER_CHAR.times(text.chars().count());
+    Patches::covering(Samples::over(longest, rate), samples_per_patch)
 }
 
 #[cfg(test)]
@@ -795,10 +800,11 @@ mod tests {
     #[test]
     fn caps_a_requests_patches_by_its_text_where_asked() {
         // At the real model's patch of 160 ms: 5 s, 34 s and 3 s.
-        assert_eq!(babble_cap("Yes.", 7680, 48000), 32);
+        let (patch, rate) = (Samples::new(7680), SampleRate::new(48000));
+        assert_eq!(babble_cap("Yes.", patch, rate), Patches::new(32));
         let line = "Hello there, could someone please come to medbay? I need help.";
-        assert_eq!(babble_cap(line, 7680, 48000), 213);
-        assert_eq!(babble_cap("", 7680, 48000), 19);
+        assert_eq!(babble_cap(line, patch, rate), Patches::new(213));
+        assert_eq!(babble_cap("", patch, rate), Patches::new(19));
 
         // The tiny config's patches are 24 samples at 48 kHz, so "Yes." is capped at 10000, and
         // a longer text at the most any request may have.
