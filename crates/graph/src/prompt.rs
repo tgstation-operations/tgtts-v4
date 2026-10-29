@@ -91,18 +91,17 @@ pub struct PromptGraphs {
 #[derive(Clone, Copy, Debug)]
 pub struct PromptTensors {
     pub max_rows: usize,
-    /// The patch to embed, laid out as the patch step's `cond`, and its embedding `[hidden]` f16.
-    pub patch: TensorId,
-    pub embedding: TensorId,
-    /// The first position and the length of the run, and the slot of the caches it goes to, three
-    /// u32.
-    pub run: TensorId,
-    /// The positions' embeddings, `[max_rows][hidden]` f16.
-    pub x: TensorId,
+    /// The patch to embed, laid out as the patch step's `cond`, and its embedding `[1][hidden]`.
+    pub patch: Tensor<f32>,
+    pub embedding: Tensor<F16>,
+    /// The first position and the length of the run, and the slot of the caches it goes to.
+    pub run: Tensor<u32>,
+    /// The positions' embeddings, `[max_rows][hidden]`.
+    pub x: Tensor<F16>,
     /// The audio positions' embeddings, laid out as `x`, zero at text.
-    pub audio_x: TensorId,
-    /// Whether each position is audio, a u32 each.
-    pub audio: TensorId,
+    pub audio_x: Tensor<F16>,
+    /// Whether each position is audio, one to a position.
+    pub audio: Tensor<u32>,
 }
 
 fn u(v: usize) -> SpecValue {
@@ -132,23 +131,18 @@ pub fn prompt_graphs(
     g.ops.clear();
 
     let encoder = &patch.encoder;
-    let bytes = |graph: &Graph, t: TensorId| graph.tensors[t.0].bytes;
-    let input = g.untyped(
-        "embed.patch",
-        bytes(&encoder.graph, encoder.patch.id()),
-        Kind::Input,
-    );
-    let enc = g.untyped(
-        "embed.enc",
-        bytes(&encoder.graph, encoder.out.id()),
-        Kind::Intermediate,
-    );
-    let embedding = g.untyped("embed.out", 2 * hidden as u64, Kind::Output);
+    let encoders = |t: TensorId| encoder.graph.info(t).shape();
+    let input = g.tensor::<f32>("embed.patch", encoders(encoder.patch.id()), Kind::Input);
+    let enc = g.tensor::<F16>("embed.enc", encoders(encoder.out.id()), Kind::Intermediate);
+    let embedding = g.tensor("embed.out", &[1, hidden], Kind::Output);
     let weights = encoder.graph.tensors.iter().enumerate();
     let shared: Vec<(TensorId, TensorId)> = weights
         .filter(|(_, t)| t.kind == Kind::Constant)
         .map(|(i, _)| (TensorId(i), patch.encoder_ids[i]))
-        .chain([(encoder.patch.id(), input), (encoder.out.id(), enc)])
+        .chain([
+            (encoder.patch.id(), input.id()),
+            (encoder.out.id(), enc.id()),
+        ])
         .collect();
     splice(&mut g, &encoder.graph, "embed.", &shared);
     append_linear(
@@ -163,12 +157,11 @@ pub fn prompt_graphs(
     )?;
     let embed_ops = g.ops.len();
 
-    let rows_of = |n: usize| (max_rows * n * 2) as u64;
-    let run = g.untyped("prompt.run", 12, Kind::Param);
-    let x = g.untyped("prompt.x", rows_of(hidden), Kind::Input);
-    let audio_x = g.untyped("prompt.audio_x", rows_of(hidden), Kind::Input);
-    let audio = g.untyped("prompt.audio", (max_rows * 4) as u64, Kind::Input);
-    let mut between = |name: &str, n: usize| g.untyped(name, rows_of(n), Kind::Intermediate);
+    let run = g.tensor("prompt.run", &[3], Kind::Param);
+    let x = g.tensor("prompt.x", &[max_rows, hidden], Kind::Input);
+    let audio_x = g.tensor("prompt.audio_x", &[max_rows, hidden], Kind::Input);
+    let audio = g.tensor("prompt.audio", &[max_rows], Kind::Input);
+    let mut between = |name: &str, n: usize| g.tensor(name, &[max_rows, n], Kind::Intermediate);
     let base_out = between("prompt.base_lm.out", hidden);
     let levels = between("prompt.fsq_layer.levels", s.latent);
     let quantized = between("prompt.fsq_layer.out", hidden);
@@ -206,12 +199,12 @@ pub fn prompt_graphs(
     let rows_linear = |g: &mut Graph,
                        label: &str,
                        layer: Linear,
-                       x: &[TensorId],
+                       x: &[Tensor<F16>],
                        act: Act,
-                       out: TensorId,
+                       out: Tensor<F16>,
                        rows: usize|
      -> Result<(), Error> {
-        let width = |t: TensorId| g.tensors[t.0].bytes as usize / 2 / max_rows;
+        let width = |t: Tensor<F16>| g.info(t).shape()[1];
         let (k0, k1) = (width(x[0]), x.get(1).map_or(0, |&t| width(t)));
         let n = width(out);
         let k = k0 + k1;
@@ -283,7 +276,7 @@ pub fn prompt_graphs(
         p.op(
             "select_rows",
             select.clone(),
-            &[run, audio, quantized, base_out, lm_hidden],
+            (run, audio, quantized, base_out, lm_hidden),
             [rows as u32, 1, 1],
         );
         rows_linear(
