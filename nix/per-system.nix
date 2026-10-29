@@ -19,7 +19,6 @@ let
         tracelLlvm
         ;
     };
-    bench = import ./scripts/bench.nix { inherit pkgs rustToolchain; };
   };
 in
 {

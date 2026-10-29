@@ -151,11 +151,11 @@ pkgs.writeShellApplication {
     # wgpu into every crate it reaches, and its tests need the GPU. The GPU
     # code is linted on its own.
     stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
-    stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts -p bench --all-targets \
-      --features gpu/vulkan,tgtts/vulkan,tgtts/rt,bench/vulkan -- -D warnings
+    stage clippy-vulkan cargo clippy --locked -p gpu -p tgtts --all-targets \
+      --features gpu/vulkan,tgtts/vulkan,tgtts/rt -- -D warnings
     # cubecl's CUDA runtime links the LLVM its build script finds there.
     stage clippy-cuda env XDG_DATA_HOME=${tracelLlvm} cargo clippy --locked -p gpu -p tgtts \
-      -p bench --all-targets --features gpu/nvrtc,tgtts/cuda,bench/cuda -- -D warnings
+      --all-targets --features gpu/nvrtc,tgtts/cuda -- -D warnings
     stage clippy-burn-free cargo clippy --locked -p tgtts --all-targets --no-default-features \
       --features rt -- -D warnings
     stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps

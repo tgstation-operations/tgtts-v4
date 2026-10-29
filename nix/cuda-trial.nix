@@ -4,7 +4,7 @@
   ffmpeg,
   tracelLlvm,
 }:
-# tgtts, bench and the gpu crate's tests built for CUDA, for a first run on an
+# tgtts and the gpu crate's tests built for CUDA, for a first run on an
 # NVIDIA host: once with cubecl's default kernel compiler, LLVM to PTX, under
 # llvm/, and once with NVRTC compiling its CUDA C++, under nvrtc/. Each program
 # finds the host driver's libcuda in /run/opengl-driver/lib, as NixOS puts it,
@@ -80,8 +80,7 @@ let
         # no parent of $out.
         export CARGO_HOME=$NIX_BUILD_TOP/.cargo CARGO_TARGET_DIR=$NIX_BUILD_TOP/target
         cd $out/src
-        cargo build --release --frozen -p tgtts -p bench \
-          --features tgtts/cuda,bench/cuda${features}
+        cargo build --release --frozen -p tgtts --features tgtts/cuda${features}
         cargo test --release --frozen -p gpu --features cuda${features} --no-run \
           --message-format=json |
           jq -r 'select(.target.kind == ["test"]) | .executable // empty' >$NIX_BUILD_TOP/tests
@@ -90,7 +89,7 @@ let
       installPhase = ''
         runHook preInstall
         mkdir -p $out/bin $out/libexec
-        cp $CARGO_TARGET_DIR/release/{tgtts,bench} $out/libexec/
+        cp $CARGO_TARGET_DIR/release/tgtts $out/libexec/
         while read -r test; do
           name=$(basename "$test")
           cp "$test" "$out/libexec/gpu-test-''${name%-*}"
