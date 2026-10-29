@@ -6,6 +6,7 @@ version.workspace = true
 publish = false
 
 [dependencies]
+argh.workspace = true
 crc32fast.workspace = true
 safetensors.workspace = true
 serde_json.workspace = true

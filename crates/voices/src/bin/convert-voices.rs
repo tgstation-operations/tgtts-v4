@@ -2,32 +2,41 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     fmt::Display,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Instant,
 };
 
+use argh::FromArgs;
 use voices::{Kind, Voices, blips_path, latent_path, legacy, table_path, write_table};
 
-const USAGE: &str = "\
-usage: convert-voices SPEAKER_LATENTS VOICE_MAPPING OUT
-
-Converts every <stem>.speaker_latent and <stem>.blips file in SPEAKER_LATENTS, as the Python
-service reads them, into the voices directory OUT, which must not exist, with VOICE_MAPPING,
-the service's voice_mapping.json, as its table. Each file that cannot be converted is named
-with the reason, and the table is checked against the files: a voice without a latent or
-blips is named, and so is a stem in no voice. Exits 1 if any file failed.";
+/// Converts every \<stem\>.speaker_latent and \<stem\>.blips file in SPEAKER_LATENTS, as the
+/// Python service reads them, into the voices directory OUT, which must not exist, with
+/// VOICE_MAPPING, the service's voice_mapping.json, as its table. Each file that cannot be
+/// converted is named with the reason, and the table is checked against the files: a voice
+/// without a latent or blips is named, and so is a stem in no voice. Exits 1 if any file failed.
+#[derive(FromArgs)]
+struct Args {
+    /// the Python service's directory of voice files
+    #[argh(positional, arg_name = "SPEAKER_LATENTS")]
+    source: PathBuf,
+    /// the Python service's voice_mapping.json
+    #[argh(positional, arg_name = "VOICE_MAPPING")]
+    mapping: PathBuf,
+    /// the voices directory to make
+    #[argh(positional, arg_name = "OUT")]
+    out: PathBuf,
+}
 
 fn main() -> ExitCode {
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    let [source, mapping, out] = &args[..] else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
-    };
-    match convert(Path::new(source), Path::new(mapping), Path::new(out)) {
+    let Args {
+        source,
+        mapping,
+        out,
+    } = argh::from_env();
+    match convert(&source, &mapping, &out) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
