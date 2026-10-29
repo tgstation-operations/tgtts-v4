@@ -2459,6 +2459,7 @@ dependencies = [
  "safetensors 0.8.0",
  "serde_json",
  "testkit",
+ "thiserror 2.0.21",
  "voices",
 ]
 

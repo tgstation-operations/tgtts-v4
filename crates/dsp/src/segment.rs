@@ -5,7 +5,7 @@
 //! arithmetic. Each operation here takes the same steps, so that it gives the same samples:
 //! frames a slice drops or pads with silence where milliseconds and frames disagree included.
 
-use std::{error, fmt, ops::Range};
+use std::ops::Range;
 
 /// pydub's `db_to_float(-120)`, the gain a fade starts or ends at.
 const FADE_FLOOR_DB: f64 = -120.0;
@@ -23,9 +23,10 @@ pub struct Segment {
 }
 
 /// Something pydub raises, where the old service then failed the request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// A crossfade, in ms, longer than the segment of this length it would fade out.
+    #[error("crossfade of {crossfade} ms is longer than a segment of {len} ms")]
     CrossfadeTooLong {
         /// The crossfade.
         crossfade: i64,
@@ -33,29 +34,12 @@ pub enum Error {
         len: i64,
     },
     /// A slice that pydub would have to pad with more than 2 ms of silence.
+    #[error("slice would pad {0} missing frames with silence")]
     TooManyMissingFrames(i64),
     /// A fade of at most 100 ms over no frames, whose gain step pydub divides by zero for.
+    #[error("fade over no frames")]
     EmptyFade,
 }
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CrossfadeTooLong { crossfade, len } => {
-                write!(
-                    f,
-                    "crossfade of {crossfade} ms is longer than a segment of {len} ms"
-                )
-            }
-            Self::TooManyMissingFrames(missing) => {
-                write!(f, "slice would pad {missing} missing frames with silence")
-            }
-            Self::EmptyFade => f.write_str("fade over no frames"),
-        }
-    }
-}
-
-impl error::Error for Error {}
 
 impl Segment {
     /// A segment of `samples` at `rate` frames per second.

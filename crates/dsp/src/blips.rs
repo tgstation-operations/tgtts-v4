@@ -8,7 +8,7 @@
 //! blips service made of the text it was sent; [`message`] is what its frontend made of a message,
 //! a sentence at a time.
 
-use std::{collections::HashMap, error, fmt};
+use std::collections::HashMap;
 
 use voices::Blips;
 
@@ -26,46 +26,17 @@ const CROSSFADE: i64 = 150;
 const SENTENCE_GAP: u32 = 250;
 
 /// What made the blips fail.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The voice has no sample the text needs, or it could not be read.
-    Voice(voices::Error),
+    #[error("{0}")]
+    Voice(#[from] voices::Error),
     /// pydub would have refused an operation on the samples.
-    Segment(segment::Error),
+    #[error("{0}")]
+    Segment(#[from] segment::Error),
     /// The voice's samples are at this rate, not the service's.
+    #[error("the voice's blips are at {0} Hz, not {RATE} Hz")]
     Rate(u32),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Voice(e) => e.fmt(f),
-            Self::Segment(e) => e.fmt(f),
-            Self::Rate(rate) => write!(f, "the voice's blips are at {rate} Hz, not {RATE} Hz"),
-        }
-    }
-}
-
-impl error::Error for Error {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Self::Voice(e) => Some(e),
-            Self::Segment(e) => Some(e),
-            Self::Rate(_) => None,
-        }
-    }
-}
-
-impl From<voices::Error> for Error {
-    fn from(e: voices::Error) -> Self {
-        Self::Voice(e)
-    }
-}
-
-impl From<segment::Error> for Error {
-    fn from(e: segment::Error) -> Self {
-        Self::Segment(e)
-    }
 }
 
 /// The blips of `text` in the voice whose samples `blips` holds, at its `base` and `number`,
