@@ -8,11 +8,12 @@ use std::fs;
 use common::real;
 use dsp::{
     loudness::{CEILING, FLOOR, integrated, normalize},
+    quantity::{Gain, Loudness},
     segment::Segment,
 };
 use tgtts::{levels::Levels, synth, wav};
 
-const TARGET: f64 = -16.0;
+const TARGET: Loudness = Loudness::new(-16.0);
 
 /// Each kept line, by its voice, as `tgtts-gains --keep` named it.
 fn kept() -> Vec<(String, Segment)> {
@@ -49,7 +50,7 @@ fn holds_the_gain_of_a_line_to_its_voices_level_and_the_margin() {
     for (voice, said) in kept() {
         let finished = dsp::speech::finish(&synth::level(&said), 0);
         let most = levels.most_gain(&voice, TARGET);
-        let free = normalize(&finished, TARGET, CEILING, f64::INFINITY);
+        let free = normalize(&finished, TARGET, CEILING, Gain::new(f64::INFINITY));
         let capped = normalize(&finished, TARGET, CEILING, most);
         if free.gain <= most {
             assert_eq!(capped, free, "{voice}");
@@ -75,8 +76,8 @@ fn serves_a_line_said_under_the_floor_as_it_was_said() {
                 .map(|&s| f64::from(s) / 32768.0)
                 .collect()
         };
-        let loudness = integrated(&x(&said), said.rate);
-        let down = 10f64.powf((FLOOR - 1.0 - loudness) / 20.0);
+        let loudness = integrated(&x(&said), said.rate).value();
+        let down = 10f64.powf((FLOOR.value() - 1.0 - loudness) / 20.0);
         let quiet = said
             .samples
             .iter()

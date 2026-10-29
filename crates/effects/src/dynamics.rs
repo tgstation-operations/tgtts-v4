@@ -1,6 +1,6 @@
 //! Dynamics: a compressor, and [`dsp::limiter`]'s true-peak limiter.
 
-use dsp::limiter;
+use dsp::{limiter, quantity::TruePeak};
 
 use crate::{Processor, RATE};
 
@@ -79,8 +79,8 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    /// A limiter holding the true peak at or under `ceiling` dBTP.
-    pub fn new(ceiling: f64) -> Self {
+    /// A limiter holding the true peak at or under `ceiling`.
+    pub fn new(ceiling: TruePeak) -> Self {
         Self {
             limiter: limiter::Limiter::new(dsp::RATE, ceiling),
             buffer: Vec::new(),

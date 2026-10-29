@@ -2,7 +2,7 @@
 
 use std::{f64::consts::TAU, sync::Arc};
 
-use dsp::quantity::SampleRate;
+use dsp::quantity::{SampleRate, TruePeak};
 use effects::{
     Pipeline, Processor,
     convolve::{Impulses, Response},
@@ -208,7 +208,7 @@ fn compressor_follows_its_curve() {
 #[test]
 fn limiter_holds_the_ceiling_and_keeps_the_length() {
     let x = sine(440.0, 2.0, 0.5);
-    let y = run(&mut Limiter::new(-6.0), &x);
+    let y = run(&mut Limiter::new(TruePeak::new(-6.0)), &x);
     assert_eq!(y.len(), x.len());
     let peak = y.iter().fold(0f32, |m, s| m.max(s.abs()));
     assert!(peak <= 10f32.powf(-6.0 / 20.0), "{peak}");

@@ -20,7 +20,11 @@ use std::{
     time::Instant,
 };
 
-use dsp::{radio, segment::Segment};
+use dsp::{
+    quantity::{self, Gain, Ratio},
+    radio,
+    segment::Segment,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use voices::Voices;
@@ -50,11 +54,11 @@ pub const LINES: [&str; 12] = [
 
 /// How much more than its voice's gain the whole-file path may raise a line by, in dB: 7189 of
 /// the 7197 lines 600 voices said in a gains run came within 12 dB under their voice's level.
-pub const MARGIN: f64 = 12.0;
+pub const MARGIN: Gain = Gain::new(12.0);
 
 /// The most the whole-file path raises speech in a voice without a level by, in dB: more than
 /// 589 of those 600 voices' levels allow with [`MARGIN`].
-pub const MOST_GAIN: f64 = 24.0;
+pub const MOST_GAIN: Gain = Gain::new(24.0);
 
 /// The voices' levels.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -121,19 +125,21 @@ impl Levels {
 
     /// `voice`'s loudness, or for a voice without a level the median of the voices', or none
     /// where no voice has one.
-    pub fn loudness(&self, voice: &str) -> Option<f64> {
+    pub fn loudness(&self, voice: &str) -> Option<quantity::Loudness> {
         if let Some(level) = self.voices.get(voice) {
-            return Some(level.loudness_lufs);
+            return Some(quantity::Loudness::new(level.loudness_lufs));
         }
         let all: Vec<f64> = self.voices.values().map(|l| l.loudness_lufs).collect();
-        median(&all)
+        median(&all).map(quantity::Loudness::new)
     }
 
-    /// The most the whole-file path raises speech in `voice` by to bring it to `target` LUFS, in
-    /// dB: the gain that brings the voice's level there and [`MARGIN`], or for a voice without
-    /// a level, [`MOST_GAIN`].
-    pub fn most_gain(&self, voice: &str, target: f64) -> f64 {
-        (self.voices.get(voice)).map_or(MOST_GAIN, |level| target - level.loudness_lufs + MARGIN)
+    /// The most the whole-file path raises speech in `voice` by to bring it to `target`: the gain
+    /// that brings the voice's level there and [`MARGIN`], or for a voice without a level,
+    /// [`MOST_GAIN`].
+    pub fn most_gain(&self, voice: &str, target: quantity::Loudness) -> Gain {
+        (self.voices.get(voice)).map_or(MOST_GAIN, |level| {
+            Gain::between(quantity::Loudness::new(level.loudness_lufs), target) + MARGIN
+        })
     }
 
     /// The peaks the radio scales `voice`'s streamed speech by, or for a voice without them the
@@ -253,9 +259,9 @@ pub fn report(log: &str) -> Result<String, serde_json::Error> {
 struct Measured {
     line: usize,
     samples: Vec<f32>,
-    loudness: Option<f64>,
+    loudness: Option<quantity::Loudness>,
     patches: usize,
-    radio_lufs: f64,
+    radio_lufs: quantity::Loudness,
 }
 
 /// What [`Measure::run`] measures with.
@@ -388,7 +394,7 @@ impl Measure<'_> {
         Some(Measured {
             line,
             samples: speech.samples,
-            loudness: loudness.is_finite().then_some(loudness),
+            loudness: loudness.value().is_finite().then_some(loudness),
             patches: speech.patches,
             radio_lufs: pcm_lufs(&radio.samples),
         })
@@ -404,12 +410,15 @@ impl Measure<'_> {
         let mut lines: Vec<Measured> = lines.into_iter().flatten().collect();
         lines.retain(|m| m.loudness.is_some());
         lines.sort_by_key(|m| m.line);
-        let loud: Vec<f64> = lines.iter().filter_map(|m| m.loudness).collect();
-        let Some(loudness) = median(&loud) else {
+        let loud: Vec<f64> = (lines.iter())
+            .filter_map(|m| m.loudness)
+            .map(quantity::Loudness::value)
+            .collect();
+        let Some(loudness) = median(&loud).map(quantity::Loudness::new) else {
             return Ok(None);
         };
         // Each line as it streams: at the voice's gain and under the limiter.
-        let gain = 10f64.powf((self.loudness.target - loudness) / 20.0);
+        let gain = Ratio::of(Gain::between(loudness, self.loudness.target)).value();
         let streamed: Vec<Vec<i16>> = (lines.iter())
             .map(|m| {
                 let mut x: Vec<f64> = m.samples.iter().map(|&s| f64::from(s) * gain).collect();
@@ -448,18 +457,18 @@ impl Measure<'_> {
             let line = serde_json::json!({
                 "voice": voice,
                 "line": m.line,
-                "loudness_lufs": m.loudness,
+                "loudness_lufs": m.loudness.map(quantity::Loudness::value),
                 "seconds": m.samples.len() as f64 / f64::from(dsp::RATE),
                 "patches": m.patches,
-                "streamed_lufs": pcm_lufs(pcm),
-                "radio_level_db": pcm_lufs(&out) - m.radio_lufs,
+                "streamed_lufs": pcm_lufs(pcm).value(),
+                "radio_level_db": Gain::between(m.radio_lufs, pcm_lufs(&out)).value(),
                 "radio_drive_db": 20.0 * (f64::from(peaks.narrowed) / radio.narrowed).log10(),
                 "radio_clipped": out.iter().filter(|&&s| s == i16::MAX || s <= -i16::MAX).count(),
             });
             writeln!(log, "{line}")?;
         }
         Ok(Some(Level {
-            loudness_lufs: loudness,
+            loudness_lufs: loudness.value(),
             lines: loud.len(),
             radio: Some(radio),
         }))
@@ -480,7 +489,7 @@ fn mono(samples: &[i16]) -> radio::Pcm {
 }
 
 /// The integrated loudness of 16-bit `samples`.
-fn pcm_lufs(samples: &[i16]) -> f64 {
+fn pcm_lufs(samples: &[i16]) -> quantity::Loudness {
     let x: Vec<f64> = samples.iter().map(|&s| f64::from(s) / 32768.0).collect();
     dsp::loudness::integrated(&x, dsp::RATE)
 }
@@ -580,7 +589,7 @@ mod tests {
             voices: &voices,
             requests: 4,
             loudness: Loudness {
-                target: -16.0,
+                target: quantity::Loudness::new(-16.0),
                 ceiling: dsp::loudness::CEILING,
             },
             radio: &radio,
@@ -702,8 +711,8 @@ mod tests {
             };
             levels.set(voice, level);
         }
-        assert_eq!(levels.loudness("B"), Some(-30.0));
-        assert_eq!(levels.loudness("Z"), Some(-32.0));
+        assert_eq!(levels.loudness("B"), Some(quantity::Loudness::new(-30.0)));
+        assert_eq!(levels.loudness("Z"), Some(quantity::Loudness::new(-32.0)));
         assert_eq!(median(&[1.0, 4.0, 2.0, 3.0]), Some(2.5));
     }
 
@@ -716,8 +725,9 @@ mod tests {
             radio: None,
         };
         levels.set("A", level);
-        assert_eq!(levels.most_gain("A", -16.0), 14.0 + MARGIN);
-        assert_eq!(levels.most_gain("B", -16.0), MOST_GAIN);
+        let target = quantity::Loudness::new(-16.0);
+        assert_eq!(levels.most_gain("A", target), Gain::new(14.0) + MARGIN);
+        assert_eq!(levels.most_gain("B", target), MOST_GAIN);
     }
 
     #[test]

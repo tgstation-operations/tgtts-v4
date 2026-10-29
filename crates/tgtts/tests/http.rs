@@ -18,7 +18,7 @@ use std::{
 };
 
 use common::{Message, Reply, Server, VOICE, call};
-use dsp::quantity::SampleRate;
+use dsp::quantity::{self, SampleRate, TruePeak};
 use tgtts::{
     cache::Cache,
     ffmpeg::Ffmpeg,
@@ -252,7 +252,7 @@ fn write_assets(dir: &Path) {
 }
 
 const LOUDNESS: Loudness = Loudness {
-    target: -16.0,
+    target: quantity::Loudness::new(-16.0),
     ceiling: dsp::loudness::CEILING,
 };
 
@@ -295,7 +295,7 @@ fn levels() -> Levels {
         let mut tone: Vec<f64> = said(text).iter().map(|&s| f64::from(s)).collect();
         tone.resize(tone.len() + TAIL, 0.0);
         Level {
-            loudness_lufs: dsp::loudness::integrated(&tone, SampleRate::new(48000)),
+            loudness_lufs: dsp::loudness::integrated(&tone, SampleRate::new(48000)).value(),
             lines: 1,
             radio: None,
         }
@@ -786,12 +786,12 @@ fn shifts_the_blips_by_the_pitch() {
 fn loudness(reply: &Reply) -> f64 {
     let audio = common::decode(&reply.body);
     let samples: Vec<f64> = audio.samples.iter().map(|&s| f64::from(s)).collect();
-    dsp::loudness::integrated(&samples, audio.rate)
+    dsp::loudness::integrated(&samples, audio.rate).value()
 }
 
 #[test]
 fn brings_speech_and_blips_to_the_loudness() {
-    let (target, ceiling) = (-24.0, -1.0);
+    let (target, ceiling) = (quantity::Loudness::new(-24.0), TruePeak::new(-1.0));
     let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
     let message = Message {
         pitch: "2",
@@ -819,7 +819,7 @@ fn brings_speech_and_blips_to_the_loudness() {
     let blips = message.blips(&h);
     blips.assert_ogg(48000);
     assert!(
-        (loudness(&blips) - target).abs() < 1.0,
+        (loudness(&blips) - target.value()).abs() < 1.0,
         "{}",
         loudness(&blips)
     );
@@ -1091,7 +1091,7 @@ fn records_silence_as_silence() {
 #[test]
 fn records_metrics_without_the_text() {
     // Loud enough that the fake's speech takes the limiter to reach it.
-    let (target, ceiling) = (-4.5, -1.0);
+    let (target, ceiling) = (quantity::Loudness::new(-4.5), TruePeak::new(-1.0));
     let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
     let take = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
     let finished = dsp::speech::finish(&take, 0);
@@ -1100,7 +1100,7 @@ fn records_metrics_without_the_text() {
     assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);
     let speech_rms = wav::Audio::from_segment(&speech_leveling.segment).rms_dbfs();
     let speech_leveling = Some((
-        speech_leveling.gain,
+        speech_leveling.gain.value(),
         speech_leveling.reduction,
         speech_leveling.limited,
     ));
@@ -1304,7 +1304,7 @@ fn streamed_speech_is_as_long_and_as_loud_as_the_whole_files() {
         let decoded = tgtts::opus::decode(&streamed.body).unwrap().samples;
         assert_eq!(decoded.len(), whole.frames(48000));
         let streamed: Vec<f64> = decoded.iter().map(|&s| f64::from(s)).collect();
-        let streamed = dsp::loudness::integrated(&streamed, SampleRate::new(48000));
+        let streamed = dsp::loudness::integrated(&streamed, SampleRate::new(48000)).value();
         let whole = loudness(&whole);
         assert!(
             (streamed - whole).abs() < 0.3,
@@ -1481,7 +1481,7 @@ fn streams_the_effects_and_the_clicks() {
     };
     let integrated = |samples: &[f32]| {
         let samples: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
-        dsp::loudness::integrated(&samples, SampleRate::new(48000))
+        dsp::loudness::integrated(&samples, SampleRate::new(48000)).value()
     };
     for (effects, text) in [
         r#"[[{"effect": "lowpass", "frequency_hz": 750}, {"effect": "gain", "gain_db": -6}]]"#,
@@ -1533,7 +1533,7 @@ fn with_radio_peaks(mut levels: Levels, assets: &std::path::Path) -> Levels {
     let sounds = Sounds::open(assets).unwrap();
     for (voice, text) in [(VOICE, "Hello there."), ("Woman (Test)", LONGER)] {
         let level = levels.get(voice).unwrap();
-        let gain = 10f64.powf((LOUDNESS.target - level.loudness_lufs) / 20.0);
+        let gain = 10f64.powf((LOUDNESS.target.value() - level.loudness_lufs) / 20.0);
         let mut x: Vec<f64> = said(text).iter().map(|&s| f64::from(s) * gain).collect();
         x.resize(x.len() + TAIL, 0.0);
         let limited = dsp::limiter::limit(&x, SampleRate::new(48000), LOUDNESS.ceiling).samples;
@@ -1594,7 +1594,7 @@ fn streams_the_radio_when_asked() {
     assert_eq!(streamed.samples.len(), radio_frames(speech));
     let streamed: Vec<f64> = streamed.samples.iter().map(|&s| f64::from(s)).collect();
     let (streamed, whole) = (
-        dsp::loudness::integrated(&streamed, SampleRate::new(48000)),
+        dsp::loudness::integrated(&streamed, SampleRate::new(48000)).value(),
         loudness(&whole),
     );
     assert!(

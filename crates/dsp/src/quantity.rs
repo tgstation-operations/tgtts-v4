@@ -22,11 +22,24 @@
 //! let _ = Loudness::new(-23.0) + Gain::new(6.0);
 //! ```
 //!
-//! and silence with its duration and its rate the wrong way round:
+//! silence with its duration and its rate the wrong way round,
 //!
 //! ```compile_fail,E0308
 //! use dsp::{RATE, segment::Segment, speech::TAIL};
 //! let _ = Segment::silent(RATE, TAIL);
+//! ```
+//!
+//! and speech brought to a loudness with its target and its ceiling the wrong way round:
+//!
+//! ```compile_fail,E0308
+//! use dsp::{
+//!     RATE,
+//!     loudness::{CEILING, normalize},
+//!     quantity::{Gain, Loudness},
+//!     segment::Segment,
+//! };
+//! let speech = Segment::new(RATE, vec![0; 4800]);
+//! let _ = normalize(&speech, CEILING, Loudness::new(-16.0), Gain::new(12.0));
 //! ```
 
 use std::ops::{Add, AddAssign, Neg, Sub};

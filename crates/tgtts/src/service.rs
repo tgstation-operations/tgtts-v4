@@ -25,7 +25,11 @@ use axum::{
     routing::{get, post},
 };
 use dsp::{
-    loudness::Normalized, quantity::SampleRate, radio, resample::resample, segment::Segment,
+    loudness::Normalized,
+    quantity::{self, Gain, SampleRate, TruePeak},
+    radio,
+    resample::resample,
+    segment::Segment,
 };
 use effects::{
     Pipeline,
@@ -151,10 +155,10 @@ pub struct Limits {
 /// The loudness the service brings speech and blips to, before the game's filters.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Loudness {
-    /// The integrated loudness, in LUFS.
-    pub target: f64,
-    /// The true peak it is held under, in dBTP.
-    pub ceiling: f64,
+    /// The integrated loudness.
+    pub target: quantity::Loudness,
+    /// The true peak it is held under.
+    pub ceiling: TruePeak,
 }
 
 /// What a [`Service`] is made of.
@@ -502,7 +506,7 @@ impl Service {
                 dsp_ms = ms(t.dsp),
                 ffmpeg_ms = ms(t.ffmpeg),
                 total_ms = ms(t.total),
-                gain_db = trace.leveling.map(|l| l.gain),
+                gain_db = trace.leveling.map(|l| l.gain.value()),
                 limiter_db = trace.leveling.map(|l| l.reduction),
                 limited = trace.leveling.map(|l| l.limited),
                 "served"
@@ -746,7 +750,7 @@ impl Service {
                 &blips,
                 loudness.target,
                 loudness.ceiling,
-                f64::INFINITY,
+                Gain::new(f64::INFINITY),
             ))
         })
         .await?

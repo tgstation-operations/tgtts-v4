@@ -70,12 +70,12 @@ fn holds_tech_3341_peaks_under_the_ceiling() {
         let x: Vec<f64> = (fx.f32s(&format!("peak/{case}/samples")).into_iter())
             .map(|s| 4.0 * f64::from(s))
             .collect();
-        assert!(true_peak(&x) > CEILING + 6.0, "case {case}");
+        assert!(true_peak(&x).value() > CEILING.value() + 6.0, "case {case}");
         let limited = limit(&x, RATE, CEILING).samples;
-        let (peak, waveform) = (true_peak(&limited), waveform_peak(&limited));
-        assert!(peak <= CEILING, "case {case}: {peak} dBTP");
+        let (peak, waveform) = (true_peak(&limited).value(), waveform_peak(&limited));
+        assert!(peak <= CEILING.value(), "case {case}: {peak} dBTP");
         assert!(
-            waveform <= CEILING + WAVEFORM_OVER,
+            waveform <= CEILING.value() + WAVEFORM_OVER,
             "case {case}: the waveform at {waveform} dBFS"
         );
     }
@@ -95,7 +95,7 @@ fn takes_down_only_what_a_peak_needs() {
     let click = RATE.value() as usize;
     x[click] = 1.5;
     let limited = limit(&x, RATE, CEILING);
-    let over = true_peak(&x) - CEILING;
+    let over = true_peak(&x).value() - CEILING.value();
     assert!(
         (over..over + 0.01).contains(&limited.reduction),
         "{} dB for {over}",

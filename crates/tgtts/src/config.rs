@@ -43,6 +43,7 @@ use std::{
     time::Duration,
 };
 
+use dsp::quantity::{self, TruePeak};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Targets;
 
@@ -160,13 +161,15 @@ impl Config {
                 .seconds("radio_wait_ceiling_seconds")?
                 .unwrap_or(Duration::from_secs(30)),
             loudness: Loudness {
-                target: settings.decibels("loudness_target_lufs")?.unwrap_or(-16.0),
+                target: quantity::Loudness::new(
+                    settings.decibels("loudness_target_lufs")?.unwrap_or(-16.0),
+                ),
                 ceiling: match settings.decibels("loudness_ceiling_dbtp")? {
                     Some(ceiling) if ceiling > 0.0 => {
                         let reason = format!("loudness_ceiling_dbtp: {ceiling} is over full scale");
                         return Err(Error(reason));
                     }
-                    ceiling => ceiling.unwrap_or(dsp::loudness::CEILING),
+                    ceiling => ceiling.map_or(dsp::loudness::CEILING, TruePeak::new),
                 },
             },
             voice_levels_file: settings.parse("voice_levels_file")?,
@@ -308,8 +311,8 @@ mod tests {
                 radio_wait: Duration::from_secs(10),
                 radio_wait_ceiling: Duration::from_secs(30),
                 loudness: Loudness {
-                    target: -16.0,
-                    ceiling: -1.0,
+                    target: quantity::Loudness::new(-16.0),
+                    ceiling: TruePeak::new(-1.0),
                 },
                 voice_levels_file: None,
                 babble_cap: false,
@@ -355,8 +358,8 @@ mod tests {
         assert_eq!(config.queue_timeout, Duration::from_millis(2500));
         assert_eq!(config.radio_wait_ceiling, Duration::from_secs(45));
         let loudness = Loudness {
-            target: -18.0,
-            ceiling: -1.5,
+            target: quantity::Loudness::new(-18.0),
+            ceiling: TruePeak::new(-1.5),
         };
         assert_eq!(config.loudness, loudness);
         assert_eq!(config.log_level, LevelFilter::DEBUG);
@@ -373,7 +376,7 @@ mod tests {
         assert_eq!(config.synthesis_limit, 2);
         assert_eq!(config.log_level, LevelFilter::WARN);
         assert_eq!(config.token_file, Path::new("/etc/token"));
-        assert_eq!(config.loudness.target, -14.5);
+        assert_eq!(config.loudness.target, quantity::Loudness::new(-14.5));
     }
 
     #[test]

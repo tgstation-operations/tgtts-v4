@@ -34,7 +34,14 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use dsp::{limiter::Limiter, pitch::Shifter, radio, resample::resample, segment::Segment};
+use dsp::{
+    limiter::Limiter,
+    pitch::Shifter,
+    quantity::{self, Gain, Ratio},
+    radio,
+    resample::resample,
+    segment::Segment,
+};
 use effects::{Pipeline, Processor};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -260,7 +267,7 @@ fn mono(audio: &Audio) -> Vec<f32> {
 /// What speech the model makes anew goes through as it comes, to its stream and to the radio:
 /// the voice's gain, the pitch, the limiter, the effects, then the clicks.
 pub(super) struct Chain {
-    gain: f64,
+    gain: Ratio,
     shifter: Option<Shifter>,
     limiter: Limiter,
     effects: Option<Pipeline>,
@@ -289,7 +296,7 @@ impl Chain {
     /// `samples` in, as the model makes them.
     pub(super) fn push(&mut self, samples: &[f32]) {
         let gained: Vec<f32> = (samples.iter())
-            .map(|&s| (f64::from(s) * self.gain) as f32)
+            .map(|&s| (f64::from(s) * self.gain.value()) as f32)
             .collect();
         let pitched = match &mut self.shifter {
             Some(shifter) => {
@@ -331,7 +338,7 @@ impl Chain {
         let energy = self.energy / self.counted.max(1) as f64;
         Finished {
             leveling: Leveling {
-                gain: 20.0 * self.gain.log10(),
+                gain: Gain::of(self.gain),
                 reduction: self.limiter.reduction(),
                 limited: self.limiter.fraction(),
             },
@@ -778,15 +785,20 @@ impl Service {
 
     /// The chain speech in a voice of `loudness` streams through, as the request's `params`,
     /// `pitch` and `treatment` have it, to nowhere yet.
-    fn chain(&self, params: &Params, pitch: i32, loudness: f64, treatment: Treatment) -> Chain {
+    fn chain(
+        &self,
+        params: &Params,
+        pitch: i32,
+        loudness: quantity::Loudness,
+        treatment: Treatment,
+    ) -> Chain {
         let clicked = params.special_filters.split('|').any(|s| s == "radio");
         let effects = match treatment {
             Treatment::Effects(pipeline) => Some(pipeline),
             Treatment::Filter(_) | Treatment::None => None,
         };
-        let gain = self.loudness.target - loudness;
         Chain {
-            gain: 10f64.powf(gain / 20.0),
+            gain: Ratio::of(Gain::between(loudness, self.loudness.target)),
             shifter: (pitch != 0).then(|| Shifter::new(dsp::RATE, f64::from(pitch), 24)),
             limiter: Limiter::new(dsp::RATE, self.loudness.ceiling),
             effects,
@@ -847,7 +859,7 @@ mod tests {
     /// The chain on its own, at `gain`, shifting by `pitch`: what it keeps for the radio.
     fn chained(raw: &[f32], gain: f64, pitch: i32, chunk: usize) -> (Vec<f32>, Leveling) {
         let mut chain = Chain {
-            gain,
+            gain: Ratio::new(gain),
             shifter: (pitch != 0).then(|| Shifter::new(dsp::RATE, f64::from(pitch), 24)),
             limiter: Limiter::new(dsp::RATE, dsp::loudness::CEILING),
             effects: None,
@@ -871,11 +883,11 @@ mod tests {
         let peak = raw.iter().fold(0f32, |m, s| m.max(s.abs()));
         let leveled = synth::level(&synth::to_segment(raw));
         let finished = dsp::speech::finish(&leveled, pitch);
-        let whole =
-            dsp::loudness::normalize(&finished, -16.0, dsp::loudness::CEILING, f64::INFINITY);
+        let (target, most) = (quantity::Loudness::new(-16.0), Gain::new(f64::INFINITY));
+        let whole = dsp::loudness::normalize(&finished, target, dsp::loudness::CEILING, most);
         // From the model's samples, the leveling's gain and then the loudness's.
         let leveling = f64::from(leveled.max()) / 32768.0 / f64::from(peak);
-        let gain = leveling * 10f64.powf(whole.gain / 20.0);
+        let gain = leveling * Ratio::of(whole.gain).value();
         let samples = (whole.segment.samples.iter())
             .map(|&s| f32::from(s) / 32768.0)
             .collect();
@@ -884,7 +896,7 @@ mod tests {
 
     fn loudness(samples: &[f32]) -> f64 {
         let samples: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
-        dsp::loudness::integrated(&samples, dsp::RATE)
+        dsp::loudness::integrated(&samples, dsp::RATE).value()
     }
 
     /// At the gain the whole-file path came to, the chain makes the whole-file path's speech:

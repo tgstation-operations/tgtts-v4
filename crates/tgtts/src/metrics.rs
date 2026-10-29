@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use dsp::quantity::Gain;
 use rusqlite::{Connection, TransactionBehavior, params};
 use tracing::{error, warn};
 
@@ -121,8 +122,8 @@ pub struct Row {
 /// What bringing a request's audio to the service's loudness took.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Leveling {
-    /// The gain before the limiter, in dB.
-    pub gain: f64,
+    /// The gain before the limiter.
+    pub gain: Gain,
     /// The most the limiter took off, in dB.
     pub reduction: f64,
     /// The fraction of the samples the limiter lowered.
@@ -281,7 +282,7 @@ fn insert<'a>(
                 ms(t.ffmpeg),
                 ms(t.total),
                 row.patches.map(|p| p as i64),
-                leveling.map(|l| l.gain),
+                leveling.map(|l| l.gain.value()),
                 leveling.map(|l| l.reduction),
                 leveling.map(|l| l.limited),
                 row.cache_takes.map(|t| t as i64),
@@ -328,7 +329,7 @@ mod tests {
                 prefilled: 120,
             }),
             leveling: Some(Leveling {
-                gain: -12.5,
+                gain: Gain::new(-12.5),
                 reduction: 0.75,
                 limited: 0.03125,
             }),

@@ -58,7 +58,7 @@ pub fn serves_a_message<S: Synthesizer>(model: S, prepare: impl FnOnce(&S, &Voic
         metrics: None,
         logging: Logging::new(LevelFilter::INFO, |_| {}),
         loudness: Loudness {
-            target: -16.0,
+            target: dsp::quantity::Loudness::new(-16.0),
             ceiling: dsp::loudness::CEILING,
         },
         levels: Levels::default(),

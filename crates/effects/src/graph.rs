@@ -10,6 +10,8 @@ use std::{
     error, fmt,
 };
 
+use dsp::quantity::TruePeak;
+
 use crate::{
     Processor, RATE,
     convolve::{Convolve, Impulses},
@@ -451,7 +453,7 @@ fn processor(node: &Node, impulses: &Impulses) -> Box<dyn Processor> {
             makeup_db,
             knee_db,
         )),
-        Node::Limiter { ceiling_db } => Box::new(Limiter::new(ceiling_db)),
+        Node::Limiter { ceiling_db } => Box::new(Limiter::new(TruePeak::new(ceiling_db))),
         Node::Saturate { amount } => Box::new(Saturate::new(amount)),
         Node::Clip { ceiling_db } => Box::new(Clip::new(ceiling_db)),
         Node::Crush { rate_hz, mix } => Box::new(Crush::new(rate_hz, mix)),

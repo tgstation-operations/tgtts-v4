@@ -8,7 +8,7 @@ use std::f64::consts::PI;
 use common::Tensors;
 use dsp::{
     loudness::{CEILING, FLOOR, integrated, normalize, true_peak},
-    quantity::SampleRate,
+    quantity::{Gain, Loudness, SampleRate},
     segment::Segment,
 };
 
@@ -48,7 +48,7 @@ fn integrated_loudness_meets_tech_3341() {
     for case in cases(&fixture, "tones") {
         let name = |what: &str| format!("tone/{case}/{what}");
         let x = tone(&fx.f64s(&name("levels")), &fx.f64s(&name("seconds")));
-        let loudness = integrated(&x, RATE);
+        let loudness = integrated(&x, RATE).value();
         let expected = fx.f64s(&name("expected"))[0];
         assert!(
             (loudness - expected).abs() <= 0.1,
@@ -73,7 +73,7 @@ fn true_peak_meets_tech_3341() {
             .into_iter()
             .map(f64::from)
             .collect();
-        let peak = true_peak(&x);
+        let peak = true_peak(&x).value();
         let expected = fx.f64s(&name("expected"))[0];
         assert!(
             (expected - 0.4..=expected + 0.2).contains(&peak),
@@ -89,9 +89,9 @@ fn true_peak_meets_tech_3341() {
 
 #[test]
 fn clips_shorter_than_a_block_read_as_the_sound_held() {
-    let held = integrated(&tone(&[-23.0], &[20.0]), RATE);
+    let held = integrated(&tone(&[-23.0], &[20.0]), RATE).value();
     for seconds in [0.39, 0.1] {
-        let short = integrated(&tone(&[-23.0], &[seconds]), RATE);
+        let short = integrated(&tone(&[-23.0], &[seconds]), RATE).value();
         assert!(
             (short - held).abs() < 0.05,
             "{seconds} s: {short} for {held}"
@@ -102,11 +102,14 @@ fn clips_shorter_than_a_block_read_as_the_sound_held() {
 #[test]
 fn silence_has_no_loudness_or_peak() {
     for len in [0, 100, 48000] {
-        assert_eq!(integrated(&vec![0.0; len], RATE), f64::NEG_INFINITY);
-        assert_eq!(true_peak(&vec![0.0; len]), f64::NEG_INFINITY);
+        assert_eq!(integrated(&vec![0.0; len], RATE).value(), f64::NEG_INFINITY);
+        assert_eq!(true_peak(&vec![0.0; len]).value(), f64::NEG_INFINITY);
     }
     // A tone under the absolute gate is gated away as silence is.
-    assert_eq!(integrated(&tone(&[-80.0], &[1.0]), RATE), f64::NEG_INFINITY);
+    assert_eq!(
+        integrated(&tone(&[-80.0], &[1.0]), RATE).value(),
+        f64::NEG_INFINITY
+    );
 }
 
 /// `x` in 16 bits.
@@ -127,8 +130,13 @@ fn measured(segment: &Segment) -> Vec<f64> {
 fn normalizes_to_the_target() {
     for seconds in [3.0, 0.2] {
         let quiet = pcm(&tone(&[-40.0], &[seconds]));
-        let normalized = normalize(&quiet, -20.0, CEILING, f64::INFINITY);
-        let loudness = integrated(&measured(&normalized.segment), RATE);
+        let normalized = normalize(
+            &quiet,
+            Loudness::new(-20.0),
+            CEILING,
+            Gain::new(f64::INFINITY),
+        );
+        let loudness = integrated(&measured(&normalized.segment), RATE).value();
         assert!((loudness + 20.0).abs() < 0.01, "{seconds} s: {loudness}");
         assert_eq!((normalized.reduction, normalized.limited), (0.0, 0.0));
     }
@@ -151,11 +159,16 @@ fn limits_the_peaks_to_reach_the_target() {
     // One click, and then so many that the limiter is never done with them, which takes the
     // loudness down and the gain back up.
     for every in [10.0, 0.05] {
-        let normalized = normalize(&pcm(&clicked(every)), -20.0, CEILING, f64::INFINITY);
+        let normalized = normalize(
+            &pcm(&clicked(every)),
+            Loudness::new(-20.0),
+            CEILING,
+            Gain::new(f64::INFINITY),
+        );
         let x = measured(&normalized.segment);
-        let (loudness, peak) = (integrated(&x, RATE), true_peak(&x));
+        let (loudness, peak) = (integrated(&x, RATE).value(), true_peak(&x).value());
         assert!((loudness + 20.0).abs() < 0.1, "{every} s: {loudness} LUFS");
-        assert!(peak <= CEILING, "{every} s: {peak} dBTP");
+        assert!(peak <= CEILING.value(), "{every} s: {peak} dBTP");
         assert!(normalized.reduction > 12.0, "{every} s: {normalized:?}");
         assert!(normalized.limited > 0.0);
     }
@@ -165,10 +178,19 @@ fn limits_the_peaks_to_reach_the_target() {
 fn leaves_silence_as_it_is() {
     for x in [vec![0.0; 48000], tone(&[-80.0], &[1.0])] {
         let silence = pcm(&x);
-        let normalized = normalize(&silence, -20.0, CEILING, f64::INFINITY);
+        let normalized = normalize(
+            &silence,
+            Loudness::new(-20.0),
+            CEILING,
+            Gain::new(f64::INFINITY),
+        );
         assert_eq!(normalized.segment, silence);
         assert_eq!(
-            (normalized.gain, normalized.reduction, normalized.limited),
+            (
+                normalized.gain.value(),
+                normalized.reduction,
+                normalized.limited
+            ),
             (0.0, 0.0, 0.0)
         );
     }
@@ -182,22 +204,30 @@ fn leaves_what_is_quieter_than_the_floor_as_it_is() {
         .map(|i| f64::from((i * 7919) % 97 - 48) / 32768.0)
         .collect();
     noise.resize(19680, 0.0);
-    for x in [tone(&[FLOOR], &[1.0]), noise] {
+    for x in [tone(&[FLOOR.value()], &[1.0]), noise] {
         let near = pcm(&x);
-        let loudness = integrated(&measured(&near), RATE);
-        assert!((-70.0..FLOOR).contains(&loudness), "{loudness} LUFS");
-        let normalized = normalize(&near, -16.0, CEILING, f64::INFINITY);
+        let loudness = integrated(&measured(&near), RATE).value();
+        assert!(
+            (-70.0..FLOOR.value()).contains(&loudness),
+            "{loudness} LUFS"
+        );
+        let normalized = normalize(
+            &near,
+            Loudness::new(-16.0),
+            CEILING,
+            Gain::new(f64::INFINITY),
+        );
         assert_eq!(normalized.segment, near);
-        assert_eq!(normalized.gain, 0.0);
+        assert_eq!(normalized.gain.value(), 0.0);
     }
 }
 
 #[test]
 fn raises_by_no_more_than_the_most() {
     let quiet = pcm(&tone(&[-50.0], &[1.0]));
-    let normalized = normalize(&quiet, -16.0, CEILING, 12.0);
-    let loudness = integrated(&measured(&normalized.segment), RATE);
-    assert_eq!(normalized.gain, 12.0);
+    let normalized = normalize(&quiet, Loudness::new(-16.0), CEILING, Gain::new(12.0));
+    let loudness = integrated(&measured(&normalized.segment), RATE).value();
+    assert_eq!(normalized.gain.value(), 12.0);
     assert!((loudness + 41.0).abs() < 0.01, "{loudness} LUFS");
 
     // Clicks in silence the limiter holds down, so that no gain brings them to the target: the
@@ -207,9 +237,14 @@ fn raises_by_no_more_than_the_most() {
         clicks[at] = 0.99;
     }
     let clicks = pcm(&clicks);
-    let held = normalize(&clicks, -16.0, CEILING, 24.0);
-    assert_eq!(held.gain, 24.0);
+    let held = normalize(&clicks, Loudness::new(-16.0), CEILING, Gain::new(24.0));
+    assert_eq!(held.gain.value(), 24.0);
     assert!(held.reduction < 26.0, "{held:?}");
-    let unheld = normalize(&clicks, -16.0, CEILING, f64::INFINITY);
-    assert!(unheld.gain > 100.0, "{} dB", unheld.gain);
+    let unheld = normalize(
+        &clicks,
+        Loudness::new(-16.0),
+        CEILING,
+        Gain::new(f64::INFINITY),
+    );
+    assert!(unheld.gain.value() > 100.0, "{} dB", unheld.gain.value());
 }
