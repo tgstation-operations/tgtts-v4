@@ -4,8 +4,7 @@
 //! A device must speak Vulkan 1.3, carry every extension in [`REQUIRED_EXTENSIONS`], support every
 //! feature in [`Features`], have a compute queue that can write timestamps, and not be a CPU
 //! implementation: Mesa's lavapipe would otherwise qualify, and run every kernel correctly and very
-//! slowly. Among those that qualify a discrete GPU is preferred, then an integrated one, as burn's
-//! Vulkan runtime chooses.
+//! slowly. Among those that qualify a discrete GPU is preferred, then an integrated one.
 
 use std::ffi::CStr;
 
