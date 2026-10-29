@@ -4,15 +4,23 @@
 //! ```text
 //! cargo run -p vulkan --example properties [-- --all]
 //! ```
-//!
-//! By default only the chosen device is reported in full; `--all` reports every device.
 
 use std::process::ExitCode;
 
+use argh::FromArgs;
 use vulkan::{Instance, select};
 
+/// Prints what the Vulkan devices report about themselves, which of them the runtime would
+/// choose, and why the others were passed over.
+#[derive(FromArgs)]
+struct Args {
+    /// report every device in full, not only the chosen one
+    #[argh(switch)]
+    all: bool,
+}
+
 fn main() -> ExitCode {
-    let all = std::env::args().skip(1).any(|a| a == "--all");
+    let Args { all } = argh::from_env();
     let instance = match Instance::new() {
         Ok(i) => i,
         Err(e) => {
