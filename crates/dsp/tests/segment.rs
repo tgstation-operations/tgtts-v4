@@ -4,7 +4,7 @@ mod common;
 
 use common::{Tensors, first_difference};
 use dsp::{
-    quantity::SampleRate,
+    quantity::{Millis, SampleRate},
     segment::{Error, Segment},
 };
 
@@ -44,7 +44,7 @@ fn matches_pydub() {
         .collect();
     for (case, seg) in segments.iter().enumerate() {
         let name = |op: &str| format!("{case}/{op}");
-        assert_eq!(seg.len_ms(), fx.int(&name("len_ms")), "{case}");
+        assert_eq!(seg.len_ms(), Millis::new(fx.int(&name("len_ms"))), "{case}");
         assert_eq!(i64::from(seg.rms()), fx.int(&name("rms")), "{case}");
         assert_eq!(i64::from(seg.max()), fx.int(&name("max")), "{case}");
         assert_eq!(
@@ -59,7 +59,7 @@ fn matches_pydub() {
         );
         assert_eq!(
             seg.leading_silence(),
-            Ok(fx.int(&name("leading_silence"))),
+            Ok(Millis::new(fx.int(&name("leading_silence")))),
             "{case}"
         );
         check(&fx, &name("strip_silence"), seg.strip_silence());
@@ -74,12 +74,13 @@ fn matches_pydub() {
             );
         }
         for (k, duration) in fx.ints(&name("fade")).into_iter().enumerate() {
+            let duration = Millis::new(duration);
             check(&fx, &name(&format!("fade_in/{k}")), seg.fade_in(duration));
             check(&fx, &name(&format!("fade_out/{k}")), seg.fade_out(duration));
         }
         for (k, row) in fx.int_rows(&name("slice")).into_iter().enumerate() {
-            let start = (row[0] != 0).then_some(row[1]);
-            let end = (row[2] != 0).then_some(row[3]);
+            let start = (row[0] != 0).then_some(Millis::new(row[1]));
+            let end = (row[2] != 0).then_some(Millis::new(row[3]));
             check(&fx, &name(&format!("slice/{k}")), seg.slice(start, end));
         }
         for (k, row) in fx.int_rows(&name("append")).into_iter().enumerate() {
@@ -87,13 +88,13 @@ fn matches_pydub() {
             check(
                 &fx,
                 &name(&format!("append/{k}")),
-                seg.append(other, row[1]),
+                seg.append(other, Millis::new(row[1])),
             );
         }
     }
     for duration in [250, 1, 33] {
         for rate in [48000, 44100, 11025, 3001] {
-            let silent = Segment::silent(duration, SampleRate::new(rate));
+            let silent = Segment::silent(Millis::new(duration), SampleRate::new(rate));
             assert!(silent.samples.iter().all(|&s| s == 0));
             let frames = fx.int(&format!("silent/{duration}/{rate}"));
             assert_eq!(

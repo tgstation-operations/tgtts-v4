@@ -10,7 +10,7 @@ use dsp::{
     Random,
     blips::{self, Error},
     float::{from_pcm, to_pcm},
-    quantity::SampleRate,
+    quantity::{Millis, SampleRate},
     resample::resample,
     segment::{self, Segment},
 };
@@ -243,7 +243,7 @@ fn messages_take_the_pitch() {
     let mut expected = blips::sentence("Hob.", &voice.1, "male", "1", 5, &mut Still).unwrap();
     expected
         .samples
-        .extend(Segment::silent(250, dsp::RATE).samples);
+        .extend(Segment::silent(Millis::new(250), dsp::RATE).samples);
     assert_eq!(message, expected);
 }
 
@@ -258,7 +258,7 @@ fn silent_sentences_take_no_time() {
     for text in ["Hob.", "b!"] {
         let sentence = blips::sentence(text, &voice.1, "male", "1", 0, &mut Still).unwrap();
         expected.extend(sentence.samples);
-        expected.extend(Segment::silent(250, dsp::RATE).samples);
+        expected.extend(Segment::silent(Millis::new(250), dsp::RATE).samples);
     }
     assert_eq!(message("Hob. - . b!").samples, expected);
 }

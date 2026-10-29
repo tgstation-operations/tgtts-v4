@@ -3,11 +3,12 @@
 use crate::{
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
+    quantity::Millis,
     segment::Segment,
 };
 
-/// The silence after the speech, in ms.
-pub const TAIL: u32 = 250;
+/// The silence after the speech.
+pub const TAIL: Millis = Millis::new(250);
 
 /// `speech` with 250 ms of silence after it, then, unless `pitch` is 0, all of it shifted by
 /// `pitch` quarter tones, as the old frontend finished the model's speech. The shift can take

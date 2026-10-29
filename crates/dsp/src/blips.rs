@@ -16,15 +16,15 @@ use crate::{
     RATE, Random,
     float::{from_pcm, to_pcm},
     pitch::pitch_shift,
-    quantity::SampleRate,
+    quantity::{Millis, SampleRate},
     segment::{self, Segment},
     sentences,
 };
 
-/// How far blips overlap, in ms.
-const CROSSFADE: i64 = 150;
-/// The silence after each sentence of a message, in ms.
-const SENTENCE_GAP: u32 = 250;
+/// How far blips overlap.
+const CROSSFADE: Millis = Millis::new(150);
+/// The silence after each sentence of a message.
+const SENTENCE_GAP: Millis = Millis::new(250);
 
 /// What made the blips fail.
 #[derive(Debug, thiserror::Error)]
@@ -152,10 +152,12 @@ fn detune(
 /// out of a shorter segment repeats its first frames.
 fn fade(blip: &Segment) -> Result<Segment, Error> {
     let len = blip.len_ms();
-    if len == 0 {
+    if len == Millis::ZERO {
         return Ok(blip.clone());
     }
-    Ok(blip.fade_in(3.min(len))?.fade_out(8.min(len))?)
+    Ok(blip
+        .fade_in(Millis::new(3).min(len))?
+        .fade_out(Millis::new(8).min(len))?)
 }
 
 /// The old service's `change_volume`: a gain of the amplitude ratio `multiplier`, through dB.

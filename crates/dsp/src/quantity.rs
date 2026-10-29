@@ -15,11 +15,18 @@
 //! a request or measured from samples, and gives it back with `value` where arithmetic on the
 //! samples takes it, which stays on bare numbers.
 //!
-//! What the types refuse, as a compile error:
+//! What the types refuse, as a compile error: a gain added to a loudness,
 //!
 //! ```compile_fail,E0369
 //! use dsp::quantity::{Gain, Loudness};
 //! let _ = Loudness::new(-23.0) + Gain::new(6.0);
+//! ```
+//!
+//! and silence with its duration and its rate the wrong way round:
+//!
+//! ```compile_fail,E0308
+//! use dsp::{RATE, segment::Segment, speech::TAIL};
+//! let _ = Segment::silent(RATE, TAIL);
 //! ```
 
 use std::ops::{Add, AddAssign, Neg, Sub};
