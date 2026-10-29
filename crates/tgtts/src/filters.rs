@@ -220,7 +220,20 @@ const FISH_TONGUE: Known = Known {
     effects: fish_tongue,
 };
 
-const KNOWN: [Known; 15] = [
+// TerraGov Marine Corps's silicons and combat robots.
+const ROBOT: Known = Known {
+    filter: "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:\
+             overlap=1,rubberband=pitch=0.8",
+    effects: |_| {
+        json!([[
+            {"effect": "robot", "frequency_hz": 187.5},
+            {"effect": "gain", "gain_db": -3.01},
+            {"effect": "pitch", "semitones": -3.863},
+        ]])
+    },
+};
+
+const KNOWN: [Known; 16] = [
     SYNTHETIC,
     TRAM,
     FISHING_CAPSULE,
@@ -236,6 +249,7 @@ const KNOWN: [Known; 15] = [
     CULT_SLURRING,
     POLY,
     FISH_TONGUE,
+    ROBOT,
 ];
 
 /// The machines' voice.
@@ -459,6 +473,7 @@ mod tests {
                 SECHAILER,
             ],
             &[FISH_TONGUE, STUTTER, GAS_MASK],
+            &[ROBOT, CULT_SLURRING, GAS_MASK],
             &[TRAM, TRAM],
         ];
         for filters in joined {
@@ -529,10 +544,6 @@ mod tests {
             // Pitched down past what rubberband takes, and past what the effects do.
             filled(&FISH_TONGUE, "40", "0", "0"),
             filled(&FISH_TONGUE, "30", "0", "0"),
-            // TerraGov Marine Corps's silicons and combat robots.
-            "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:\
-             overlap=1,rubberband=pitch=0.8"
-                .to_owned(),
         ] {
             assert!(pipeline(&graph, &impulses).is_none(), "{graph}");
         }
