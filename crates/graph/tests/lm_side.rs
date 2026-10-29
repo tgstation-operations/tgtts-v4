@@ -523,7 +523,7 @@ fn rows_condition_bit_for_bit_as_they_do_alone() {
         // while their keys and values go to their own. Only those two may come out otherwise.
         let mut tensors =
             lm_side_batch_graph(&shape, &base, batch).unwrap_or_else(|e| panic!("{e}"));
-        let words = tensors.graph.info(tensors.position).shape().to_vec();
+        let words = tensors.graph.info(tensors.position).shape.clone();
         let wrong = tensors
             .graph
             .tensor::<u32>("wrong_position", &words, Kind::Param);

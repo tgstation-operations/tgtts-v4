@@ -81,14 +81,6 @@ impl<E> Bound for Tensor<E> {
     }
 }
 
-/// A name for a tensor of elements of `E`: its handle, or its id, which no element type is checked
-/// against.
-pub trait Holds<E>: Bound {}
-
-impl<E> Holds<E> for Tensor<E> {}
-
-impl<E> Holds<E> for TensorId {}
-
 /// The tensors an op binds, one per binding of its kernel in order: a tuple of them, or a slice
 /// or array of one kind.
 pub trait Bindings {
@@ -166,33 +158,24 @@ impl Kind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TensorInfo {
     pub name: String,
-    pub bytes: u64,
-    /// What it holds, and its extents; none for a tensor added by its bytes alone
-    /// ([`Graph::untyped`]).
-    pub element: Option<(ElementType, Vec<usize>)>,
+    pub element: ElementType,
+    pub shape: Vec<usize>,
     pub kind: Kind,
 }
 
 impl TensorInfo {
-    /// Its extents.
-    ///
-    /// # Panics
-    ///
-    /// If it was added by its bytes alone.
-    pub fn shape(&self) -> &[usize] {
-        match &self.element {
-            Some((_, shape)) => shape,
-            None => panic!("{} was added by its bytes alone", self.name),
-        }
-    }
-
     /// The elements it holds.
     pub fn len(&self) -> usize {
-        self.shape().iter().product()
+        self.shape.iter().product()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Its bytes: its elements'.
+    pub fn bytes(&self) -> u64 {
+        self.len() as u64 * self.element.bytes()
     }
 }
 
@@ -243,15 +226,14 @@ impl Graph {
         shape: &[usize],
         kind: Kind,
     ) -> Tensor<E> {
-        let elements: usize = shape.iter().product();
-        self.tensors.push(TensorInfo {
+        let id = self.add(TensorInfo {
             name: name.into(),
-            bytes: elements as u64 * E::TYPE.bytes(),
-            element: Some((E::TYPE, shape.to_vec())),
+            element: E::TYPE,
+            shape: shape.to_vec(),
             kind,
         });
         Tensor {
-            id: TensorId(self.tensors.len() - 1),
+            id,
             element: PhantomData,
         }
     }
@@ -264,17 +246,6 @@ impl Graph {
     /// Adds a tensor as `info` describes it.
     pub(crate) fn add(&mut self, info: TensorInfo) -> TensorId {
         self.tensors.push(info);
-        TensorId(self.tensors.len() - 1)
-    }
-
-    /// Adds a tensor of `bytes` bytes, whose element type no op checks.
-    pub fn untyped(&mut self, name: impl Into<String>, bytes: u64, kind: Kind) -> TensorId {
-        self.tensors.push(TensorInfo {
-            name: name.into(),
-            bytes,
-            element: None,
-            kind,
-        });
         TensorId(self.tensors.len() - 1)
     }
 
@@ -304,15 +275,14 @@ impl Graph {
         for (i, (t, binding)) in bindings.iter().zip(kernel.bindings).enumerate() {
             let tensor = self.tensors.get(t.0);
             let tensor = tensor.unwrap_or_else(|| panic!("{label}: no tensor {}", t.0));
-            if let Some((element, _)) = &tensor.element {
-                assert!(
-                    *element == binding.element,
-                    "{label}: {}, bound as binding {i} of {}, holds {element}, not {}",
-                    tensor.name,
-                    kernel.name,
-                    binding.element
-                );
-            }
+            assert!(
+                tensor.element == binding.element,
+                "{label}: {}, bound as binding {i} of {}, holds {}, not {}",
+                tensor.name,
+                kernel.name,
+                tensor.element,
+                binding.element
+            );
         }
         self.ops.push(Op {
             label,
@@ -378,7 +348,7 @@ pub fn plan(graph: &Graph) -> Plan {
 /// If the graphs' tensors differ in number, size or kind.
 pub fn plan_programs(graphs: &[&Graph], first: usize) -> Plan {
     let shape =
-        |g: &Graph| -> Vec<(u64, Kind)> { g.tensors.iter().map(|t| (t.bytes, t.kind)).collect() };
+        |g: &Graph| -> Vec<(u64, Kind)> { g.tensors.iter().map(|t| (t.bytes(), t.kind)).collect() };
     let tensors = graphs.first().map_or(0, |g| g.tensors.len());
     assert!(
         graphs.iter().all(|g| shape(g) == shape(graphs[0])),
@@ -392,7 +362,7 @@ pub fn plan_programs(graphs: &[&Graph], first: usize) -> Plan {
             _ => false,
         })
     };
-    let bytes = |t: usize| graphs[0].tensors[t].bytes;
+    let bytes = |t: usize| graphs[0].tensors[t].bytes();
     let mut order: Vec<usize> = (first..tensors).filter(|&t| live(t)).collect();
     order.sort_by_key(|&t| (std::cmp::Reverse(bytes(t)), t));
     let mut offsets = vec![None; tensors];
@@ -425,7 +395,7 @@ pub fn plan_programs(graphs: &[&Graph], first: usize) -> Plan {
 
 /// Where a tensor's bytes are: a range of the arena, or a buffer of its own.
 fn region(graph: &Graph, plan: &Plan, t: TensorId) -> (Option<TensorId>, Range<u64>) {
-    let bytes = graph.tensors[t.0].bytes;
+    let bytes = graph.tensors[t.0].bytes();
     match plan.offsets[t.0] {
         Some(offset) => (None, offset..offset + bytes),
         None => (Some(t), 0..bytes),
@@ -506,7 +476,7 @@ mod tests {
     fn overlaps(plan: &Plan, g: &Graph, s: TensorId, t: TensorId) -> bool {
         let r = |t: TensorId| {
             let o = plan.offsets[t.0].unwrap();
-            o..o + g.tensors[t.0].bytes
+            o..o + g.tensors[t.0].bytes()
         };
         let (a, b) = (r(s), r(t));
         a.start < b.end && b.start < a.end

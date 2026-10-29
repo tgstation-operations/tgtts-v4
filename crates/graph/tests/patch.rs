@@ -321,7 +321,7 @@ fn rows_sample_bit_for_bit_as_they_do_alone() {
         // Defect: request 0's attention reads request 2's slot and the reverse wherever both run,
         // while their keys and values go to their own. Only those two may come out otherwise.
         let mut crossed = model.graph(subgroup, 16, SLOTS);
-        let words = crossed.graph.info(crossed.position).shape().to_vec();
+        let words = crossed.graph.info(crossed.position).shape.clone();
         let wrong = crossed
             .graph
             .tensor::<u32>("wrong_position", &words, Kind::Param);

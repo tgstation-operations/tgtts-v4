@@ -108,8 +108,8 @@ pub fn patch_batch_graph(
     let side = lm_side_batch_graph(side, lm, batch)?;
     let sampler = sampler_graph(config, timesteps, batch.rows, local)?;
     let mut g = Graph::default();
-    let samples = |t: Tensor<f32>| sampler.graph.info(t).shape();
-    let sides = |t: TensorId| side.graph.info(t).shape();
+    let samples = |t: Tensor<f32>| sampler.graph.info(t).shape.as_slice();
+    let sides = |t: TensorId| side.graph.info(t).shape.as_slice();
     let cond = g.tensor("cond", samples(sampler.cond), Kind::Input);
     let position = g.tensor("position", sides(side.position.id()), Kind::Param);
     let noise = g.tensor("noise", samples(sampler.noise), Kind::Input);
@@ -641,7 +641,7 @@ pub(crate) mod tests {
                     );
                 }
             }
-            let bytes = |t: TensorId| tensors[t.0].bytes;
+            let bytes = |t: TensorId| tensors[t.0].bytes();
             assert_eq!(bytes(p.cond.id()), (rows[i] * 64 * 4 * 4) as u64);
             assert_eq!(bytes(p.position.id()), (2 * rows[i] * 4) as u64);
             let first = &all[0];

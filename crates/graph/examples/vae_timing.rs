@@ -129,7 +129,7 @@ fn main() {
         tensors
             .iter()
             .filter(|t| t.kind == kind)
-            .map(|t| t.bytes)
+            .map(|t| t.bytes())
             .sum()
     };
     println!(

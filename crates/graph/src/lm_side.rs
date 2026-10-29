@@ -19,7 +19,7 @@ use crate::{
         Batch, DecodeGraph, LayerTensors, LmConfig, Row, Shape, Tuning, decode_batch_graph,
         load_stack,
     },
-    graph::{Graph, Holds, Kind, Pipeline, Tensor, TensorId, TensorInfo},
+    graph::{Graph, Kind, Pipeline, Tensor, TensorId, TensorInfo},
     kernels::{KernelInfo, Kernels, read, write},
     local::identity,
     step::Step,
@@ -193,15 +193,13 @@ pub fn splice(
             |(i, t)| match shared.iter().find(|(theirs, _)| theirs.0 == i) {
                 Some(&(_, ours)) => {
                     let held = &g.tensors[ours.0];
-                    let element = |t: &TensorInfo| t.element.as_ref().map(|e| e.0);
-                    let typed = element(held).is_some() && element(t).is_some();
                     assert!(
-                        held.bytes == t.bytes && (!typed || element(held) == element(t)),
-                        "{prefix}{} as {}, of {} bytes of {:?}",
+                        held.element == t.element && held.len() == t.len(),
+                        "{prefix}{} as {}, of {} {}",
                         t.name,
                         held.name,
-                        held.bytes,
-                        element(held)
+                        held.len(),
+                        held.element
                     );
                     ours
                 }
@@ -261,9 +259,9 @@ pub(crate) fn append_linear(
     g: &mut Graph,
     label: &str,
     layer: Linear,
-    x: &[impl Holds<F16> + Copy],
+    x: &[Tensor<F16>],
     act: Act,
-    out: (impl Holds<F16>, usize),
+    out: (Tensor<F16>, usize),
     tuning: &Tuning,
     levels: u32,
 ) -> Result<(), Error> {
@@ -276,9 +274,9 @@ fn append_batch_linear(
     g: &mut Graph,
     label: &str,
     layer: Linear,
-    x: &[impl Holds<F16> + Copy],
+    x: &[Tensor<F16>],
     act: Act,
-    (out, offset): (impl Holds<F16>, usize),
+    (out, offset): (Tensor<F16>, usize),
     tuning: &Tuning,
     levels: u32,
     rows: usize,
@@ -289,8 +287,8 @@ fn append_batch_linear(
         ..
     } = *tuning;
     let subgroups = (workgroup / subgroup) as usize;
-    let len = |t: TensorId| g.info(t).bytes as usize / size_of::<F16>() / rows;
-    let (x0, x1) = (x[0].id(), x[x.len() - 1].id());
+    let len = |t: Tensor<F16>| g.info(t).len() / rows;
+    let (x0, x1) = (x[0], x[x.len() - 1]);
     let (k0, k1) = (len(x0), if x.len() > 1 { len(x1) } else { 0 });
     for k in [k0, k1] {
         if !k.is_multiple_of(8 * subgroup as usize) {
@@ -315,14 +313,18 @@ fn append_batch_linear(
             (7, SpecValue::F32(levels as f32)),
             (8, SpecValue::U32(taken as u32)),
             (9, SpecValue::U32(tuning.span(k0 + k1, taken, 0)?)),
-            (10, SpecValue::U32(len(out.id()) as u32)),
+            (10, SpecValue::U32(len(out) as u32)),
             (11, SpecValue::U32(split as u32)),
         ],
         subgroup_size: Some(subgroup),
     };
     let groups = (n.div_ceil(subgroups) * split) as u32;
-    let bindings = (x0, x1, layer.weight, layer.bias, out.id());
-    g.op(label, pipeline, bindings, [groups, 1, 1]);
+    g.op(
+        label,
+        pipeline,
+        &[x0, x1, layer.weight, layer.bias, out],
+        [groups, 1, 1],
+    );
     Ok(())
 }
 
@@ -353,7 +355,7 @@ pub fn lm_side_batch_graph(
     let rows = batch.rows;
     let enc = g.tensor("enc", &[rows, s.encoder], Kind::Input);
     let position = g.tensor("position", &[batch.words()], Kind::Param);
-    let table = base.graph.info(base.cos).shape().to_vec();
+    let table = base.graph.info(base.cos).shape.clone();
     let cos = g.tensor("rope.cos", &table, Kind::Constant);
     let sin = g.tensor("rope.sin", &table, Kind::Constant);
     let mu = g.tensor("mu", &[rows, 2 * s.dit], Kind::Output);
@@ -777,7 +779,7 @@ mod tests {
             .iter()
             .filter(|op| op.pipeline.kernel.name == GEMV_LINEAR.name)
         {
-            let out = g.graph.tensors[op.bindings[4].0].bytes;
+            let out = g.graph.tensors[op.bindings[4].0].bytes();
             let (n, offset, stride) = (constant(op, 4), constant(op, 5), constant(op, 10));
             assert_eq!(constant(op, 8) * constant(op, 11), 4, "{}", op.label);
             assert_eq!(4 * stride * 2, out, "{}", op.label);
@@ -785,8 +787,8 @@ mod tests {
             layers += 1;
         }
         assert_eq!(layers, 8);
-        assert_eq!(g.graph.info(g.mu).shape(), [4, 2 * s.dit]);
-        assert_eq!(g.graph.info(g.stop_logits).shape(), [4, 2]);
+        assert_eq!(g.graph.info(g.mu).shape, [4, 2 * s.dit]);
+        assert_eq!(g.graph.info(g.stop_logits).shape, [4, 2]);
     }
 
     #[test]
@@ -819,12 +821,12 @@ mod tests {
         let tuning = Tuning::for_subgroup(64);
         let stack = decode_graph(&stack(1, true), &tuning).unwrap();
         let mut g = Graph::default();
-        let x = g.untyped("x", 2 * s.base.hidden as u64, Kind::Intermediate);
-        let ids = splice(&mut g, &stack.graph, "a.", &[(stack.x.id(), x)]);
-        assert_eq!(stack.x.moved(&ids).id(), x);
+        let x = g.tensor::<F16>("x", &[1, s.base.hidden], Kind::Intermediate);
+        let ids = splice(&mut g, &stack.graph, "a.", &[(stack.x.id(), x.id())]);
+        assert_eq!(stack.x.moved(&ids), x);
         // The stack's own x is not added: x stands for it.
         assert_eq!(g.tensors.len(), stack.graph.tensors.len());
-        assert_eq!(g.ops[0].bindings[0], x);
+        assert_eq!(g.ops[0].bindings[0], x.id());
         assert_eq!(g.ops[0].label, "a.qkv_rope");
         assert_eq!(g.info(stack.norm.moved(&ids)).name, "a.norm");
     }

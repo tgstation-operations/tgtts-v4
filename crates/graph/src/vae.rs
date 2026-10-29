@@ -21,7 +21,7 @@
 use std::iter;
 
 use serde::Deserialize;
-use vulkan::{Context, Memory, Residence, SpecValue, Timing};
+use vulkan::{Buffer, Context, Residence, SpecValue, Timing};
 
 use crate::{
     Error,
@@ -607,7 +607,7 @@ pub struct VaeDecoder {
     /// A multiple of every ring's length.
     period: u32,
     /// Zeros, as many as a stream's largest ring holds.
-    zeros: Memory,
+    zeros: Buffer<f32>,
 }
 
 impl VaeDecoder {
@@ -625,9 +625,9 @@ impl VaeDecoder {
             .rings
             .iter()
             .fold(1, |period, &(_, reach)| lcm(period, reach as u32));
-        let ring = |&(t, _): &(Tensor<f32>, usize)| tensors.graph.info(t).bytes;
+        let ring = |&(t, _): &(Tensor<f32>, usize)| tensors.graph.info(t).len();
         let largest = tensors.rings.iter().map(ring).max().unwrap_or(0);
-        let zeros = ctx.memory_in(largest / shape.streams as u64, Residence::Device)?;
+        let zeros = ctx.buffer_in(largest / shape.streams, Residence::Device)?;
         Ok(VaeDecoder {
             step,
             frames_before: vec![0; shape.streams],
@@ -767,17 +767,17 @@ impl VaeDecoder {
         if stream >= streams {
             return Err(Error::Shape(format!("stream {stream} of {streams}")));
         }
-        let regions: Vec<Region> = self
+        let regions: Vec<Region<f32>> = self
             .tensors
             .rings
             .iter()
             .map(|&(ring, _)| {
-                let bytes = self.tensors.graph.info(ring).bytes / streams as u64;
+                let len = self.tensors.graph.info(ring).len() / streams;
                 Region {
-                    tensor: ring.id(),
-                    offset: stream as u64 * bytes,
+                    tensor: ring,
+                    offset: stream * len,
                     other: 0,
-                    bytes,
+                    len,
                 }
             })
             .collect();

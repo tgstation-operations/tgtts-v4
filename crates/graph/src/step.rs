@@ -3,6 +3,16 @@
 //! dispatches recorded once, with the barriers [`barriers`] finds, into a [`Recording`]
 //! submitted every step. More graphs over the same memory may be recorded beside it as programs
 //! of their own ([`Step::add`]), such as a prefill beside a decode step.
+//!
+//! The host writes and reads a tensor as the elements it holds:
+//!
+//! ```compile_fail,E0308
+//! use graph::{graph::{Graph, Kind}, step::Step};
+//! fn write(step: &mut Step, g: &mut Graph) -> Result<(), graph::Error> {
+//!     let x = g.tensor::<vulkan::F16>("x", &[4], Kind::Input);
+//!     step.write(x, &[1.0f32; 4])
+//! }
+//! ```
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -10,12 +20,12 @@ use std::{
 };
 
 use vulkan::{
-    Binding, Context, Dispatch, Element, Memory, Recording, Residence, Submission, Timing,
+    Binding, Buffer, Context, Dispatch, Element, Recording, Residence, Submission, Timing,
 };
 
 use crate::{
     Error,
-    graph::{ALIGN, Graph, Holds, Kind, Plan, TensorId, barriers, plan, plan_programs},
+    graph::{ALIGN, Graph, Kind, Plan, Tensor, TensorId, barriers, plan, plan_programs},
     kernels::Kernels,
 };
 
@@ -37,21 +47,21 @@ struct Layout {
 impl Layout {
     fn of(graph: &Graph) -> Self {
         Layout {
-            tensors: graph.tensors.iter().map(|t| (t.bytes, t.kind)).collect(),
+            tensors: graph.tensors.iter().map(|t| (t.bytes(), t.kind)).collect(),
             plan: plan(graph),
         }
     }
 }
 
-/// Bytes copied between a tensor and a buffer outside the step ([`Step::copy_out`],
+/// Elements copied between a tensor and a buffer of them outside the step ([`Step::copy_out`],
 /// [`Step::copy_in`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Region {
-    pub tensor: TensorId,
-    /// The offset in the tensor, and in the buffer outside.
-    pub offset: u64,
-    pub other: u64,
-    pub bytes: u64,
+pub struct Region<E: Element> {
+    pub tensor: Tensor<E>,
+    /// The element it starts at in the tensor, and in the buffer outside.
+    pub offset: usize,
+    pub other: usize,
+    pub len: usize,
 }
 
 /// One of the graphs a step runs, recorded over its memory ([`Step::add`]).
@@ -114,7 +124,7 @@ impl Step {
             places.push(match offset {
                 &Some(offset) => Place { buffer: 0, offset },
                 None => {
-                    buffers.push(ctx.memory_in(tensor.bytes, tensor.kind.residence())?);
+                    buffers.push(ctx.memory_in(tensor.bytes(), tensor.kind.residence())?);
                     Place {
                         buffer: buffers.len() - 1,
                         offset: 0,
@@ -182,7 +192,7 @@ impl Step {
         };
         let held = self.tensors.len();
         let shape = |g: &Graph| -> Vec<(u64, Kind)> {
-            g.tensors.iter().map(|t| (t.bytes, t.kind)).collect()
+            g.tensors.iter().map(|t| (t.bytes(), t.kind)).collect()
         };
         let tensors = shape(first);
         if tensors.get(..held) != Some(&self.tensors[..])
@@ -252,63 +262,77 @@ impl Step {
         (buffer, (offset / E::TYPE.bytes()) as usize)
     }
 
+    /// The elements tensor `t` of elements of `E` holds.
+    fn len<E: Element>(&self, t: Tensor<E>) -> usize {
+        (self.tensors[t.id().0].0 / E::TYPE.bytes()) as usize
+    }
+
     /// Writes `values` into tensor `t`, which they must fill exactly: in place if the host maps
     /// it, through a staging copy if it lives in the GPU's own memory.
     ///
     /// # Panics
     ///
     /// If they do not fill it.
-    pub fn write<E: Element>(&mut self, t: impl Holds<E>, values: &[E]) -> Result<(), Error> {
-        let t = t.id();
-        let len = self.tensors[t.0].0;
+    pub fn write<E: Element>(&mut self, t: Tensor<E>, values: &[E]) -> Result<(), Error> {
+        let len = self.len(t);
         assert_eq!(
-            size_of_val(values) as u64,
+            values.len(),
             len,
-            "tensor {} is {len} bytes",
-            t.0
+            "tensor {} holds {len} elements",
+            t.id().0
         );
-        let (buffer, at) = self.element_place::<E>(t);
+        let (buffer, at) = self.element_place::<E>(t.id());
         Ok(self.recording.buffer_mut(buffer).write_at(at, values)?)
     }
 
     /// Tensor `t`'s contents.
-    pub fn read<E: Element>(&self, t: impl Holds<E>) -> Result<Vec<E>, Error> {
-        let t = t.id();
-        let (buffer, at) = self.element_place::<E>(t);
-        let count = (self.tensors[t.0].0 / E::TYPE.bytes()) as usize;
-        Ok(self.recording.buffer::<E>(buffer).read_at(at, count)?)
+    pub fn read<E: Element>(&self, t: Tensor<E>) -> Result<Vec<E>, Error> {
+        let (buffer, at) = self.element_place::<E>(t.id());
+        let len = self.len(t);
+        Ok(self.recording.buffer::<E>(buffer).read_at(at, len)?)
     }
 
     /// Copies `regions` of tensors into `to`, on the GPU after the last run.
-    pub fn copy_out(&mut self, regions: &[Region], to: &mut Memory) -> Result<(), Error> {
+    pub fn copy_out<E: Element>(
+        &mut self,
+        regions: &[Region<E>],
+        to: &mut Buffer<E>,
+    ) -> Result<(), Error> {
         let regions = self.regions(regions)?;
         Ok(self.recording.copy_out(&regions, to)?)
     }
 
     /// Copies `regions` of `from` into tensors, on the GPU after the last run.
-    pub fn copy_in(&mut self, from: &Memory, regions: &[Region]) -> Result<(), Error> {
+    pub fn copy_in<E: Element>(
+        &mut self,
+        from: &Buffer<E>,
+        regions: &[Region<E>],
+    ) -> Result<(), Error> {
         let regions = self.regions(regions)?;
         Ok(self.recording.copy_in(from, &regions)?)
     }
 
-    /// `regions` in the buffers the tensors live in.
-    fn regions(&self, regions: &[Region]) -> Result<Vec<vulkan::Region>, Error> {
+    /// `regions` in the buffers the tensors live in, in bytes.
+    fn regions<E: Element>(&self, regions: &[Region<E>]) -> Result<Vec<vulkan::Region>, Error> {
+        let bytes = |elements: usize| elements as u64 * E::TYPE.bytes();
         regions
             .iter()
             .map(|r| {
-                let len = self.tensors[r.tensor.0].0;
-                if r.offset.checked_add(r.bytes).is_none_or(|end| end > len) {
+                let len = self.len(r.tensor);
+                if r.offset.checked_add(r.len).is_none_or(|end| end > len) {
                     return Err(Error::Shape(format!(
-                        "{} bytes from {} of tensor {} of {len}",
-                        r.bytes, r.offset, r.tensor.0
+                        "{} elements from {} of tensor {} of {len}",
+                        r.len,
+                        r.offset,
+                        r.tensor.id().0
                     )));
                 }
-                let (buffer, at) = self.place(r.tensor);
+                let (buffer, at) = self.place(r.tensor.id());
                 Ok(vulkan::Region {
                     buffer,
-                    offset: at + r.offset,
-                    other: r.other,
-                    bytes: r.bytes,
+                    offset: at + bytes(r.offset),
+                    other: bytes(r.other),
+                    bytes: bytes(r.len),
                 })
             })
             .collect()

@@ -751,7 +751,7 @@ pub fn load_stack(
         } else {
             checkpoint.rows_f16(&names)?.1
         };
-        let want = graph.info(t).bytes as usize / size_of::<F16>();
+        let want = graph.info(t).len();
         if values.len() != want {
             return Err(Error::Checkpoint(format!(
                 "{names:?}: {} values, not {want}",
@@ -1100,7 +1100,7 @@ mod tests {
         let one = decode_graph(&s, &tuning).unwrap();
         let batch = Batch { rows: 4, slots: 6 };
         let four = decode_batch_graph(&s, &tuning, batch).unwrap();
-        let bytes = |g: &DecodeGraph, t: TensorId| g.graph.info(t).bytes;
+        let bytes = |g: &DecodeGraph, t: TensorId| g.graph.info(t).bytes();
         assert_eq!(bytes(&four, four.x.id()), 4 * bytes(&one, one.x.id()));
         assert_eq!(bytes(&four, four.out.id()), 4 * bytes(&one, one.out.id()));
         assert_eq!(bytes(&four, four.position.id()), 4 * 2 * 4);

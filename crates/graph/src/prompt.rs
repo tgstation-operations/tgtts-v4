@@ -25,7 +25,7 @@ use std::{
     iter,
 };
 
-use vulkan::{Context, F16, Memory, Residence, SpecValue};
+use vulkan::{Buffer, Context, F16, Residence, SpecValue};
 
 use crate::{
     Error,
@@ -131,7 +131,7 @@ pub fn prompt_graphs(
     g.ops.clear();
 
     let encoder = &patch.encoder;
-    let encoders = |t: TensorId| encoder.graph.info(t).shape();
+    let encoders = |t: TensorId| encoder.graph.info(t).shape.as_slice();
     let input = g.tensor::<f32>("embed.patch", encoders(encoder.patch.id()), Kind::Input);
     let enc = g.tensor::<F16>("embed.enc", encoders(encoder.out.id()), Kind::Intermediate);
     let embedding = g.tensor("embed.out", &[1, hidden], Kind::Output);
@@ -204,7 +204,7 @@ pub fn prompt_graphs(
                        out: Tensor<F16>,
                        rows: usize|
      -> Result<(), Error> {
-        let width = |t: Tensor<F16>| g.info(t).shape()[1];
+        let width = |t: Tensor<F16>| g.info(t).shape[1];
         let (k0, k1) = (width(x[0]), x.get(1).map_or(0, |&t| width(t)));
         let n = width(out);
         let k = k0 + k1;
@@ -375,7 +375,7 @@ struct Prefix {
     patches: Vec<u32>,
     audio: Vec<bool>,
     /// Laid out as [`cache_regions`] lays out as many positions as it holds.
-    kept: Memory,
+    kept: Buffer<F16>,
 }
 
 impl Prefix {
@@ -486,7 +486,7 @@ impl PromptCache {
 /// laid out as `rope_rows.comp` writes them, `[slots][kv_heads][capacity][head_dim]` in f16 for
 /// each layer's keys and values: for each in turn, each head's `len` positions, from `held`
 /// positions apart in the buffer outside.
-fn cache_regions(graph: &PatchGraph, slot: usize, len: usize, held: usize) -> Vec<Region> {
+fn cache_regions(graph: &PatchGraph, slot: usize, len: usize, held: usize) -> Vec<Region<F16>> {
     let side = &graph.side;
     let stacks = [
         (&side.base, &side.shape.base),
@@ -495,18 +495,17 @@ fn cache_regions(graph: &PatchGraph, slot: usize, len: usize, held: usize) -> Ve
     let mut regions = Vec::new();
     let mut other = 0;
     for (stack, shape) in stacks {
-        let row = 2 * shape.head_dim as u64;
-        let heads = shape.kv_heads as u64;
+        let (row, heads) = (shape.head_dim, shape.kv_heads);
         for layer in &stack.layers {
             for cache in [layer.k_cache, layer.v_cache] {
-                for head in slot as u64 * heads..(slot as u64 + 1) * heads {
+                for head in slot * heads..(slot + 1) * heads {
                     regions.push(Region {
-                        tensor: cache.moved(&graph.side_ids).id(),
-                        offset: head * shape.capacity as u64 * row,
+                        tensor: cache.moved(&graph.side_ids),
+                        offset: head * shape.capacity * row,
                         other,
-                        bytes: len as u64 * row,
+                        len: len * row,
                     });
-                    other += held as u64 * row;
+                    other += held * row;
                 }
             }
         }
@@ -626,11 +625,12 @@ impl Prompter {
         if kept.prefix.is_none() && held > 0 {
             let (graph, recorded) = step.parts_mut();
             let regions = cache_regions(graph, slot, held, held);
-            let bytes: u64 = regions.iter().map(|r| r.bytes).sum();
+            let values: usize = regions.iter().map(|r| r.len).sum();
             let patch = prompt.patches.len() / len;
+            let bytes = (values * size_of::<F16>()) as u64;
             let prefix = Prefix::bytes_of(bytes, patch, held);
             if 4 * key.len() + kept.bytes() + prefix <= cache.budget {
-                let mut buffer = cache.ctx.memory_in(bytes, Residence::Device)?;
+                let mut buffer = cache.ctx.buffer_in(values, Residence::Device)?;
                 recorded.copy_out(&regions, &mut buffer)?;
                 let patches = &prompt.patches[..held * patch];
                 kept.prefix = Some(Prefix {
@@ -787,7 +787,7 @@ mod tests {
             let patch = patch::tests::graph(subgroup);
             let p = prompt_graphs(&patch, 2 * TILE, &Tuning::for_subgroup(subgroup)).unwrap();
             let shape = |g: &Graph| -> Vec<(u64, Kind)> {
-                g.tensors.iter().map(|t| (t.bytes, t.kind)).collect()
+                g.tensors.iter().map(|t| (t.bytes(), t.kind)).collect()
             };
             assert_eq!(p.programs.len(), 2);
             assert!(p.programs.iter().all(|g| shape(g) == shape(&p.embed)));
@@ -844,22 +844,21 @@ mod tests {
         let (len, held) = (5, 7);
         let regions = cache_regions(&patch, slot, len, held);
         let side = &patch.side;
-        let caches: Vec<TensorId> = [&side.base, &side.residual]
+        let caches: Vec<Tensor<F16>> = [&side.base, &side.residual]
             .into_iter()
             .flat_map(|stack| &stack.layers)
             .flat_map(|l| [l.k_cache, l.v_cache])
-            .map(|t| t.moved(&patch.side_ids).id())
+            .map(|t| t.moved(&patch.side_ids))
             .collect();
         let s = &side.shape.base;
-        let row = 2 * s.head_dim as u64;
+        let row = s.head_dim;
         assert_eq!(regions.len(), caches.len() * s.kv_heads);
         for (i, r) in regions.iter().enumerate() {
             assert_eq!(r.tensor, caches[i / s.kv_heads]);
-            let bytes = patch.graph.tensors[r.tensor.0].bytes;
-            let head = bytes / (slots * s.kv_heads) as u64;
-            assert_eq!(r.offset, (slot * s.kv_heads + i % s.kv_heads) as u64 * head);
-            assert_eq!(r.bytes, len as u64 * row);
-            assert_eq!(r.other, i as u64 * held as u64 * row);
+            let head = patch.graph.info(r.tensor).len() / (slots * s.kv_heads);
+            assert_eq!(r.offset, (slot * s.kv_heads + i % s.kv_heads) * head);
+            assert_eq!(r.len, len * row);
+            assert_eq!(r.other, i * held * row);
         }
     }
 }

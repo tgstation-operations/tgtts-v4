@@ -15,7 +15,7 @@ use vulkan::{Context, F16, SpecValue};
 use crate::{
     Error,
     decode::{DecodeGraph, Decoder, LayerTensors, SUBGROUPS, Shape, Tuning},
-    graph::{Graph, Holds, Kind, Pipeline, Tensor},
+    graph::{Graph, Kind, Pipeline, Tensor},
     kernels::{KernelInfo, Kernels, read, write},
     step::Program,
 };
@@ -222,11 +222,7 @@ pub fn append_prefill(
     rows: usize,
     max_rows: usize,
     tuning: &Tuning,
-    (run, x, out): (
-        impl Holds<u32> + Copy,
-        impl Holds<F16> + Copy,
-        impl Holds<F16> + Copy,
-    ),
+    (run, x, out): (Tensor<u32>, Tensor<F16>, Tensor<F16>),
 ) -> Result<(), Error> {
     let s = stack.shape;
     let check = |ok: bool, why: String| if ok { Ok(()) } else { Err(Error::Shape(why)) };
@@ -309,27 +305,23 @@ pub fn append_prefill(
     let down_gemm = gemm_op(s.hidden, s.inner)?;
 
     let rows_of = |n: usize| [max_rows, n];
-    let ins = [
-        (run.id(), 3 * size_of::<u32>()),
-        (x.id(), max_rows * s.hidden * size_of::<F16>()),
-        (out.id(), max_rows * s.hidden * size_of::<F16>()),
-    ];
-    for (t, want) in ins {
-        let bytes = g.info(t).bytes;
-        check(
-            bytes == want as u64,
-            format!("{name}: tensor {} of {bytes} bytes, not {want}", t.0),
-        )?;
-    }
+    let rows_in = |t: Tensor<F16>| g.info(t).shape == rows_of(s.hidden);
+    check(
+        g.info(run).len() == 3 && rows_in(x) && rows_in(out),
+        format!(
+            "{name}: tensors of {:?}, {:?} and {:?}",
+            g.info(run).shape,
+            g.info(x).shape,
+            g.info(out).shape
+        ),
+    )?;
     let row_groups = [rows as u32, 1, 1];
-    let mut input = x.id();
-    let mut normed = g
-        .tensor::<F16>(
-            format!("{name}.layers.0.normed"),
-            &rows_of(s.hidden),
-            Kind::Intermediate,
-        )
-        .id();
+    let mut input = x;
+    let mut normed = g.tensor::<F16>(
+        format!("{name}.layers.0.normed"),
+        &rows_of(s.hidden),
+        Kind::Intermediate,
+    );
     g.op(
         format!("{name}.input_norm"),
         norm,
@@ -360,11 +352,10 @@ pub fn append_prefill(
                     format!("{name}.layers.{}.normed", l + 1),
                     &rows_of(s.hidden),
                     Kind::Intermediate,
-                )
-                .id(),
+                ),
                 next.input_norm,
             ),
-            None => (out.id(), stack.norm),
+            None => (out, stack.norm),
         };
         g.op(
             "qkv_proj",
@@ -415,7 +406,7 @@ pub fn append_prefill(
             (run, down, mid, gain, output, next_normed),
             row_groups,
         );
-        input = output.id();
+        input = output;
         normed = next_normed;
     }
     Ok(())
@@ -566,7 +557,7 @@ mod tests {
             let p = program(2, rows, 512).unwrap();
             let tensors = |p: &PrefillGraph| {
                 let t = p.graph.tensors.iter();
-                t.map(|t| (t.name.clone(), t.bytes, t.kind))
+                t.map(|t| (t.name.clone(), t.bytes(), t.kind))
                     .collect::<Vec<_>>()
             };
             assert_eq!(tensors(&p), tensors(&first), "{rows} rows");
