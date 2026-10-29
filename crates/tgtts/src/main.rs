@@ -17,7 +17,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::oneshot,
 };
-use tracing::{error, info, level_filters::LevelFilter};
+use tracing::{error, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt};
 use voices::Voices;
 
@@ -71,6 +71,13 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         Some(path) => {
             let levels = Levels::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             info!(voices = levels.len(), "read the voices' levels");
+            let without = voices.names().filter(|v| levels.get(v).is_none()).count();
+            if without > 0 {
+                warn!(
+                    voices = without,
+                    "voices without a level, streamed at the voices' median"
+                );
+            }
             levels
         }
         None => Levels::default(),

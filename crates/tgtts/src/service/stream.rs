@@ -46,7 +46,7 @@ use effects::{Pipeline, Processor};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{Failure, MAX_PITCH, Params, Route, Served, Service, Trace, Treatment, blocking, json};
 use crate::{metrics::Leveling, opus, replay::Replay, synth, wav::Audio};
@@ -420,11 +420,11 @@ struct Outs {
 }
 
 pub(super) async fn create(State(service): State<Arc<Service>>, body: Bytes) -> Response {
-    let bad = |reason: String| (StatusCode::BAD_REQUEST, reason).into_response();
     let message: Message = match serde_json::from_slice(&body) {
         Ok(message) => message,
-        Err(e) => return bad(format!("body: {e}")),
+        Err(e) => return refused("", StatusCode::BAD_REQUEST, format!("body: {e}")),
     };
+    let bad = |reason: String| refused(&message.identifier, StatusCode::BAD_REQUEST, reason);
     let mut routes: Vec<Route> = Vec::new();
     for name in &message.variants {
         match Route::named(name) {
@@ -443,7 +443,7 @@ pub(super) async fn create(State(service): State<Arc<Service>>, body: Bytes) -> 
         return bad(format!("pitch {}", message.pitch));
     }
     if let Err(failure) = service.treatment(&message.params(), &message.body()) {
-        return (failure.status, failure.reason).into_response();
+        return refused(&message.identifier, failure.status, failure.reason);
     }
 
     let id = capability();
@@ -470,7 +470,10 @@ pub(super) async fn create(State(service): State<Arc<Service>>, body: Bytes) -> 
         let serial = rand::rng().random();
         let (encoder, headers) = match opus::Stream::new(1, BITRATE, serial) {
             Ok(encoder) => encoder,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => {
+                let status = StatusCode::INTERNAL_SERVER_ERROR;
+                return refused(&message.identifier, status, e.to_string());
+            }
         };
         let replay = Arc::new(Replay::default());
         replay.push(headers);
@@ -511,6 +514,18 @@ pub(super) async fn create(State(service): State<Arc<Service>>, body: Bytes) -> 
     let reply = serde_json::json!({ "job": id, "streams": streams });
     tokio::spawn(service.clone().run(id, tokens, job, message, outs));
     json(StatusCode::OK, reply)
+}
+
+/// The reply to a job of `identifier` that is not made, logged as a whole-file route logs its
+/// failures.
+fn refused(identifier: &str, status: StatusCode, reason: String) -> Response {
+    warn!(
+        route = "stream",
+        %identifier,
+        status = status.as_u16(),
+        "failed: {reason}"
+    );
+    (status, reason).into_response()
 }
 
 #[derive(Debug, Default, Deserialize)]
