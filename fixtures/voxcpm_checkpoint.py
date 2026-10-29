@@ -3,12 +3,11 @@ VOICES_DIR as the Python service had it spoken, in f32: each patch upstream gene
 stop head says to stop, the noise it was sampled from and the stop head's logits, and the start
 and end of the audio decoded from the patches.
 
-The voice is read from VOICES_DIR again when the golden is checked, and kept out of the golden
-but for checksums. The tokenizer runs tokenizer.json as transformers 4 runs it.
+The voice is kept out of the golden but for checksums. The tokenizer runs tokenizer.json as
+transformers 4 runs it.
 
-Without both directories this leaves the golden as it is, and the voxcpm tests refuse it once it
-was made by another torch or upstream than the fixtures beside it, or by another version of this
-file.
+Without both directories this leaves the golden as it is. The graph crate's GPU tests read it,
+the voice it names from VOICES_DIR, and its patches and their noise, which they take as inputs.
 """
 
 import hashlib

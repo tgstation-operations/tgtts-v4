@@ -1,8 +1,9 @@
 """Shared by the fixture generators, which `nix run .#fixtures` runs.
 
-A generator builds an upstream module at a tiny config with seeded random weights, runs it
-on seeded random inputs, and saves the weights under their state_dict names, the inputs and
-the outputs to crates/<crate>/tests/fixtures/<generator>.safetensors.
+A generator runs what a crate is checked against, upstream VoxCPM, the old Python services or
+ffmpeg, on inputs it makes from a seed, or on the real weights, voices and assets where the
+environment names them, and saves the inputs and the outputs, as a rule to
+crates/<crate>/tests/fixtures/<generator>.safetensors.
 """
 
 import importlib
