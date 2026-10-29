@@ -1,9 +1,8 @@
-//! Test support for the model crates, which take it as a dev-dependency.
+//! Test support for the crates that take it as a dev-dependency.
 //!
-//! A model is checked against upstream VoxCPM through fixtures: safetensors files that
-//! `nix run .#fixtures` writes from the generators in `fixtures/`, each holding an upstream
-//! module's weights under their state_dict names, the inputs it was run on and the outputs it
-//! gave.
+//! A crate is checked against what it replaces, upstream VoxCPM, the Python services or ffmpeg,
+//! through fixtures: safetensors files that `nix run .#fixtures` writes from the generators in
+//! `fixtures/`, each holding the inputs a generator ran that on and the outputs it gave.
 //!
 //! The GPU's tests on the real weights are held to goldens: what the GPU gave in each when it
 //! was captured, on a tree whose output burn's CPU oracles had shown right, kept as JSON under
