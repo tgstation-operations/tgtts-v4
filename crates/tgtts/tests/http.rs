@@ -20,7 +20,6 @@ use std::{
 use common::{Message, Reply, Server, VOICE, call};
 use dsp::quantity::{self, QuarterTones, SampleRate, TruePeak};
 use tgtts::{
-    cache::Cache,
     ffmpeg::Ffmpeg,
     levels::{Level, Levels, RadioPeaks},
     metrics::Metrics,
@@ -271,7 +270,6 @@ struct Harness {
     server: Server,
     _dir: tempfile::TempDir,
     fake: Arc<Fake>,
-    cache: PathBuf,
     metrics: PathBuf,
     levels: Arc<Mutex<Vec<LevelFilter>>>,
 }
@@ -321,7 +319,7 @@ fn serve_fake(
     let (voices, assets) = (dir.path().join("voices"), dir.path().join("assets"));
     write_voices(&voices);
     write_assets(&assets);
-    let (cache, metrics) = (dir.path().join("cache"), dir.path().join("metrics.sqlite"));
+    let metrics = dir.path().join("metrics.sqlite");
     let levels = Arc::new(Mutex::new(Vec::new()));
     let set = levels.clone();
     let fake = Arc::new(fake);
@@ -329,7 +327,6 @@ fn serve_fake(
         token: String::new(),
         voices: Voices::open(&voices).unwrap(),
         synthesizer: ready.then(|| fake.clone() as Arc<dyn Synthesizer>),
-        cache: Cache::open(&cache).unwrap(),
         ffmpeg: Ffmpeg::new("ffmpeg"),
         sounds: Sounds::open(&assets).unwrap(),
         metrics: Some(Metrics::open(&metrics, 1024).unwrap()),
@@ -345,7 +342,6 @@ fn serve_fake(
         server,
         _dir: dir,
         fake,
-        cache,
         metrics,
         levels,
     }
@@ -365,8 +361,8 @@ impl Harness {
         let connection = rusqlite::Connection::open(&self.metrics).unwrap();
         let mut select = connection
             .prepare(
-                "SELECT route, voice, identifier, status, cache_hit, text_length, audio_seconds, \
-                 patches, gain_db, limiter_reduction_db, limited_fraction, cache_takes, rms_dbfs \
+                "SELECT route, voice, identifier, status, text_length, audio_seconds, patches, \
+                 gain_db, limiter_reduction_db, limited_fraction, rms_dbfs \
                  FROM requests ORDER BY id",
             )
             .unwrap();
@@ -377,19 +373,17 @@ impl Harness {
                     voice: r.get(1)?,
                     identifier: r.get(2)?,
                     status: r.get(3)?,
-                    cache_hit: r.get(4)?,
-                    text_length: r.get(5)?,
-                    audio_seconds: r.get(6)?,
-                    patches: r.get(7)?,
-                    leveling: match (r.get(8)?, r.get(9)?, r.get(10)?) {
+                    text_length: r.get(4)?,
+                    audio_seconds: r.get(5)?,
+                    patches: r.get(6)?,
+                    leveling: match (r.get(7)?, r.get(8)?, r.get(9)?) {
                         (Some(gain), Some(reduction), Some(limited)) => {
                             Some((gain, reduction, limited))
                         }
                         (None, None, None) => None,
                         some => panic!("leveling recorded in part: {some:?}"),
                     },
-                    cache_takes: r.get(11)?,
-                    rms_dbfs: r.get(12)?,
+                    rms_dbfs: r.get(10)?,
                 })
             })
             .unwrap()
@@ -404,13 +398,11 @@ struct Row {
     voice: String,
     identifier: String,
     status: u16,
-    cache_hit: Option<bool>,
     text_length: i64,
     audio_seconds: Option<f64>,
     patches: Option<i64>,
     /// The gain, the limiter's largest reduction and the fraction it limited.
     leveling: Option<(f64, f64, f64)>,
-    cache_takes: Option<i64>,
     rms_dbfs: Option<f64>,
 }
 
@@ -799,13 +791,10 @@ fn brings_speech_and_blips_to_the_loudness() {
     };
     let speech = message.speech(&h);
     speech.assert_ogg(48000);
-    // The cache keeps the take as the model said it, its peak at -0.1 dBFS.
-    let take = synth::level(&synth::to_segment(&said("Hello there.")));
-    let entry = Cache::open(&h.cache).unwrap().entry(VOICE, "Hello there.");
-    let cached = std::fs::read(entry.join("0.wav")).unwrap();
-    assert_eq!(cached, wav::write_pcm16(dsp::RATE, 1, &take.samples));
-    // What is played is the take finished, then brought to the loudness.
-    let finished = dsp::speech::finish(&take, QuarterTones::new(2));
+    // What is played is what the model said, its peak at -0.1 dBFS, finished, then brought to
+    // the loudness.
+    let leveled = synth::level(&synth::to_segment(&said("Hello there.")));
+    let finished = dsp::speech::finish(&leveled, QuarterTones::new(2));
     let most = levels().most_gain(VOICE, target);
     let expected = dsp::loudness::normalize(&finished, target, ceiling, most).segment;
     let expected = wav::Audio::from_segment(&expected);
@@ -955,36 +944,6 @@ fn refuses_an_unknown_voice_everywhere() {
 }
 
 #[test]
-fn caches_five_takes_then_reuses_them() {
-    let h = harness(Fake::default(), limits());
-    let message = Message::default();
-    for _ in 0..7 {
-        message.speech(&h).assert_ogg(48000);
-    }
-    assert_eq!(h.fake.texts(), ["Hello there."; 5]);
-    let hits: Vec<_> = h.rows().iter().map(|row| row.cache_hit).collect();
-    let (miss, hit) = (Some(false), Some(true));
-    assert_eq!(hits, [miss, miss, miss, miss, miss, hit, hit]);
-    let takes: Vec<_> = h.rows().iter().map(|row| row.cache_takes).collect();
-    assert_eq!(takes, [0, 1, 2, 3, 4, 5, 5].map(Some));
-    let entries = std::fs::read_dir(&h.cache).unwrap().count();
-    assert_eq!(entries, 1);
-
-    // Voices and texts that run together alike are kept apart.
-    for (speaker, text) in [("A", "bc"), ("Ab", "c")] {
-        Message {
-            speaker,
-            text,
-            ..Message::default()
-        }
-        .speech(&h)
-        .assert_ogg(48000);
-    }
-    assert_eq!(h.fake.texts()[5..], ["Bc. ", "C. "]);
-    assert_eq!(std::fs::read_dir(&h.cache).unwrap().count(), 3);
-}
-
-#[test]
 fn bounds_synthesis_and_refuses_a_long_wait() {
     let (fake, entered, release) = Fake::gated();
     let h = harness(
@@ -1093,8 +1052,8 @@ fn records_metrics_without_the_text() {
     // Loud enough that the fake's speech takes the limiter to reach it.
     let (target, ceiling) = (quantity::Loudness::new(-4.5), TruePeak::new(-1.0));
     let h = harness_at(Fake::default(), limits(), Loudness { target, ceiling });
-    let take = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
-    let finished = dsp::speech::finish(&take, QuarterTones::ZERO);
+    let leveled = synth::level(&synth::to_segment(&said("Zebra quartz nightingale.")));
+    let finished = dsp::speech::finish(&leveled, QuarterTones::ZERO);
     let most = levels().most_gain(VOICE, target);
     let speech_leveling = dsp::loudness::normalize(&finished, target, ceiling, most);
     assert!(speech_leveling.reduction > 0.0 && speech_leveling.limited > 0.0);
@@ -1132,37 +1091,31 @@ fn records_metrics_without_the_text() {
         );
     }
     assert_eq!(levels[5], None);
-    let row = |route: &str, reply: &Reply, cache_hit, patches, leveling| Row {
+    let row = |route: &str, reply: &Reply, patches, leveling| Row {
         route: route.to_owned(),
         voice: VOICE.to_owned(),
         identifier: "metrics.42".to_owned(),
         status: reply.status,
-        cache_hit,
         text_length: 25,
         audio_seconds: Some(reply.length.as_deref().unwrap().parse().unwrap()),
         patches,
         leveling,
-        cache_takes: None,
         rms_dbfs: None,
     };
     assert_eq!(
         rows,
         [
-            Row {
-                cache_takes: Some(0),
-                ..row("tts", &speech, Some(false), Some(25), speech_leveling)
-            },
-            row("tts-blips", &blips, None, None, blips_leveling),
-            row("tts-blips-radio", &blips_radio, None, None, None),
-            row("tts-radio", &radio, None, None, None),
-            row("tts-radio-gibberish", &gibberish, None, None, None),
+            row("tts", &speech, Some(25), speech_leveling),
+            row("tts-blips", &blips, None, blips_leveling),
+            row("tts-blips-radio", &blips_radio, None, None),
+            row("tts-radio", &radio, None, None),
+            row("tts-radio-gibberish", &gibberish, None, None),
             Row {
                 voice: "Nobody".to_owned(),
                 status: 400,
-                cache_hit: None,
                 audio_seconds: None,
                 patches: None,
-                ..row("tts", &speech, None, None, None)
+                ..row("tts", &speech, None, None)
             },
         ]
     );
@@ -1355,8 +1308,8 @@ fn streams_speech_as_the_model_makes_it() {
     assert_eq!(play(&h, &streams["tts"]).body, read);
 }
 
-/// Speech from the cache, through an ffmpeg filter graph or in a voice with no level is made
-/// whole first, as the whole-file route makes it, and streamed at once.
+/// Speech through an ffmpeg filter graph or in a voice with no level is made whole first, as the
+/// whole-file route makes it, and streamed at once.
 #[test]
 fn serves_whole_what_cannot_stream() {
     let h = harness(Fake::default(), limits());
@@ -1468,13 +1421,11 @@ fn refuses_a_job_it_cannot_do_and_streams_nobody_has() {
 }
 
 /// Streamed, speech goes through the effects, the silicon effect and the clicks as it does
-/// whole: as long as the whole-file route's, and as loud. Each line is new, so that none comes
-/// from the cache.
+/// whole: as long as the whole-file route's, and as loud.
 #[test]
 fn streams_the_effects_and_the_clicks() {
     let h = harness(Fake::default(), limits());
     let speech = 12 * FRAMES_PER_CHAR + TAIL;
-    let lines: Vec<String> = (0..8).map(|i| format!("Hello {i:05}.")).collect();
     let streamed = |message: &Message| {
         let (id, streams) = job(&h.post("/stream", &message.job(&["tts"])));
         assert_eq!(status(&h, &id, 30.0)["done"], true);
@@ -1485,16 +1436,12 @@ fn streams_the_effects_and_the_clicks() {
         let samples: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
         dsp::loudness::integrated(&samples, SampleRate::new(48000)).value()
     };
-    for (effects, text) in [
+    for effects in [
         r#"[[{"effect": "lowpass", "frequency_hz": 750}, {"effect": "gain", "gain_db": -6}]]"#,
         r#"[[{"effect": "tempo", "ratio": 2}]]"#,
-    ]
-    .into_iter()
-    .zip(&lines)
-    {
+    ] {
         let message = Message {
             effects,
-            text,
             ..Message::default()
         };
         let whole = message.speech(&h);
@@ -1508,17 +1455,15 @@ fn streams_the_effects_and_the_clicks() {
     }
     let silicon = Message {
         special_filters: "silicon",
-        text: &lines[2],
         ..Message::default()
     };
     assert_eq!(streamed(&silicon).len(), speech + 69);
+    let radio = Message {
+        special_filters: "radio",
+        ..Message::default()
+    };
     let (starts, ends) = ([1200, 2400], [240, 480, 720, 960]);
-    for text in &lines[3..7] {
-        let radio = Message {
-            special_filters: "radio",
-            text,
-            ..Message::default()
-        };
+    for _ in 0..4 {
         let clicks = streamed(&radio).len() - speech;
         assert!(
             starts.iter().any(|s| ends.iter().any(|e| s + e == clicks)),

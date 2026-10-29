@@ -5,7 +5,6 @@ use std::{env, error::Error, future::IntoFuture, path::PathBuf, process::ExitCod
 
 use argh::FromArgs;
 use tgtts::{
-    cache::Cache,
     config::{self, Config},
     ffmpeg::Ffmpeg,
     levels::Levels,
@@ -66,7 +65,6 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
     let token = config::read_token(&config.token_file)?;
     let voices = Voices::open(&config.voices_dir)?;
     let sounds = Sounds::open(&config.assets_dir)?;
-    let cache = Cache::open(&config.cache_dir)?;
     let levels = match &config.voice_levels_file {
         Some(path) => {
             let levels = Levels::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -90,7 +88,6 @@ fn run(config: Config, logging: Logging) -> Result<(), Box<dyn Error + Send + Sy
         token,
         voices,
         synthesizer: None,
-        cache,
         ffmpeg: Ffmpeg::new(&config.ffmpeg),
         sounds,
         metrics,

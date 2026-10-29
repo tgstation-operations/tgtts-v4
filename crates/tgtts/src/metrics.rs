@@ -28,7 +28,8 @@ const PRAGMAS: &str = "
 
 /// What each version of the schema adds to the one before. A database records the version it is
 /// at as its `user_version`, which databases made before there were versions have at 0, with the
-/// first version's table.
+/// first version's table. No column is dropped, since an older build writes to every column it
+/// names: those of the speech cache, which is gone, are left NULL.
 const MIGRATIONS: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY,
@@ -84,13 +85,13 @@ const MIGRATIONS: [&str; 3] = [
 
 const INSERT: &str = "
     INSERT INTO requests (
-        time_unix_ms, route, voice, identifier, status, cache_hit, text_length, audio_seconds,
+        time_unix_ms, route, voice, identifier, status, text_length, audio_seconds,
         queue_ms, handoff_ms, synthesis_ms, dsp_ms, ffmpeg_ms, total_ms, patches, gain_db,
-        limiter_reduction_db, limited_fraction, cache_takes, rms_dbfs, wait_to_first_patch_ms,
+        limiter_reduction_db, limited_fraction, rms_dbfs, wait_to_first_patch_ms,
         prompt_positions, prefilled_positions
     ) VALUES (
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-        ?21, ?22, ?23
+        ?21
     )
 ";
 
@@ -104,9 +105,6 @@ pub struct Row {
     pub voice: String,
     pub identifier: String,
     pub status: u16,
-    pub cache_hit: Option<bool>,
-    /// How many takes the cache held when it was looked up.
-    pub cache_takes: Option<usize>,
     /// The length of the text in characters.
     pub text_length: usize,
     pub audio_seconds: Option<f64>,
@@ -272,7 +270,6 @@ fn insert<'a>(
                 row.voice,
                 row.identifier,
                 row.status,
-                row.cache_hit,
                 row.text_length as i64,
                 row.audio_seconds,
                 ms(t.queue),
@@ -285,7 +282,6 @@ fn insert<'a>(
                 leveling.map(|l| l.gain.value()),
                 leveling.map(|l| l.reduction),
                 leveling.map(|l| l.limited),
-                row.cache_takes.map(|t| t as i64),
                 row.rms_dbfs.map(Level::value),
                 row.start.map(|s| ms(s.waited)),
                 row.start.map(|s| s.prompt as i64),
@@ -309,8 +305,6 @@ mod tests {
             voice: "Man (Ace Detective)".into(),
             identifier: format!("id{n}"),
             status: 200 + n,
-            cache_hit: Some(false),
-            cache_takes: Some(3),
             text_length: 13,
             audio_seconds: Some(1.25),
             rms_dbfs: Some(Level::new(-21.5)),
@@ -357,8 +351,6 @@ mod tests {
         assert!(metrics.record(row(0)));
         let mut radio = row(1);
         radio.route = "tts-radio";
-        radio.cache_hit = None;
-        radio.cache_takes = None;
         radio.audio_seconds = None;
         radio.rms_dbfs = None;
         radio.patches = None;
@@ -378,7 +370,7 @@ mod tests {
                     text("Man (Ace Detective)"),
                     text("id0"),
                     I(200),
-                    I(0),
+                    Null,
                     I(13),
                     R(1.25),
                     R(1.5),
@@ -391,7 +383,7 @@ mod tests {
                     R(-12.5),
                     R(0.75),
                     R(0.03125),
-                    I(3),
+                    Null,
                     R(-21.5),
                     R(250.0),
                     I(481),
@@ -460,7 +452,7 @@ mod tests {
         assert!(written[0][19..].iter().all(|v| *v == Value::Null));
         assert_eq!(
             written[1][19..21],
-            [Value::Integer(3), Value::Real(f64::NEG_INFINITY)]
+            [Value::Null, Value::Real(f64::NEG_INFINITY)]
         );
         let latest = MIGRATIONS.len() as i64;
         let version = |path: &Path| -> i64 {

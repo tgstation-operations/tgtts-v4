@@ -9,7 +9,6 @@ use std::{
 };
 
 use tgtts::{
-    cache::Cache,
     ffmpeg::Ffmpeg,
     levels::Levels,
     service::{Limits, Logging, Loudness, Setup, Sounds},
@@ -47,12 +46,10 @@ pub fn serves_a_message<S: Synthesizer>(model: S, prepare: impl FnOnce(&S, &Voic
     let (voices, assets) = (dir("VOICES_DIR"), dir("ASSETS_DIR"));
     let table = Voices::open(&voices).unwrap();
     let speaker = table.names().next().unwrap().to_owned();
-    let cache = tempfile::tempdir().unwrap();
     let server = super::serve(Setup {
         token: String::new(),
         voices: Voices::open(&voices).unwrap(),
         synthesizer: None,
-        cache: Cache::open(cache.path()).unwrap(),
         ffmpeg: Ffmpeg::new("ffmpeg"),
         sounds: Sounds::open(&assets).unwrap(),
         metrics: None,

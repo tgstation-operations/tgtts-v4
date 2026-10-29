@@ -18,9 +18,9 @@
 //! voice's [level](crate::levels), where the whole-file routes measure the whole line instead,
 //! and held under the ceiling by the same limiter, then through the pitch, the effects and the
 //! clicks as there. Everything else is made whole first, as the whole-file routes make it, and
-//! streams at once: speech from the cache, in a voice with no level, or through an ffmpeg filter
-//! graph; the blips; and the radio, which the old radio service made over the whole speech. The
-//! gibberish radio streams the plain radio, as its whole-file route serves it.
+//! streams at once: speech in a voice with no level or through an ffmpeg filter graph; the blips;
+//! and the radio, which the old radio service made over the whole speech. The gibberish radio
+//! streams the plain radio, as its whole-file route serves it.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -679,19 +679,10 @@ impl Service {
         let treatment = self.treatment(&params, &message.body())?;
         let voice = &message.voice;
         let text = synth::prepare(&message.text);
-        let take = match &text {
-            Some(text) => self.cached(voice, text, trace).await?,
-            None => None,
-        };
         let loudness = self.levels.loudness(voice);
         let mut outcomes = Outcomes::new();
-        let audio = match (text, take, loudness, treatment) {
-            (
-                Some(text),
-                None,
-                Some(loudness),
-                treatment @ (Treatment::Effects(_) | Treatment::None),
-            ) => {
+        let audio = match (text, loudness, treatment) {
+            (Some(text), Some(loudness), treatment @ (Treatment::Effects(_) | Treatment::None)) => {
                 let routes = speech.as_ref().map(|out| out.routes.clone());
                 let mut chain = self.chain(
                     &params,
@@ -730,12 +721,11 @@ impl Service {
                     samples: finished.kept.unwrap_or_default(),
                 }
             }
-            (text, take, _, treatment) => {
-                let spoken = match (text, take) {
+            (text, _, treatment) => {
+                let spoken = match text {
                     // The old model service's empty WAV.
-                    (None, _) => Segment::new(dsp::RATE, Vec::new()),
-                    (Some(_), Some(take)) => take,
-                    (Some(text), None) => self.synthesized(voice, text, None, trace).await?.0,
+                    None => Segment::new(dsp::RATE, Vec::new()),
+                    Some(text) => self.synthesized(voice, text, None, trace).await?.0,
                 };
                 let finished = self
                     .finish(voice, spoken, QuarterTones::new(message.pitch), trace)

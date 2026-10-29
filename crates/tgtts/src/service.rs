@@ -45,7 +45,6 @@ use voices::Voices;
 
 use self::stream::{Chain, Jobs};
 use crate::{
-    cache::Cache,
     ffmpeg::{self, Ffmpeg},
     handoff::{Handoff, Missing, Source},
     levels::Levels,
@@ -167,9 +166,8 @@ pub struct Setup {
     pub token: String,
     pub voices: Voices,
     /// The model, or none while it loads, until [`Service::ready`] gives it: until then the
-    /// health check answers 503, and so does speech the cache does not hold.
+    /// health check answers 503, and so does speech.
     pub synthesizer: Option<Arc<dyn Synthesizer>>,
-    pub cache: Cache,
     pub ffmpeg: Ffmpeg,
     pub sounds: Sounds,
     pub metrics: Option<Metrics>,
@@ -184,12 +182,11 @@ pub struct Setup {
     pub blip_seed: Option<u64>,
 }
 
-/// The service: its voices, model, cache and limits, shared by every request.
+/// The service: its voices, model and limits, shared by every request.
 pub struct Service {
     token: Vec<u8>,
     voices: Voices,
     synthesizer: OnceLock<Arc<dyn Synthesizer>>,
-    cache: Cache,
     ffmpeg: Ffmpeg,
     sounds: Sounds,
     metrics: Option<Metrics>,
@@ -210,7 +207,6 @@ impl Service {
             token: setup.token.into_bytes(),
             voices: setup.voices,
             synthesizer: setup.synthesizer.map_or_else(OnceLock::new, OnceLock::from),
-            cache: setup.cache,
             ffmpeg: setup.ffmpeg,
             sounds: setup.sounds,
             metrics: setup.metrics,
@@ -410,8 +406,6 @@ struct Served {
 #[derive(Clone, Default)]
 struct Trace {
     timings: Timings,
-    cache_hit: Option<bool>,
-    cache_takes: Option<usize>,
     patches: Option<usize>,
     start: Option<Start>,
     leveling: Option<Leveling>,
@@ -421,8 +415,8 @@ struct Trace {
 
 impl Service {
     async fn serve(self: Arc<Self>, route: Route, params: Params, body: Bytes) -> Response {
-        // Run to the end even if the game hangs up, so that the speech is cached, the radio
-        // routes get what they wait for and the metrics are recorded.
+        // Run to the end even if the game hangs up, so that the radio routes get what they wait
+        // for and the metrics are recorded.
         match tokio::spawn(self.respond(route, params, body)).await {
             Ok(response) => response,
             Err(e) => {
@@ -496,8 +490,6 @@ impl Service {
                 route = route.name(),
                 identifier = %params.identifier,
                 voice = %params.voice,
-                cache_hit = trace.cache_hit,
-                cache_takes = trace.cache_takes,
                 seconds = served.seconds,
                 rms_dbfs = trace.rms_dbfs.map(Level::value),
                 queue_ms = ms(t.queue),
@@ -531,8 +523,6 @@ impl Service {
                     Ok(_) => StatusCode::OK.as_u16(),
                     Err(failure) => failure.status.as_u16(),
                 },
-                cache_hit: trace.cache_hit,
-                cache_takes: trace.cache_takes,
                 text_length,
                 audio_seconds: result.as_ref().ok().map(|served| served.seconds),
                 rms_dbfs: result.as_ref().ok().and(trace.rms_dbfs),
@@ -596,7 +586,7 @@ impl Service {
         let spoken = match synth::prepare(text) {
             // The old model service's empty WAV.
             None => Segment::new(dsp::RATE, Vec::new()),
-            Some(text) => self.spoken(voice, text, trace).await?,
+            Some(text) => self.synthesized(voice, text, None, trace).await?.0,
         };
         self.finish(voice, spoken, pitch, trace).await
     }
@@ -621,48 +611,8 @@ impl Service {
         Ok(leveled(normalized, trace))
     }
 
-    /// What the model says for `text` in `voice`, from the cache once it has said it often
-    /// enough, leveled.
-    async fn spoken(
-        self: &Arc<Self>,
-        voice: &str,
-        text: String,
-        trace: &mut Trace,
-    ) -> Result<Segment, Failure> {
-        if let Some(speech) = self.cached(voice, &text, trace).await? {
-            return Ok(speech);
-        }
-        let (speech, _) = self.synthesized(voice, text, None, trace).await?;
-        Ok(speech)
-    }
-
-    /// A take of `text` in `voice` from the cache, once it holds enough of them.
-    async fn cached(
-        self: &Arc<Self>,
-        voice: &str,
-        text: &str,
-        trace: &mut Trace,
-    ) -> Result<Option<Segment>, Failure> {
-        let service = self.clone();
-        let (voice, text) = (voice.to_owned(), text.to_owned());
-        let cached =
-            blocking(move || service.cache.lookup(&voice, &text, &mut rand::rng())).await?;
-        match cached {
-            Ok(lookup) => {
-                trace.cache_takes = Some(lookup.takes);
-                if let Some(speech) = lookup.take {
-                    trace.cache_hit = Some(true);
-                    return Ok(Some(speech));
-                }
-            }
-            Err(e) => warn!("reading the cache, speaking anew: {e}"),
-        }
-        trace.cache_hit = Some(false);
-        Ok(None)
-    }
-
-    /// What the model says for `text` in `voice` anew, leveled and cached; streamed through
-    /// `chain` as it is made where there is one, which comes back with it.
+    /// What the model says for `text` in `voice`, leveled; streamed through `chain` as it is made
+    /// where there is one, which comes back with it.
     async fn synthesized(
         self: &Arc<Self>,
         voice: &str,
@@ -708,12 +658,6 @@ impl Service {
             };
             let speech = speech.map_err(|e| Failure::internal(format!("synthesis: {e}")))?;
             let leveled = synth::level(&synth::to_segment(&speech.samples));
-            if let Err(e) = service
-                .cache
-                .store(&voice, &text, &leveled, &mut rand::rng())
-            {
-                warn!("caching: {e}");
-            }
             Ok((leveled, speech.patches, speech.start, chain))
         })
         .await?;

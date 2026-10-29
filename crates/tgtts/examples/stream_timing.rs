@@ -2,9 +2,9 @@
 //! [--at-once N] [--voices N] [--radio] [--streamed-radio] [--whole]`, with the token in `TOKEN`.
 //!
 //! It makes `N` jobs of the lines below, each with its job's number and the run's start time, so
-//! that no run asks for a line another asked for and none comes from the cache, in voices spread
-//! over `/tts-voices`, or over `--voices` of them, so that the model keeps what it computed of
-//! each, `--at-once` of them at a time, and plays each job's speech stream, and its radio with
+//! that no run asks for a line another asked for, in voices spread over `/tts-voices`,
+//! or over `--voices` of them, so that the model keeps what it computed of each,
+//! `--at-once` of them at a time, and plays each job's speech stream, and its radio with
 //! `--radio`, as it comes, noting when each page of it arrives. For each stream it writes a line
 //! of JSON: from the job's making to the first page of audio, `first_audio_ms`; to the stream's
 //! end, `done_ms`; the audio's length; and `buffer_ms`, the least a player that starts playing

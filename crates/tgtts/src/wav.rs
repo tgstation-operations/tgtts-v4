@@ -1,5 +1,5 @@
 //! WAV as the service reads and writes it: 16-bit PCM and 32-bit float, which is what ffmpeg is
-//! given and gives back, what the cache keeps and what the assets are.
+//! given and gives back and what the assets are.
 
 use dsp::{
     quantity::{Level, SampleRate},

@@ -62,8 +62,8 @@ fn holds_the_gain_of_a_line_to_its_voices_level_and_the_margin() {
     assert!(held > 0, "no line held");
 }
 
-/// A line the model said under the floor is served as it said it, where the cache would have
-/// raised its peak to full scale and the loudness raised it the rest of the way to the target.
+/// A line the model said under the floor is served as it said it, where [`synth::level`] would
+/// have raised its peak to full scale and the loudness raised it the rest of the way to the target.
 #[test]
 #[ignore = "needs VOICE_LEVELS_FILE to name a gains run's table and GAINS_KEPT_DIR the lines it \
             kept"]
@@ -83,9 +83,9 @@ fn serves_a_line_said_under_the_floor_as_it_was_said() {
             .iter()
             .map(|&s| (f64::from(s) * down).round() as i16);
         let quiet = Segment::new(said.rate, quiet.collect());
-        let take = synth::level(&quiet);
-        assert_eq!(take, quiet, "{voice}");
-        let finished = dsp::speech::finish(&take, QuarterTones::ZERO);
+        let leveled = synth::level(&quiet);
+        assert_eq!(leveled, quiet, "{voice}");
+        let finished = dsp::speech::finish(&leveled, QuarterTones::ZERO);
         let most = levels.most_gain(&voice, TARGET);
         let served = normalize(&finished, TARGET, CEILING, most);
         assert_eq!(served.segment, finished, "{voice}");

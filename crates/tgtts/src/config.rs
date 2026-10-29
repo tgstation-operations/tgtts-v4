@@ -6,7 +6,6 @@
 //! - `voices_dir`: the voices directory.
 //! - `assets_dir`: the radio's clicks and static and the silicon effect's impulse responses.
 //! - `checkpoint_dir`: the VoxCPM2 checkpoint.
-//! - `cache_dir`: where the speech cache is kept.
 //! - `glsl_kernels_dir`, `mlir_kernels_dir`: the kernels the model runs on the GPU, as `nix build
 //!   .#glsl-kernels` and `nix build .#gpu-kernels` compile them.
 //! - `metrics_db`: the SQLite database the metrics go to, none by default.
@@ -52,13 +51,12 @@ use crate::{
     service::{Loudness, parse_level},
 };
 
-const KEYS: [&str; 21] = [
+const KEYS: [&str; 20] = [
     "listen",
     "token_file",
     "voices_dir",
     "assets_dir",
     "checkpoint_dir",
-    "cache_dir",
     "glsl_kernels_dir",
     "mlir_kernels_dir",
     "metrics_db",
@@ -84,7 +82,6 @@ pub struct Config {
     pub voices_dir: PathBuf,
     pub assets_dir: PathBuf,
     pub checkpoint_dir: PathBuf,
-    pub cache_dir: PathBuf,
     pub glsl_kernels_dir: PathBuf,
     pub mlir_kernels_dir: PathBuf,
     pub metrics_db: Option<PathBuf>,
@@ -141,7 +138,6 @@ impl Config {
             voices_dir: settings.required("voices_dir")?,
             assets_dir: settings.required("assets_dir")?,
             checkpoint_dir: settings.required("checkpoint_dir")?,
-            cache_dir: settings.required("cache_dir")?,
             glsl_kernels_dir: settings.required("glsl_kernels_dir")?,
             mlir_kernels_dir: settings.required("mlir_kernels_dir")?,
             metrics_db: settings.parse("metrics_db")?,
@@ -264,7 +260,6 @@ mod tests {
         voices_dir = "/var/lib/tgtts/voices"
         assets_dir = "/var/lib/tgtts/assets"
         checkpoint_dir = "/var/lib/tgtts/VoxCPM2"
-        cache_dir = "/var/cache/tgtts"
         glsl_kernels_dir = "/k/glsl"
         mlir_kernels_dir = "/k/mlir"
     "#;
@@ -292,7 +287,6 @@ mod tests {
                 voices_dir: "/var/lib/tgtts/voices".into(),
                 assets_dir: "/var/lib/tgtts/assets".into(),
                 checkpoint_dir: "/var/lib/tgtts/VoxCPM2".into(),
-                cache_dir: "/var/cache/tgtts".into(),
                 glsl_kernels_dir: "/k/glsl".into(),
                 mlir_kernels_dir: "/k/mlir".into(),
                 metrics_db: None,
@@ -379,7 +373,6 @@ mod tests {
             ("TGTTS_VOICES_DIR", "/v"),
             ("TGTTS_ASSETS_DIR", "/a"),
             ("TGTTS_CHECKPOINT_DIR", "/c"),
-            ("TGTTS_CACHE_DIR", "/k"),
             ("TGTTS_GLSL_KERNELS_DIR", "/g"),
             ("TGTTS_MLIR_KERNELS_DIR", "/m"),
         ]
@@ -394,9 +387,11 @@ mod tests {
         assert_eq!(error("", &[]), "token_file is not set");
         let unknown = error(&format!("{REQUIRED}\ntoken = \"hunter2\""), &[]);
         assert!(unknown.ends_with("no setting \"token\""), "{unknown}");
-        // One device is left, which no setting names.
+        // One device is left, which no setting names, and there is no speech cache.
         let gone = error(&format!("{REQUIRED}\ndevice = \"rt\""), &[]);
         assert!(gone.ends_with("no setting \"device\""), "{gone}");
+        let gone = error(&format!("{REQUIRED}\ncache_dir = \"cache\""), &[]);
+        assert!(gone.ends_with("no setting \"cache_dir\""), "{gone}");
         assert!(error(REQUIRED, &[("TGTTS_LISTEN", "localhost")]).starts_with("listen:"));
         assert!(error(REQUIRED, &[("TGTTS_CPU_LIMIT", "0")]).starts_with("cpu_limit:"));
         assert!(error(REQUIRED, &[("TGTTS_RADIO_WAIT_SECONDS", "-1")]).starts_with("radio_wait"));

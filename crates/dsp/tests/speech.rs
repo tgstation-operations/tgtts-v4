@@ -60,7 +60,7 @@ fn finishes_as_the_old_frontend() {
 }
 
 /// Two seconds of a buzz at a wandering pitch, its harmonics' phases spread as Schroeder's, so
-/// that its peaks stand little over the rest, at the level the cache keeps speech at.
+/// that its peaks stand little over the rest, at the level the service first brings speech to.
 fn buzz() -> Segment {
     let mut phase = 0.0;
     let x = (0..96000).map(|i| {
