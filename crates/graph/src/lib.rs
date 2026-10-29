@@ -34,46 +34,22 @@ pub mod pth;
 pub mod step;
 pub mod vae;
 
-use std::fmt;
-
 /// Why a step could not be built or run.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Vulkan(vulkan::Error),
+    #[error("{0}")]
+    Vulkan(#[from] vulkan::Error),
     /// A kernel's SPIR-V could not be found or read.
+    #[error("kernels: {0}")]
     Kernels(String),
     /// The checkpoint could not be read, or lacks a weight at the shape the step needs.
+    #[error("checkpoint: {0}")]
     Checkpoint(String),
     /// Shapes the kernels cannot run, or a config VoxCPM2 does not use.
+    #[error("shape: {0}")]
     Shape(String),
     /// The patch, by its index, came out NaN or infinite, after which the stop head might never
     /// say to stop.
+    #[error("patch {0} came out NaN or infinite")]
     NotFinite(usize),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Vulkan(e) => write!(f, "{e}"),
-            Error::Kernels(why) => write!(f, "kernels: {why}"),
-            Error::Checkpoint(why) => write!(f, "checkpoint: {why}"),
-            Error::Shape(why) => write!(f, "shape: {why}"),
-            Error::NotFinite(patch) => write!(f, "patch {patch} came out NaN or infinite"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Vulkan(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<vulkan::Error> for Error {
-    fn from(e: vulkan::Error) -> Self {
-        Error::Vulkan(e)
-    }
 }

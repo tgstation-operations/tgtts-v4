@@ -12,6 +12,7 @@ device = []
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 vulkan = { path = "../vulkan" }
 
 [dev-dependencies]
