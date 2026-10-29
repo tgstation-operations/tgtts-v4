@@ -360,8 +360,8 @@ fn caches(gpu: &mut Gpu) -> Vec<Vec<Vec<F16>>> {
         .flat_map(|stack| &stack.layers)
         .flat_map(|l| [l.k_cache, l.v_cache])
         .map(|t| {
-            let held: Vec<F16> = step
-                .read(graph.side_ids[t.0])
+            let held = step
+                .read(t.moved(&graph.side_ids))
                 .unwrap_or_else(|e| panic!("{e}"));
             let slot = held.len() / side.batch.slots;
             held.chunks(slot).map(<[F16]>::to_vec).collect()

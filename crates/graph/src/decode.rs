@@ -16,7 +16,7 @@ use vulkan::{Context, DeviceReport, F16, SpecValue, Submission, Timing};
 use crate::{
     Error,
     checkpoint::Checkpoint,
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Graph, Kind, Pipeline, Tensor, TensorId},
     kernels::{
         ATTENTION_COMBINE, ATTENTION_SPLIT, GEMV_GATE_UP, GEMV_QKV_ROPE, GEMV_RESIDUAL, Kernels,
         RMSNORM,
@@ -384,28 +384,29 @@ pub const SUBGROUPS: [u32; 2] = [64, 32];
 /// One layer's tensors.
 #[derive(Clone, Debug)]
 pub struct LayerTensors {
-    pub input_norm: TensorId,
-    pub qkv: TensorId,
-    pub o: TensorId,
-    pub post_norm: TensorId,
-    pub gate_up: TensorId,
-    pub down: TensorId,
-    pub k_cache: TensorId,
-    pub v_cache: TensorId,
+    pub input_norm: Tensor<F16>,
+    pub qkv: Tensor<F16>,
+    pub o: Tensor<F16>,
+    pub post_norm: Tensor<F16>,
+    pub gate_up: Tensor<F16>,
+    pub down: Tensor<F16>,
+    pub k_cache: Tensor<F16>,
+    pub v_cache: Tensor<F16>,
 }
 
 impl LayerTensors {
-    /// The layer's tensors where `at` puts each, such as in a graph its graph was spliced into.
-    pub fn map(&self, at: impl Fn(TensorId) -> TensorId) -> Self {
+    /// The layer's tensors where `ids` puts each, such as in a graph its graph was spliced into
+    /// ([`Tensor::moved`]).
+    pub fn moved(&self, ids: &[TensorId]) -> Self {
         LayerTensors {
-            input_norm: at(self.input_norm),
-            qkv: at(self.qkv),
-            o: at(self.o),
-            post_norm: at(self.post_norm),
-            gate_up: at(self.gate_up),
-            down: at(self.down),
-            k_cache: at(self.k_cache),
-            v_cache: at(self.v_cache),
+            input_norm: self.input_norm.moved(ids),
+            qkv: self.qkv.moved(ids),
+            o: self.o.moved(ids),
+            post_norm: self.post_norm.moved(ids),
+            gate_up: self.gate_up.moved(ids),
+            down: self.down.moved(ids),
+            k_cache: self.k_cache.moved(ids),
+            v_cache: self.v_cache.moved(ids),
         }
     }
 }
@@ -417,15 +418,16 @@ pub struct DecodeGraph {
     pub graph: Graph,
     pub shape: Shape,
     pub batch: Batch,
-    /// The rows' hidden states, `[rows][hidden]` f16.
-    pub x: TensorId,
-    /// Where the rows run, [`Batch::words`] u32: at batch 1, the one position.
-    pub position: TensorId,
-    pub cos: TensorId,
-    pub sin: TensorId,
-    pub norm: TensorId,
-    /// The rows' outputs after the final norm, `[rows][hidden]` f16.
-    pub out: TensorId,
+    /// The rows' hidden states, `[rows][hidden]`.
+    pub x: Tensor<F16>,
+    /// Where the rows run, [`Batch::words`]: at batch 1, the one position.
+    pub position: Tensor<u32>,
+    /// `[capacity][head_dim / 2]` each.
+    pub cos: Tensor<f32>,
+    pub sin: Tensor<f32>,
+    pub norm: Tensor<F16>,
+    /// The rows' outputs after the final norm, `[rows][hidden]`.
+    pub out: Tensor<F16>,
     /// Their caches hold `[slots][kv_heads][capacity][head_dim]`.
     pub layers: Vec<LayerTensors>,
 }
@@ -614,74 +616,57 @@ pub fn decode_batch_graph(
     };
 
     let mut g = Graph::default();
-    let half = 2u64;
-    let vector = |n: usize| (rows * n) as u64 * half;
-    let x = g.untyped("x", vector(s.hidden), Kind::Input);
-    let position = g.untyped("position", 4 * batch.words() as u64, Kind::Param);
-    let table = (s.capacity * s.head_dim / 2 * 4) as u64;
-    let cos = g.untyped("rope.cos", table, Kind::Constant);
-    let sin = g.untyped("rope.sin", table, Kind::Constant);
+    let x = g.tensor::<F16>("x", &[rows, s.hidden], Kind::Input);
+    let position = g.tensor("position", &[batch.words()], Kind::Param);
+    let table = [s.capacity, s.head_dim / 2];
+    let cos = g.tensor("rope.cos", &table, Kind::Constant);
+    let sin = g.tensor("rope.sin", &table, Kind::Constant);
     let chunks = s.capacity / CHUNK;
-    let weight = |n: usize| n as u64 * half;
-    let cache = weight(slots * s.kv_heads * s.capacity * s.head_dim);
+    let cache = [slots, s.kv_heads, s.capacity, s.head_dim];
     let qkv_rows = (s.heads + 2 * s.kv_heads) * s.head_dim;
+    let attention = s.heads * s.head_dim;
     let mut layers = Vec::with_capacity(s.layers);
     let mut input = x;
     for l in 0..s.layers {
         let name = |what: &str| format!("layers.{l}.{what}");
         let t = LayerTensors {
-            input_norm: g.untyped(name("input_layernorm"), weight(s.hidden), Kind::Constant),
-            qkv: g.untyped(
-                name("qkv_proj"),
-                weight(qkv_rows * s.hidden),
-                Kind::Constant,
-            ),
-            o: g.untyped(
-                name("o_proj"),
-                weight(s.hidden * s.heads * s.head_dim),
-                Kind::Constant,
-            ),
-            post_norm: g.untyped(
+            input_norm: g.tensor(name("input_layernorm"), &[s.hidden], Kind::Constant),
+            qkv: g.tensor(name("qkv_proj"), &[qkv_rows, s.hidden], Kind::Constant),
+            o: g.tensor(name("o_proj"), &[s.hidden, attention], Kind::Constant),
+            post_norm: g.tensor(
                 name("post_attention_layernorm"),
-                weight(s.hidden),
+                &[s.hidden],
                 Kind::Constant,
             ),
-            gate_up: g.untyped(
+            gate_up: g.tensor(
                 name("gate_up_proj"),
-                weight(2 * s.inner * s.hidden),
+                &[2 * s.inner, s.hidden],
                 Kind::Constant,
             ),
-            down: g.untyped(
-                name("down_proj"),
-                weight(s.hidden * s.inner),
-                Kind::Constant,
-            ),
-            k_cache: g.untyped(name("k_cache"), cache, Kind::State),
-            v_cache: g.untyped(name("v_cache"), cache, Kind::State),
+            down: g.tensor(name("down_proj"), &[s.hidden, s.inner], Kind::Constant),
+            k_cache: g.tensor(name("k_cache"), &cache, Kind::State),
+            v_cache: g.tensor(name("v_cache"), &cache, Kind::State),
         };
-        let q = g.untyped(name("q"), vector(s.heads * s.head_dim), Kind::Intermediate);
-        let partial_o = g.untyped(
+        let q = g.tensor::<F16>(name("q"), &[rows, attention], Kind::Intermediate);
+        let partial_o = g.tensor::<f32>(
             name("partial_o"),
-            (rows * s.heads * chunks * s.head_dim * 4) as u64,
+            &[rows, s.heads, chunks, s.head_dim],
             Kind::Intermediate,
         );
-        let partial_ml = g.untyped(
+        // Each chunk's maximum score and its sum of exponentials.
+        let partial_ml = g.tensor::<f32>(
             name("partial_ml"),
-            (rows * s.heads * chunks * 8) as u64,
+            &[rows, s.heads, chunks, 2],
             Kind::Intermediate,
         );
-        let attended = g.untyped(
-            name("attended"),
-            vector(s.heads * s.head_dim),
-            Kind::Intermediate,
-        );
-        let mid = g.untyped(name("mid"), vector(s.hidden), Kind::Intermediate);
-        let mlp = g.untyped(name("mlp"), vector(s.inner), Kind::Intermediate);
-        let output = g.untyped(name("out"), vector(s.hidden), Kind::Intermediate);
+        let attended = g.tensor::<F16>(name("attended"), &[rows, attention], Kind::Intermediate);
+        let mid = g.tensor::<F16>(name("mid"), &[rows, s.hidden], Kind::Intermediate);
+        let mlp = g.tensor::<F16>(name("mlp"), &[rows, s.inner], Kind::Intermediate);
+        let output = g.tensor::<F16>(name("out"), &[rows, s.hidden], Kind::Intermediate);
         g.op(
             "qkv_rope",
             qkv_pipeline.clone(),
-            &[
+            (
                 input,
                 t.input_norm,
                 t.qkv,
@@ -691,19 +676,19 @@ pub fn decode_batch_graph(
                 q,
                 t.k_cache,
                 t.v_cache,
-            ],
+            ),
             [qkv_groups, 1, 1],
         );
         g.op(
             "attention_split",
             split_pipeline.clone(),
-            &[q, t.k_cache, t.v_cache, position, partial_o, partial_ml],
+            (q, t.k_cache, t.v_cache, position, partial_o, partial_ml),
             [chunks as u32, s.kv_heads as u32, rows as u32],
         );
         g.op(
             "attention_combine",
             combine_pipeline.clone(),
-            &[position, partial_o, partial_ml, attended],
+            (position, partial_o, partial_ml, attended),
             [s.heads as u32, rows as u32, 1],
         );
         g.op(
@@ -727,8 +712,8 @@ pub fn decode_batch_graph(
         layers.push(t);
         input = output;
     }
-    let norm = g.untyped("norm", weight(s.hidden), Kind::Constant);
-    let out = g.untyped("out", vector(s.hidden), Kind::Output);
+    let norm = g.tensor("norm", &[s.hidden], Kind::Constant);
+    let out = g.tensor("out", &[rows, s.hidden], Kind::Output);
     g.op(
         "final_norm",
         norm_pipeline,
@@ -755,18 +740,18 @@ pub fn load_stack(
     step: &mut Step,
     graph: &Graph,
     layers: &[LayerTensors],
-    norm: TensorId,
+    norm: Tensor<F16>,
     checkpoint: &Checkpoint,
     prefix: &str,
 ) -> Result<(), Error> {
-    let mut write = |t: TensorId, names: &[&str]| -> Result<(), Error> {
+    let mut write = |t: Tensor<F16>, names: &[&str]| -> Result<(), Error> {
         let names: Vec<String> = names.iter().map(|n| format!("{prefix}{n}")).collect();
         let values = if names.len() == 1 && checkpoint.shape(&names[0]).map(<[_]>::len) == Some(1) {
             checkpoint.f16(&names[0])?.1
         } else {
             checkpoint.rows_f16(&names)?.1
         };
-        let want = graph.tensors[t.0].bytes as usize / 2;
+        let want = graph.info(t).bytes as usize / size_of::<F16>();
         if values.len() != want {
             return Err(Error::Checkpoint(format!(
                 "{names:?}: {} values, not {want}",
@@ -1115,14 +1100,17 @@ mod tests {
         let one = decode_graph(&s, &tuning).unwrap();
         let batch = Batch { rows: 4, slots: 6 };
         let four = decode_batch_graph(&s, &tuning, batch).unwrap();
-        let bytes = |g: &DecodeGraph, t: TensorId| g.graph.tensors[t.0].bytes;
-        assert_eq!(bytes(&four, four.x), 4 * bytes(&one, one.x));
-        assert_eq!(bytes(&four, four.out), 4 * bytes(&one, one.out));
-        assert_eq!(bytes(&four, four.position), 4 * 2 * 4);
+        let bytes = |g: &DecodeGraph, t: TensorId| g.graph.info(t).bytes;
+        assert_eq!(bytes(&four, four.x.id()), 4 * bytes(&one, one.x.id()));
+        assert_eq!(bytes(&four, four.out.id()), 4 * bytes(&one, one.out.id()));
+        assert_eq!(bytes(&four, four.position.id()), 4 * 2 * 4);
         for (l, w) in one.layers.iter().zip(&four.layers) {
-            assert_eq!(bytes(&four, w.k_cache), 6 * bytes(&one, l.k_cache));
-            assert_eq!(bytes(&four, w.qkv), bytes(&one, l.qkv));
-            assert_eq!(bytes(&four, w.down), bytes(&one, l.down));
+            assert_eq!(
+                bytes(&four, w.k_cache.id()),
+                6 * bytes(&one, l.k_cache.id())
+            );
+            assert_eq!(bytes(&four, w.qkv.id()), bytes(&one, l.qkv.id()));
+            assert_eq!(bytes(&four, w.down.id()), bytes(&one, l.down.id()));
         }
         let norm_width = (0, SpecValue::U32(tuning.norm_width()));
         for (a, b) in one.graph.ops.iter().zip(&four.graph.ops) {

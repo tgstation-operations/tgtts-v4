@@ -171,9 +171,9 @@ impl<'a> From<&'a DecodeGraph> for StackTensors<'a> {
             shape: &decode.shape,
             slots: decode.batch.slots,
             layers: &decode.layers,
-            norm: decode.norm,
-            cos: decode.cos,
-            sin: decode.sin,
+            norm: decode.norm.id(),
+            cos: decode.cos.id(),
+            sin: decode.sin.id(),
         }
     }
 }
@@ -325,7 +325,7 @@ pub fn append_prefill(
     g.op(
         format!("{name}.input_norm"),
         norm,
-        &[run, x, stack.layers[0].input_norm, normed],
+        &[run, x, stack.layers[0].input_norm.id(), normed],
         row_groups,
     );
     for (l, w) in stack.layers.iter().enumerate() {
@@ -353,39 +353,52 @@ pub fn append_prefill(
                     half(s.hidden),
                     Kind::Intermediate,
                 ),
-                next.input_norm,
+                next.input_norm.id(),
             ),
             None => (out, stack.norm),
         };
         g.op(
             "qkv_proj",
             qkv_gemm.0.clone(),
-            &[normed, w.qkv, qkv],
+            &[normed, w.qkv.id(), qkv],
             qkv_gemm.1,
         );
         g.op(
             "rope_rows",
             rope_pipeline.clone(),
-            &[run, qkv, stack.cos, stack.sin, q, w.k_cache, w.v_cache],
+            &[
+                run,
+                qkv,
+                stack.cos,
+                stack.sin,
+                q,
+                w.k_cache.id(),
+                w.v_cache.id(),
+            ],
             row_groups,
         );
         g.op(
             "attention_rows",
             attention.clone(),
-            &[run, q, w.k_cache, w.v_cache, attended],
+            &[run, q, w.k_cache.id(), w.v_cache.id(), attended],
             [(rows / per_group) as u32, s.kv_heads as u32, 1],
         );
-        g.op("o_proj", o_gemm.0.clone(), &[attended, w.o, o], o_gemm.1);
+        g.op(
+            "o_proj",
+            o_gemm.0.clone(),
+            &[attended, w.o.id(), o],
+            o_gemm.1,
+        );
         g.op(
             "add_norm_rows",
             add_norm.clone(),
-            &[run, o, input, w.post_norm, mid, mid_normed],
+            &[run, o, input, w.post_norm.id(), mid, mid_normed],
             row_groups,
         );
         g.op(
             "gate_up_proj",
             gate_up_gemm.0.clone(),
-            &[mid_normed, w.gate_up, gate_up],
+            &[mid_normed, w.gate_up.id(), gate_up],
             gate_up_gemm.1,
         );
         g.op(
@@ -397,7 +410,7 @@ pub fn append_prefill(
         g.op(
             "down_proj",
             down_gemm.0.clone(),
-            &[mlp, w.down, down],
+            &[mlp, w.down.id(), down],
             down_gemm.1,
         );
         g.op(

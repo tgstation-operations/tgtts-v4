@@ -31,6 +31,15 @@ impl<E> Tensor<E> {
     pub fn id(self) -> TensorId {
         self.id
     }
+
+    /// The tensor this one is in a graph `ids` maps its own into, as a splice does
+    /// ([`splice`](crate::lm_side::splice)), which holds the same elements there.
+    pub fn moved(self, ids: &[TensorId]) -> Self {
+        Tensor {
+            id: ids[self.id.0],
+            element: PhantomData,
+        }
+    }
 }
 
 impl<E> Clone for Tensor<E> {
@@ -245,6 +254,11 @@ impl Graph {
             id: TensorId(self.tensors.len() - 1),
             element: PhantomData,
         }
+    }
+
+    /// What the graph holds of tensor `t`.
+    pub fn info(&self, t: impl Bound) -> &TensorInfo {
+        &self.tensors[t.id().0]
     }
 
     /// Adds a tensor of `bytes` bytes, whose element type no op checks.

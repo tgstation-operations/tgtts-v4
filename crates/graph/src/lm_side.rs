@@ -19,7 +19,7 @@ use crate::{
         Batch, DecodeGraph, LayerTensors, LmConfig, Row, Shape, Tuning, decode_batch_graph,
         load_stack,
     },
-    graph::{Graph, Kind, Pipeline, TensorId},
+    graph::{Graph, Kind, Pipeline, Tensor, TensorId},
     kernels::{KernelInfo, Kernels, read, write},
     local::identity,
     step::Step,
@@ -132,7 +132,7 @@ impl Heads {
 #[derive(Clone, Debug)]
 pub struct Stack {
     pub layers: Vec<LayerTensors>,
-    pub norm: TensorId,
+    pub norm: Tensor<F16>,
 }
 
 /// The LM side's graph, and the tensors the host writes and reads, a row of each for every row of
@@ -208,17 +208,16 @@ fn append_stack(
     [x, position, cos, sin, out]: [TensorId; 5],
 ) -> Stack {
     let shared = [
-        (stack.x, x),
-        (stack.position, position),
-        (stack.cos, cos),
-        (stack.sin, sin),
-        (stack.out, out),
+        (stack.x.id(), x),
+        (stack.position.id(), position),
+        (stack.cos.id(), cos),
+        (stack.sin.id(), sin),
+        (stack.out.id(), out),
     ];
     let ids = splice(g, &stack.graph, prefix, &shared);
-    let at = |t: TensorId| ids[t.0];
     Stack {
-        layers: stack.layers.iter().map(|l| l.map(at)).collect(),
-        norm: at(stack.norm),
+        layers: stack.layers.iter().map(|l| l.moved(&ids)).collect(),
+        norm: stack.norm.moved(&ids),
     }
 }
 
@@ -334,7 +333,7 @@ pub fn lm_side_batch_graph(
     let weight = |n: usize| n as u64 * 2;
     let enc = g.untyped("enc", vector(s.encoder), Kind::Input);
     let position = g.untyped("position", 4 * batch.words() as u64, Kind::Param);
-    let table = base.graph.tensors[base.cos.0].bytes;
+    let table = base.graph.info(base.cos).bytes;
     let cos = g.untyped("rope.cos", table, Kind::Constant);
     let sin = g.untyped("rope.sin", table, Kind::Constant);
     let mu = g.untyped("mu", vector(2 * s.dit), Kind::Output);
@@ -475,8 +474,15 @@ pub fn load_lm_side(
 ) -> Result<(), Error> {
     let at = |t: TensorId| ids[t.0];
     for (stack, prefix) in [(&side.base, "base_lm."), (&side.residual, "residual_lm.")] {
-        let layers: Vec<LayerTensors> = stack.layers.iter().map(|l| l.map(at)).collect();
-        load_stack(step, graph, &layers, at(stack.norm), checkpoint, prefix)?;
+        let layers: Vec<LayerTensors> = stack.layers.iter().map(|l| l.moved(ids)).collect();
+        load_stack(
+            step,
+            graph,
+            &layers,
+            stack.norm.moved(ids),
+            checkpoint,
+            prefix,
+        )?;
     }
     for (name, layer, has_bias) in side.heads.named() {
         let parts = [("weight", layer.weight)]
@@ -788,12 +794,12 @@ mod tests {
         let stack = decode_graph(&stack(1, true), &tuning).unwrap();
         let mut g = Graph::default();
         let x = g.untyped("x", 2 * s.base.hidden as u64, Kind::Intermediate);
-        let ids = splice(&mut g, &stack.graph, "a.", &[(stack.x, x)]);
-        assert_eq!(ids[stack.x.0], x);
+        let ids = splice(&mut g, &stack.graph, "a.", &[(stack.x.id(), x)]);
+        assert_eq!(stack.x.moved(&ids).id(), x);
         // The stack's own x is not added: x stands for it.
         assert_eq!(g.tensors.len(), stack.graph.tensors.len());
         assert_eq!(g.ops[0].bindings[0], x);
         assert_eq!(g.ops[0].label, "a.qkv_rope");
-        assert_eq!(g.tensors[ids[stack.norm.0].0].name, "a.norm");
+        assert_eq!(g.info(stack.norm.moved(&ids)).name, "a.norm");
     }
 }

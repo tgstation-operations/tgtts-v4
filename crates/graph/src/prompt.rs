@@ -109,11 +109,11 @@ fn u(v: usize) -> SpecValue {
     SpecValue::U32(v as u32)
 }
 
-/// The stack `stack` of the LM side, where `at` puts its tensors in the patch step's graph.
-fn stack_layers(stack: &Stack, at: impl Fn(TensorId) -> TensorId) -> (Vec<LayerTensors>, TensorId) {
+/// The stack `stack` of the LM side, where `ids` puts its tensors in the patch step's graph.
+fn stack_layers(stack: &Stack, ids: &[TensorId]) -> (Vec<LayerTensors>, TensorId) {
     (
-        stack.layers.iter().map(|l| l.map(&at)).collect(),
-        at(stack.norm),
+        stack.layers.iter().map(|l| l.moved(ids)).collect(),
+        stack.norm.moved(ids).id(),
     )
 }
 
@@ -179,8 +179,8 @@ pub fn prompt_graphs(
     let lm_hidden = between("prompt.lm_hidden", hidden);
     let residual_in = between("prompt.residual_lm.in", hidden);
     let residual_out = between("prompt.residual_lm.out", hidden);
-    let (base_layers, base_norm) = stack_layers(&side.base, at);
-    let (residual_layers, residual_norm) = stack_layers(&side.residual, at);
+    let (base_layers, base_norm) = stack_layers(&side.base, &patch.side_ids);
+    let (residual_layers, residual_norm) = stack_layers(&side.residual, &patch.side_ids);
     let stack = |shape, layers, norm| StackTensors {
         shape,
         slots: side.batch.slots,
@@ -512,7 +512,7 @@ fn cache_regions(graph: &PatchGraph, slot: usize, len: usize, held: usize) -> Ve
             for cache in [layer.k_cache, layer.v_cache] {
                 for head in slot as u64 * heads..(slot as u64 + 1) * heads {
                     regions.push(Region {
-                        tensor: graph.side_ids[cache.0],
+                        tensor: cache.moved(&graph.side_ids).id(),
                         offset: head * shape.capacity as u64 * row,
                         other,
                         bytes: len as u64 * row,
@@ -817,8 +817,8 @@ mod tests {
                 }
             }
             let caches = |stack: &Stack| -> Vec<TensorId> {
-                let at = |t: TensorId| patch.side_ids[t.0];
-                stack.layers.iter().map(|l| at(l.k_cache)).collect()
+                let at = |l: &LayerTensors| l.k_cache.moved(&patch.side_ids).id();
+                stack.layers.iter().map(at).collect()
             };
             let mut keys = caches(&patch.side.base);
             keys.extend(caches(&patch.side.residual));
@@ -859,7 +859,7 @@ mod tests {
             .into_iter()
             .flat_map(|stack| &stack.layers)
             .flat_map(|l| [l.k_cache, l.v_cache])
-            .map(|t| patch.side_ids[t.0])
+            .map(|t| t.moved(&patch.side_ids).id())
             .collect();
         let s = &side.shape.base;
         let row = 2 * s.head_dim as u64;

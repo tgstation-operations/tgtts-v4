@@ -653,10 +653,11 @@ pub(crate) mod tests {
             let bytes = |t: TensorId| tensors[t.0].bytes;
             assert_eq!(bytes(p.cond), (rows[i] * 64 * 4 * 4) as u64);
             assert_eq!(bytes(p.position), (2 * rows[i] * 4) as u64);
-            let (head, cache) = (p.side.heads.stop_head.weight, p.side.base.layers[0].k_cache);
+            let head = p.side.heads.stop_head.weight;
             let first = &all[0];
             assert_eq!(at(p, head), at(first, first.side.heads.stop_head.weight));
-            assert_eq!(at(p, cache), at(first, first.side.base.layers[0].k_cache));
+            let cache_at = |p: &PatchGraph| p.side.base.layers[0].k_cache.moved(&p.side_ids);
+            assert_eq!(cache_at(p), cache_at(first));
         }
         let labels = |g: &Graph| g.ops.iter().map(|op| op.label.clone()).collect::<Vec<_>>();
         assert_eq!(labels(&all[0].graph), labels(&graphs[0].graph));
